@@ -1,4 +1,8 @@
-/target
+# Rust build artifacts
+target/
+
 *.log
-.DS_Store
 .env
+
+# macOS metadata
+.DS_Store
