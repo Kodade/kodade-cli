@@ -1,0 +1,12 @@
+name = "opencode"
+display = "OpenCode"
+process = ["opencode"]
+title = ["OpenCode"]
+
+[[rule]]
+state = "blocked"
+any = ["Allow", "y/n"]
+
+[[rule]]
+state = "working"
+any = ["esc to interrupt"]

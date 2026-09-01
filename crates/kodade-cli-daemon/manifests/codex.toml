@@ -1,0 +1,12 @@
+name = "codex"
+display = "Codex"
+process = ["codex"]
+title = ["Codex"]
+
+[[rule]]
+state = "blocked"
+any = ["Allow", "y/n", "Would you like"]
+
+[[rule]]
+state = "working"
+any = ["esc to interrupt"]

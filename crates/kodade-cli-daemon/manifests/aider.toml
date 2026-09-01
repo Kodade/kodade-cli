@@ -1,0 +1,8 @@
+name = "aider"
+display = "Aider"
+process = ["aider"]
+title = ["Aider"]
+
+[[rule]]
+state = "blocked"
+any = ["Proceed?", "y/n"]

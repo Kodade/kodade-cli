@@ -1,0 +1,8 @@
+name = "grok"
+display = "Grok Build"
+process = ["grok"]
+title = ["Grok"]
+
+[[rule]]
+state = "blocked"
+any = ["Allow this", "y/n"]

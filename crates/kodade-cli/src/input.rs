@@ -1,4 +1,4 @@
-use kodade_cli_proto::{Direction, PaneId, TabId, TabInfo};
+use kodade_cli_proto::{AgentStateKind, Direction, PaneId, TabId, TabInfo};
 use ratatui::layout::Rect;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -19,10 +19,13 @@ pub fn tab_spans(start: u16, tabs: &[TabInfo]) -> Vec<TabSpan> {
     let mut column = start;
     tabs.iter()
         .map(|tab| {
+            let prefix = matches!(tab.state, AgentStateKind::Blocked | AgentStateKind::Working)
+                .then_some("● ")
+                .unwrap_or("");
             let label = if tab.active {
-                format!("[{}]", tab.name)
+                format!("{prefix}[{}]", tab.name)
             } else {
-                format!(" {} ", tab.name)
+                format!(" {prefix}{} ", tab.name)
             };
             let span = TabSpan {
                 id: tab.id,
@@ -122,11 +125,13 @@ mod tests {
                 id: TabId(1),
                 name: "shell".into(),
                 active: true,
+                state: AgentStateKind::Idle,
             },
             TabInfo {
                 id: TabId(2),
                 name: "logs".into(),
                 active: false,
+                state: AgentStateKind::Working,
             },
         ];
         let spans = tab_spans(10, &tabs);

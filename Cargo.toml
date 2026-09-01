@@ -24,6 +24,8 @@ ratatui = "0.29"
 # Serde JSON is the documented, script-friendly daemon protocol.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# TOML plus Serde derives load public agent-detection manifests without a custom parser.
+toml = "0.8"
 # Tokio multiplexes clients while the blocking PTY reader uses its blocking pool.
 tokio = { version = "1", features = ["io-util", "macros", "net", "process", "rt-multi-thread", "sync", "time"] }
 # vt100 makes the daemon the durable owner of screen and scrollback state.

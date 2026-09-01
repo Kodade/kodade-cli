@@ -1,0 +1,12 @@
+name = "claude-code"
+display = "Claude Code"
+process = ["claude"]
+title = ["Claude"]
+
+[[rule]]
+state = "blocked"
+any = ["Do you want to", "Allow this", "y/n"]
+
+[[rule]]
+state = "working"
+any = ["esc to interrupt"]

@@ -1,20 +1,23 @@
 //! Persistent PTY host and session model for Ködade CLI.
 
+mod agent;
 mod layout;
+mod manifest;
 
 use std::{
     collections::HashMap,
     env, fs,
     io::{Read, Write},
     path::{Path, PathBuf},
+    process::Command,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
 use anyhow::{anyhow, bail, Context, Result};
 use kodade_cli_proto::{
-    decode, encode, ClientMessage, Direction, LayoutSnapshot, LayoutTree, PaneId, PaneSnapshot,
-    Screen, ServerMessage, SplitAxis, TabId, TabInfo, WorkspaceId, WorkspaceInfo,
+    decode, encode, AgentStateKind, ClientMessage, Direction, LayoutSnapshot, LayoutTree, PaneId,
+    PaneSnapshot, Screen, ServerMessage, SplitAxis, TabId, TabInfo, WorkspaceId, WorkspaceInfo,
 };
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use tokio::{
@@ -28,6 +31,7 @@ struct Session {
     panes: Mutex<HashMap<PaneId, Arc<Pane>>>,
     updates: broadcast::Sender<()>,
     size: Mutex<(u16, u16)>,
+    manifests: Vec<manifest::Manifest>,
 }
 struct SessionState {
     workspaces: Vec<Workspace>,
@@ -53,6 +57,22 @@ struct Pane {
     master: Mutex<Box<dyn MasterPty + Send>>,
     parser: Arc<Mutex<vt100::Parser>>,
     scroll_offset: Mutex<usize>,
+    last_output: Arc<Mutex<Instant>>,
+    hook: Mutex<Option<ReportedHook>>,
+    spawn_process: String,
+    process: Mutex<ProcessEvidence>,
+}
+
+#[derive(Clone)]
+struct ReportedHook {
+    state: AgentStateKind,
+    source: String,
+    reported_at: Instant,
+}
+
+struct ProcessEvidence {
+    name: Option<String>,
+    checked_at: Instant,
 }
 
 pub fn socket_path(session: &str) -> PathBuf {
@@ -139,6 +159,7 @@ impl Session {
             panes: Mutex::new(HashMap::new()),
             updates,
             size: Mutex::new((cols, rows)),
+            manifests: manifest::load()?,
         };
         let pane = session.new_pane("shell")?;
         let tab = Tab {
@@ -238,6 +259,11 @@ impl Session {
             .panes
             .lock()
             .map_err(|_| anyhow!("pane lock poisoned"))?;
+        let now = Instant::now();
+        let detections: HashMap<_, _> = panes
+            .iter()
+            .map(|(id, pane)| (*id, pane.detect(&self.manifests, now)))
+            .collect();
         let snapshots = ids
             .into_iter()
             .filter_map(|id| {
@@ -247,6 +273,9 @@ impl Session {
                     focused: id == tab.focused,
                     scroll_offset: pane.scroll_offset(),
                     screen: pane.snapshot(),
+                    agent: detections[&id].agent.clone(),
+                    state: detections[&id].state,
+                    state_reason: detections[&id].reason.clone(),
                 })
             })
             .collect();
@@ -260,6 +289,7 @@ impl Session {
                     id: item.id,
                     name: item.name.clone(),
                     active: item.id == workspace.id,
+                    state: agent::rollup(item.tabs.iter().map(|tab| tab_state(tab, &detections))),
                 })
                 .collect(),
             tabs: workspace
@@ -269,6 +299,7 @@ impl Session {
                     id: item.id,
                     name: item.name.clone(),
                     active: item.id == tab.id,
+                    state: tab_state(item, &detections),
                 })
                 .collect(),
             tree,
@@ -562,6 +593,25 @@ impl Session {
                 drop(state);
                 self.resize_current()?;
             }
+            ClientMessage::AgentState {
+                pane,
+                state,
+                source,
+            } => {
+                if let Some(pane) = self
+                    .panes
+                    .lock()
+                    .map_err(|_| anyhow!("pane lock poisoned"))?
+                    .get(&pane)
+                {
+                    *pane.hook.lock().expect("hook lock poisoned") = Some(ReportedHook {
+                        state,
+                        source,
+                        reported_at: Instant::now(),
+                    });
+                    self.notify();
+                }
+            }
         }
         Ok(())
     }
@@ -649,7 +699,12 @@ impl Pane {
             pixel_height: 0,
         })?;
         let shell = env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_owned());
-        let mut command = CommandBuilder::new(shell);
+        let spawn_process = Path::new(&shell)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("sh")
+            .to_owned();
+        let mut command = CommandBuilder::new(&shell);
         command.arg("-l");
         pair.slave
             .spawn_command(command)
@@ -657,13 +712,26 @@ impl Pane {
         let writer = pair.master.take_writer()?;
         let reader = pair.master.try_clone_reader()?;
         let parser = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, 10_000)));
-        read_pty(reader, Arc::clone(&parser), updates);
+        let last_output = Arc::new(Mutex::new(Instant::now()));
+        read_pty(
+            reader,
+            Arc::clone(&parser),
+            Arc::clone(&last_output),
+            updates,
+        );
         Ok(Self {
             title: Mutex::new(title.into()),
             writer: Mutex::new(writer),
             master: Mutex::new(pair.master),
             parser,
             scroll_offset: Mutex::new(0),
+            last_output,
+            hook: Mutex::new(None),
+            spawn_process,
+            process: Mutex::new(ProcessEvidence {
+                name: None,
+                checked_at: Instant::now() - Duration::from_secs(2),
+            }),
         })
     }
     fn snapshot(&self) -> Screen {
@@ -728,6 +796,74 @@ impl Pane {
             .lock()
             .expect("scroll offset lock poisoned")
     }
+
+    fn detect(&self, manifests: &[manifest::Manifest], now: Instant) -> agent::Detection {
+        let (screen, title) = {
+            let parser = self.parser.lock().expect("PTY parser lock poisoned");
+            (
+                parser.screen().contents(),
+                parser.screen().title().to_owned(),
+            )
+        };
+        // portable-pty obtains the foreground process-group leader from the PTY itself.
+        // `ps` turns that portable pid into a basename without sysctl; unavailable leaders fall
+        // back to the login-shell process captured at spawn, with OSC terminal title as evidence.
+        let process = self.process_name(now);
+        let hook = self
+            .hook
+            .lock()
+            .expect("hook lock poisoned")
+            .clone()
+            .map(|hook| agent::HookState {
+                state: hook.state,
+                source: hook.source,
+                age: now.saturating_duration_since(hook.reported_at),
+            });
+        let output_age =
+            now.saturating_duration_since(*self.last_output.lock().expect("output lock poisoned"));
+        agent::detect(
+            manifests,
+            process.as_deref().or(Some(&self.spawn_process)),
+            &title,
+            &screen,
+            output_age,
+            hook,
+        )
+    }
+
+    fn process_name(&self, now: Instant) -> Option<String> {
+        let mut process = self.process.lock().expect("process lock poisoned");
+        if now.saturating_duration_since(process.checked_at) >= Duration::from_secs(2) {
+            process.name = self
+                .master
+                .lock()
+                .expect("PTY master lock poisoned")
+                .process_group_leader()
+                .and_then(|pid| {
+                    let output = Command::new("ps")
+                        .args(["-p", &pid.to_string(), "-o", "comm="])
+                        .output()
+                        .ok()?;
+                    let path = String::from_utf8(output.stdout).ok()?;
+                    Path::new(path.trim())
+                        .file_name()?
+                        .to_str()
+                        .map(str::to_owned)
+                });
+            process.checked_at = now;
+        }
+        process.name.clone()
+    }
+}
+
+fn tab_state(tab: &Tab, detections: &HashMap<PaneId, agent::Detection>) -> AgentStateKind {
+    let mut panes = Vec::new();
+    layout::leaves(&tab.tree, &mut panes);
+    agent::rollup(
+        panes
+            .into_iter()
+            .filter_map(|id| detections.get(&id).map(|item| item.state)),
+    )
 }
 
 fn scroll_offset_after_delta(offset: usize, delta: i16, available: usize) -> usize {
@@ -743,6 +879,7 @@ fn scroll_offset_after_delta(offset: usize, delta: i16, available: usize) -> usi
 fn read_pty(
     mut reader: Box<dyn Read + Send>,
     parser: Arc<Mutex<vt100::Parser>>,
+    last_output: Arc<Mutex<Instant>>,
     updates: broadcast::Sender<()>,
 ) {
     tokio::task::spawn_blocking(move || {
@@ -755,6 +892,7 @@ fn read_pty(
                 .lock()
                 .expect("PTY parser lock poisoned")
                 .process(&bytes[..count]);
+            *last_output.lock().expect("output lock poisoned") = Instant::now();
             let _ = updates.send(());
         }
     });
@@ -801,6 +939,8 @@ async fn serve_client(stream: UnixStream, session: Arc<Session>, name: String) -
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader).lines();
     let mut updates = session.updates.subscribe();
+    let mut process_timer = tokio::time::interval(Duration::from_secs(2));
+    process_timer.tick().await;
     let mut last_snapshot = Instant::now() - Duration::from_millis(16);
     write_server(&mut writer, &ServerMessage::Welcome { session: name }).await?;
     write_server(&mut writer, &ServerMessage::Layout(session.snapshot()?)).await?;
@@ -820,7 +960,11 @@ async fn serve_client(stream: UnixStream, session: Arc<Session>, name: String) -
                     last_snapshot = Instant::now();
                 }
                 Err(broadcast::error::RecvError::Closed) => return Ok(()),
-            }
+            },
+            _ = process_timer.tick() => {
+                write_server(&mut writer, &ServerMessage::Layout(session.snapshot()?)).await?;
+                last_snapshot = Instant::now();
+            },
         }
     }
 }

@@ -59,6 +59,11 @@ pub enum ClientMessage {
         delta: i16,
     },
     ZoomPane,
+    AgentState {
+        pane: PaneId,
+        state: AgentStateKind,
+        source: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -93,6 +98,16 @@ pub enum SplitAxis {
     Vertical,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AgentStateKind {
+    Blocked,
+    Working,
+    Done,
+    Idle,
+    Unknown,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum LayoutTree {
     Leaf {
@@ -111,6 +126,7 @@ pub struct WorkspaceInfo {
     pub id: WorkspaceId,
     pub name: String,
     pub active: bool,
+    pub state: AgentStateKind,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -118,6 +134,7 @@ pub struct TabInfo {
     pub id: TabId,
     pub name: String,
     pub active: bool,
+    pub state: AgentStateKind,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -127,6 +144,9 @@ pub struct PaneSnapshot {
     pub focused: bool,
     pub scroll_offset: usize,
     pub screen: Screen,
+    pub agent: Option<String>,
+    pub state: AgentStateKind,
+    pub state_reason: String,
 }
 
 /// A daemon-owned tree with terminal-independent pane contents. Clients choose pixels.
@@ -171,11 +191,13 @@ mod tests {
                 id: WorkspaceId(1),
                 name: "main".into(),
                 active: true,
+                state: AgentStateKind::Idle,
             }],
             tabs: vec![TabInfo {
                 id: TabId(2),
                 name: "shell".into(),
                 active: true,
+                state: AgentStateKind::Idle,
             }],
             tree: LayoutTree::Leaf { pane: PaneId(3) },
             panes: vec![PaneSnapshot {
@@ -184,6 +206,9 @@ mod tests {
                 focused: true,
                 scroll_offset: 0,
                 screen: Screen::default(),
+                agent: None,
+                state: AgentStateKind::Idle,
+                state_reason: "no agent process".into(),
             }],
             zoomed: false,
         });

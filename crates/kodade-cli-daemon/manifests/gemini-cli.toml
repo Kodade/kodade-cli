@@ -1,0 +1,8 @@
+name = "gemini-cli"
+display = "Gemini CLI"
+process = ["gemini"]
+title = ["Gemini"]
+
+[[rule]]
+state = "blocked"
+any = ["Allow", "y/n"]

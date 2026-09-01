@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use kodade_cli_proto::{LayoutSnapshot, LayoutTree, PaneId};
+use kodade_cli_proto::{AgentStateKind, LayoutSnapshot, LayoutTree, PaneId};
 use ratatui::{
     layout::{Constraint, Direction as LayoutDirection, Layout, Rect},
     style::{Color, Style},
@@ -31,10 +31,11 @@ pub fn render(frame: &mut Frame, layout: &LayoutSnapshot, prefix: bool, rename: 
         .tabs
         .iter()
         .map(|tab| {
+            let prefix = state_dot(tab.state);
             if tab.active {
-                format!("[{}]", tab.name)
+                format!("{prefix}[{}]", tab.name)
             } else {
-                format!(" {} ", tab.name)
+                format!(" {prefix}{} ", tab.name)
             }
         })
         .collect::<Vec<_>>()
@@ -50,20 +51,16 @@ pub fn render(frame: &mut Frame, layout: &LayoutSnapshot, prefix: bool, rename: 
     for pane in &layout.panes {
         if let Some(rect) = rects.get(&pane.id) {
             let title = if pane.scroll_offset > 0 {
-                format!("{} [scroll]", pane.title)
+                format!("{} [scroll]", pane_title(pane))
             } else {
-                pane.title.clone()
+                pane_title(pane)
             };
             frame.render_widget(
                 Paragraph::new(pane.screen.contents.as_str()).block(
                     Block::default()
                         .borders(Borders::ALL)
                         .title(title)
-                        .border_style(Style::default().fg(if pane.focused {
-                            Color::Cyan
-                        } else {
-                            Color::DarkGray
-                        })),
+                        .border_style(Style::default().fg(border_color(pane.state, pane.focused))),
                 ),
                 *rect,
             );
@@ -80,6 +77,44 @@ pub fn render(frame: &mut Frame, layout: &LayoutSnapshot, prefix: bool, rename: 
         Paragraph::new(status).style(Style::default().fg(Color::DarkGray)),
         areas[2],
     );
+}
+
+fn pane_title(pane: &kodade_cli_proto::PaneSnapshot) -> String {
+    pane.agent
+        .as_ref()
+        .map(|agent| format!("{agent} — {}", state_name(pane.state)))
+        .unwrap_or_else(|| pane.title.clone())
+}
+
+fn border_color(state: AgentStateKind, focused: bool) -> Color {
+    if state == AgentStateKind::Blocked {
+        if focused {
+            Color::Red
+        } else {
+            Color::Yellow
+        }
+    } else if focused {
+        Color::Cyan
+    } else {
+        Color::DarkGray
+    }
+}
+
+fn state_dot(state: AgentStateKind) -> &'static str {
+    match state {
+        AgentStateKind::Blocked | AgentStateKind::Working => "● ",
+        _ => "",
+    }
+}
+
+fn state_name(state: AgentStateKind) -> &'static str {
+    match state {
+        AgentStateKind::Blocked => "blocked",
+        AgentStateKind::Working => "working",
+        AgentStateKind::Done => "done",
+        AgentStateKind::Idle => "idle",
+        AgentStateKind::Unknown => "unknown",
+    }
 }
 
 pub fn tab_spans_for(layout: &LayoutSnapshot) -> Vec<TabSpan> {
