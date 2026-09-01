@@ -7,8 +7,8 @@ tabs contain panes. It is the terminal-native companion to the
 
 ## Status
 
-v0.1.0 is the first release. M0–M3 are complete; M4 is in progress while the
-release is prepared.
+v0.1.0 is released: prebuilt binaries for macOS and Linux (arm64/x86_64) are
+on the releases page, installable with the command below.
 
 | Milestone | Scope | Status |
 |---|---|---|
@@ -16,12 +16,11 @@ release is prepared.
 | M1 | Splits, tabs, workspaces, resize, mouse focus/resize/select, prefix keys, detach/reattach | Done |
 | M2 | Agent detection, five states, sidebar rollup, agent subcommands, Claude Code hooks | Done |
 | M3 | Themes, config, navigate mode, menus, scrollback/copy mode, OSC 52 | Done |
-| M4 | CI builds, release binaries, install script, documentation | In progress — first release imminent |
+| M4 | CI builds, release binaries, install script, documentation | Done |
 
 ## Install
 
-Once the first tagged release is published, install a matching prebuilt binary
-with:
+Install a prebuilt binary with:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Kodade/kodade-cli/main/install.sh | sh
@@ -34,9 +33,7 @@ cargo build
 cargo run -p kodade-cli
 ```
 
-The installer supports macOS and Linux on arm64 and x86_64. Binaries appear
-with the first tagged release; there are no public prebuilt binaries before
-then.
+The installer supports macOS and Linux on arm64 and x86_64.
 
 ## Quick usage
 
