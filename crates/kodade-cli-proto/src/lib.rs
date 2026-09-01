@@ -11,13 +11,100 @@ pub enum ClientMessage {
     Hello { cols: u16, rows: u16 },
     Input { bytes: Vec<u8> },
     Resize { cols: u16, rows: u16 },
+    SplitRight,
+    SplitDown,
+    ClosePane,
+    FocusPane { direction: Direction },
+    NewTab,
+    NextTab,
+    PrevTab,
+    SelectTab { id: TabId },
+    NewWorkspace { name: String },
+    SelectWorkspace { id: WorkspaceId },
+    RenamePane { name: String },
+    RenameTab { name: String },
+    RenameWorkspace { name: String },
+    ResizePane { direction: Direction, cells: i16 },
+    ZoomPane,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum ServerMessage {
+    Welcome { session: String },
+    Layout(LayoutSnapshot),
+    Error { message: String },
+}
+
+macro_rules! id_type {
+    ($name:ident) => {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+        pub struct $name(pub u64);
+    };
+}
+
+id_type!(WorkspaceId);
+id_type!(TabId);
+id_type!(PaneId);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Direction {
+    Up,
+    Down,
+    Left,
+    Right,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SplitAxis {
+    Horizontal,
+    Vertical,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum LayoutTree {
+    Leaf {
+        pane: PaneId,
+    },
+    Split {
+        axis: SplitAxis,
+        ratio: f32,
+        first: Box<LayoutTree>,
+        second: Box<LayoutTree>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ServerMessage {
-    Welcome { session: String },
-    Screen(Screen),
-    Error { message: String },
+pub struct WorkspaceInfo {
+    pub id: WorkspaceId,
+    pub name: String,
+    pub active: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TabInfo {
+    pub id: TabId,
+    pub name: String,
+    pub active: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PaneSnapshot {
+    pub id: PaneId,
+    pub title: String,
+    pub focused: bool,
+    pub screen: Screen,
+}
+
+/// A daemon-owned tree with terminal-independent pane contents. Clients choose pixels.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LayoutSnapshot {
+    pub active_workspace: WorkspaceId,
+    pub active_tab: TabId,
+    pub workspaces: Vec<WorkspaceInfo>,
+    pub tabs: Vec<TabInfo>,
+    pub tree: LayoutTree,
+    pub panes: Vec<PaneSnapshot>,
+    pub zoomed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -43,14 +130,33 @@ mod tests {
 
     #[test]
     fn messages_round_trip_as_newline_delimited_json() {
-        let message = ClientMessage::Input {
-            bytes: vec![0, b'a', 255],
-        };
+        let message = ServerMessage::Layout(LayoutSnapshot {
+            active_workspace: WorkspaceId(1),
+            active_tab: TabId(2),
+            workspaces: vec![WorkspaceInfo {
+                id: WorkspaceId(1),
+                name: "main".into(),
+                active: true,
+            }],
+            tabs: vec![TabInfo {
+                id: TabId(2),
+                name: "shell".into(),
+                active: true,
+            }],
+            tree: LayoutTree::Leaf { pane: PaneId(3) },
+            panes: vec![PaneSnapshot {
+                id: PaneId(3),
+                title: "zsh".into(),
+                focused: true,
+                screen: Screen::default(),
+            }],
+            zoomed: false,
+        });
 
         let encoded = encode(&message).expect("message encodes");
         assert_eq!(encoded.last(), Some(&b'\n'));
         assert_eq!(
-            decode::<ClientMessage>(&encoded).expect("message decodes"),
+            decode::<ServerMessage>(&encoded).expect("message decodes"),
             message
         );
     }
