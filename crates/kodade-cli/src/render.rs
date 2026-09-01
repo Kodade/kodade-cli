@@ -8,7 +8,10 @@ use ratatui::{
     Frame,
 };
 
-use crate::input::{tab_spans, TabSpan};
+use crate::{
+    config::Theme,
+    input::{tab_spans, TabSpan},
+};
 
 pub const TAB_PREFIX: &str = " Ködade · ";
 pub const SIDEBAR_WIDTH: u16 = 24;
@@ -34,6 +37,7 @@ pub fn render(
     prefix: bool,
     rename: bool,
     name: &str,
+    theme: &Theme,
 ) {
     let areas = Layout::default()
         .direction(LayoutDirection::Horizontal)
@@ -43,10 +47,10 @@ pub fn render(
         ])
         .split(frame.area());
     if sidebar {
-        render_sidebar(frame, layout, areas[0]);
+        render_sidebar(frame, layout, areas[0], theme);
     } else {
         frame.render_widget(
-            Paragraph::new("▸").style(Style::default().fg(Color::DarkGray)),
+            Paragraph::new("▸").style(Style::default().fg(theme.dim)),
             areas[0],
         );
     }
@@ -79,7 +83,7 @@ pub fn render(
         .join(" ");
     frame.render_widget(
         Paragraph::new(format!("{TAB_PREFIX}{workspace}  {tabs}"))
-            .style(Style::default().fg(Color::Cyan)),
+            .style(Style::default().fg(theme.text).bg(theme.tabbar_bg)),
         areas[0],
     );
 
@@ -97,7 +101,11 @@ pub fn render(
                     Block::default()
                         .borders(Borders::ALL)
                         .title(title)
-                        .border_style(Style::default().fg(border_color(pane.state, pane.focused))),
+                        .border_style(Style::default().fg(border_color(
+                            theme,
+                            pane.state,
+                            pane.focused,
+                        ))),
                 ),
                 *rect,
             );
@@ -111,7 +119,7 @@ pub fn render(
         format!(" session · {workspace}")
     };
     frame.render_widget(
-        Paragraph::new(status).style(Style::default().fg(Color::DarkGray)),
+        Paragraph::new(status).style(Style::default().fg(theme.dim).bg(theme.status_bg)),
         areas[2],
     );
 }
@@ -168,7 +176,7 @@ pub fn sidebar_row_at(rows: &[SidebarRow], row: u16) -> Option<&SidebarRow> {
     rows.get(row as usize)
 }
 
-fn render_sidebar(frame: &mut Frame, layout: &LayoutSnapshot, area: Rect) {
+fn render_sidebar(frame: &mut Frame, layout: &LayoutSnapshot, area: Rect, theme: &Theme) {
     for (index, row) in sidebar_rows(layout).iter().enumerate() {
         let y = area.y.saturating_add(index as u16);
         if y >= area.y.saturating_add(area.height) {
@@ -179,7 +187,7 @@ fn render_sidebar(frame: &mut Frame, layout: &LayoutSnapshot, area: Rect) {
             area.width,
         );
         frame.render_widget(
-            Paragraph::new(text).style(Style::default().fg(sidebar_color(row.state))),
+            Paragraph::new(text).style(Style::default().fg(state_color(theme, row.state))),
             Rect::new(area.x, y, area.width, 1),
         );
     }
@@ -197,12 +205,12 @@ fn sidebar_dot(state: AgentStateKind) -> &'static str {
     }
 }
 
-fn sidebar_color(state: AgentStateKind) -> Color {
+fn state_color(theme: &Theme, state: AgentStateKind) -> Color {
     match state {
-        AgentStateKind::Blocked => Color::Red,
-        AgentStateKind::Working => Color::Blue,
-        AgentStateKind::Done => Color::Green,
-        AgentStateKind::Idle | AgentStateKind::Unknown => Color::DarkGray,
+        AgentStateKind::Blocked => theme.blocked,
+        AgentStateKind::Working => theme.working,
+        AgentStateKind::Done => theme.done,
+        AgentStateKind::Idle | AgentStateKind::Unknown => theme.idle,
     }
 }
 
@@ -213,17 +221,13 @@ fn pane_title(pane: &kodade_cli_proto::PaneSnapshot) -> String {
         .unwrap_or_else(|| pane.title.clone())
 }
 
-fn border_color(state: AgentStateKind, focused: bool) -> Color {
+fn border_color(theme: &Theme, state: AgentStateKind, focused: bool) -> Color {
     if state == AgentStateKind::Blocked {
-        if focused {
-            Color::Red
-        } else {
-            Color::Yellow
-        }
+        theme.blocked
     } else if focused {
-        Color::Cyan
+        theme.accent
     } else {
-        Color::DarkGray
+        theme.border
     }
 }
 

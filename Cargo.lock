@@ -306,10 +306,14 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "crossterm",
+ "dirs",
  "kodade-cli-daemon",
  "kodade-cli-proto",
+ "libc",
  "ratatui",
+ "serde",
  "tokio",
+ "toml",
 ]
 
 [[package]]

@@ -1,4 +1,5 @@
 mod commands;
+mod config;
 mod input;
 mod render;
 
@@ -28,9 +29,10 @@ struct DragState {
 }
 #[tokio::main]
 async fn main() -> Result<()> {
+    let config = config::Config::load();
     let args: Vec<_> = env::args().skip(1).collect();
     match commands::parse(&args)? {
-        commands::Command::Attach { session } => attach(&session).await,
+        commands::Command::Attach { session } => attach(&session, &config).await,
         commands::Command::Daemon { session } => kodade_cli_daemon::run(session).await,
         commands::Command::Ls {
             session,
@@ -52,7 +54,7 @@ async fn main() -> Result<()> {
             commands::layout(
                 commands::request(&session, ClientMessage::FocusPaneId { id: pane }).await?,
             )?;
-            attach(&session).await
+            attach(&session, &config).await
         }
         commands::Command::Rename {
             session,
@@ -112,7 +114,7 @@ async fn main() -> Result<()> {
         }
     }
 }
-async fn attach(session: &str) -> Result<()> {
+async fn attach(session: &str, config: &config::Config) -> Result<()> {
     let path = kodade_cli_daemon::socket_path(session);
     let stream = match UnixStream::connect(&path).await {
         Ok(s) => s,
@@ -138,9 +140,9 @@ async fn attach(session: &str) -> Result<()> {
         }
         Err(e) => return Err(e.into()),
     };
-    tui(stream).await
+    tui(stream, config).await
 }
-async fn tui(stream: UnixStream) -> Result<()> {
+async fn tui(stream: UnixStream, config: &config::Config) -> Result<()> {
     let (reader, mut writer) = stream.into_split();
     let (tx, mut rx) = mpsc::channel(16);
     tokio::spawn(async move {
@@ -156,21 +158,24 @@ async fn tui(stream: UnixStream) -> Result<()> {
     let (cols, rows) = crossterm::terminal::size()?;
     writer
         .write_all(&encode(&ClientMessage::Hello {
-            cols: pane_cols(cols, true),
+            cols: pane_cols(cols, config.sidebar),
             rows,
         })?)
         .await?;
+    let theme = config.resolve_theme();
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    execute!(stdout, EnterAlternateScreen)?;
+    if config.mouse {
+        execute!(stdout, EnableMouseCapture)?;
+    }
     let mut term = Terminal::new(CrosstermBackend::new(stdout))?;
-    let result = loop_tui(&mut term, &mut writer, &mut rx).await;
+    let result = loop_tui(&mut term, &mut writer, &mut rx, config, &theme).await;
     disable_raw_mode()?;
-    execute!(
-        term.backend_mut(),
-        DisableMouseCapture,
-        LeaveAlternateScreen
-    )?;
+    execute!(term.backend_mut(), LeaveAlternateScreen)?;
+    if config.mouse {
+        execute!(term.backend_mut(), DisableMouseCapture)?;
+    }
     term.show_cursor()?;
     result
 }
@@ -178,20 +183,22 @@ async fn loop_tui(
     term: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     writer: &mut tokio::net::unix::OwnedWriteHalf,
     rx: &mut mpsc::Receiver<LayoutSnapshot>,
+    config: &config::Config,
+    theme: &config::Theme,
 ) -> Result<()> {
     let mut layout = None;
     let mut prefix = false;
     let mut rename = false;
     let mut name = String::new();
     let mut drag = None;
-    let mut sidebar = true;
+    let mut sidebar = config.sidebar;
     loop {
         while let Ok(next) = rx.try_recv() {
             layout = Some(next);
         }
         term.draw(|f| {
             if let Some(layout) = &layout {
-                render::render(f, layout, sidebar, prefix, rename, &name)
+                render::render(f, layout, sidebar, prefix, rename, &name, theme)
             }
         })?;
         if !event::poll(Duration::from_millis(16))? {
@@ -227,42 +234,46 @@ async fn loop_tui(
             },
             Event::Key(k) if prefix => {
                 prefix = false;
-                if k.code == KeyCode::Char('b') && k.modifiers.contains(KeyModifiers::CONTROL) {
+                if k == config.prefix {
                     writer
-                        .write_all(&encode(&ClientMessage::Input { bytes: vec![2] })?)
-                        .await?
-                } else if k.code == KeyCode::Char('b') {
-                    sidebar = !sidebar;
-                    let size = term.size()?;
-                    writer
-                        .write_all(&encode(&ClientMessage::Resize {
-                            cols: pane_cols(size.width, sidebar),
-                            rows: size.height,
+                        .write_all(&encode(&ClientMessage::Input {
+                            bytes: bytes(k).unwrap_or_default(),
                         })?)
                         .await?
-                } else if k.code == KeyCode::Char('r') {
-                    rename = true
-                } else if k.code == KeyCode::Char('d') {
-                    return Ok(());
-                } else if k.code == KeyCode::Char('w') {
-                    if let Some(current) = &layout {
-                        let index = current
-                            .workspaces
-                            .iter()
-                            .position(|workspace| workspace.active)
-                            .unwrap_or(0);
-                        let next = (index + 1) % current.workspaces.len();
+                } else if let Some(action) = config.action(k) {
+                    if matches!(action, config::Action::SidebarToggle) {
+                        sidebar = !sidebar;
+                        let size = term.size()?;
                         writer
-                            .write_all(&encode(&ClientMessage::SelectWorkspace {
-                                id: current.workspaces[next].id,
+                            .write_all(&encode(&ClientMessage::Resize {
+                                cols: pane_cols(size.width, sidebar),
+                                rows: size.height,
                             })?)
-                            .await?
+                            .await?;
+                    } else if matches!(action, config::Action::Rename) {
+                        rename = true;
+                    } else if matches!(action, config::Action::Detach) {
+                        return Ok(());
+                    } else if matches!(action, config::Action::WorkspaceNext) {
+                        if let Some(current) = &layout {
+                            let index = current
+                                .workspaces
+                                .iter()
+                                .position(|workspace| workspace.active)
+                                .unwrap_or(0);
+                            let next = (index + 1) % current.workspaces.len();
+                            writer
+                                .write_all(&encode(&ClientMessage::SelectWorkspace {
+                                    id: current.workspaces[next].id,
+                                })?)
+                                .await?
+                        }
+                    } else if let Some(message) = action.message() {
+                        writer.write_all(&encode(&message)?).await?
                     }
-                } else if let Some(m) = command(k) {
-                    writer.write_all(&encode(&m)?).await?
                 }
             }
-            Event::Key(k) if is_prefix(k) => prefix = true,
+            Event::Key(k) if k == config.prefix => prefix = true,
             Event::Key(k) => {
                 if let Some(bytes) = bytes(k) {
                     writer
@@ -270,7 +281,7 @@ async fn loop_tui(
                         .await?
                 }
             }
-            Event::Mouse(mouse) => {
+            Event::Mouse(mouse) if config.mouse => {
                 let Some(current) = &layout else { continue };
                 match mouse.kind {
                     MouseEventKind::Down(MouseButton::Left) => {
@@ -387,52 +398,6 @@ async fn loop_tui(
 
 fn pane_cols(cols: u16, sidebar: bool) -> u16 {
     cols.saturating_sub(render::sidebar_width(sidebar)).max(1)
-}
-fn is_prefix(k: KeyEvent) -> bool {
-    k.code == KeyCode::Char('b') && k.modifiers.contains(KeyModifiers::CONTROL)
-}
-fn command(k: KeyEvent) -> Option<ClientMessage> {
-    Some(match k.code {
-        KeyCode::Char('%') => ClientMessage::SplitRight,
-        KeyCode::Char('\"') => ClientMessage::SplitDown,
-        KeyCode::Char('c') => ClientMessage::NewTab,
-        KeyCode::Char('n') => ClientMessage::NextTab,
-        KeyCode::Char('p') => ClientMessage::PrevTab,
-        KeyCode::Char('x') => ClientMessage::ClosePane,
-        KeyCode::Char('z') => ClientMessage::ZoomPane,
-        KeyCode::Char('H') => ClientMessage::ResizePane {
-            direction: Direction::Left,
-            cells: 2,
-        },
-        KeyCode::Char('J') => ClientMessage::ResizePane {
-            direction: Direction::Down,
-            cells: 2,
-        },
-        KeyCode::Char('K') => ClientMessage::ResizePane {
-            direction: Direction::Up,
-            cells: 2,
-        },
-        KeyCode::Char('L') => ClientMessage::ResizePane {
-            direction: Direction::Right,
-            cells: 2,
-        },
-        KeyCode::Char('W') => ClientMessage::NewWorkspace {
-            name: "workspace".into(),
-        },
-        KeyCode::Up | KeyCode::Char('k') => ClientMessage::FocusPane {
-            direction: Direction::Up,
-        },
-        KeyCode::Down | KeyCode::Char('j') => ClientMessage::FocusPane {
-            direction: Direction::Down,
-        },
-        KeyCode::Left | KeyCode::Char('h') => ClientMessage::FocusPane {
-            direction: Direction::Left,
-        },
-        KeyCode::Right | KeyCode::Char('l') => ClientMessage::FocusPane {
-            direction: Direction::Right,
-        },
-        _ => return None,
-    })
 }
 fn bytes(k: KeyEvent) -> Option<Vec<u8>> {
     let alt = k.modifiers.contains(KeyModifiers::ALT);

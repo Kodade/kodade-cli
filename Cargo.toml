@@ -18,6 +18,7 @@ anyhow = "1"
 crossterm = "0.28"
 # `dirs` supplies the cross-platform home-directory fallback for socket state.
 dirs = "5"
+libc = "0.2"
 # Portable-pty hosts the login shell independently from the attaching client.
 portable-pty = "0.8"
 ratatui = "0.29"
