@@ -144,6 +144,7 @@ impl Default for Config {
             ("x", Action::ClosePane),
             ("c", Action::NewTab),
             ("n", Action::Navigate),
+            ("tab", Action::NextTab),
             ("p", Action::PrevTab),
             ("z", Action::Zoom),
             ("d", Action::Detach),
@@ -273,6 +274,7 @@ pub fn parse_key_chord(value: &str) -> Result<KeyEvent, String> {
         "down" => KeyCode::Down,
         "left" => KeyCode::Left,
         "right" => KeyCode::Right,
+        "tab" => KeyCode::Tab,
         _ if key.len() == 2 && key.starts_with('F') => key[1..]
             .parse::<u8>()
             .map(KeyCode::F)
