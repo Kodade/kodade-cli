@@ -1,45 +1,92 @@
 # Ködade CLI
 
 Ködade CLI is a terminal workspace for running agent CLIs such as Claude Code,
-Codex, and other programs that run in a terminal. Its layout model follows
-herdr: workspaces contain tabs, and tabs contain panes. It is the
-terminal-native companion to the [Ködade desktop app](https://github.com/Kodade/kodade).
+Codex, and other programs that run in a terminal. Workspaces contain tabs, and
+tabs contain panes. It is the terminal-native companion to the
+[Ködade desktop app](https://github.com/Kodade/kodade).
 
 ## Status
 
-Pre-alpha. M0–M2 are complete. Today the CLI runs a daemon-backed multiplexer
-(workspaces, tabs, split panes) with mouse support, a sidebar with rolled-up
-agent states (blocked/working/done/idle/unknown), agent detection via TOML
-manifests, and scripting subcommands (`ls`, `agent`, `send`, `kill-session`).
-Themes, config, navigate mode, and release packaging (M3–M4) are next.
+v0.1.0 is the first release. M0–M3 are complete; M4 is in progress while the
+release is prepared.
 
 | Milestone | Scope | Status |
 |---|---|---|
 | M0 | Cargo workspace, daemon/client handshake, one PTY, rendering, keyboard passthrough | Done |
 | M1 | Splits, tabs, workspaces, resize, mouse focus/resize/select, prefix keys, detach/reattach | Done |
-| M2 | Agent detection, five states, sidebar rollup, agent subcommands, Claude Code hooks | Done (hook intake via `agent report`; `integrate` helper pending) |
-| M3 | Themes, config, navigate mode, menus, scrollback/copy mode, OSC 52 | Planned |
-| M4 | CI builds, release binaries, install script, documentation site page | Planned |
+| M2 | Agent detection, five states, sidebar rollup, agent subcommands, Claude Code hooks | Done |
+| M3 | Themes, config, navigate mode, menus, scrollback/copy mode, OSC 52 | Done |
+| M4 | CI builds, release binaries, install script, documentation | In progress — first release imminent |
 
-## Build and run
+## Install
 
-Build and run from the repository:
+Once the first tagged release is published, install a matching prebuilt binary
+with:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Kodade/kodade-cli/main/install.sh | sh
+```
+
+Or build from source:
 
 ```bash
 cargo build
 cargo run -p kodade-cli
 ```
 
-The client starts the daemon automatically when needed. Detach with `ctrl+b`
-followed by `d`; the PTY remains owned by the daemon. Reattach by running
-`cargo run -p kodade-cli` again. A named session can be selected with
-`cargo run -p kodade-cli -- -s SESSION`.
+The installer supports macOS and Linux on arm64 and x86_64. Binaries appear
+with the first tagged release; there are no public prebuilt binaries before
+then.
 
-There is no installer or public prebuilt release yet.
+## Quick usage
 
-## Roadmap
+Run `kodade-cli` to attach to the default session; it starts the daemon when
+needed. Use `kodade-cli -s SESSION` for a named session. Detach with the prefix
+followed by `d`, and reattach by running `kodade-cli` again.
 
-See [docs/PRD.md](docs/PRD.md) for the product requirements and roadmap.
+The default prefix is `ctrl+b`. After the prefix, the default actions are:
+
+| Key | Action |
+|---|---|
+| `%` / `"` | Split right / down |
+| `x` / `c` | Close pane / new tab |
+| `n` | Navigate mode |
+| `tab` / `p` | Next / previous tab |
+| `z` / `d` | Zoom pane / detach |
+| `r` / `w` / `W` | Rename / next workspace / new workspace |
+| `b` / `[` | Toggle sidebar / copy mode |
+| `h` `j` `k` `l` or arrows | Focus left, down, up, right |
+| `H` `J` `K` `L` | Resize left, down, up, right |
+
+Mouse is enabled by default: click panes, tabs, and sidebar rows to focus;
+drag pane borders to resize; scroll over a pane to scroll; right-click a pane,
+tab, or workspace for its menu. In navigate mode, `j`/`k` move through the
+sidebar and `enter` activates a row; `esc` exits.
+
+Copy mode uses `v` to set a selection anchor, movement keys to select, and `y`
+to copy. Copying sends the selection through OSC 52, including over SSH; copy
+payloads are limited to 100 KB. See [docs/CONFIG.md](docs/CONFIG.md) for all
+bindings and configuration.
+
+The scripting commands are:
+
+- `kodade-cli ls` — list sessions, workspaces, tabs, panes, and states.
+- `kodade-cli agent ls` — list recognized agents and states.
+- `kodade-cli agent attach PANE` — focus a pane and attach the TUI.
+- `kodade-cli agent rename PANE NAME` — rename a pane.
+- `kodade-cli agent explain PANE` — print a pane's state and reason.
+- `kodade-cli agent report PANE STATE` — report an agent state to the daemon.
+- `kodade-cli send PANE TEXT` — send text followed by a newline (`--no-newline` is also supported).
+- `kodade-cli kill-session` — stop the current session.
+
+`kodade-cli integrate claude-code` prints Claude Code hook settings;
+`kodade-cli integrate claude-code --write` merges them into
+`~/.claude/settings.json`.
+
+See [docs/CONFIG.md](docs/CONFIG.md), [docs/AGENT-DETECTION.md](docs/AGENT-DETECTION.md),
+[docs/DEVELOPMENT.md](docs/DEVELOPMENT.md), and [docs/RELEASING.md](docs/RELEASING.md)
+for reference and contributor details. The product direction is in
+[docs/PRD.md](docs/PRD.md).
 
 ## License
 
