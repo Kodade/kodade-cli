@@ -258,6 +258,7 @@ mod tests {
                 name: "repo".into(),
                 active: true,
                 state: AgentStateKind::Blocked,
+                tabs: vec![],
             }],
             tabs: vec![TabInfo {
                 id: TabId(2),

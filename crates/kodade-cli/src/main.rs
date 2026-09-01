@@ -155,7 +155,10 @@ async fn tui(stream: UnixStream) -> Result<()> {
     });
     let (cols, rows) = crossterm::terminal::size()?;
     writer
-        .write_all(&encode(&ClientMessage::Hello { cols, rows })?)
+        .write_all(&encode(&ClientMessage::Hello {
+            cols: pane_cols(cols, true),
+            rows,
+        })?)
         .await?;
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
@@ -181,13 +184,14 @@ async fn loop_tui(
     let mut rename = false;
     let mut name = String::new();
     let mut drag = None;
+    let mut sidebar = true;
     loop {
         while let Ok(next) = rx.try_recv() {
             layout = Some(next);
         }
         term.draw(|f| {
             if let Some(layout) = &layout {
-                render::render(f, layout, prefix, rename, &name)
+                render::render(f, layout, sidebar, prefix, rename, &name)
             }
         })?;
         if !event::poll(Duration::from_millis(16))? {
@@ -196,7 +200,10 @@ async fn loop_tui(
         match event::read()? {
             Event::Resize(cols, rows) => {
                 writer
-                    .write_all(&encode(&ClientMessage::Resize { cols, rows })?)
+                    .write_all(&encode(&ClientMessage::Resize {
+                        cols: pane_cols(cols, sidebar),
+                        rows,
+                    })?)
                     .await?
             }
             Event::Key(k) if rename => match k.code {
@@ -223,6 +230,15 @@ async fn loop_tui(
                 if k.code == KeyCode::Char('b') && k.modifiers.contains(KeyModifiers::CONTROL) {
                     writer
                         .write_all(&encode(&ClientMessage::Input { bytes: vec![2] })?)
+                        .await?
+                } else if k.code == KeyCode::Char('b') {
+                    sidebar = !sidebar;
+                    let size = term.size()?;
+                    writer
+                        .write_all(&encode(&ClientMessage::Resize {
+                            cols: pane_cols(size.width, sidebar),
+                            rows: size.height,
+                        })?)
                         .await?
                 } else if k.code == KeyCode::Char('r') {
                     rename = true
@@ -258,10 +274,40 @@ async fn loop_tui(
                 let Some(current) = &layout else { continue };
                 match mouse.kind {
                     MouseEventKind::Down(MouseButton::Left) => {
-                        let rects = render::pane_rects_for(current, {
-                            let size = term.size()?;
-                            ratatui::layout::Rect::new(0, 0, size.width, size.height)
-                        });
+                        let size = term.size()?;
+                        let frame_area = ratatui::layout::Rect::new(0, 0, size.width, size.height);
+                        let content_area = render::content_area(frame_area, sidebar);
+                        if mouse.column < content_area.x {
+                            if sidebar {
+                                if let Some(row) = render::sidebar_row_at(
+                                    &render::sidebar_rows(current),
+                                    mouse.row,
+                                ) {
+                                    let message = match row.target {
+                                        render::SidebarTarget::Workspace(id) => {
+                                            ClientMessage::SelectWorkspace { id }
+                                        }
+                                        render::SidebarTarget::Tab(id) => {
+                                            ClientMessage::SelectTab { id }
+                                        }
+                                        render::SidebarTarget::Pane(id) => {
+                                            ClientMessage::FocusPaneId { id }
+                                        }
+                                    };
+                                    writer.write_all(&encode(&message)?).await?;
+                                }
+                            } else {
+                                sidebar = true;
+                                writer
+                                    .write_all(&encode(&ClientMessage::Resize {
+                                        cols: pane_cols(size.width, sidebar),
+                                        rows: size.height,
+                                    })?)
+                                    .await?;
+                            }
+                            continue;
+                        }
+                        let rects = render::pane_rects_for(current, content_area);
                         if let Some(border) = input::border_at(&rects, mouse.column, mouse.row) {
                             writer
                                 .write_all(&encode(&ClientMessage::FocusPaneId {
@@ -278,9 +324,10 @@ async fn loop_tui(
                                 },
                             });
                         } else if mouse.row == 0 {
-                            if let Some(id) =
-                                input::tab_at(&render::tab_spans_for(current), mouse.column)
-                            {
+                            if let Some(id) = input::tab_at(
+                                &render::tab_spans_for(current, content_area.x),
+                                mouse.column,
+                            ) {
                                 writer
                                     .write_all(&encode(&ClientMessage::SelectTab { id })?)
                                     .await?;
@@ -314,7 +361,10 @@ async fn loop_tui(
                     MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
                         let rects = render::pane_rects_for(current, {
                             let size = term.size()?;
-                            ratatui::layout::Rect::new(0, 0, size.width, size.height)
+                            render::content_area(
+                                ratatui::layout::Rect::new(0, 0, size.width, size.height),
+                                sidebar,
+                            )
                         });
                         if let Some(id) = input::pane_at(&rects, mouse.column, mouse.row) {
                             let delta = if matches!(mouse.kind, MouseEventKind::ScrollUp) {
@@ -333,6 +383,10 @@ async fn loop_tui(
             _ => {}
         }
     }
+}
+
+fn pane_cols(cols: u16, sidebar: bool) -> u16 {
+    cols.saturating_sub(render::sidebar_width(sidebar)).max(1)
 }
 fn is_prefix(k: KeyEvent) -> bool {
     k.code == KeyCode::Char('b') && k.modifiers.contains(KeyModifiers::CONTROL)

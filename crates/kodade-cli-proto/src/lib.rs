@@ -143,6 +143,23 @@ pub struct WorkspaceInfo {
     pub name: String,
     pub active: bool,
     pub state: AgentStateKind,
+    /// Metadata for every tab, including panes outside the active screen.
+    pub tabs: Vec<SidebarTabInfo>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SidebarTabInfo {
+    pub id: TabId,
+    pub name: String,
+    pub state: AgentStateKind,
+    pub agents: Vec<AgentInfo>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentInfo {
+    pub pane: PaneId,
+    pub name: String,
+    pub state: AgentStateKind,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -208,6 +225,16 @@ mod tests {
                 name: "main".into(),
                 active: true,
                 state: AgentStateKind::Idle,
+                tabs: vec![SidebarTabInfo {
+                    id: TabId(2),
+                    name: "shell".into(),
+                    state: AgentStateKind::Idle,
+                    agents: vec![AgentInfo {
+                        pane: PaneId(3),
+                        name: "zsh".into(),
+                        state: AgentStateKind::Idle,
+                    }],
+                }],
             }],
             tabs: vec![TabInfo {
                 id: TabId(2),
