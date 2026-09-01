@@ -1,0 +1,17 @@
+[package]
+name = "kodade-cli"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "kodade-cli"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+crossterm.workspace = true
+kodade-cli-daemon = { path = "../kodade-cli-daemon" }
+kodade-cli-proto = { path = "../kodade-cli-proto" }
+ratatui.workspace = true
+tokio.workspace = true
