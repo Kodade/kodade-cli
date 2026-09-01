@@ -1,7 +1,8 @@
+mod commands;
 mod input;
 mod render;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use crossterm::{
     event::{
         self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
@@ -18,7 +19,6 @@ use tokio::{
     net::UnixStream,
     sync::mpsc,
 };
-const DEFAULT_SESSION: &str = "default";
 const SCROLL_STEP: i16 = 3;
 
 struct DragState {
@@ -29,20 +29,88 @@ struct DragState {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args: Vec<_> = env::args().skip(1).collect();
-    if args.first().is_some_and(|x| x == "daemon") {
-        return kodade_cli_daemon::run(
-            args.get(1)
-                .cloned()
-                .unwrap_or_else(|| DEFAULT_SESSION.into()),
-        )
-        .await;
+    match commands::parse(&args)? {
+        commands::Command::Attach { session } => attach(&session).await,
+        commands::Command::Daemon { session } => kodade_cli_daemon::run(session).await,
+        commands::Command::Ls {
+            session,
+            agents_only,
+        } => {
+            let layout =
+                commands::layout(commands::request(&session, commands::layout_query()).await?)?;
+            println!(
+                "{}",
+                if agents_only {
+                    commands::format_agents(&layout)
+                } else {
+                    commands::format_ls(&layout)
+                }
+            );
+            Ok(())
+        }
+        commands::Command::AgentAttach { session, pane } => {
+            commands::layout(
+                commands::request(&session, ClientMessage::FocusPaneId { id: pane }).await?,
+            )?;
+            attach(&session).await
+        }
+        commands::Command::Rename {
+            session,
+            pane,
+            name,
+        } => {
+            commands::layout(
+                commands::request(&session, ClientMessage::RenamePaneId { id: pane, name }).await?,
+            )?;
+            Ok(())
+        }
+        commands::Command::Explain { session, pane } => {
+            let layout =
+                commands::layout(commands::request(&session, commands::layout_query()).await?)?;
+            let pane = commands::find_pane(&layout, pane)?;
+            println!(
+                "{}  {}",
+                commands::state_name(pane.state),
+                pane.state_reason
+            );
+            Ok(())
+        }
+        commands::Command::Report {
+            session,
+            pane,
+            state,
+            source,
+        } => {
+            commands::layout(
+                commands::request(
+                    &session,
+                    ClientMessage::AgentState {
+                        pane,
+                        state,
+                        source,
+                    },
+                )
+                .await?,
+            )?;
+            Ok(())
+        }
+        commands::Command::Send {
+            session,
+            pane,
+            bytes,
+        } => {
+            commands::layout(
+                commands::request(&session, ClientMessage::SendToPane { id: pane, bytes }).await?,
+            )?;
+            Ok(())
+        }
+        commands::Command::KillSession { session } => {
+            match commands::request(&session, ClientMessage::KillSession).await? {
+                ServerMessage::Shutdown => Ok(()),
+                message => commands::layout(message).map(|_| ()),
+            }
+        }
     }
-    attach(match args.as_slice() {
-        [] => DEFAULT_SESSION,
-        [flag, name] if flag == "-s" || flag == "--session" => name,
-        _ => bail!("usage: kodade-cli [-s SESSION]"),
-    })
-    .await
 }
 async fn attach(session: &str) -> Result<()> {
     let path = kodade_cli_daemon::socket_path(session);

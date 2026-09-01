@@ -17,8 +17,8 @@ use std::{
 use anyhow::{anyhow, bail, Context, Result};
 use kodade_cli_proto::{
     decode, encode, AgentInfo, AgentStateKind, ClientMessage, Direction, LayoutSnapshot,
-    LayoutTree, PaneId, PaneSnapshot, Screen, ServerMessage, SidebarTabInfo, SplitAxis, TabId,
-    TabInfo, WorkspaceId, WorkspaceInfo,
+    LayoutTree, PaneId, PaneSnapshot, QueryKind, Screen, ServerMessage, SidebarTabInfo, SplitAxis,
+    TabId, TabInfo, WorkspaceId, WorkspaceInfo,
 };
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use tokio::{
@@ -31,6 +31,7 @@ struct Session {
     state: Mutex<SessionState>,
     panes: Mutex<HashMap<PaneId, Arc<Pane>>>,
     updates: broadcast::Sender<()>,
+    shutdown: broadcast::Sender<()>,
     size: Mutex<(u16, u16)>,
     manifests: Vec<manifest::Manifest>,
 }
@@ -119,15 +120,25 @@ pub async fn run(session_name: String) -> Result<()> {
     }
     let listener = UnixListener::bind(&socket).context("bind Ködade CLI socket")?;
     let session = Arc::new(Session::spawn(80, 24)?);
+    let mut shutdown = session.shutdown.subscribe();
     loop {
-        let (stream, _) = listener.accept().await?;
-        let session = Arc::clone(&session);
-        let session_name = session_name.clone();
-        tokio::spawn(async move {
-            if let Err(error) = serve_client(stream, session, session_name).await {
-                eprintln!("Ködade CLI client disconnected: {error:#}");
+        tokio::select! {
+            _ = shutdown.recv() => {
+                drop(listener);
+                let _ = fs::remove_file(&socket);
+                return Ok(());
             }
-        });
+            accepted = listener.accept() => {
+                let (stream, _) = accepted?;
+                let session = Arc::clone(&session);
+                let session_name = session_name.clone();
+                tokio::spawn(async move {
+                    if let Err(error) = serve_client(stream, session, session_name).await {
+                        eprintln!("Ködade CLI client disconnected: {error:#}");
+                    }
+                });
+            }
+        }
     }
 }
 
@@ -151,6 +162,7 @@ fn validate_session_name(session: &str) -> Result<()> {
 impl Session {
     fn spawn(cols: u16, rows: u16) -> Result<Self> {
         let (updates, _) = broadcast::channel(64);
+        let (shutdown, _) = broadcast::channel(16);
         let session = Self {
             state: Mutex::new(SessionState {
                 workspaces: Vec::new(),
@@ -159,6 +171,7 @@ impl Session {
             }),
             panes: Mutex::new(HashMap::new()),
             updates,
+            shutdown,
             size: Mutex::new((cols, rows)),
             manifests: manifest::load()?,
         };
@@ -353,6 +366,7 @@ impl Session {
 
     fn handle(&self, message: ClientMessage) -> Result<()> {
         match message {
+            ClientMessage::Query(QueryKind::Layout) => {}
             ClientMessage::Hello { cols, rows } | ClientMessage::Resize { cols, rows } => {
                 self.resize(cols, rows)?
             }
@@ -418,6 +432,32 @@ impl Session {
                 } else {
                     self.notify();
                 }
+            }
+            ClientMessage::SendToPane { id, bytes } => {
+                let panes = self
+                    .panes
+                    .lock()
+                    .map_err(|_| anyhow!("pane lock poisoned"))?;
+                let pane = panes
+                    .get(&id)
+                    .ok_or_else(|| anyhow!("pane {} not found", id.0))?;
+                pane.reset_scrollback();
+                pane.write(&bytes)?;
+                self.notify();
+            }
+            ClientMessage::RenamePaneId { id, name } => {
+                let panes = self
+                    .panes
+                    .lock()
+                    .map_err(|_| anyhow!("pane lock poisoned"))?;
+                let pane = panes
+                    .get(&id)
+                    .ok_or_else(|| anyhow!("pane {} not found", id.0))?;
+                *pane.title.lock().expect("title lock poisoned") = name;
+                self.notify();
+            }
+            ClientMessage::KillSession => {
+                let _ = self.shutdown.send(());
             }
             ClientMessage::NewTab => {
                 let pane = self.new_pane("shell")?;
@@ -609,19 +649,19 @@ impl Session {
                 state,
                 source,
             } => {
-                if let Some(pane) = self
+                let panes = self
                     .panes
                     .lock()
-                    .map_err(|_| anyhow!("pane lock poisoned"))?
+                    .map_err(|_| anyhow!("pane lock poisoned"))?;
+                let pane = panes
                     .get(&pane)
-                {
-                    *pane.hook.lock().expect("hook lock poisoned") = Some(ReportedHook {
-                        state,
-                        source,
-                        reported_at: Instant::now(),
-                    });
-                    self.notify();
-                }
+                    .ok_or_else(|| anyhow!("pane {} not found", pane.0))?;
+                *pane.hook.lock().expect("hook lock poisoned") = Some(ReportedHook {
+                    state,
+                    source,
+                    reported_at: Instant::now(),
+                });
+                self.notify();
             }
         }
         Ok(())
@@ -1004,19 +1044,38 @@ async fn serve_client(stream: UnixStream, session: Arc<Session>, name: String) -
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader).lines();
     let mut updates = session.updates.subscribe();
+    let mut shutdown = session.shutdown.subscribe();
     let mut process_timer = tokio::time::interval(Duration::from_secs(2));
     process_timer.tick().await;
     let mut last_snapshot = Instant::now() - Duration::from_millis(16);
-    write_server(&mut writer, &ServerMessage::Welcome { session: name }).await?;
-    write_server(&mut writer, &ServerMessage::Layout(session.snapshot()?)).await?;
+    let mut initialized = false;
     loop {
         tokio::select! {
             line = reader.next_line() => {
                 let Some(line) = line? else { return Ok(()); };
-                session.handle(decode::<ClientMessage>(line.as_bytes())?)?;
+                let message = decode::<ClientMessage>(line.as_bytes())?;
+                let hello = matches!(message, ClientMessage::Hello { .. });
+                let kill = matches!(message, ClientMessage::KillSession);
+                match session.handle(message) {
+                    Ok(()) if hello => {
+                        initialized = true;
+                        write_server(&mut writer, &ServerMessage::Welcome { session: name.clone() }).await?;
+                        write_server(&mut writer, &ServerMessage::Layout(session.snapshot()?)).await?;
+                    }
+                    Ok(()) if kill => {
+                        write_server(&mut writer, &ServerMessage::Shutdown).await?;
+                        return Ok(());
+                    }
+                    Ok(()) => write_server(&mut writer, &ServerMessage::Layout(session.snapshot()?)).await?,
+                    Err(error) => {
+                        write_server(&mut writer, &ServerMessage::Error { message: error.to_string() }).await?;
+                        return Ok(());
+                    }
+                }
             }
             update = updates.recv() => match update {
                 Ok(()) | Err(broadcast::error::RecvError::Lagged(_)) => {
+                    if !initialized { continue; }
                     // PTY output can be bursty; one newest snapshot per frame is enough.
                     while updates.try_recv().is_ok() {}
                     let remaining = Duration::from_millis(16).saturating_sub(last_snapshot.elapsed());
@@ -1027,8 +1086,14 @@ async fn serve_client(stream: UnixStream, session: Arc<Session>, name: String) -
                 Err(broadcast::error::RecvError::Closed) => return Ok(()),
             },
             _ = process_timer.tick() => {
-                write_server(&mut writer, &ServerMessage::Layout(session.snapshot()?)).await?;
-                last_snapshot = Instant::now();
+                if initialized {
+                    write_server(&mut writer, &ServerMessage::Layout(session.snapshot()?)).await?;
+                    last_snapshot = Instant::now();
+                }
+            }
+            _ = shutdown.recv() => {
+                write_server(&mut writer, &ServerMessage::Shutdown).await?;
+                return Ok(());
             },
         }
     }

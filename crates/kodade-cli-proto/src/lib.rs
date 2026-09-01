@@ -8,6 +8,7 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ClientMessage {
+    Query(QueryKind),
     Hello {
         cols: u16,
         rows: u16,
@@ -28,6 +29,15 @@ pub enum ClientMessage {
     FocusPaneId {
         id: PaneId,
     },
+    SendToPane {
+        id: PaneId,
+        bytes: Vec<u8>,
+    },
+    RenamePaneId {
+        id: PaneId,
+        name: String,
+    },
+    KillSession,
     NewTab,
     NextTab,
     PrevTab,
@@ -66,11 +76,17 @@ pub enum ClientMessage {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum QueryKind {
+    Layout,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ServerMessage {
     Welcome { session: String },
     Layout(LayoutSnapshot),
     Error { message: String },
+    Shutdown,
 }
 
 macro_rules! id_type {
