@@ -4,12 +4,17 @@ Ködade CLI is a Rust workspace with three crates:
 
 - `kodade-cli-proto` owns the shared client and server message types and JSON
   encoding/decoding.
-- `kodade-cli-daemon` owns sessions, the PTY, terminal parsing, screen state,
-  and the Unix socket server. The daemon runs the user's shell as a login
-  shell and keeps the PTY alive when a client disconnects.
+- `kodade-cli-daemon` owns sessions, PTYs, terminal parsing, screen state,
+  agent detection, and the Unix socket server. Its current modules include
+  `agent.rs`, `manifest.rs`, and `layout.rs`.
 - `kodade-cli` owns the `kodade-cli` binary and its thin ratatui/crossterm TUI.
-  It connects to the daemon, forwards input and resize events, and renders
-  screen updates.
+  Its current modules are `config.rs`, `mode.rs`, `render.rs`, `input.rs`, and
+  `commands.rs`.
+
+The daemon runs the user's shell as a login shell and keeps the PTY alive when
+a client disconnects. The client connects to the daemon, forwards input and
+resize events, renders screen updates, and also provides the scripting
+subcommands.
 
 ## Client and daemon protocol
 
@@ -39,3 +44,6 @@ cargo fmt && cargo clippy --all-targets -- -D warnings && cargo test
 
 CI mirrors these checks on `ubuntu-latest` and `macos-latest`. CI runs
 `cargo fmt --check`, the same clippy command, `cargo build`, and `cargo test`.
+
+See [RELEASING.md](RELEASING.md) for versioning, tagging, release artifacts,
+and installer details.
