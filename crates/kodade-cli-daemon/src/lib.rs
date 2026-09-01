@@ -16,8 +16,9 @@ use std::{
 
 use anyhow::{anyhow, bail, Context, Result};
 use kodade_cli_proto::{
-    decode, encode, AgentStateKind, ClientMessage, Direction, LayoutSnapshot, LayoutTree, PaneId,
-    PaneSnapshot, Screen, ServerMessage, SplitAxis, TabId, TabInfo, WorkspaceId, WorkspaceInfo,
+    decode, encode, AgentInfo, AgentStateKind, ClientMessage, Direction, LayoutSnapshot,
+    LayoutTree, PaneId, PaneSnapshot, Screen, ServerMessage, SidebarTabInfo, SplitAxis, TabId,
+    TabInfo, WorkspaceId, WorkspaceInfo,
 };
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use tokio::{
@@ -285,11 +286,19 @@ impl Session {
             workspaces: state
                 .workspaces
                 .iter()
-                .map(|item| WorkspaceInfo {
-                    id: item.id,
-                    name: item.name.clone(),
-                    active: item.id == workspace.id,
-                    state: agent::rollup(item.tabs.iter().map(|tab| tab_state(tab, &detections))),
+                .map(|item| {
+                    let tabs = item
+                        .tabs
+                        .iter()
+                        .map(|tab| sidebar_tab_info(tab, &panes, &detections))
+                        .collect::<Vec<_>>();
+                    WorkspaceInfo {
+                        id: item.id,
+                        name: item.name.clone(),
+                        active: item.id == workspace.id,
+                        state: agent::rollup(tabs.iter().map(|tab| tab.state)),
+                        tabs,
+                    }
                 })
                 .collect(),
             tabs: workspace
@@ -402,11 +411,13 @@ impl Session {
                     .state
                     .lock()
                     .map_err(|_| anyhow!("state lock poisoned"))?;
-                let tab = Self::active_tab_mut(&mut state);
-                if layout::contains(&tab.tree, id) {
-                    tab.focused = id;
+                let changed = focus_pane_id(&mut state, id);
+                drop(state);
+                if changed {
+                    self.resize_current()?;
+                } else {
+                    self.notify();
                 }
-                self.notify();
             }
             ClientMessage::NewTab => {
                 let pane = self.new_pane("shell")?;
@@ -687,6 +698,60 @@ impl Session {
         }
         self.resize_current()
     }
+}
+
+fn sidebar_tab_info(
+    tab: &Tab,
+    panes: &HashMap<PaneId, Arc<Pane>>,
+    detections: &HashMap<PaneId, agent::Detection>,
+) -> SidebarTabInfo {
+    let mut pane_ids = Vec::new();
+    layout::leaves(&tab.tree, &mut pane_ids);
+    SidebarTabInfo {
+        id: tab.id,
+        name: tab.name.clone(),
+        state: tab_state(tab, detections),
+        agents: pane_ids
+            .into_iter()
+            .filter_map(|pane| {
+                let pane_ref = panes.get(&pane)?;
+                let detection = detections.get(&pane)?;
+                Some(AgentInfo {
+                    pane,
+                    name: detection.agent.clone().unwrap_or_else(|| {
+                        pane_ref.title.lock().expect("title lock poisoned").clone()
+                    }),
+                    state: detection.state,
+                })
+            })
+            .collect(),
+    }
+}
+
+/// Focus a pane wherever it lives, activating its tab and workspace first.
+fn focus_pane_id(state: &mut SessionState, pane: PaneId) -> bool {
+    let location = state
+        .workspaces
+        .iter()
+        .enumerate()
+        .find_map(|(workspace_index, workspace)| {
+            workspace
+                .tabs
+                .iter()
+                .position(|tab| layout::contains(&tab.tree, pane))
+                .map(|tab_index| (workspace_index, tab_index))
+        });
+    let Some((workspace_index, tab_index)) = location else {
+        return false;
+    };
+    let workspace_id = state.workspaces[workspace_index].id;
+    {
+        let workspace = &mut state.workspaces[workspace_index];
+        workspace.active_tab = workspace.tabs[tab_index].id;
+        workspace.tabs[tab_index].focused = pane;
+    }
+    state.active_workspace = workspace_id;
+    true
 }
 
 impl Pane {
@@ -1015,6 +1080,44 @@ mod tests {
     fn scroll_offset_clamps_to_available_history() {
         assert_eq!(scroll_offset_after_delta(1, 99, 2), 2);
         assert_eq!(scroll_offset_after_delta(1, -99, 2), 0);
+    }
+    #[test]
+    fn focus_pane_id_activates_its_workspace_and_tab() {
+        let mut state = SessionState {
+            active_workspace: WorkspaceId(1),
+            next_id: 6,
+            workspaces: vec![
+                Workspace {
+                    id: WorkspaceId(1),
+                    name: "one".into(),
+                    active_tab: TabId(2),
+                    tabs: vec![Tab {
+                        id: TabId(2),
+                        name: "shell".into(),
+                        tree: LayoutTree::Leaf { pane: PaneId(3) },
+                        focused: PaneId(3),
+                        zoomed: false,
+                    }],
+                },
+                Workspace {
+                    id: WorkspaceId(4),
+                    name: "two".into(),
+                    active_tab: TabId(5),
+                    tabs: vec![Tab {
+                        id: TabId(5),
+                        name: "agents".into(),
+                        tree: LayoutTree::Leaf { pane: PaneId(6) },
+                        focused: PaneId(6),
+                        zoomed: false,
+                    }],
+                },
+            ],
+        };
+        assert!(focus_pane_id(&mut state, PaneId(6)));
+        assert_eq!(state.active_workspace, WorkspaceId(4));
+        assert_eq!(state.workspaces[1].active_tab, TabId(5));
+        assert_eq!(state.workspaces[1].tabs[0].focused, PaneId(6));
+        assert!(!focus_pane_id(&mut state, PaneId(99)));
     }
     #[tokio::test]
     async fn stale_socket_file_is_removed_before_binding() {
