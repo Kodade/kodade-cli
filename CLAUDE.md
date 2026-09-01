@@ -8,7 +8,7 @@ binary that a Ködade user can run over SSH or in any terminal and manage
 several agent panes without the desktop app.
 
 ## Status
-skeleton — last touched 2026-09-01
+M0–M2 complete (daemon multiplexer, mouse, agent detection, sidebar, scripting CLI) — last touched 2026-09-01
 
 ## Commands
 ```bash

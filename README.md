@@ -7,17 +7,17 @@ terminal-native companion to the [Ködade desktop app](https://github.com/Kodade
 
 ## Status
 
-Pre-alpha. M0 is complete and M1 is in progress. Today, the CLI starts a
-daemon, owns one login-shell PTY, renders it in a thin TUI client, and keeps the
-PTY alive when the client detaches. Multiplexer features such as splits, tabs,
-workspaces, mouse controls, and agent-state awareness are planned but are not
-available yet.
+Pre-alpha. M0–M2 are complete. Today the CLI runs a daemon-backed multiplexer
+(workspaces, tabs, split panes) with mouse support, a sidebar with rolled-up
+agent states (blocked/working/done/idle/unknown), agent detection via TOML
+manifests, and scripting subcommands (`ls`, `agent`, `send`, `kill-session`).
+Themes, config, navigate mode, and release packaging (M3–M4) are next.
 
 | Milestone | Scope | Status |
 |---|---|---|
 | M0 | Cargo workspace, daemon/client handshake, one PTY, rendering, keyboard passthrough | Done |
-| M1 | Splits, tabs, workspaces, resize, mouse focus/resize/select, prefix keys, detach/reattach | In progress |
-| M2 | Agent detection, five states, sidebar rollup, agent subcommands, Claude Code hooks | Planned |
+| M1 | Splits, tabs, workspaces, resize, mouse focus/resize/select, prefix keys, detach/reattach | Done |
+| M2 | Agent detection, five states, sidebar rollup, agent subcommands, Claude Code hooks | Done (hook intake via `agent report`; `integrate` helper pending) |
 | M3 | Themes, config, navigate mode, menus, scrollback/copy mode, OSC 52 | Planned |
 | M4 | CI builds, release binaries, install script, documentation site page | Planned |
 
