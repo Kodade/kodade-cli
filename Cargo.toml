@@ -20,7 +20,7 @@ crossterm = "0.28"
 dirs = "5"
 libc = "0.2"
 # Portable-pty hosts the login shell independently from the attaching client.
-portable-pty = "0.8"
+portable-pty = "0.9"
 ratatui = "0.29"
 # Serde JSON is the documented, script-friendly daemon protocol.
 serde = { version = "1", features = ["derive"] }
