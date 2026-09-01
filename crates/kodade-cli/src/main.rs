@@ -1,26 +1,31 @@
+mod input;
+mod render;
+
 use anyhow::{bail, Context, Result};
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
+        MouseButton, MouseEventKind,
+    },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use kodade_cli_proto::{
-    decode, encode, ClientMessage, Direction, LayoutSnapshot, LayoutTree, PaneId, ServerMessage,
-};
-use ratatui::{
-    backend::CrosstermBackend,
-    layout::{Constraint, Direction as LDir, Layout, Rect},
-    style::{Color, Style},
-    widgets::{Block, Borders, Paragraph},
-    Terminal,
-};
-use std::{collections::HashMap, env, process::Stdio, time::Duration};
+use kodade_cli_proto::{decode, encode, ClientMessage, Direction, LayoutSnapshot, ServerMessage};
+use ratatui::{backend::CrosstermBackend, Terminal};
+use std::{env, process::Stdio, time::Duration};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::UnixStream,
     sync::mpsc,
 };
 const DEFAULT_SESSION: &str = "default";
+const SCROLL_STEP: i16 = 3;
+
+struct DragState {
+    direction: Direction,
+    vertical: bool,
+    last: u16,
+}
 #[tokio::main]
 async fn main() -> Result<()> {
     let args: Vec<_> = env::args().skip(1).collect();
@@ -86,11 +91,15 @@ async fn tui(stream: UnixStream) -> Result<()> {
         .await?;
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let mut term = Terminal::new(CrosstermBackend::new(stdout))?;
     let result = loop_tui(&mut term, &mut writer, &mut rx).await;
     disable_raw_mode()?;
-    execute!(term.backend_mut(), LeaveAlternateScreen)?;
+    execute!(
+        term.backend_mut(),
+        DisableMouseCapture,
+        LeaveAlternateScreen
+    )?;
     term.show_cursor()?;
     result
 }
@@ -103,13 +112,14 @@ async fn loop_tui(
     let mut prefix = false;
     let mut rename = false;
     let mut name = String::new();
+    let mut drag = None;
     loop {
         while let Ok(next) = rx.try_recv() {
             layout = Some(next);
         }
         term.draw(|f| {
             if let Some(layout) = &layout {
-                render(f, layout, prefix, rename, &name)
+                render::render(f, layout, prefix, rename, &name)
             }
         })?;
         if !event::poll(Duration::from_millis(16))? {
@@ -176,101 +186,83 @@ async fn loop_tui(
                         .await?
                 }
             }
-            _ => {}
-        }
-    }
-}
-fn render(f: &mut ratatui::Frame, layout: &LayoutSnapshot, prefix: bool, rename: bool, name: &str) {
-    let a = Layout::default()
-        .direction(LDir::Vertical)
-        .constraints([
-            Constraint::Length(1),
-            Constraint::Min(1),
-            Constraint::Length(1),
-        ])
-        .split(f.area());
-    let ws = layout
-        .workspaces
-        .iter()
-        .find(|x| x.active)
-        .map(|x| x.name.as_str())
-        .unwrap_or("workspace");
-    let tabs = layout
-        .tabs
-        .iter()
-        .map(|x| {
-            if x.active {
-                format!("[{}]", x.name)
-            } else {
-                format!(" {} ", x.name)
+            Event::Mouse(mouse) => {
+                let Some(current) = &layout else { continue };
+                match mouse.kind {
+                    MouseEventKind::Down(MouseButton::Left) => {
+                        let rects = render::pane_rects_for(current, {
+                            let size = term.size()?;
+                            ratatui::layout::Rect::new(0, 0, size.width, size.height)
+                        });
+                        if let Some(border) = input::border_at(&rects, mouse.column, mouse.row) {
+                            writer
+                                .write_all(&encode(&ClientMessage::FocusPaneId {
+                                    id: border.pane,
+                                })?)
+                                .await?;
+                            drag = Some(DragState {
+                                direction: border.direction,
+                                vertical: border.vertical,
+                                last: if border.vertical {
+                                    mouse.column
+                                } else {
+                                    mouse.row
+                                },
+                            });
+                        } else if mouse.row == 0 {
+                            if let Some(id) =
+                                input::tab_at(&render::tab_spans_for(current), mouse.column)
+                            {
+                                writer
+                                    .write_all(&encode(&ClientMessage::SelectTab { id })?)
+                                    .await?;
+                            }
+                        } else if let Some(id) = input::pane_at(&rects, mouse.column, mouse.row) {
+                            writer
+                                .write_all(&encode(&ClientMessage::FocusPaneId { id })?)
+                                .await?;
+                        }
+                    }
+                    MouseEventKind::Drag(MouseButton::Left) => {
+                        if let Some(dragging) = &mut drag {
+                            let now = if dragging.vertical {
+                                mouse.column
+                            } else {
+                                mouse.row
+                            };
+                            let cells = input::drag_delta(dragging.last, now);
+                            if cells != 0 {
+                                writer
+                                    .write_all(&encode(&ClientMessage::ResizePane {
+                                        direction: dragging.direction,
+                                        cells,
+                                    })?)
+                                    .await?;
+                                dragging.last = now;
+                            }
+                        }
+                    }
+                    MouseEventKind::Up(MouseButton::Left) => drag = None,
+                    MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                        let rects = render::pane_rects_for(current, {
+                            let size = term.size()?;
+                            ratatui::layout::Rect::new(0, 0, size.width, size.height)
+                        });
+                        if let Some(id) = input::pane_at(&rects, mouse.column, mouse.row) {
+                            let delta = if matches!(mouse.kind, MouseEventKind::ScrollUp) {
+                                SCROLL_STEP
+                            } else {
+                                -SCROLL_STEP
+                            };
+                            writer
+                                .write_all(&encode(&ClientMessage::ScrollPane { id, delta })?)
+                                .await?;
+                        }
+                    }
+                    _ => {}
+                }
             }
-        })
-        .collect::<Vec<_>>()
-        .join(" ");
-    f.render_widget(
-        Paragraph::new(format!(" Ködade · {ws}  {tabs}")).style(Style::default().fg(Color::Cyan)),
-        a[0],
-    );
-    let mut rects = HashMap::new();
-    rects_for(&layout.tree, a[1], &mut rects);
-    for pane in &layout.panes {
-        if let Some(rect) = rects.get(&pane.id) {
-            f.render_widget(
-                Paragraph::new(pane.screen.contents.as_str()).block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .title(pane.title.as_str())
-                        .border_style(Style::default().fg(if pane.focused {
-                            Color::Cyan
-                        } else {
-                            Color::DarkGray
-                        })),
-                ),
-                *rect,
-            );
-        }
-    }
-    let status = if rename {
-        format!(" rename pane: {name}")
-    } else if prefix {
-        " prefix: % \" hjkl c n p w W x z d r".into()
-    } else {
-        format!(" session · {ws}")
-    };
-    f.render_widget(
-        Paragraph::new(status).style(Style::default().fg(Color::DarkGray)),
-        a[2],
-    );
-}
-fn rects_for(tree: &LayoutTree, rect: Rect, out: &mut HashMap<PaneId, Rect>) {
-    match tree {
-        LayoutTree::Leaf { pane } => {
-            out.insert(*pane, rect);
-        }
-        LayoutTree::Split {
-            axis,
-            ratio,
-            first,
-            second,
-        } => {
-            let dir = match axis {
-                kodade_cli_proto::SplitAxis::Horizontal => LDir::Horizontal,
-                kodade_cli_proto::SplitAxis::Vertical => LDir::Vertical,
-            };
-            let n = if dir == LDir::Horizontal {
-                rect.width
-            } else {
-                rect.height
-            };
-            let a = Layout::default()
-                .direction(dir)
-                .constraints([
-                    Constraint::Length(((n as f32 * ratio) as u16).max(1)),
-                    Constraint::Min(1),
-                ])
-                .split(rect);
-            rects_for(first, a[0], out);
-            rects_for(second, a[1], out);
+            _ => {}
         }
     }
 }

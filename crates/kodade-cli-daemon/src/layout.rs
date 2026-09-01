@@ -55,6 +55,15 @@ pub fn leaves(tree: &LayoutTree, output: &mut Vec<PaneId>) {
     }
 }
 
+pub fn contains(tree: &LayoutTree, target: PaneId) -> bool {
+    match tree {
+        LayoutTree::Leaf { pane } => *pane == target,
+        LayoutTree::Split { first, second, .. } => {
+            contains(first, target) || contains(second, target)
+        }
+    }
+}
+
 pub fn resize(tree: &mut LayoutTree, target: PaneId, direction: Direction, delta: f32) -> bool {
     resize_inner(tree, target, direction, delta).is_some()
 }

@@ -8,23 +8,56 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ClientMessage {
-    Hello { cols: u16, rows: u16 },
-    Input { bytes: Vec<u8> },
-    Resize { cols: u16, rows: u16 },
+    Hello {
+        cols: u16,
+        rows: u16,
+    },
+    Input {
+        bytes: Vec<u8>,
+    },
+    Resize {
+        cols: u16,
+        rows: u16,
+    },
     SplitRight,
     SplitDown,
     ClosePane,
-    FocusPane { direction: Direction },
+    FocusPane {
+        direction: Direction,
+    },
+    FocusPaneId {
+        id: PaneId,
+    },
     NewTab,
     NextTab,
     PrevTab,
-    SelectTab { id: TabId },
-    NewWorkspace { name: String },
-    SelectWorkspace { id: WorkspaceId },
-    RenamePane { name: String },
-    RenameTab { name: String },
-    RenameWorkspace { name: String },
-    ResizePane { direction: Direction, cells: i16 },
+    SelectTab {
+        id: TabId,
+    },
+    NewWorkspace {
+        name: String,
+    },
+    SelectWorkspace {
+        id: WorkspaceId,
+    },
+    RenamePane {
+        name: String,
+    },
+    RenameTab {
+        name: String,
+    },
+    RenameWorkspace {
+        name: String,
+    },
+    ResizePane {
+        direction: Direction,
+        cells: i16,
+    },
+    /// Positive deltas move back through terminal history.
+    ScrollPane {
+        id: PaneId,
+        delta: i16,
+    },
     ZoomPane,
 }
 
@@ -92,6 +125,7 @@ pub struct PaneSnapshot {
     pub id: PaneId,
     pub title: String,
     pub focused: bool,
+    pub scroll_offset: usize,
     pub screen: Screen,
 }
 
@@ -148,6 +182,7 @@ mod tests {
                 id: PaneId(3),
                 title: "zsh".into(),
                 focused: true,
+                scroll_offset: 0,
                 screen: Screen::default(),
             }],
             zoomed: false,

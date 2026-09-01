@@ -52,6 +52,7 @@ struct Pane {
     writer: Mutex<Box<dyn Write + Send>>,
     master: Mutex<Box<dyn MasterPty + Send>>,
     parser: Arc<Mutex<vt100::Parser>>,
+    scroll_offset: Mutex<usize>,
 }
 
 pub fn socket_path(session: &str) -> PathBuf {
@@ -244,6 +245,7 @@ impl Session {
                     id,
                     title: pane.title.lock().expect("title lock poisoned").clone(),
                     focused: id == tab.focused,
+                    scroll_offset: pane.scroll_offset(),
                     screen: pane.snapshot(),
                 })
             })
@@ -327,8 +329,10 @@ impl Session {
                     .map_err(|_| anyhow!("pane lock poisoned"))?
                     .get(&focused)
                 {
+                    pane.reset_scrollback();
                     pane.write(&bytes)?;
                 }
+                self.notify();
             }
             ClientMessage::SplitRight | ClientMessage::SplitDown => {
                 let axis = if matches!(message, ClientMessage::SplitRight) {
@@ -359,6 +363,17 @@ impl Session {
                     if let Some(pane) = layout::focus_neighbor(&tab.tree, tab.focused, direction) {
                         tab.focused = pane;
                     }
+                }
+                self.notify();
+            }
+            ClientMessage::FocusPaneId { id } => {
+                let mut state = self
+                    .state
+                    .lock()
+                    .map_err(|_| anyhow!("state lock poisoned"))?;
+                let tab = Self::active_tab_mut(&mut state);
+                if layout::contains(&tab.tree, id) {
+                    tab.focused = id;
                 }
                 self.notify();
             }
@@ -526,6 +541,17 @@ impl Session {
                 drop(state);
                 self.resize_current()?;
             }
+            ClientMessage::ScrollPane { id, delta } => {
+                if let Some(pane) = self
+                    .panes
+                    .lock()
+                    .map_err(|_| anyhow!("pane lock poisoned"))?
+                    .get(&id)
+                {
+                    pane.scroll(delta);
+                }
+                self.notify();
+            }
             ClientMessage::ZoomPane => {
                 let mut state = self
                     .state
@@ -637,10 +663,17 @@ impl Pane {
             writer: Mutex::new(writer),
             master: Mutex::new(pair.master),
             parser,
+            scroll_offset: Mutex::new(0),
         })
     }
     fn snapshot(&self) -> Screen {
-        let parser = self.parser.lock().expect("PTY parser lock poisoned");
+        let mut offset = self
+            .scroll_offset
+            .lock()
+            .expect("scroll offset lock poisoned");
+        let mut parser = self.parser.lock().expect("PTY parser lock poisoned");
+        parser.set_scrollback(*offset);
+        *offset = parser.screen().scrollback();
         snapshot(&parser)
     }
     fn resize(&self, cols: u16, rows: u16) -> Result<()> {
@@ -668,6 +701,42 @@ impl Pane {
         writer.flush()?;
         Ok(())
     }
+    fn scroll(&self, delta: i16) {
+        let mut offset = self
+            .scroll_offset
+            .lock()
+            .expect("scroll offset lock poisoned");
+        let mut parser = self.parser.lock().expect("PTY parser lock poisoned");
+        *offset = scroll_offset_after_delta(*offset, delta, usize::MAX);
+        parser.set_scrollback(*offset);
+        *offset = parser.screen().scrollback();
+    }
+    fn reset_scrollback(&self) {
+        let mut offset = self
+            .scroll_offset
+            .lock()
+            .expect("scroll offset lock poisoned");
+        *offset = 0;
+        self.parser
+            .lock()
+            .expect("PTY parser lock poisoned")
+            .set_scrollback(0);
+    }
+    fn scroll_offset(&self) -> usize {
+        *self
+            .scroll_offset
+            .lock()
+            .expect("scroll offset lock poisoned")
+    }
+}
+
+fn scroll_offset_after_delta(offset: usize, delta: i16, available: usize) -> usize {
+    let next = if delta.is_negative() {
+        offset.saturating_sub(delta.unsigned_abs() as usize)
+    } else {
+        offset.saturating_add(delta as usize)
+    };
+    next.min(available)
 }
 
 /// PTY reading blocks, so parser ownership stays in Tokio's blocking pool.
@@ -797,6 +866,11 @@ mod tests {
         let mut sizes = Vec::new();
         pane_sizes(&LayoutTree::Leaf { pane: PaneId(1) }, 80, 24, &mut sizes);
         assert_eq!(sizes, vec![(PaneId(1), 78, 22)]);
+    }
+    #[test]
+    fn scroll_offset_clamps_to_available_history() {
+        assert_eq!(scroll_offset_after_delta(1, 99, 2), 2);
+        assert_eq!(scroll_offset_after_delta(1, -99, 2), 0);
     }
     #[tokio::test]
     async fn stale_socket_file_is_removed_before_binding() {
