@@ -23,6 +23,12 @@ pub enum ClientMessage {
     SplitRight,
     SplitDown,
     ClosePane,
+    CloseTab {
+        id: TabId,
+    },
+    CloseWorkspace {
+        id: WorkspaceId,
+    },
     FocusPane {
         direction: Direction,
     },

@@ -1,6 +1,7 @@
 mod commands;
 mod config;
 mod input;
+mod mode;
 mod render;
 
 use anyhow::{Context, Result};
@@ -14,7 +15,7 @@ use crossterm::{
 };
 use kodade_cli_proto::{decode, encode, ClientMessage, Direction, LayoutSnapshot, ServerMessage};
 use ratatui::{backend::CrosstermBackend, Terminal};
-use std::{env, process::Stdio, time::Duration};
+use std::{env, io::Write, process::Stdio, time::Duration};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::UnixStream,
@@ -112,6 +113,7 @@ async fn main() -> Result<()> {
                 message => commands::layout(message).map(|_| ()),
             }
         }
+        commands::Command::Integrate { write } => commands::integrate_claude_code(write),
     }
 }
 async fn attach(session: &str, config: &config::Config) -> Result<()> {
@@ -190,15 +192,39 @@ async fn loop_tui(
     let mut prefix = false;
     let mut rename = false;
     let mut name = String::new();
+    let mut rename_target = None;
     let mut drag = None;
     let mut sidebar = config.sidebar;
+    let mut navigate = None;
+    let mut copy: Option<mode::CopyMode> = None;
+    let mut menu: Option<mode::Menu> = None;
+    let mut note: Option<String> = None;
     loop {
         while let Ok(next) = rx.try_recv() {
+            if let Some(copy_mode) = &mut copy {
+                if let Some(pane) = next.panes.iter().find(|pane| pane.id == copy_mode.pane) {
+                    copy_mode.refresh(pane.screen.clone());
+                }
+            }
             layout = Some(next);
         }
         term.draw(|f| {
             if let Some(layout) = &layout {
-                render::render(f, layout, sidebar, prefix, rename, &name, theme)
+                render::render(
+                    f,
+                    layout,
+                    &render::Ui {
+                        sidebar,
+                        prefix,
+                        rename,
+                        name: &name,
+                        navigate,
+                        copy: copy.as_ref(),
+                        menu: menu.as_ref(),
+                        note: note.as_deref(),
+                    },
+                    theme,
+                )
             }
         })?;
         if !event::poll(Duration::from_millis(16))? {
@@ -215,11 +241,26 @@ async fn loop_tui(
             }
             Event::Key(k) if rename => match k.code {
                 KeyCode::Enter => {
-                    writer
-                        .write_all(&encode(&ClientMessage::RenamePane {
-                            name: std::mem::take(&mut name),
-                        })?)
-                        .await?;
+                    let name = std::mem::take(&mut name);
+                    let message = match rename_target.take() {
+                        Some(mode::MenuTarget::Pane(id)) => {
+                            ClientMessage::RenamePaneId { id, name }
+                        }
+                        Some(mode::MenuTarget::Tab(id)) => {
+                            writer
+                                .write_all(&encode(&ClientMessage::SelectTab { id })?)
+                                .await?;
+                            ClientMessage::RenameTab { name }
+                        }
+                        Some(mode::MenuTarget::Workspace(id)) => {
+                            writer
+                                .write_all(&encode(&ClientMessage::SelectWorkspace { id })?)
+                                .await?;
+                            ClientMessage::RenameWorkspace { name }
+                        }
+                        None => ClientMessage::RenamePane { name },
+                    };
+                    writer.write_all(&encode(&message)?).await?;
                     rename = false
                 }
                 KeyCode::Esc => {
@@ -232,6 +273,100 @@ async fn loop_tui(
                 KeyCode::Char(c) => name.push(c),
                 _ => {}
             },
+            Event::Key(k) if let Some(copy_mode) = &mut copy => match k.code {
+                KeyCode::Esc | KeyCode::Char('q') => copy = None,
+                KeyCode::Char('v') => copy_mode.anchor = Some(copy_mode.cursor),
+                KeyCode::Char('y') => {
+                    if let Some(anchor) = copy_mode.anchor {
+                        let text = mode::selected_text(
+                            &copy_mode.screen.contents,
+                            anchor,
+                            copy_mode.cursor,
+                        );
+                        let (payload, truncated) = mode::osc52(&text);
+                        execute!(term.backend_mut(), crossterm::style::Print(payload))?;
+                        term.backend_mut().flush()?;
+                        note = Some(if truncated {
+                            " copied (truncated to 100KB)".into()
+                        } else {
+                            " copied".into()
+                        });
+                        copy = None;
+                    }
+                }
+                KeyCode::Up | KeyCode::Char('k') => copy_mode.move_by(-1, 0),
+                KeyCode::Down | KeyCode::Char('j') => copy_mode.move_by(1, 0),
+                KeyCode::Left | KeyCode::Char('h') => copy_mode.move_by(0, -1),
+                KeyCode::Right | KeyCode::Char('l') => copy_mode.move_by(0, 1),
+                KeyCode::PageUp | KeyCode::Char('u')
+                    if k.modifiers.contains(KeyModifiers::CONTROL)
+                        || matches!(k.code, KeyCode::PageUp) =>
+                {
+                    writer
+                        .write_all(&encode(&ClientMessage::ScrollPane {
+                            id: copy_mode.pane,
+                            delta: 20,
+                        })?)
+                        .await?
+                }
+                KeyCode::PageDown | KeyCode::Char('d')
+                    if k.modifiers.contains(KeyModifiers::CONTROL)
+                        || matches!(k.code, KeyCode::PageDown) =>
+                {
+                    writer
+                        .write_all(&encode(&ClientMessage::ScrollPane {
+                            id: copy_mode.pane,
+                            delta: -20,
+                        })?)
+                        .await?
+                }
+                _ => {}
+            },
+            Event::Key(k) if let Some(menu_state) = &mut menu => match k.code {
+                KeyCode::Esc => menu = None,
+                KeyCode::Up | KeyCode::Char('k') => menu_state.move_by(-1),
+                KeyCode::Down | KeyCode::Char('j') => menu_state.move_by(1),
+                KeyCode::Enter => {
+                    execute_menu(writer, &mut menu, &mut rename, &mut rename_target).await?;
+                }
+                _ => {}
+            },
+            Event::Key(k) if let Some(current) = navigate => {
+                let rows = render::sidebar_rows(layout.as_ref().expect("navigate has layout"));
+                match k.code {
+                    KeyCode::Esc | KeyCode::Char('q') => {
+                        navigate = None;
+                        if !config.sidebar {
+                            sidebar = false;
+                        }
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        navigate = mode::navigate(
+                            &rows
+                                .iter()
+                                .map(|row| row.target.clone())
+                                .collect::<Vec<_>>(),
+                            Some(current),
+                            -1,
+                        )
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        navigate = mode::navigate(
+                            &rows
+                                .iter()
+                                .map(|row| row.target.clone())
+                                .collect::<Vec<_>>(),
+                            Some(current),
+                            1,
+                        )
+                    }
+                    KeyCode::Enter => {
+                        activate_sidebar(writer, rows[current].target.clone()).await?;
+                        navigate = None;
+                    }
+                    _ => {}
+                }
+            }
             Event::Key(k) if prefix => {
                 prefix = false;
                 if k == config.prefix {
@@ -250,6 +385,15 @@ async fn loop_tui(
                                 rows: size.height,
                             })?)
                             .await?;
+                    } else if matches!(action, config::Action::Navigate) {
+                        sidebar = true;
+                        navigate = Some(0);
+                    } else if matches!(action, config::Action::CopyMode) {
+                        if let Some(current) = &layout {
+                            if let Some(pane) = current.panes.iter().find(|pane| pane.focused) {
+                                copy = Some(mode::CopyMode::new(pane.id, pane.screen.clone()));
+                            }
+                        }
                     } else if matches!(action, config::Action::Rename) {
                         rename = true;
                     } else if matches!(action, config::Action::Detach) {
@@ -285,6 +429,18 @@ async fn loop_tui(
                 let Some(current) = &layout else { continue };
                 match mouse.kind {
                     MouseEventKind::Down(MouseButton::Left) => {
+                        if let Some(menu_state) = &mut menu {
+                            if let Some(selected) =
+                                mode::menu_hit(menu_state, mouse.column, mouse.row)
+                            {
+                                menu_state.selected = selected;
+                                execute_menu(writer, &mut menu, &mut rename, &mut rename_target)
+                                    .await?;
+                            } else {
+                                menu = None;
+                            }
+                            continue;
+                        }
                         let size = term.size()?;
                         let frame_area = ratatui::layout::Rect::new(0, 0, size.width, size.height);
                         let content_area = render::content_area(frame_area, sidebar);
@@ -349,6 +505,41 @@ async fn loop_tui(
                                 .await?;
                         }
                     }
+                    MouseEventKind::Down(MouseButton::Right) => {
+                        let size = term.size()?;
+                        let content = render::content_area(
+                            ratatui::layout::Rect::new(0, 0, size.width, size.height),
+                            sidebar,
+                        );
+                        let target = if sidebar && mouse.column < content.x {
+                            render::sidebar_row_at(&render::sidebar_rows(current), mouse.row).map(
+                                |row| match row.target {
+                                    render::SidebarTarget::Workspace(id) => {
+                                        mode::MenuTarget::Workspace(id)
+                                    }
+                                    render::SidebarTarget::Tab(id) => mode::MenuTarget::Tab(id),
+                                    render::SidebarTarget::Pane(id) => mode::MenuTarget::Pane(id),
+                                },
+                            )
+                        } else {
+                            input::pane_at(
+                                &render::pane_rects_for(current, content),
+                                mouse.column,
+                                mouse.row,
+                            )
+                            .map(mode::MenuTarget::Pane)
+                        };
+                        if let Some(target) = target {
+                            menu = Some(mode::Menu {
+                                target,
+                                x: mouse.column,
+                                y: mouse.row,
+                                selected: 0,
+                            });
+                        } else {
+                            menu = None;
+                        }
+                    }
                     MouseEventKind::Drag(MouseButton::Left) => {
                         if let Some(dragging) = &mut drag {
                             let now = if dragging.vertical {
@@ -394,6 +585,58 @@ async fn loop_tui(
             _ => {}
         }
     }
+}
+
+async fn activate_sidebar(
+    writer: &mut tokio::net::unix::OwnedWriteHalf,
+    target: render::SidebarTarget,
+) -> Result<()> {
+    let message = match target {
+        render::SidebarTarget::Workspace(id) => ClientMessage::SelectWorkspace { id },
+        render::SidebarTarget::Tab(id) => ClientMessage::SelectTab { id },
+        render::SidebarTarget::Pane(id) => ClientMessage::FocusPaneId { id },
+    };
+    writer.write_all(&encode(&message)?).await?;
+    Ok(())
+}
+async fn execute_menu(
+    writer: &mut tokio::net::unix::OwnedWriteHalf,
+    menu: &mut Option<mode::Menu>,
+    rename: &mut bool,
+    rename_target: &mut Option<mode::MenuTarget>,
+) -> Result<()> {
+    let menu_state = menu.take().expect("menu exists");
+    if let mode::MenuTarget::Pane(id) = menu_state.target {
+        writer
+            .write_all(&encode(&ClientMessage::FocusPaneId { id })?)
+            .await?;
+    }
+    match menu_state.action() {
+        mode::MenuAction::Rename => {
+            *rename = true;
+            *rename_target = Some(menu_state.target);
+        }
+        mode::MenuAction::SplitRight => {
+            writer
+                .write_all(&encode(&ClientMessage::SplitRight)?)
+                .await?
+        }
+        mode::MenuAction::SplitDown => {
+            writer
+                .write_all(&encode(&ClientMessage::SplitDown)?)
+                .await?
+        }
+        mode::MenuAction::Zoom => writer.write_all(&encode(&ClientMessage::ZoomPane)?).await?,
+        mode::MenuAction::Close => {
+            let message = match menu_state.target {
+                mode::MenuTarget::Pane(_) => ClientMessage::ClosePane,
+                mode::MenuTarget::Tab(id) => ClientMessage::CloseTab { id },
+                mode::MenuTarget::Workspace(id) => ClientMessage::CloseWorkspace { id },
+            };
+            writer.write_all(&encode(&message)?).await?;
+        }
+    };
+    Ok(())
 }
 
 fn pane_cols(cols: u16, sidebar: bool) -> u16 {

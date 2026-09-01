@@ -9,6 +9,7 @@ name = "kodade-cli"
 path = "src/main.rs"
 
 [dependencies]
+serde_json.workspace = true
 dirs.workspace = true
 anyhow.workspace = true
 crossterm.workspace = true

@@ -2,6 +2,8 @@ use anyhow::{anyhow, bail, Context, Result};
 use kodade_cli_proto::{
     decode, encode, AgentStateKind, ClientMessage, LayoutSnapshot, PaneId, QueryKind, ServerMessage,
 };
+use serde_json::{json, Value};
+use std::{fs, path::Path};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::UnixStream,
@@ -48,6 +50,9 @@ pub enum Command {
     KillSession {
         session: String,
     },
+    Integrate {
+        write: bool,
+    },
 }
 
 pub fn parse(args: &[String]) -> Result<Command> {
@@ -72,6 +77,15 @@ pub fn parse(args: &[String]) -> Result<Command> {
             agents_only: false,
         }),
         [command] if command == "kill-session" => Ok(Command::KillSession { session }),
+        [command, agent] if command == "integrate" && agent == "claude-code" => {
+            Ok(Command::Integrate { write: false })
+        }
+        [command, agent, flag]
+            if command == "integrate" && agent == "claude-code" && flag == "--write" =>
+        {
+            Ok(Command::Integrate { write: true })
+        }
+        [command, _] if command == "integrate" => bail!("no integration available yet"),
         [command, pane, text] if command == "send" => Ok(Command::Send {
             session,
             pane: pane_id(pane)?,
@@ -107,6 +121,16 @@ pub fn parse(args: &[String]) -> Result<Command> {
                 pane: pane_id(pane)?,
             })
         }
+        [agent, command, pane, state, flag, hook_session]
+            if agent == "agent" && command == "report" && flag == "-s" =>
+        {
+            Ok(Command::Report {
+                session: hook_session.clone(),
+                pane: pane_id(pane)?,
+                state: parse_state(state)?,
+                source: "cli".into(),
+            })
+        }
         [agent, command, pane, state, rest @ ..] if agent == "agent" && command == "report" => {
             let source = match rest {
                 [] => "cli".into(),
@@ -120,8 +144,73 @@ pub fn parse(args: &[String]) -> Result<Command> {
                 source,
             })
         }
-        _ => bail!("usage: kodade-cli [-s SESSION] [ls | agent | send | kill-session]"),
+        _ => bail!("usage: kodade-cli [-s SESSION] [ls | agent | send | kill-session | integrate]"),
     }
+}
+
+pub fn integrate_claude_code(write: bool) -> Result<()> {
+    let snippet = claude_hooks();
+    if !write {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({ "hooks": snippet }))?
+        );
+        return Ok(());
+    }
+    let home = dirs::home_dir().ok_or_else(|| anyhow!("home directory unavailable"))?;
+    let path = home.join(".claude/settings.json");
+    merge_claude_settings_path(&path)?;
+    println!("installed Claude Code hooks in {}", path.display());
+    Ok(())
+}
+
+fn claude_hooks() -> Value {
+    json!({
+        "Stop": [{ "hooks": [{ "type": "command", "command": "kodade-cli agent report $KODADE_PANE idle -s \"$KODADE_SESSION\"" }] }],
+        "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "kodade-cli agent report $KODADE_PANE working -s \"$KODADE_SESSION\"" }] }],
+        "Notification": [{ "hooks": [{ "type": "command", "command": "kodade-cli agent report $KODADE_PANE blocked -s \"$KODADE_SESSION\"" }] }]
+    })
+}
+
+fn merge_claude_settings_path(path: &Path) -> Result<()> {
+    let mut settings: Value = match fs::read_to_string(path) {
+        Ok(source) => serde_json::from_str(&source).context("parse Claude settings.json")?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => json!({}),
+        Err(error) => return Err(error.into()),
+    };
+    let hooks = settings
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("Claude settings.json must be an object"))?
+        .entry("hooks")
+        .or_insert_with(|| json!({}))
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("Claude hooks must be an object"))?;
+    for (event, entries) in claude_hooks().as_object().expect("hooks object") {
+        let destination = hooks
+            .entry(event)
+            .or_insert_with(|| json!([]))
+            .as_array_mut()
+            .ok_or_else(|| anyhow!("Claude hook event must be an array"))?;
+        let command = entries[0]["hooks"][0]["command"].as_str().expect("command");
+        let exists = destination.iter().any(|entry| {
+            entry["hooks"].as_array().is_some_and(|nested| {
+                nested
+                    .iter()
+                    .any(|hook| hook["command"].as_str() == Some(command))
+            })
+        });
+        if !exists {
+            destination.extend(entries.as_array().expect("entries").iter().cloned());
+        }
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(
+        path,
+        format!("{}\n", serde_json::to_string_pretty(&settings)?),
+    )?;
+    Ok(())
 }
 
 pub fn parse_state(value: &str) -> Result<AgentStateKind> {
@@ -331,5 +420,23 @@ mod tests {
                 bytes: b"hello".to_vec()
             }
         );
+    }
+
+    #[test]
+    fn merges_claude_settings_without_duplicate_hooks() {
+        let temp = std::env::temp_dir().join(format!("kodade-cli-hooks-{}", std::process::id()));
+        let path = temp.join("settings.json");
+        fs::create_dir_all(&temp).unwrap();
+        fs::write(&path, r#"{"theme":"dark","hooks":{"Stop":[]}}"#).unwrap();
+        merge_claude_settings_path(&path).unwrap();
+        merge_claude_settings_path(&path).unwrap();
+        let settings: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(settings["theme"], "dark");
+        assert_eq!(settings["hooks"]["Stop"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            settings["hooks"]["Notification"].as_array().unwrap().len(),
+            1
+        );
+        fs::remove_dir_all(temp).unwrap();
     }
 }

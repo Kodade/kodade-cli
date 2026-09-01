@@ -28,6 +28,7 @@ use tokio::{
 };
 
 struct Session {
+    name: String,
     state: Mutex<SessionState>,
     panes: Mutex<HashMap<PaneId, Arc<Pane>>>,
     updates: broadcast::Sender<()>,
@@ -119,7 +120,7 @@ pub async fn run(session_name: String) -> Result<()> {
         remove_stale_socket(&socket).await?;
     }
     let listener = UnixListener::bind(&socket).context("bind Ködade CLI socket")?;
-    let session = Arc::new(Session::spawn(80, 24)?);
+    let session = Arc::new(Session::spawn(80, 24, session_name.clone())?);
     let mut shutdown = session.shutdown.subscribe();
     loop {
         tokio::select! {
@@ -160,10 +161,11 @@ fn validate_session_name(session: &str) -> Result<()> {
 }
 
 impl Session {
-    fn spawn(cols: u16, rows: u16) -> Result<Self> {
+    fn spawn(cols: u16, rows: u16, name: String) -> Result<Self> {
         let (updates, _) = broadcast::channel(64);
         let (shutdown, _) = broadcast::channel(16);
         let session = Self {
+            name,
             state: Mutex::new(SessionState {
                 workspaces: Vec::new(),
                 active_workspace: WorkspaceId(1),
@@ -215,7 +217,14 @@ impl Session {
     fn new_pane(&self, title: &str) -> Result<PaneId> {
         let id = self.pane_id();
         let (cols, rows) = *self.size.lock().expect("size lock poisoned");
-        let pane = Arc::new(Pane::spawn(title, cols, rows, self.updates.clone())?);
+        let pane = Arc::new(Pane::spawn(
+            id,
+            title,
+            cols,
+            rows,
+            self.name.clone(),
+            self.updates.clone(),
+        )?);
         self.panes
             .lock()
             .expect("pane lock poisoned")
@@ -407,6 +416,8 @@ impl Session {
                 self.resize_current()?;
             }
             ClientMessage::ClosePane => self.close_pane()?,
+            ClientMessage::CloseTab { id } => self.close_tab(id)?,
+            ClientMessage::CloseWorkspace { id } => self.close_workspace(id)?,
             ClientMessage::FocusPane { direction } => {
                 let mut state = self
                     .state
@@ -738,6 +749,127 @@ impl Session {
         }
         self.resize_current()
     }
+
+    fn close_tab(&self, id: TabId) -> Result<()> {
+        let needs_fresh = {
+            let state = self
+                .state
+                .lock()
+                .map_err(|_| anyhow!("state lock poisoned"))?;
+            state
+                .workspaces
+                .iter()
+                .any(|workspace| workspace.tabs.len() == 1 && workspace.tabs[0].id == id)
+        };
+        let fresh = needs_fresh.then(|| self.new_pane("shell")).transpose()?;
+        let fresh_tab = needs_fresh.then(|| self.tab_id());
+        let pane_ids = {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| anyhow!("state lock poisoned"))?;
+            let workspace = state
+                .workspaces
+                .iter_mut()
+                .find(|workspace| workspace.tabs.iter().any(|tab| tab.id == id));
+            let Some(workspace) = workspace else {
+                return Ok(());
+            };
+            let index = workspace
+                .tabs
+                .iter()
+                .position(|tab| tab.id == id)
+                .expect("tab exists");
+            let tab = workspace.tabs.remove(index);
+            let mut ids = Vec::new();
+            layout::leaves(&tab.tree, &mut ids);
+            if workspace.tabs.is_empty() {
+                let pane = fresh.expect("final tab receives a replacement pane");
+                let tab_id = fresh_tab.expect("final tab receives a replacement tab");
+                workspace.tabs.push(Tab {
+                    id: tab_id,
+                    name: "shell".into(),
+                    tree: LayoutTree::Leaf { pane },
+                    focused: pane,
+                    zoomed: false,
+                });
+            }
+            workspace.active_tab = workspace.tabs[index.saturating_sub(1)].id;
+            ids
+        };
+        let mut panes = self
+            .panes
+            .lock()
+            .map_err(|_| anyhow!("pane lock poisoned"))?;
+        for id in pane_ids {
+            panes.remove(&id);
+        }
+        drop(panes);
+        self.resize_current()
+    }
+
+    fn close_workspace(&self, id: WorkspaceId) -> Result<()> {
+        let needs_fresh = {
+            let state = self
+                .state
+                .lock()
+                .map_err(|_| anyhow!("state lock poisoned"))?;
+            state.workspaces.len() == 1
+                && state.workspaces.iter().any(|workspace| workspace.id == id)
+        };
+        let fresh = needs_fresh.then(|| self.new_pane("shell")).transpose()?;
+        let fresh_tab = needs_fresh.then(|| self.tab_id());
+        let pane_ids = {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| anyhow!("state lock poisoned"))?;
+            let index = match state
+                .workspaces
+                .iter()
+                .position(|workspace| workspace.id == id)
+            {
+                Some(index) => index,
+                None => return Ok(()),
+            };
+            if state.workspaces.len() == 1 {
+                let workspace = &mut state.workspaces[index];
+                let old_tabs = std::mem::take(&mut workspace.tabs);
+                let mut ids = Vec::new();
+                for tab in old_tabs {
+                    layout::leaves(&tab.tree, &mut ids);
+                }
+                let pane = fresh.expect("final workspace receives a replacement pane");
+                let tab_id = fresh_tab.expect("final workspace receives a replacement tab");
+                workspace.tabs.push(Tab {
+                    id: tab_id,
+                    name: "shell".into(),
+                    tree: LayoutTree::Leaf { pane },
+                    focused: pane,
+                    zoomed: false,
+                });
+                workspace.active_tab = tab_id;
+                ids
+            } else {
+                let workspace = state.workspaces.remove(index);
+                let mut ids = Vec::new();
+                for tab in workspace.tabs {
+                    layout::leaves(&tab.tree, &mut ids);
+                }
+                state.active_workspace = state.workspaces[index.saturating_sub(1)].id;
+                ids
+            }
+        };
+        let mut panes = self
+            .panes
+            .lock()
+            .map_err(|_| anyhow!("pane lock poisoned"))?;
+        for id in pane_ids {
+            panes.remove(&id);
+        }
+        drop(panes);
+        self.resize_current()
+    }
 }
 
 fn sidebar_tab_info(
@@ -795,7 +927,14 @@ fn focus_pane_id(state: &mut SessionState, pane: PaneId) -> bool {
 }
 
 impl Pane {
-    fn spawn(title: &str, cols: u16, rows: u16, updates: broadcast::Sender<()>) -> Result<Self> {
+    fn spawn(
+        id: PaneId,
+        title: &str,
+        cols: u16,
+        rows: u16,
+        session: String,
+        updates: broadcast::Sender<()>,
+    ) -> Result<Self> {
         let pty_system = native_pty_system();
         let pair = pty_system.openpty(PtySize {
             rows,
@@ -811,6 +950,8 @@ impl Pane {
             .to_owned();
         let mut command = CommandBuilder::new(&shell);
         command.arg("-l");
+        command.env("KODADE_PANE", id.0.to_string());
+        command.env("KODADE_SESSION", session);
         pair.slave
             .spawn_command(command)
             .context("spawn login shell in PTY")?;

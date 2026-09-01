@@ -11,6 +11,7 @@ use ratatui::{
 use crate::{
     config::Theme,
     input::{tab_spans, TabSpan},
+    mode::{CopyMode, Menu, MenuAction},
 };
 
 pub const TAB_PREFIX: &str = " Ködade · ";
@@ -30,15 +31,29 @@ pub struct SidebarRow {
     pub state: AgentStateKind,
 }
 
-pub fn render(
-    frame: &mut Frame,
-    layout: &LayoutSnapshot,
-    sidebar: bool,
-    prefix: bool,
-    rename: bool,
-    name: &str,
-    theme: &Theme,
-) {
+/// Per-frame UI state that is not part of the daemon layout snapshot.
+pub struct Ui<'a> {
+    pub sidebar: bool,
+    pub prefix: bool,
+    pub rename: bool,
+    pub name: &'a str,
+    pub navigate: Option<usize>,
+    pub copy: Option<&'a CopyMode>,
+    pub menu: Option<&'a Menu>,
+    pub note: Option<&'a str>,
+}
+
+pub fn render(frame: &mut Frame, layout: &LayoutSnapshot, ui: &Ui, theme: &Theme) {
+    let Ui {
+        sidebar,
+        prefix,
+        rename,
+        name,
+        navigate,
+        copy,
+        menu,
+        note,
+    } = *ui;
     let areas = Layout::default()
         .direction(LayoutDirection::Horizontal)
         .constraints([
@@ -47,7 +62,7 @@ pub fn render(
         ])
         .split(frame.area());
     if sidebar {
-        render_sidebar(frame, layout, areas[0], theme);
+        render_sidebar(frame, layout, areas[0], navigate, theme);
     } else {
         frame.render_widget(
             Paragraph::new("▸").style(Style::default().fg(theme.dim)),
@@ -96,8 +111,12 @@ pub fn render(
             } else {
                 pane_title(pane)
             };
+            let contents = copy
+                .filter(|copy| copy.pane == pane.id)
+                .map(|copy| copy.screen.contents.as_str())
+                .unwrap_or(&pane.screen.contents);
             frame.render_widget(
-                Paragraph::new(pane.screen.contents.as_str()).block(
+                Paragraph::new(contents).block(
                     Block::default()
                         .borders(Borders::ALL)
                         .title(title)
@@ -113,6 +132,10 @@ pub fn render(
     }
     let status = if rename {
         format!(" rename pane: {name}")
+    } else if copy.is_some() {
+        " copy mode · v select · y copy · esc exit".into()
+    } else if navigate.is_some() {
+        " navigate · j/k move · enter activate · esc exit".into()
     } else if prefix {
         " prefix: % \" b hjkl c n p w W x z d r".into()
     } else {
@@ -122,6 +145,15 @@ pub fn render(
         Paragraph::new(status).style(Style::default().fg(theme.dim).bg(theme.status_bg)),
         areas[2],
     );
+    if let Some(note) = note {
+        frame.render_widget(
+            Paragraph::new(note).style(Style::default().fg(theme.done).bg(theme.status_bg)),
+            areas[2],
+        );
+    }
+    if let Some(menu) = menu {
+        render_menu(frame, menu, frame.area(), theme);
+    }
 }
 
 pub fn sidebar_width(visible: bool) -> u16 {
@@ -176,7 +208,13 @@ pub fn sidebar_row_at(rows: &[SidebarRow], row: u16) -> Option<&SidebarRow> {
     rows.get(row as usize)
 }
 
-fn render_sidebar(frame: &mut Frame, layout: &LayoutSnapshot, area: Rect, theme: &Theme) {
+fn render_sidebar(
+    frame: &mut Frame,
+    layout: &LayoutSnapshot,
+    area: Rect,
+    navigate: Option<usize>,
+    theme: &Theme,
+) {
     for (index, row) in sidebar_rows(layout).iter().enumerate() {
         let y = area.y.saturating_add(index as u16);
         if y >= area.y.saturating_add(area.height) {
@@ -186,9 +224,44 @@ fn render_sidebar(frame: &mut Frame, layout: &LayoutSnapshot, area: Rect, theme:
             &format!("{} {}", row.label, sidebar_dot(row.state)),
             area.width,
         );
+        let style = if navigate == Some(index) {
+            Style::default().fg(theme.tabbar_bg).bg(theme.accent)
+        } else {
+            Style::default().fg(state_color(theme, row.state))
+        };
         frame.render_widget(
-            Paragraph::new(text).style(Style::default().fg(state_color(theme, row.state))),
+            Paragraph::new(text).style(style),
             Rect::new(area.x, y, area.width, 1),
+        );
+    }
+}
+
+fn render_menu(frame: &mut Frame, menu: &Menu, area: Rect, theme: &Theme) {
+    let labels = menu
+        .actions()
+        .iter()
+        .map(|action| match action {
+            MenuAction::SplitRight => "Split right",
+            MenuAction::SplitDown => "Split down",
+            MenuAction::Rename => "Rename",
+            MenuAction::Zoom => "Zoom",
+            MenuAction::Close => "Close",
+        })
+        .collect::<Vec<_>>();
+    let width = 14.min(area.width.saturating_sub(menu.x));
+    for (index, label) in labels.iter().enumerate() {
+        let y = menu.y.saturating_add(index as u16);
+        if y >= area.height {
+            break;
+        }
+        let style = if index == menu.selected {
+            Style::default().fg(theme.tabbar_bg).bg(theme.accent)
+        } else {
+            Style::default().fg(theme.text).bg(theme.status_bg)
+        };
+        frame.render_widget(
+            Paragraph::new(*label).style(style),
+            Rect::new(menu.x, y, width, 1),
         );
     }
 }
