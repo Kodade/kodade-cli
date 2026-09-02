@@ -1,0 +1,6 @@
+# unverified: sourced from https://github.com/cline/cline (CLI not installed locally)
+# Identification only: no screen rules until a real session confirms its prompt strings.
+name = "cline"
+display = "Cline"
+process = ["cline"]
+title = ["Cline"]

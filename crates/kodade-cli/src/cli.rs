@@ -96,6 +96,8 @@ pub enum AgentCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Refresh agent-detection manifests from the repo (opt-in network call).
+    UpdateManifests,
     /// Report an agent state to the daemon (used by agent hooks).
     Report {
         #[arg(value_name = "PANE", value_parser = pane_id)]
@@ -111,11 +113,28 @@ pub enum AgentCommand {
 
 #[derive(Debug, Subcommand, PartialEq, Eq)]
 pub enum IntegrateCommand {
+    /// List available integrations and whether their config directory exists.
+    List,
     /// Claude Code hooks that report agent state to the daemon.
     ClaudeCode {
         /// Merge the hooks into ~/.claude/settings.json instead of printing them.
         #[arg(long)]
         write: bool,
+    },
+    /// Gemini CLI hooks (Claude-compatible) that report agent state.
+    GeminiCli {
+        /// Merge the hooks into ~/.gemini/settings.json instead of printing them.
+        #[arg(long)]
+        write: bool,
+    },
+    /// Codex `notify` entry that reports agent state.
+    Codex {
+        /// Merge the entry into ~/.codex/config.toml instead of printing it.
+        #[arg(long)]
+        write: bool,
+        /// Replace an existing `notify` entry instead of refusing.
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -268,6 +287,37 @@ mod tests {
     fn rejects_unknown_states_and_pane_ids() {
         assert!(Cli::try_parse_from(["kodade-cli", "agent", "report", "7", "busy"]).is_err());
         assert!(Cli::try_parse_from(["kodade-cli", "agent", "explain", "x"]).is_err());
-        assert!(Cli::try_parse_from(["kodade-cli", "integrate", "codex"]).is_err());
+        assert!(Cli::try_parse_from(["kodade-cli", "integrate", "nope"]).is_err());
+    }
+
+    #[test]
+    fn parses_integrate_and_manifest_subcommands() {
+        assert_eq!(
+            parse(&["kodade-cli", "integrate", "list"]).command,
+            Some(Command::Integrate {
+                target: IntegrateCommand::List
+            })
+        );
+        assert_eq!(
+            parse(&["kodade-cli", "integrate", "codex", "--write", "--force"]).command,
+            Some(Command::Integrate {
+                target: IntegrateCommand::Codex {
+                    write: true,
+                    force: true
+                }
+            })
+        );
+        assert_eq!(
+            parse(&["kodade-cli", "integrate", "gemini-cli", "--write"]).command,
+            Some(Command::Integrate {
+                target: IntegrateCommand::GeminiCli { write: true }
+            })
+        );
+        assert_eq!(
+            parse(&["kodade-cli", "agent", "update-manifests"]).command,
+            Some(Command::Agent {
+                command: AgentCommand::UpdateManifests
+            })
+        );
     }
 }

@@ -166,6 +166,9 @@ pub struct AgentInfo {
     pub pane: PaneId,
     pub name: String,
     pub state: AgentStateKind,
+    /// Seconds the current state has held, for sidebar age labels.
+    #[serde(default)]
+    pub state_age_secs: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -186,6 +189,9 @@ pub struct PaneSnapshot {
     pub agent: Option<String>,
     pub state: AgentStateKind,
     pub state_reason: String,
+    /// Seconds the current state has held (see daemon state_since tracking).
+    #[serde(default)]
+    pub state_age_secs: u64,
 }
 
 /// A daemon-owned tree with terminal-independent pane contents. Clients choose pixels.
@@ -273,6 +279,7 @@ mod tests {
                         pane: PaneId(3),
                         name: "zsh".into(),
                         state: AgentStateKind::Idle,
+                        state_age_secs: 12,
                     }],
                 }],
             }],
@@ -305,6 +312,7 @@ mod tests {
                 agent: None,
                 state: AgentStateKind::Idle,
                 state_reason: "no agent process".into(),
+                state_age_secs: 12,
             }],
             zoomed: false,
         });

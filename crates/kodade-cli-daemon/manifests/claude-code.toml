@@ -2,6 +2,7 @@ name = "claude-code"
 display = "Claude Code"
 process = ["claude"]
 title = ["Claude"]
+resume = "claude --continue"
 
 [[rule]]
 state = "blocked"

@@ -78,8 +78,9 @@ for the installed version. The scripting commands are:
 - `kodade-cli agent ls` — list recognized agents and states.
 - `kodade-cli agent attach PANE` — focus a pane and attach the TUI.
 - `kodade-cli agent rename PANE NAME` — rename a pane.
-- `kodade-cli agent explain PANE` — print a pane's state and reason.
+- `kodade-cli agent explain PANE` — print a pane's state, reason, and the bottom-8-line window it matched.
 - `kodade-cli agent report PANE STATE` — report an agent state to the daemon.
+- `kodade-cli agent update-manifests` — opt-in refresh of agent-detection manifests from GitHub.
 - `kodade-cli send PANE TEXT` — send text followed by a newline (`--no-newline` is also supported).
 - `kodade-cli kill-session` — stop the current session.
 
@@ -90,9 +91,12 @@ the next value through verbatim when it collides with a flag
 `ls`, `agent ls`, and `agent explain` also accept `--json`, which prints the
 matching protocol snapshots for scripts.
 
-`kodade-cli integrate claude-code` prints Claude Code hook settings;
-`kodade-cli integrate claude-code --write` merges them into
-`~/.claude/settings.json`.
+`kodade-cli integrate list` shows the available integrations.
+`kodade-cli integrate <agent>` prints the hook/notify settings and
+`--write` installs them: `claude-code` and `gemini-cli` merge hooks into their
+`settings.json`; `codex` merges a `notify` entry into `~/.codex/config.toml`
+(add `--force` to replace an existing one). See
+[docs/AGENT-DETECTION.md](docs/AGENT-DETECTION.md) for details.
 
 See [docs/CONFIG.md](docs/CONFIG.md), [docs/AGENT-DETECTION.md](docs/AGENT-DETECTION.md),
 [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md), and [docs/RELEASING.md](docs/RELEASING.md)

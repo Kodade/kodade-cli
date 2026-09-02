@@ -9,8 +9,13 @@ then `working`, `done`, `idle`, and `unknown`.
   before producing this state.
 - `working`: The agent is actively producing output, or a hook or manifest
   explicitly reports this state.
-- `done`: A hook or manifest explicitly reports that the agent completed work.
-  The current built-in manifests do not define a `done` screen rule.
+- `done`: The agent's turn finished. Lifecycle "turn ended" hooks report this
+  (`Stop` for Claude Code and Gemini CLI, `notify` for Codex), so it marks a
+  completed turn rather than a decayed working state. The current built-in
+  manifests do not define a `done` screen rule. A hook-reported `done`
+  *sticks*: unlike the other states it has no TTL and stays until the pane
+  prints new PTY output or the next hook report arrives (see "Authority and
+  fallback"). The sidebar shows how long it has held.
 - `idle`: A recognized agent has no matching screen rule and has produced no
   output in the working window. An ordinary shell also uses `idle`.
 - `unknown`: The foreground process is not a recognized agent and is not one
@@ -20,10 +25,15 @@ then `working`, `done`, `idle`, and `unknown`.
 
 Detection uses the highest available authority in this order:
 
-1. **Lifecycle hook.** A hook report wins when it is no more than 30 seconds
-   old. The daemon constant is `HOOK_TTL = Duration::from_secs(30)`; a report
-   exactly 30 seconds old is still valid. The report supplies the state and a
-   source string. An expired report is ignored.
+1. **Lifecycle hook.** A hook report wins when it is still current. For
+   `blocked`, `working`, and `idle` reports that means no more than 30 seconds
+   old — the daemon constant is `HOOK_TTL = Duration::from_secs(30)`, and a
+   report exactly 30 seconds old is still valid. A `done` report has **no
+   TTL**: it sticks until the pane produces new PTY output (or a newer hook
+   report replaces it), matching the "unviewed done" behavior of the desktop
+   app. The report supplies the state and a source string. An expired report
+   is ignored. The daemon also tracks how long the current state has held
+   (`state_since`) and exposes it as `state_age_secs` for the sidebar.
 2. **Screen manifest.** Ködade first identifies a known agent from its
    foreground process name or terminal title. It then examines only the
    bottom eight screen lines (`SCREEN_LINES = 8`) and applies the first rule
@@ -53,6 +63,9 @@ name = "example-agent"
 
 # Human-readable label shown for a detected agent.
 display = "Example Agent"
+
+# Optional: command that resumes the agent's last session (metadata only).
+resume = "example-agent --continue"
 
 # Exact foreground process basenames that identify the agent.
 process = ["example-agent", "example"]
@@ -86,14 +99,55 @@ match is specific to an attention prompt.
 
 Built-ins are source files in
 `crates/kodade-cli-daemon/manifests/` and are embedded into the binary by
-`crates/kodade-cli-daemon/src/manifest.rs`. The shipped agents are:
+`crates/kodade-cli-daemon/src/manifest.rs`. "Verified" means the process,
+title, and screen strings were checked against a real local session;
+"unverified" manifests were sourced from the CLI's public docs (the source URL
+is noted at the top of each file) and ship with process/title identification
+only — no screen rules — until a real session confirms their prompt strings.
 
-- Claude Code (`claude-code.toml`)
-- Codex (`codex.toml`)
-- Grok Build (`grok.toml`)
-- OpenCode (`opencode.toml`)
-- Gemini CLI (`gemini-cli.toml`)
-- Aider (`aider.toml`)
+Verified:
+
+- Claude Code (`claude-code.toml`) — blocked/working rules, `resume = "claude --continue"`
+- Codex (`codex.toml`) — blocked/working rules, `resume = "codex resume --last"`
+- Grok Build (`grok.toml`) — blocked rule, `resume = "grok --continue"`
+- OpenCode (`opencode.toml`) — blocked/working rules
+- Gemini CLI (`gemini-cli.toml`) — blocked rule, `resume = "gemini --resume latest"`
+- Aider (`aider.toml`) — blocked rule
+
+Unverified (identification only, no screen rules):
+
+- Cursor CLI (`cursor-agent.toml`)
+- GitHub Copilot CLI (`copilot.toml`)
+- Cline (`cline.toml`)
+- Amp (`amp.toml`)
+- Droid / Factory (`droid.toml`)
+- Kimi CLI (`kimi.toml`)
+- Qwen Code (`qwen-code.toml`)
+- Pi (`pi.toml`)
+- Hermes (`hermes.toml`)
+
+None of the built-ins define a `done` screen rule: the interactive agents
+return to their prompt on completion with no distinctive, stable footer, so
+`done` is reported through lifecycle hooks instead (`codex exec` prints a
+`tokens used` footer, but that is the non-interactive path, not the TUI panes
+Ködade hosts).
+
+### `resume`
+
+A manifest may set an optional `resume` string — the command that resumes the
+agent's most recent session (for example `codex resume --last`). Session
+restore uses it to relaunch an agent where it left off. It is metadata only and
+does not affect state detection.
+
+### The `y/n` caveat
+
+`y/n` is a deliberately broad `blocked` string used by several agents. It is
+only ever consulted for a pane whose identified process matches that agent, so
+an ordinary shell prompt does not trip it. The one known false positive: a
+shell prompt that reads `... y/n` *inside a Claude Code Bash tool* runs under
+the `claude` process, so the `claude-code` manifest can briefly read that pane
+as `blocked`. This is accepted as the price of catching real Claude approval
+prompts; it clears as soon as the prompt scrolls past the bottom eight lines.
 
 User manifests are loaded from:
 
@@ -129,10 +183,47 @@ confident indication that the agent is waiting for user action. Avoid generic
 words such as `error`, `continue`, or `ready` unless they are part of a
 distinctive prompt.
 
-## Planned interfaces
+## CLI commands
 
-The PRD describes `kodade-cli agent explain <pane>` to show why a state was
-chosen and `kodade-cli integrate <agent>` to install lifecycle-hook
-integration. Those commands are planned; the current CLI does not implement
-them. The daemon's protocol can accept an `AgentState` report, but the hook
-installer and agent-facing integration are not yet present.
+### `agent explain <pane>`
+
+Prints the chosen state, the reason (which names the matched needle), the
+detected agent, and the bottom eight screen lines the detector examined — the
+same window the daemon matches against. Use it to see exactly why a pane read
+as `blocked` or `idle`.
+
+### `integrate`
+
+Installs the lifecycle hook / notify entry that lets an agent self-report its
+state, so detection does not depend on screen strings alone.
+
+- `integrate list` — shows each known integration, its config file, and
+  whether that config directory exists on this machine.
+- `integrate claude-code [--write]` — merges hook entries into
+  `~/.claude/settings.json` (`Stop` → done, `UserPromptSubmit` → working,
+  `Notification` → blocked). Without `--write` it prints the snippet. The
+  `Stop` event fires when the agent's turn ends, so it reports `done` (which
+  then sticks) rather than `idle`.
+- `integrate gemini-cli [--write]` — Gemini CLI exposes Claude-compatible
+  hooks (it even ships `gemini hooks migrate`), so the same three events are
+  merged into `~/.gemini/settings.json`.
+- `integrate codex [--write] [--force]` — Codex uses a single top-level
+  `notify` program. Codex fires `notify` only when a turn completes, so this
+  merges `notify = ["sh", "-c", "<report done>"]` into
+  `~/.codex/config.toml` with `toml_edit`, preserving comments. Codex appends a
+  JSON payload as the program's last argument (`$0` for `sh -c`), which the
+  report command ignores. If a `notify` entry already exists, Ködade refuses to
+  overwrite it and prints instructions instead — pass `--force` to replace it.
+
+Merges are idempotent and never remove unrelated keys or hooks. A previously
+installed Ködade report hook for the same event is upgraded in place (matched
+on the `kodade-cli agent report $KODADE_PANE ` command prefix), so users who
+installed the earlier `Stop` → `idle` hook are migrated to `done` without a
+duplicate.
+
+### `agent update-manifests`
+
+Opt-in manifest refresh. Downloads `index.txt` and each listed manifest from
+`main` on GitHub into `~/.config/kodade-cli/agent-detection/` using the system
+`curl` (no HTTP crate, no telemetry), printing every file it writes. This is
+the only command that ever reaches the network; nothing runs automatically.

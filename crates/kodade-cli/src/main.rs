@@ -65,7 +65,12 @@ async fn main() -> Result<()> {
             }
         }
         Some(cli::Command::Integrate { target }) => match target {
+            cli::IntegrateCommand::List => commands::integrate_list(),
             cli::IntegrateCommand::ClaudeCode { write } => commands::integrate_claude_code(write),
+            cli::IntegrateCommand::GeminiCli { write } => commands::integrate_gemini(write, false),
+            cli::IntegrateCommand::Codex { write, force } => {
+                commands::integrate_codex(write, force)
+            }
         },
     }
 }
@@ -105,14 +110,11 @@ async fn agent(session: &str, config: &config::Config, command: cli::AgentComman
             if json {
                 println!("{}", serde_json::to_string_pretty(pane)?);
             } else {
-                println!(
-                    "{}  {}",
-                    commands::state_name(pane.state),
-                    pane.state_reason
-                );
+                println!("{}", commands::format_explain(pane));
             }
             Ok(())
         }
+        cli::AgentCommand::UpdateManifests => commands::update_manifests(),
         cli::AgentCommand::Report {
             pane,
             state,

@@ -14,6 +14,9 @@ pub struct Manifest {
     pub process: Vec<String>,
     #[serde(default)]
     pub title: Vec<String>,
+    /// Command that resumes the agent's last session, e.g. `codex resume --last`.
+    #[serde(default)]
+    pub resume: Option<String>,
     #[serde(default, rename = "rule")]
     pub rules: Vec<Rule>,
 }
@@ -91,6 +94,15 @@ fn builtin() -> Result<HashMap<String, Manifest>> {
         include_str!("../manifests/opencode.toml"),
         include_str!("../manifests/gemini-cli.toml"),
         include_str!("../manifests/aider.toml"),
+        include_str!("../manifests/cursor-agent.toml"),
+        include_str!("../manifests/copilot.toml"),
+        include_str!("../manifests/cline.toml"),
+        include_str!("../manifests/amp.toml"),
+        include_str!("../manifests/droid.toml"),
+        include_str!("../manifests/kimi.toml"),
+        include_str!("../manifests/qwen-code.toml"),
+        include_str!("../manifests/pi.toml"),
+        include_str!("../manifests/hermes.toml"),
     ]
     .into_iter()
     .map(|contents| toml::from_str::<Manifest>(contents).context("parse built-in agent manifest"))
