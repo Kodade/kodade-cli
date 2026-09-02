@@ -361,8 +361,8 @@ fn group_of(action: Action) -> Group {
         | DisplayPanes => Group::Panes,
         NewTab | NextTab | PrevTab | SelectTabIndex(_) | CloseTab | RenameTab | MoveTabLeft
         | MoveTabRight => Group::Tabs,
-        WorkspaceNext | WorkspacePrev | WorkspacePicker | NewWorkspace | RenameWorkspace
-        | CloseWorkspace => Group::Workspaces,
+        WorkspaceNext | WorkspacePrev | WorkspacePicker | NewWorkspace | WorktreeNew
+        | RenameWorkspace | CloseWorkspace => Group::Workspaces,
         Navigate | Goto | CopyMode | ResizeMode | Settings | Help => Group::Modes,
         Detach | SidebarToggle | ReloadConfig | PasteBuffer | MouseToggle | NotificationJump => {
             Group::Other
@@ -387,6 +387,7 @@ fn label_of(action: Action) -> String {
         WorkspacePicker => "workspace picker".into(),
         Goto => "go to".into(),
         NewWorkspace => "new workspace".into(),
+        WorktreeNew => "new worktree workspace".into(),
         SidebarToggle => "toggle sidebar".into(),
         FocusUp => "focus up".into(),
         FocusDown => "focus down".into(),

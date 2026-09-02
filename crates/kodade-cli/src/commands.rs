@@ -696,6 +696,57 @@ pub fn resolve_tab_anywhere(layout: &LayoutSnapshot, needle: &str) -> Result<Tab
     Ok(first.id)
 }
 
+/// Workspaces that carry a git branch — the `worktree list` set. Includes any
+/// workspace rooted in a repo, not just linked worktrees (#22).
+pub fn worktree_workspaces(layout: &LayoutSnapshot) -> Vec<&kodade_cli_proto::WorkspaceInfo> {
+    layout
+        .workspaces
+        .iter()
+        .filter(|workspace| workspace.branch.is_some())
+        .collect()
+}
+
+/// Resolve a `worktree remove` target — a workspace id, workspace name, or the
+/// branch of a worktree workspace — to a workspace id.
+pub fn resolve_worktree(layout: &LayoutSnapshot, needle: &str) -> Result<WorkspaceId> {
+    if let Ok(id) = resolve_workspace(layout, needle) {
+        return Ok(id);
+    }
+    layout
+        .workspaces
+        .iter()
+        .find(|workspace| workspace.branch.as_deref() == Some(needle))
+        .map(|workspace| workspace.id)
+        .ok_or_else(|| anyhow!("no worktree workspace for '{needle}'"))
+}
+
+/// Human-readable `worktree list`: one line per branch workspace with its id,
+/// name, branch, root, and parent workspace name when nested (#22).
+pub fn format_worktrees(layout: &LayoutSnapshot) -> String {
+    worktree_workspaces(layout)
+        .into_iter()
+        .map(|workspace| {
+            let root = workspace
+                .root
+                .as_deref()
+                .map(|root| root.display().to_string())
+                .unwrap_or_default();
+            let parent = workspace
+                .parent
+                .and_then(|id| layout.workspaces.iter().find(|item| item.id == id))
+                .map(|parent| format!("  parent {}", parent.name))
+                .unwrap_or_default();
+            format!(
+                "{}  {}  ⎇ {}  {root}{parent}",
+                workspace.id.0,
+                workspace.name,
+                workspace.branch.as_deref().unwrap_or("-"),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// The focused pane in a snapshot — used to report the pane a `NewPane` reply
 /// just created (the daemon focuses new panes).
 pub fn focused_pane(layout: &LayoutSnapshot) -> Result<PaneId> {
@@ -747,6 +798,8 @@ mod tests {
                 state: AgentStateKind::Blocked,
                 root: None,
                 color: None,
+                branch: None,
+                parent: None,
                 tabs: vec![SidebarTabInfo {
                     id: TabId(2),
                     name: "agents".into(),
@@ -804,6 +857,32 @@ mod tests {
             format_agents(&layout),
             "7  Codex  blocked  manifest rule 'Allow?' matched"
         );
+    }
+
+    #[test]
+    fn worktree_list_and_resolve_by_branch() {
+        let mut layout = fixture();
+        layout.workspaces[0].branch = Some("main".into());
+        layout.workspaces.push(WorkspaceInfo {
+            id: WorkspaceId(2),
+            name: "repo:feat-a".into(),
+            active: false,
+            state: AgentStateKind::Idle,
+            root: Some("/tmp/wt/repo/feat-a".into()),
+            color: None,
+            branch: Some("feat-a".into()),
+            parent: Some(WorkspaceId(1)),
+            tabs: vec![],
+        });
+        // Both branch workspaces are listed; the child shows its parent.
+        assert_eq!(worktree_workspaces(&layout).len(), 2);
+        let text = format_worktrees(&layout);
+        assert!(text.contains("⎇ feat-a"));
+        assert!(text.contains("parent repo"));
+        // Remove resolves by branch, workspace id, or name.
+        assert_eq!(resolve_worktree(&layout, "feat-a").unwrap(), WorkspaceId(2));
+        assert_eq!(resolve_worktree(&layout, "2").unwrap(), WorkspaceId(2));
+        assert!(resolve_worktree(&layout, "nope").is_err());
     }
 
     #[test]
@@ -968,6 +1047,8 @@ mod tests {
             state: AgentStateKind::Idle,
             root: None,
             color: None,
+            branch: None,
+            parent: None,
             tabs: vec![SidebarTabInfo {
                 id: TabId(11),
                 name: "notes".into(),

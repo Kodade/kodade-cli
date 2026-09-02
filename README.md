@@ -51,6 +51,7 @@ The default prefix is `ctrl+b`. After the prefix, the default actions are:
 | `tab` / `p` | Next / previous tab |
 | `z` / `d` | Zoom pane / detach |
 | `r` / `W` | Rename / new workspace (`W` prompts for `NAME [PATH]`) |
+| `G` | New git-worktree workspace (prompts for a branch) |
 | `w` / `g` | Workspace picker / goto palette (fuzzy; type to filter, `enter` jumps) |
 | `alt+w` | Next workspace (cycle without the picker) |
 | `b` / `[` | Cycle sidebar (full → compact → hidden) / copy mode |
@@ -185,6 +186,11 @@ for the installed version. The scripting commands are:
 - `kodade-cli layout export [FILE]|apply FILE` — save and restore a layout.
   **`apply` runs the commands saved in the file** (through the login shell, in
   each pane's saved directory), so only apply layout files you trust.
+- `kodade-cli worktree add BRANCH [--from REF] [-w NAME]` — `git worktree add`
+  a branch on the workspace's repo and open a `repo:branch` workspace rooted in
+  it (prints the new workspace id). `worktree list` shows every branch workspace
+  with its root and parent; `worktree remove WS|BRANCH [--keep]` closes it and
+  removes the worktree unless `--keep`.
 - `kodade-cli events [--json]` — stream session events until interrupted.
 - `kodade-cli completion zsh|bash|fish` — print a completion script.
 - `kodade-cli agent ls` — list recognized agents and states.
@@ -250,6 +256,24 @@ and `KODADE_BIN` in their environment, which is everything a custom agent needs
 to report its own state. The socket protocol itself — framing, every message,
 the `Subscribe` event stream, and the schema query — is documented in
 [docs/SOCKET-API.md](docs/SOCKET-API.md).
+
+### Two agents on two branches
+
+From a workspace rooted in a git repo, `prefix G` (or `worktree add`) spins up an
+isolated worktree per branch so two agents never step on each other:
+
+```sh
+kodade-cli new -w repo ~/src/repo      # workspace rooted in the repo (on main)
+kodade-cli worktree add feat-a         # → workspace repo:feat-a in a new worktree
+kodade-cli worktree add feat-b --from main
+# run an agent in each branch's workspace
+kodade-cli run -w repo:feat-a -- claude
+kodade-cli run -w repo:feat-b -- codex
+```
+
+The sidebar nests each worktree under `repo` with its branch (`⎇ feat-a`), and
+`repo` shows its own branch dimmed after the name. `worktree remove feat-a`
+closes the workspace and deletes the worktree directory.
 
 ## Remote
 

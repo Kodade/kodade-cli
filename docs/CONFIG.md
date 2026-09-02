@@ -204,6 +204,7 @@ modifier (`ctrl+…`/`alt+…`) fires globally.
 | `workspace_next` | `prefix+alt+w` |
 | `workspace_picker` | `w` |
 | `new_workspace` | `W` |
+| `worktree_new` | `G` |
 | `rename_workspace` | `R` |
 | `close_workspace` | `D` |
 | `workspace_prev` | unbound |
@@ -297,6 +298,27 @@ the same `config.toml`, read by the daemon, controls restore behavior:
 [session]
 resume_agents = true
 ```
+
+## Git worktrees
+
+`prefix G` (the `worktree_new` action) and `kodade-cli worktree add BRANCH`
+open a git-worktree workspace: the daemon runs `git worktree add` for the
+active workspace's repository and opens a `repo:branch` workspace rooted in the
+new worktree. One key, read by the daemon, sets where worktrees are created:
+
+| Setting | Default | Description |
+|---|---|---|
+| `worktrees.directory` | `~/.kodade/worktrees` | Root directory new worktrees are created under, as `<directory>/<repo-name>/<branch>`. A leading `~` expands to your home directory. |
+
+```toml
+[worktrees]
+directory = "~/.kodade/worktrees"
+```
+
+Closing a worktree workspace (`prefix D` or the sidebar menu) asks
+`remove worktree <branch>? y/n/k(eep)`: `y` runs `git worktree remove`, `k`
+closes the workspace but leaves the directory, `n` cancels. Ködade only ever
+removes a directory that git reports as a registered worktree.
 
 ## Key-chord syntax
 

@@ -1,6 +1,7 @@
 //! Persistent PTY host and session model for Ködade CLI.
 
 mod agent;
+mod git;
 mod layout;
 mod manifest;
 mod persist;
@@ -80,6 +81,11 @@ struct Workspace {
     root: Option<PathBuf>,
     /// Sidebar swatch color as `#rrggbb`, when the user set one (#19).
     color: Option<String>,
+    /// Cached git branch of `root`, refreshed on the 2 s process tick so the
+    /// sidebar can label it without a subprocess per frame (#22).
+    branch: Option<String>,
+    /// When `branch` was last read, so the refresh only re-reads HEAD every 2 s.
+    branch_checked_at: Option<Instant>,
 }
 struct Tab {
     id: TabId,
@@ -331,6 +337,8 @@ impl Session {
                 tabs: vec![tab],
                 root: None,
                 color: None,
+                branch: None,
+                branch_checked_at: None,
             });
         Ok(session)
     }
@@ -408,6 +416,8 @@ impl Session {
                 active_tab,
                 root: saved.root.clone(),
                 color: saved.color.clone(),
+                branch: None,
+                branch_checked_at: None,
             });
         }
         let active_workspace = workspace_ids
@@ -691,10 +701,12 @@ impl Session {
     }
 
     fn snapshot(&self) -> Result<LayoutSnapshot> {
-        let state = self
+        let mut state = self
             .state
             .lock()
             .map_err(|_| anyhow!("state lock poisoned"))?;
+        // Refresh each workspace's cached branch at most every 2 s (cheap HEAD read).
+        refresh_branches(&mut state, Instant::now());
         let workspace = state
             .workspaces
             .iter()
@@ -786,6 +798,8 @@ impl Session {
                         state: agent::rollup(tabs.iter().map(|tab| tab.state)),
                         root: item.root.clone(),
                         color: item.color.clone(),
+                        branch: item.branch.clone(),
+                        parent: workspace_parent(&state, item),
                         tabs,
                     }
                 })
@@ -1017,6 +1031,14 @@ impl Session {
             ClientMessage::ClosePane => self.close_pane()?,
             ClientMessage::CloseTab { id } => self.close_tab(id)?,
             ClientMessage::CloseWorkspace { id } => self.close_workspace(id)?,
+            ClientMessage::NewWorktreeWorkspace {
+                repo_root,
+                branch,
+                from,
+            } => self.new_worktree_workspace(repo_root, branch, from)?,
+            ClientMessage::RemoveWorktreeWorkspace { id, keep } => {
+                self.remove_worktree_workspace(id, keep)?
+            }
             ClientMessage::FocusPane { direction } => {
                 let mut state = self
                     .state
@@ -1321,6 +1343,8 @@ impl Session {
                     }],
                     root,
                     color: None,
+                    branch: None,
+                    branch_checked_at: None,
                 });
                 state.active_workspace = id;
                 drop(state);
@@ -1599,6 +1623,85 @@ impl Session {
             self.emit(event);
         }
         self.resize_current()
+    }
+
+    /// Create a git-worktree workspace: run `git worktree add` under the
+    /// `[worktrees] directory`, then open a workspace `repo:branch` rooted in the
+    /// new worktree with a fresh shell tab (#22).
+    fn new_worktree_workspace(
+        &self,
+        repo_root: PathBuf,
+        branch: String,
+        from: Option<String>,
+    ) -> Result<()> {
+        let repo = git::repo_root(&repo_root)
+            .ok_or_else(|| anyhow!("{} is not inside a git repository", repo_root.display()))?;
+        let basename = repo
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| anyhow!("repository path has no name"))?
+            .to_owned();
+        // `<worktrees.directory>/<repo-basename>/<branch>`; a slashed branch nests.
+        let dest = persist::worktrees_directory().join(&basename).join(&branch);
+        git::worktree_add(&repo, &branch, from.as_deref(), &dest)?;
+
+        let name = format!("{basename}:{branch}");
+        let pane = self.new_pane("shell", Some(dest.clone()), None)?;
+        let tab_id = self.tab_id();
+        let id = self.workspace_id();
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow!("state lock poisoned"))?;
+        state.workspaces.push(Workspace {
+            id,
+            name,
+            active_tab: tab_id,
+            tabs: vec![Tab {
+                id: tab_id,
+                name: "shell".into(),
+                tree: LayoutTree::Leaf { pane },
+                focused: pane,
+                zoomed: false,
+            }],
+            root: Some(dest),
+            color: None,
+            branch: Some(branch),
+            branch_checked_at: Some(Instant::now()),
+        });
+        state.active_workspace = id;
+        drop(state);
+        self.resize_current()
+    }
+
+    /// Close a worktree workspace and, unless `keep`, `git worktree remove` its
+    /// directory. The directory is only ever removed when it is a registered
+    /// worktree of a known main repo, so nothing outside a worktree is deleted (#22).
+    fn remove_worktree_workspace(&self, id: WorkspaceId, keep: bool) -> Result<()> {
+        // Resolve the worktree's own root and its main repo before we close it.
+        let root = {
+            let state = self
+                .state
+                .lock()
+                .map_err(|_| anyhow!("state lock poisoned"))?;
+            state
+                .workspaces
+                .iter()
+                .find(|workspace| workspace.id == id)
+                .and_then(|workspace| workspace.root.clone())
+        };
+        let removal = root
+            .as_deref()
+            .and_then(|root| git::main_worktree_root(root).map(|main| (main, root.to_path_buf())));
+        // Drop the workspace (and its panes) first so no shell holds the cwd.
+        self.close_workspace(id)?;
+        if keep {
+            return Ok(());
+        }
+        if let Some((main, dest)) = removal {
+            git::worktree_remove(&main, &dest, true)?;
+        }
+        Ok(())
     }
 
     fn close_workspace(&self, id: WorkspaceId) -> Result<()> {
@@ -1990,6 +2093,8 @@ impl Session {
                 active_tab,
                 root: saved.root.clone(),
                 color: saved.color.clone(),
+                branch: None,
+                branch_checked_at: None,
             });
         }
         Ok((workspaces, used, highest))
@@ -2023,6 +2128,51 @@ fn locate_tab(state: &SessionState, tab: TabId) -> Option<(usize, usize)> {
                 .position(|item| item.id == tab)
                 .map(|position| (index, position))
         })
+}
+
+/// Refresh each workspace's cached git branch, re-reading HEAD at most once
+/// every 2 s so the sidebar can label branches without a subprocess per frame.
+fn refresh_branches(state: &mut SessionState, now: Instant) {
+    for workspace in &mut state.workspaces {
+        let Some(root) = workspace.root.clone() else {
+            workspace.branch = None;
+            continue;
+        };
+        let stale = workspace
+            .branch_checked_at
+            .map(|at| now.saturating_duration_since(at) >= Duration::from_secs(2))
+            .unwrap_or(true);
+        if stale {
+            workspace.branch = git::branch_of(&root);
+            workspace.branch_checked_at = Some(now);
+        }
+    }
+}
+
+/// The workspace `item` nests under: the one whose root is the main repo of
+/// `item`'s worktree, if such a workspace is open. `None` for a normal workspace.
+fn workspace_parent(state: &SessionState, item: &Workspace) -> Option<WorkspaceId> {
+    let main = item.root.as_deref().and_then(git::main_worktree_root)?;
+    state
+        .workspaces
+        .iter()
+        .filter(|other| other.id != item.id)
+        .find(|other| {
+            other
+                .root
+                .as_deref()
+                .is_some_and(|root| same_dir(root, &main))
+        })
+        .map(|other| other.id)
+}
+
+/// Whether two paths point at the same directory, comparing canonical forms so
+/// symlinks and `..` segments do not defeat the match.
+fn same_dir(a: &Path, b: &Path) -> bool {
+    match (a.canonicalize(), b.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => a == b,
+    }
 }
 
 fn sidebar_tab_info(
@@ -3146,6 +3296,8 @@ mod tests {
                     active_tab: TabId(2),
                     root: None,
                     color: None,
+                    branch: None,
+                    branch_checked_at: None,
                     tabs: vec![Tab {
                         id: TabId(2),
                         name: "shell".into(),
@@ -3160,6 +3312,8 @@ mod tests {
                     active_tab: TabId(5),
                     root: None,
                     color: None,
+                    branch: None,
+                    branch_checked_at: None,
                     tabs: vec![Tab {
                         id: TabId(5),
                         name: "agents".into(),
@@ -3187,6 +3341,8 @@ mod tests {
                 active_tab: TabId(2),
                 root: None,
                 color: None,
+                branch: None,
+                branch_checked_at: None,
                 tabs: vec![Tab {
                     id: TabId(2),
                     name: "agents".into(),

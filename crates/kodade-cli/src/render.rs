@@ -117,6 +117,8 @@ pub struct Ui<'a> {
     pub rename: bool,
     /// The `prefix W` name/path prompt shares the rename text buffer.
     pub new_workspace: bool,
+    /// The `prefix G` worktree branch prompt, also sharing the text buffer (#22).
+    pub worktree_new: bool,
     pub name: &'a str,
     pub navigate: Option<usize>,
     pub copy: Option<&'a CopyMode>,
@@ -159,6 +161,7 @@ pub fn render(frame: &mut Frame, layout: &LayoutSnapshot, ui: &Ui, theme: &Theme
         prefix,
         rename,
         new_workspace,
+        worktree_new,
         name,
         navigate,
         copy,
@@ -258,6 +261,8 @@ pub fn render(frame: &mut Frame, layout: &LayoutSnapshot, ui: &Ui, theme: &Theme
         " resize · hjkl 1 · HJKL 5 · esc".into()
     } else if new_workspace {
         format!(" new workspace: {name}")
+    } else if worktree_new {
+        format!(" worktree branch: {name}")
     } else if let Some(cm) = copy {
         if let Some(prompt) = &cm.prompt {
             // Live search entry: echo the sigil and the query being typed.
@@ -836,25 +841,38 @@ pub fn sidebar_rows(
     agents_panel: bool,
 ) -> SidebarModel {
     let mut workspaces = vec![heading_row("workspaces")];
-    for workspace in &layout.workspaces {
+    // Worktree workspaces nest under their parent repo workspace, so emit each
+    // top-level workspace followed immediately by its worktree children (#22).
+    for (workspace, is_worktree) in ordered_workspaces(layout) {
         let expanded = !collapsed.contains(&workspace.id);
         // Rows under a non-active but expanded workspace draw dimmer.
         let dim = !workspace.active;
-        let root = workspace
-            .root
-            .as_deref()
-            .and_then(std::path::Path::file_name)
-            .and_then(|name| name.to_str())
-            .filter(|base| *base != workspace.name);
-        let name = match root {
-            Some(base) => format!("{}  {}", workspace.name, base),
-            None => workspace.name.clone(),
-        };
         let caret = if expanded { "▾" } else { "▸" };
+        // A worktree row is indented one level and labelled by its branch; a
+        // normal repo workspace shows its branch dimmed after the name (#22).
+        let (label, tab_indent, pane_indent) = if is_worktree {
+            let branch = workspace.branch.as_deref().unwrap_or(&workspace.name);
+            (format!("  {caret} ⎇ {branch}"), "    ", "      ")
+        } else {
+            let root = workspace
+                .root
+                .as_deref()
+                .and_then(std::path::Path::file_name)
+                .and_then(|name| name.to_str())
+                .filter(|base| *base != workspace.name);
+            let mut name = match root {
+                Some(base) => format!("{}  {}", workspace.name, base),
+                None => workspace.name.clone(),
+            };
+            if let Some(branch) = &workspace.branch {
+                name = format!("{name} ⎇ {branch}");
+            }
+            (format!("{caret} {name}"), "  ", "    ")
+        };
         workspaces.push(SidebarRow {
             kind: SidebarKind::Workspace,
             target: Some(SidebarTarget::Workspace(workspace.id)),
-            label: format!("{caret} {name}"),
+            label,
             state: workspace.state,
             dim,
             color: Some(workspace_color(workspace)),
@@ -864,7 +882,7 @@ pub fn sidebar_rows(
                 workspaces.push(SidebarRow {
                     kind: SidebarKind::Tab,
                     target: Some(SidebarTarget::Tab(tab.id)),
-                    label: format!("  {}", tab.name),
+                    label: format!("{tab_indent}{}", tab.name),
                     state: tab.state,
                     dim,
                     color: None,
@@ -872,7 +890,7 @@ pub fn sidebar_rows(
                 workspaces.extend(tab.agents.iter().map(|agent| SidebarRow {
                     kind: SidebarKind::Pane,
                     target: Some(SidebarTarget::Pane(agent.pane)),
-                    label: agent_label("    ", agent),
+                    label: agent_label(pane_indent, agent),
                     state: agent.state,
                     dim,
                     color: None,
@@ -886,6 +904,27 @@ pub fn sidebar_rows(
         Vec::new()
     };
     SidebarModel { workspaces, agents }
+}
+
+/// Workspaces in sidebar order: each top-level workspace followed by its
+/// worktree children (`parent` points at it), then any worktree whose parent is
+/// not open. The bool flags a worktree workspace so it renders nested (#22).
+fn ordered_workspaces(layout: &LayoutSnapshot) -> Vec<(&WorkspaceInfo, bool)> {
+    let present = |id: WorkspaceId| layout.workspaces.iter().any(|item| item.id == id);
+    let mut ordered = Vec::with_capacity(layout.workspaces.len());
+    for workspace in &layout.workspaces {
+        // A worktree whose parent is present is emitted under that parent below.
+        if workspace.parent.is_some_and(present) {
+            continue;
+        }
+        ordered.push((workspace, false));
+        for child in &layout.workspaces {
+            if child.parent == Some(workspace.id) {
+                ordered.push((child, true));
+            }
+        }
+    }
+    ordered
 }
 
 /// A `● Name · workspace/tab age` label for an agent, with the given indent.
@@ -1414,6 +1453,8 @@ mod tests {
                     state: AgentStateKind::Blocked,
                     root: Some("/Users/keith/src/active".into()),
                     color: None,
+                    branch: None,
+                    parent: None,
                     tabs: vec![SidebarTabInfo {
                         id: TabId(2),
                         name: "agents".into(),
@@ -1433,6 +1474,8 @@ mod tests {
                     state: AgentStateKind::Done,
                     root: None,
                     color: None,
+                    branch: None,
+                    parent: None,
                     tabs: vec![SidebarTabInfo {
                         id: TabId(5),
                         name: "hidden".into(),
@@ -1486,6 +1529,45 @@ mod tests {
             sidebar_row_at(&model, &place, 3).map(|(_, row)| row.target.clone()),
             Some(Some(SidebarTarget::Pane(PaneId(3))))
         );
+    }
+
+    #[test]
+    fn worktree_workspaces_nest_under_their_parent_with_branch_labels() {
+        let mut layout = snapshot();
+        // The active workspace is a repo on `main`; add a worktree child of it.
+        layout.workspaces[0].branch = Some("main".into());
+        layout.workspaces.push(WorkspaceInfo {
+            id: WorkspaceId(7),
+            name: "active:feat-a".into(),
+            active: false,
+            state: AgentStateKind::Idle,
+            root: Some("/Users/keith/.kodade/worktrees/active/feat-a".into()),
+            color: None,
+            branch: Some("feat-a".into()),
+            parent: Some(WorkspaceId(1)),
+            tabs: vec![SidebarTabInfo {
+                id: TabId(9),
+                name: "shell".into(),
+                state: AgentStateKind::Idle,
+                agents: vec![],
+            }],
+        });
+        let model = sidebar_rows(&layout, &no_collapse(), false);
+        // A repo workspace shows its branch dimmed after the name.
+        assert!(model.workspaces[1].label.contains("⎇ main"));
+        // The worktree child renders right after its parent's rows, indented and
+        // labelled by its branch, targeting its own workspace id.
+        let worktree = model
+            .workspaces
+            .iter()
+            .find(|row| row.target == Some(SidebarTarget::Workspace(WorkspaceId(7))))
+            .expect("worktree row present");
+        assert_eq!(worktree.label, "  ▾ ⎇ feat-a");
+        // Its shell tab is indented one level deeper than a top-level tab.
+        assert!(model
+            .workspaces
+            .iter()
+            .any(|row| row.label == "    shell" && row.kind == SidebarKind::Tab));
     }
 
     #[test]
@@ -1791,6 +1873,7 @@ mod tests {
             prefix: false,
             rename: false,
             new_workspace: false,
+            worktree_new: false,
             name: "",
             navigate: None,
             copy: None,
@@ -1932,6 +2015,7 @@ mod tests {
             prefix: false,
             rename: false,
             new_workspace: false,
+            worktree_new: false,
             name: "",
             navigate: None,
             copy: None,

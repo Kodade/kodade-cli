@@ -111,6 +111,11 @@ pub enum Command {
         #[arg(long = "name", value_name = "NAME")]
         name: Option<String>,
     },
+    /// Manage git-worktree workspaces (#22).
+    Worktree {
+        #[command(subcommand)]
+        command: WorktreeCommand,
+    },
     /// Stop the session and its daemon.
     KillSession,
     /// Inspect the configuration file.
@@ -441,6 +446,37 @@ pub enum AgentCommand {
 }
 
 #[derive(Debug, Subcommand, PartialEq, Eq)]
+pub enum WorktreeCommand {
+    /// Add a worktree workspace for BRANCH, rooted in the given workspace's repo.
+    Add {
+        /// Branch to check out (created from `--from` when it does not exist).
+        #[arg(value_name = "BRANCH")]
+        branch: String,
+        /// Base ref for a new branch (defaults to the repo's current HEAD).
+        #[arg(long = "from", value_name = "REF")]
+        from: Option<String>,
+        /// Workspace whose root repo to branch from (defaults to the active one).
+        #[arg(short = 'w', long = "workspace", value_name = "NAME")]
+        workspace: Option<String>,
+    },
+    /// Remove a worktree workspace by workspace name/id or branch name.
+    Remove {
+        /// Workspace name, workspace id, or branch of the worktree to remove.
+        #[arg(value_name = "WS|BRANCH")]
+        target: String,
+        /// Close the workspace but leave the worktree directory on disk.
+        #[arg(long)]
+        keep: bool,
+    },
+    /// List worktree workspaces, showing their root and parent workspace.
+    List {
+        /// Print the matching workspaces as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand, PartialEq, Eq)]
 pub enum ConfigCommand {
     /// Print the path of the config file.
     Path,
@@ -670,6 +706,35 @@ mod tests {
         assert_eq!(
             parse(&["kodade-cli", "session", "path", "--remote", "host"]).remote,
             Some("host".into())
+        );
+    }
+
+    #[test]
+    fn parses_worktree_subcommands() {
+        assert_eq!(
+            parse(&["kodade-cli", "worktree", "add", "feat-a", "--from", "main"]).command,
+            Some(Command::Worktree {
+                command: WorktreeCommand::Add {
+                    branch: "feat-a".into(),
+                    from: Some("main".into()),
+                    workspace: None,
+                }
+            })
+        );
+        assert_eq!(
+            parse(&["kodade-cli", "worktree", "remove", "feat-a", "--keep"]).command,
+            Some(Command::Worktree {
+                command: WorktreeCommand::Remove {
+                    target: "feat-a".into(),
+                    keep: true,
+                }
+            })
+        );
+        assert_eq!(
+            parse(&["kodade-cli", "worktree", "list", "--json"]).command,
+            Some(Command::Worktree {
+                command: WorktreeCommand::List { json: true }
+            })
         );
     }
 

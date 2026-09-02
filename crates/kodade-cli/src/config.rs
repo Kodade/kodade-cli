@@ -182,6 +182,8 @@ pub enum Action {
     Rename,
     WorkspaceNext,
     NewWorkspace,
+    /// Prompt for a branch and open a git-worktree workspace (#22).
+    WorktreeNew,
     /// Fuzzy workspace switcher overlay (#17).
     WorkspacePicker,
     /// Fuzzy goto palette over every workspace, tab, and agent pane (#17).
@@ -247,6 +249,7 @@ const ACTIONS: &[(&str, Action)] = &[
     ("workspace_picker", Action::WorkspacePicker),
     ("goto", Action::Goto),
     ("new_workspace", Action::NewWorkspace),
+    ("worktree_new", Action::WorktreeNew),
     ("sidebar_toggle", Action::SidebarToggle),
     ("focus_up", Action::FocusUp),
     ("focus_down", Action::FocusDown),
@@ -384,6 +387,7 @@ impl Action {
             | Self::RenameWorkspace
             | Self::LastPane
             | Self::ResizeMode
+            | Self::WorktreeNew
             | Self::DisplayPanes => return None,
             // Client-side only: they never reach the daemon.
             Self::ReloadConfig
@@ -525,6 +529,7 @@ impl Default for Config {
             ("alt+w", Action::WorkspaceNext),
             ("g", Action::Goto),
             ("W", Action::NewWorkspace),
+            ("G", Action::WorktreeNew),
             ("b", Action::SidebarToggle),
             ("[", Action::CopyMode),
             // #14 took `R` for rename_workspace, so reload is prefix+ctrl+r.
