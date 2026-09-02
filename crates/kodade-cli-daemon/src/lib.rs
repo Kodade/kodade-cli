@@ -119,10 +119,23 @@ struct Pane {
     /// kept so persistence can record them without inspecting the live process.
     spawn_command: Option<Vec<String>>,
     spawn_cwd: Option<PathBuf>,
+    /// Kept so dropping the pane ends its process; otherwise the PTY reader
+    /// thread never sees EOF (the daemon and the test runtime would wait forever).
+    child: Mutex<Box<dyn portable_pty::Child + Send>>,
     process: Mutex<ProcessEvidence>,
     // Tracks how long the current detected state has held, for sidebar age labels.
     last_state: Mutex<Option<AgentStateKind>>,
     state_since: Mutex<Instant>,
+}
+
+/// Closing a pane terminates its process so the PTY reader thread exits.
+impl Drop for Pane {
+    fn drop(&mut self) {
+        if let Ok(mut child) = self.child.lock() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -2342,7 +2355,8 @@ impl Pane {
         if let Ok(exe) = env::current_exe() {
             command.env("KODADE_BIN", exe);
         }
-        pair.slave
+        let child = pair
+            .slave
             .spawn_command(command)
             .context("spawn login shell in PTY")?;
         let writer = pair.master.take_writer()?;
@@ -2371,6 +2385,7 @@ impl Pane {
             spawn_process,
             spawn_command: run,
             spawn_cwd: cwd,
+            child: Mutex::new(child),
             process: Mutex::new(ProcessEvidence {
                 name: None,
                 cwd: None,
