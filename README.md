@@ -65,6 +65,12 @@ to copy. Copying sends the selection through OSC 52, including over SSH; copy
 payloads are limited to 100 KB. See [docs/CONFIG.md](docs/CONFIG.md) for all
 bindings and configuration.
 
+The CLI ships the Ködade look: warm neutrals with the amber accent `#E7A33B`
+and a purple-free ANSI palette, matching the desktop app. `theme = "auto"`
+(the default) picks `kodade-dark` or `kodade-light` from the terminal
+background; `tokyo-night` and custom themes are also available. See the
+[Themes](docs/CONFIG.md#themes) section for the schema.
+
 The scripting commands are:
 
 - `kodade-cli ls` — list sessions, workspaces, tabs, panes, and states.
