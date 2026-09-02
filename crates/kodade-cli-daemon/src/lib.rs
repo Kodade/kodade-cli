@@ -20,10 +20,10 @@ use std::{
 
 use anyhow::{anyhow, bail, Context, Result};
 use kodade_cli_proto::{
-    decode, encode, AgentInfo, AgentStateKind, CellColor, ClientMessage, Direction, LayoutSnapshot,
-    LayoutTree, Notification, PaneId, PaneSnapshot, QueryKind, Run, Screen, ServerMessage,
-    SidebarTabInfo, SplitAxis, TabId, TabInfo, WorkspaceId, WorkspaceInfo, ATTR_BOLD, ATTR_DIM,
-    ATTR_INVERSE, ATTR_ITALIC, ATTR_UNDERLINE, PROTOCOL_VERSION,
+    decode, encode, schema_message, AgentInfo, AgentStateKind, CellColor, ClientMessage, Direction,
+    Event, LayoutSnapshot, LayoutTree, Notification, PaneId, PaneSnapshot, QueryKind, Run, Screen,
+    ServerMessage, SidebarTabInfo, SplitAxis, TabId, TabInfo, WorkspaceId, WorkspaceInfo,
+    ATTR_BOLD, ATTR_DIM, ATTR_INVERSE, ATTR_ITALIC, ATTR_UNDERLINE, PROTOCOL_VERSION,
 };
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use tokio::{
@@ -33,7 +33,8 @@ use tokio::{
 };
 
 struct Session {
-    name: String,
+    /// Session name; behind a lock because `session rename` moves it (#16).
+    name: Mutex<String>,
     state: Mutex<SessionState>,
     panes: Mutex<HashMap<PaneId, Arc<Pane>>>,
     updates: broadcast::Sender<()>,
@@ -54,6 +55,12 @@ struct Session {
     /// Monotonic high-water mark for `Notification.seq`; also the id a freshly
     /// attached client uses so it never replays the backlog.
     notify_seq: AtomicU64,
+    /// Session events for subscribed connections (#16). Nothing is buffered:
+    /// a client that is not subscribed when an event fires never sees it.
+    events: broadcast::Sender<Event>,
+    /// Path of the bound socket file. `session rename` renames the file in
+    /// place, so teardown reads it from here rather than from the start value.
+    socket: Mutex<PathBuf>,
 }
 struct SessionState {
     workspaces: Vec<Workspace>,
@@ -122,16 +129,25 @@ struct ProcessEvidence {
 }
 
 pub fn socket_path(session: &str) -> PathBuf {
+    socket_dir().join(format!("{session}.sock"))
+}
+
+/// Directory holding one `<session>.sock` per live session. `session ls` scans
+/// it, so it is part of the public surface.
+pub fn socket_dir() -> PathBuf {
     let runtime = env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from);
     let home = dirs::home_dir();
     let uid = env::var("UID").unwrap_or_else(|_| "unknown".to_owned());
     socket_path_for(
-        session,
+        "unused",
         runtime.as_deref(),
         home.as_deref(),
         &uid,
         cfg!(target_os = "macos"),
     )
+    .parent()
+    .expect("socket path always has a parent directory")
+    .to_path_buf()
 }
 
 fn socket_path_for(
@@ -165,6 +181,10 @@ pub async fn run(session_name: String) -> Result<()> {
     let listener = UnixListener::bind(&socket).context("bind Ködade CLI socket")?;
     // Binding succeeded, so no live daemon owns this session: safe to restore.
     let session = Arc::new(load_session(&session_name)?);
+    // The socket name wins over whatever the state file recorded (it may have
+    // been renamed or copied), so `save` and teardown stay on this path.
+    *session.name.lock().expect("name lock poisoned") = session_name.clone();
+    *session.socket.lock().expect("socket lock poisoned") = socket.clone();
     let mut shutdown = session.shutdown.subscribe();
     // Debounced layout persistence runs alongside the accept loop.
     tokio::spawn(persist_loop(Arc::clone(&session)));
@@ -176,23 +196,22 @@ pub async fn run(session_name: String) -> Result<()> {
             _ = shutdown.recv() => {
                 // `kill-session` is deliberate: drop the state file so it does
                 // not resurrect on the next cold start.
-                persist::remove_session_file(&session_name);
+                persist::remove_session_file(&session.session_name());
                 drop(listener);
-                let _ = fs::remove_file(&socket);
+                let _ = fs::remove_file(session.socket_path());
                 return Ok(());
             }
             _ = sigterm.recv() => {
                 session.save();
                 drop(listener);
-                let _ = fs::remove_file(&socket);
+                let _ = fs::remove_file(session.socket_path());
                 return Ok(());
             }
             accepted = listener.accept() => {
                 let (stream, _) = accepted?;
                 let session = Arc::clone(&session);
-                let session_name = session_name.clone();
                 tokio::spawn(async move {
-                    if let Err(error) = serve_client(stream, session, session_name).await {
+                    if let Err(error) = serve_client(stream, session).await {
                         eprintln!("Ködade CLI client disconnected: {error:#}");
                     }
                 });
@@ -262,10 +281,12 @@ fn validate_session_name(session: &str) -> Result<()> {
 
 impl Session {
     fn spawn(cols: u16, rows: u16, name: String) -> Result<Self> {
+        let name_for_socket = name.clone();
         let (updates, _) = broadcast::channel(64);
         let (shutdown, _) = broadcast::channel(16);
+        let (events, _) = broadcast::channel(256);
         let session = Self {
-            name,
+            name: Mutex::new(name),
             state: Mutex::new(SessionState {
                 workspaces: Vec::new(),
                 active_workspace: WorkspaceId(1),
@@ -280,6 +301,8 @@ impl Session {
             restored: AtomicBool::new(false),
             notifications: Mutex::new(Vec::new()),
             notify_seq: AtomicU64::new(0),
+            events,
+            socket: Mutex::new(socket_path(&name_for_socket)),
         };
         let pane = session.new_pane("shell", None, None)?;
         let tab = Tab {
@@ -312,8 +335,9 @@ impl Session {
     fn restore(file: persist::SessionFile, resume_agents: bool) -> Result<Self> {
         let (updates, _) = broadcast::channel(64);
         let (shutdown, _) = broadcast::channel(16);
+        let (events, _) = broadcast::channel(256);
         let session = Self {
-            name: file.name.clone(),
+            name: Mutex::new(file.name.clone()),
             state: Mutex::new(SessionState {
                 workspaces: Vec::new(),
                 active_workspace: WorkspaceId(1),
@@ -328,6 +352,8 @@ impl Session {
             restored: AtomicBool::new(true),
             notifications: Mutex::new(Vec::new()),
             notify_seq: AtomicU64::new(0),
+            events,
+            socket: Mutex::new(socket_path(&file.name)),
         };
         let mut workspaces = Vec::new();
         let mut workspace_ids: HashMap<u64, WorkspaceId> = HashMap::new();
@@ -433,7 +459,7 @@ impl Session {
             .collect();
         persist::SessionFile {
             version: 1,
-            name: self.name.clone(),
+            name: self.session_name(),
             active_workspace: state.active_workspace.0,
             workspaces,
         }
@@ -442,15 +468,13 @@ impl Session {
     /// Persist the current layout to this session's state file. Best-effort:
     /// errors are logged, never propagated to the client-facing loop.
     fn save(&self) {
-        let Some(path) = persist::session_file_path(&self.name) else {
+        let name = self.session_name();
+        let Some(path) = persist::session_file_path(&name) else {
             return;
         };
         let file = self.build_file();
         if let Err(error) = persist::write_session_file(&path, &file) {
-            eprintln!(
-                "Ködade CLI could not persist session '{}': {error:#}",
-                self.name
-            );
+            eprintln!("Ködade CLI could not persist session '{name}': {error:#}");
         }
     }
 
@@ -469,20 +493,42 @@ impl Session {
         WorkspaceId(self.next_id())
     }
 
+    /// Current session name (see [`Session::name`]).
+    fn session_name(&self) -> String {
+        self.name.lock().expect("name lock poisoned").clone()
+    }
+
+    /// Publish a session event to subscribed connections. Never fails: with no
+    /// subscribers the send is a no-op.
+    fn emit(&self, event: Event) {
+        let _ = self.events.send(event);
+    }
+
     fn new_pane(
         &self,
         title: &str,
         cwd: Option<PathBuf>,
         command: Option<Vec<String>>,
     ) -> Result<PaneId> {
-        let id = self.pane_id();
+        self.new_pane_with_id(self.pane_id(), title, cwd, command)
+    }
+
+    /// Spawn a pane under a caller-chosen id, used by `layout apply` so a pane
+    /// that is already alive keeps its id.
+    fn new_pane_with_id(
+        &self,
+        id: PaneId,
+        title: &str,
+        cwd: Option<PathBuf>,
+        command: Option<Vec<String>>,
+    ) -> Result<PaneId> {
         let (cols, rows) = *self.size.lock().expect("size lock poisoned");
         let pane = Arc::new(Pane::spawn(
             id,
             title,
             cols,
             rows,
-            self.name.clone(),
+            self.session_name(),
             self.updates.clone(),
             cwd,
             command,
@@ -491,6 +537,7 @@ impl Session {
             .lock()
             .expect("pane lock poisoned")
             .insert(id, pane);
+        self.emit(Event::PaneOpened { pane: id });
         Ok(id)
     }
 
@@ -672,6 +719,15 @@ impl Session {
             let previous = pane.last_state();
             let age = pane.track_state(detection.state, now);
             ages.insert(*id, age);
+            // The `track_state` write above makes this fire once per real
+            // transition even when several clients snapshot concurrently.
+            if let Some(from) = previous.filter(|from| *from != detection.state) {
+                self.emit(Event::AgentStateChanged {
+                    pane: *id,
+                    from,
+                    to: detection.state,
+                });
+            }
             let agent_known = detection.agent.is_some() || detection.from_hook;
             if should_notify(previous, detection.state, agent_known) {
                 if let Some((workspace, tab)) = locate_pane(&state, *id) {
@@ -763,10 +819,15 @@ impl Session {
             state,
             seq,
         });
+        let notification = queue.last().cloned().expect("just pushed");
         let overflow = queue.len().saturating_sub(64);
         if overflow > 0 {
             queue.drain(0..overflow);
         }
+        drop(queue);
+        // Subscribed connections read notifications off the event stream; #10's
+        // `ServerMessage::Notification` stays for plain attached clients.
+        self.emit(Event::Notification(notification));
     }
 
     /// Highest sequence handed out so far. A client records this at attach time
@@ -838,10 +899,13 @@ impl Session {
 
     fn handle(&self, message: ClientMessage) -> Result<()> {
         match message {
-            // `Version` is answered directly in `serve_client`.
-            ClientMessage::Query(_) => {}
-            // Handled directly in `serve_client`, which replies with `PaneText`.
-            ClientMessage::ReadPane { .. } => {}
+            // `Version` / `Session` / `Schema` queries, `Subscribe`, and
+            // `ReadPane` are answered by `serve_client`; no state changes here.
+            ClientMessage::Query(_) | ClientMessage::Subscribe | ClientMessage::ReadPane { .. } => {
+            }
+            ClientMessage::ApplyLayout(file) => self.apply_layout(file)?,
+            ClientMessage::MovePaneToTab { pane, tab } => self.move_pane_to_tab(pane, tab)?,
+            ClientMessage::RenameSession { name } => self.rename_session(&name)?,
             ClientMessage::Hello {
                 cols,
                 rows,
@@ -972,6 +1036,7 @@ impl Session {
                 });
                 workspace.active_tab = id;
                 drop(state);
+                self.emit(Event::TabOpened { tab: id });
                 self.resize_current()?;
             }
             ClientMessage::NewPane {
@@ -1133,9 +1198,10 @@ impl Session {
                     .flat_map(|workspace| workspace.tabs.iter_mut())
                     .find(|tab| tab.id == id)
                 {
-                    tab.name = name;
+                    tab.name = name.clone();
                 }
                 drop(state);
+                self.emit(Event::TabRenamed { tab: id, name });
                 self.notify();
             }
             ClientMessage::RenameWorkspaceId { id, name } => {
@@ -1144,9 +1210,13 @@ impl Session {
                     .lock()
                     .map_err(|_| anyhow!("state lock poisoned"))?;
                 if let Some(workspace) = state.workspaces.iter_mut().find(|item| item.id == id) {
-                    workspace.name = name;
+                    workspace.name = name.clone();
                 }
                 drop(state);
+                self.emit(Event::WorkspaceRenamed {
+                    workspace: id,
+                    name,
+                });
                 self.notify();
             }
             ClientMessage::SetWorkspaceColor { id, color } => {
@@ -1191,6 +1261,8 @@ impl Session {
                 });
                 state.active_workspace = id;
                 drop(state);
+                self.emit(Event::WorkspaceOpened { workspace: id });
+                self.emit(Event::TabOpened { tab: tab_id });
                 self.resize_current()?;
             }
             ClientMessage::SelectWorkspace { id } => {
@@ -1226,7 +1298,11 @@ impl Session {
                     .state
                     .lock()
                     .map_err(|_| anyhow!("state lock poisoned"))?;
-                Self::active_tab_mut(&mut state).name = name;
+                let tab = Self::active_tab_mut(&mut state);
+                tab.name = name.clone();
+                let id = tab.id;
+                drop(state);
+                self.emit(Event::TabRenamed { tab: id, name });
                 self.notify();
             }
             ClientMessage::RenameWorkspace { name } => {
@@ -1240,7 +1316,12 @@ impl Session {
                     .iter_mut()
                     .find(|item| item.id == active)
                     .expect("active workspace exists")
-                    .name = name;
+                    .name = name.clone();
+                drop(state);
+                self.emit(Event::WorkspaceRenamed {
+                    workspace: active,
+                    name,
+                });
                 self.notify();
             }
             ClientMessage::ResizePane { direction, cells } => {
@@ -1380,6 +1461,7 @@ impl Session {
                 .lock()
                 .map_err(|_| anyhow!("pane lock poisoned"))?
                 .remove(&id);
+            self.emit(Event::PaneClosed { pane: id });
         }
         self.resize_current()
     }
@@ -1437,10 +1519,12 @@ impl Session {
             .panes
             .lock()
             .map_err(|_| anyhow!("pane lock poisoned"))?;
-        for id in pane_ids {
-            panes.remove(&id);
+        for pane in pane_ids {
+            panes.remove(&pane);
+            self.emit(Event::PaneClosed { pane });
         }
         drop(panes);
+        self.emit(Event::TabClosed { tab: id });
         self.resize_current()
     }
 
@@ -1502,8 +1586,204 @@ impl Session {
             .panes
             .lock()
             .map_err(|_| anyhow!("pane lock poisoned"))?;
-        for id in pane_ids {
-            panes.remove(&id);
+        for pane in pane_ids {
+            panes.remove(&pane);
+            self.emit(Event::PaneClosed { pane });
+        }
+        drop(panes);
+        self.emit(Event::WorkspaceClosed { workspace: id });
+        self.resize_current()
+    }
+}
+
+impl Session {
+    /// Move a pane into another existing tab, splitting that tab's focused pane.
+    /// The pane keeps its PTY; a tab left empty by the move is removed.
+    fn move_pane_to_tab(&self, pane: PaneId, tab: TabId) -> Result<()> {
+        {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| anyhow!("state lock poisoned"))?;
+            let source = state
+                .workspaces
+                .iter()
+                .enumerate()
+                .find_map(|(workspace, item)| {
+                    item.tabs
+                        .iter()
+                        .position(|item| layout::contains(&item.tree, pane))
+                        .map(|index| (workspace, index))
+                });
+            let Some((workspace_index, tab_index)) = source else {
+                bail!("pane {} not found", pane.0);
+            };
+            if state.workspaces[workspace_index].tabs[tab_index].id == tab {
+                return Ok(()); // Already there: nothing to move.
+            }
+            let target = state
+                .workspaces
+                .iter()
+                .enumerate()
+                .find_map(|(index, item)| {
+                    item.tabs
+                        .iter()
+                        .position(|item| item.id == tab)
+                        .map(|position| (index, position))
+                });
+            let Some((target_workspace, _)) = target else {
+                bail!("tab {} not found", tab.0);
+            };
+            // Detach from the source tab, dropping the tab when it empties.
+            let workspace = &mut state.workspaces[workspace_index];
+            match layout::close(workspace.tabs[tab_index].tree.clone(), pane) {
+                Some(tree) => {
+                    let source = &mut workspace.tabs[tab_index];
+                    source.tree = tree;
+                    source.zoomed = false;
+                    let mut leaves = Vec::new();
+                    layout::leaves(&source.tree, &mut leaves);
+                    source.focused = leaves[0];
+                }
+                None if workspace.tabs.len() > 1 || workspace_index != target_workspace => {
+                    let removed = workspace.tabs.remove(tab_index).id;
+                    if workspace.active_tab == removed && !workspace.tabs.is_empty() {
+                        workspace.active_tab = workspace.tabs[tab_index.saturating_sub(1)].id;
+                    }
+                    self.emit(Event::TabClosed { tab: removed });
+                }
+                None => bail!("a workspace's last pane cannot be moved"),
+            }
+            // Re-resolve the target: removing a tab may have shifted indices.
+            let workspace = &mut state.workspaces[target_workspace];
+            let Some(target) = workspace.tabs.iter_mut().find(|item| item.id == tab) else {
+                bail!("tab {} not found", tab.0);
+            };
+            let focused = target.focused;
+            layout::split(&mut target.tree, focused, SplitAxis::Horizontal, pane);
+            target.focused = pane;
+            target.zoomed = false;
+            workspace.active_tab = tab;
+            let active = workspace.id;
+            state.active_workspace = active;
+        }
+        self.resize_current()
+    }
+
+    /// Rename a live session: the bound socket file and the state file move with
+    /// it, so `-s NEW` reaches the same daemon and PTYs.
+    fn rename_session(&self, new_name: &str) -> Result<()> {
+        validate_session_name(new_name)?;
+        let old_name = self.session_name();
+        if old_name == new_name {
+            return Ok(());
+        }
+        let old_socket = self.socket_path();
+        let new_socket = socket_path(new_name);
+        if new_socket.exists() {
+            bail!("session '{new_name}' already exists");
+        }
+        // Renaming the socket file keeps the listener bound: the daemon simply
+        // answers on the new path.
+        fs::rename(&old_socket, &new_socket).context("rename session socket")?;
+        *self.socket.lock().expect("socket lock poisoned") = new_socket;
+        *self.name.lock().expect("name lock poisoned") = new_name.to_owned();
+        persist::remove_session_file(&old_name);
+        self.save();
+        self.notify();
+        Ok(())
+    }
+
+    fn socket_path(&self) -> PathBuf {
+        self.socket.lock().expect("socket lock poisoned").clone()
+    }
+
+    /// Replace the layout with a persisted one (`layout apply`). Panes whose ids
+    /// are still alive keep their PTY; every other saved pane is spawned fresh
+    /// through the same path a cold restore uses. Panes the file does not
+    /// mention are closed.
+    fn apply_layout(&self, file: kodade_cli_proto::SessionFile) -> Result<()> {
+        file.validate()?;
+        let live: Vec<PaneId> = self
+            .panes
+            .lock()
+            .map_err(|_| anyhow!("pane lock poisoned"))?
+            .keys()
+            .copied()
+            .collect();
+        let mut workspaces = Vec::new();
+        let mut used: Vec<PaneId> = Vec::new();
+        let mut highest = 0;
+        for saved in &file.workspaces {
+            let mut tabs = Vec::new();
+            for saved_tab in &saved.tabs {
+                for saved_pane in &saved_tab.panes {
+                    let id = PaneId(saved_pane.id);
+                    highest = highest.max(saved_pane.id);
+                    used.push(id);
+                    if !live.contains(&id) {
+                        let cwd = restore_cwd(saved_pane.cwd.clone(), saved.root.clone());
+                        self.new_pane_with_id(
+                            id,
+                            &saved_pane.title,
+                            cwd,
+                            saved_pane.command.clone(),
+                        )?;
+                    }
+                }
+                let mut leaves = Vec::new();
+                layout::leaves(&saved_tab.tree, &mut leaves);
+                let focused = if leaves.contains(&PaneId(saved_tab.focused)) {
+                    PaneId(saved_tab.focused)
+                } else {
+                    leaves[0]
+                };
+                highest = highest.max(saved_tab.id);
+                tabs.push(Tab {
+                    id: TabId(saved_tab.id),
+                    name: saved_tab.name.clone(),
+                    tree: saved_tab.tree.clone(),
+                    focused,
+                    zoomed: saved_tab.zoomed,
+                });
+            }
+            highest = highest.max(saved.id);
+            let active_tab = tabs
+                .iter()
+                .find(|tab| tab.id == TabId(saved.active_tab))
+                .map(|tab| tab.id)
+                .unwrap_or(tabs[0].id);
+            workspaces.push(Workspace {
+                id: WorkspaceId(saved.id),
+                name: saved.name.clone(),
+                tabs,
+                active_tab,
+                root: saved.root.clone(),
+                color: saved.color.clone(),
+            });
+        }
+        let active_workspace = workspaces
+            .iter()
+            .find(|workspace| workspace.id == WorkspaceId(file.active_workspace))
+            .map(|workspace| workspace.id)
+            .unwrap_or(workspaces[0].id);
+        {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| anyhow!("state lock poisoned"))?;
+            state.workspaces = workspaces;
+            state.active_workspace = active_workspace;
+            // Ids from the file are now in use, so never hand them out again.
+            state.next_id = state.next_id.max(highest);
+        }
+        let mut panes = self
+            .panes
+            .lock()
+            .map_err(|_| anyhow!("pane lock poisoned"))?;
+        for pane in live.into_iter().filter(|id| !used.contains(id)) {
+            panes.remove(&pane);
+            self.emit(Event::PaneClosed { pane });
         }
         drop(panes);
         self.resize_current()
@@ -1678,7 +1958,12 @@ impl Pane {
             command.cwd(dir);
         }
         command.env("KODADE_PANE", id.0.to_string());
+        command.env("KODADE_SOCKET", socket_path(&session));
         command.env("KODADE_SESSION", session);
+        // Scripts inside a pane call the same binary that hosts them.
+        if let Ok(exe) = env::current_exe() {
+            command.env("KODADE_BIN", exe);
+        }
         pair.slave
             .spawn_command(command)
             .context("spawn login shell in PTY")?;
@@ -2227,11 +2512,14 @@ fn pane_sizes(tree: &LayoutTree, width: u16, height: u16, output: &mut Vec<(Pane
     }
 }
 
-async fn serve_client(stream: UnixStream, session: Arc<Session>, name: String) -> Result<()> {
+async fn serve_client(stream: UnixStream, session: Arc<Session>) -> Result<()> {
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader).lines();
     let mut updates = session.updates.subscribe();
+    let mut events = session.events.subscribe();
     let mut shutdown = session.shutdown.subscribe();
+    // Set by `Subscribe`: this connection then receives every session event.
+    let mut subscribed = false;
     let mut process_timer = tokio::time::interval(Duration::from_secs(2));
     process_timer.tick().await;
     let mut last_snapshot = Instant::now() - Duration::from_millis(16);
@@ -2244,12 +2532,6 @@ async fn serve_client(stream: UnixStream, session: Arc<Session>, name: String) -
             line = reader.next_line() => {
                 let Some(line) = line? else { return Ok(()); };
                 let message = decode::<ClientMessage>(line.as_bytes())?;
-                // Version probe: answer and keep the connection open so a caller
-                // can follow up on the same socket.
-                if let ClientMessage::Query(QueryKind::Version) = message {
-                    write_server(&mut writer, &ServerMessage::Version { version: PROTOCOL_VERSION }).await?;
-                    continue;
-                }
                 // A client whose protocol version differs cannot be served; tell
                 // it plainly and close so it fails fast instead of misbehaving.
                 if let ClientMessage::Hello { version, .. } = message {
@@ -2262,29 +2544,47 @@ async fn serve_client(stream: UnixStream, session: Arc<Session>, name: String) -
                         return Ok(());
                     }
                 }
-                // `ReadPane` replies with pane text, not a layout snapshot.
-                if let ClientMessage::ReadPane { id, scrollback, lines } = message {
-                    match session.read_pane_text(id, scrollback, lines) {
-                        Ok((text, scrollback_lines)) => {
-                            write_server(&mut writer, &ServerMessage::PaneText { id, text, scrollback_lines }).await?;
-                        }
-                        Err(error) => {
-                            write_server(&mut writer, &ServerMessage::Error { message: error.to_string() }).await?;
-                            return Ok(());
-                        }
+                // Read-only messages answer directly; they never touch state.
+                match message {
+                    // Version probe: answer and keep the connection open so a
+                    // caller can follow up on the same socket.
+                    ClientMessage::Query(QueryKind::Version) => {
+                        write_server(&mut writer, &ServerMessage::Version { version: PROTOCOL_VERSION }).await?;
+                        continue;
                     }
-                    continue;
+                    ClientMessage::ReadPane { id, scrollback, lines } => {
+                        match session.read_pane_text(id, scrollback, lines) {
+                            Ok((text, scrollback_lines)) => {
+                                write_server(&mut writer, &ServerMessage::PaneText { id, text, scrollback_lines }).await?;
+                            }
+                            Err(error) => {
+                                write_server(&mut writer, &ServerMessage::Error { message: error.to_string() }).await?;
+                                return Ok(());
+                            }
+                        }
+                        continue;
+                    }
+                    ClientMessage::Query(QueryKind::Session) => {
+                        write_server(&mut writer, &ServerMessage::Session(session.build_file())).await?;
+                        continue;
+                    }
+                    ClientMessage::Query(QueryKind::Schema) => {
+                        write_server(&mut writer, &schema_message()).await?;
+                        continue;
+                    }
+                    ClientMessage::Subscribe => subscribed = true,
+                    _ => {}
                 }
                 let hello = matches!(message, ClientMessage::Hello { .. });
                 let kill = matches!(message, ClientMessage::KillSession);
                 match session.handle(message) {
                     Ok(()) if hello => {
                         initialized = true;
-                        write_server(&mut writer, &ServerMessage::Welcome { session: name.clone(), version: PROTOCOL_VERSION }).await?;
+                        write_server(&mut writer, &ServerMessage::Welcome { session: session.session_name(), version: PROTOCOL_VERSION }).await?;
                         // The first client attach sees `restored: true`; clear it
                         // afterward so later snapshots (and `ls`) report normally.
                         write_server(&mut writer, &ServerMessage::Layout(session.snapshot()?)).await?;
-                        send_notifications(&mut writer, &session, &mut last_notify_seq).await?;
+                        send_notifications(&mut writer, &session, &mut last_notify_seq, subscribed).await?;
                         session.clear_restored();
                     }
                     Ok(()) if kill => {
@@ -2293,7 +2593,7 @@ async fn serve_client(stream: UnixStream, session: Arc<Session>, name: String) -
                     }
                     Ok(()) => {
                         write_server(&mut writer, &ServerMessage::Layout(session.snapshot()?)).await?;
-                        send_notifications(&mut writer, &session, &mut last_notify_seq).await?;
+                        send_notifications(&mut writer, &session, &mut last_notify_seq, subscribed).await?;
                     }
                     Err(error) => {
                         write_server(&mut writer, &ServerMessage::Error { message: error.to_string() }).await?;
@@ -2309,7 +2609,7 @@ async fn serve_client(stream: UnixStream, session: Arc<Session>, name: String) -
                     let remaining = Duration::from_millis(16).saturating_sub(last_snapshot.elapsed());
                     if !remaining.is_zero() { tokio::time::sleep(remaining).await; }
                     write_server(&mut writer, &ServerMessage::Layout(session.snapshot()?)).await?;
-                    send_notifications(&mut writer, &session, &mut last_notify_seq).await?;
+                    send_notifications(&mut writer, &session, &mut last_notify_seq, subscribed).await?;
                     last_snapshot = Instant::now();
                 }
                 Err(broadcast::error::RecvError::Closed) => return Ok(()),
@@ -2317,10 +2617,20 @@ async fn serve_client(stream: UnixStream, session: Arc<Session>, name: String) -
             _ = process_timer.tick() => {
                 if initialized {
                     write_server(&mut writer, &ServerMessage::Layout(session.snapshot()?)).await?;
-                    send_notifications(&mut writer, &session, &mut last_notify_seq).await?;
+                    send_notifications(&mut writer, &session, &mut last_notify_seq, subscribed).await?;
                     last_snapshot = Instant::now();
                 }
             }
+            event = events.recv() => match event {
+                Ok(event) => {
+                    if subscribed {
+                        write_server(&mut writer, &ServerMessage::Event(event)).await?;
+                    }
+                }
+                // A slow subscriber just misses events; it never stalls the session.
+                Err(broadcast::error::RecvError::Lagged(_)) => {}
+                Err(broadcast::error::RecvError::Closed) => return Ok(()),
+            },
             _ = shutdown.recv() => {
                 write_server(&mut writer, &ServerMessage::Shutdown).await?;
                 return Ok(());
@@ -2342,10 +2652,14 @@ async fn send_notifications(
     writer: &mut tokio::net::unix::OwnedWriteHalf,
     session: &Arc<Session>,
     last_seq: &mut u64,
+    subscribed: bool,
 ) -> Result<()> {
     for notification in session.notifications_since(*last_seq) {
         *last_seq = (*last_seq).max(notification.seq);
-        write_server(writer, &ServerMessage::Notification(notification)).await?;
+        // Subscribers already receive these as `Event::Notification`.
+        if !subscribed {
+            write_server(writer, &ServerMessage::Notification(notification)).await?;
+        }
     }
     Ok(())
 }
@@ -2926,7 +3240,7 @@ mod tests {
                 while let Ok((stream, _)) = listener.accept().await {
                     let session = Arc::clone(&session);
                     tokio::spawn(async move {
-                        let _ = serve_client(stream, session, "notify".into()).await;
+                        let _ = serve_client(stream, session).await;
                     });
                 }
             })
@@ -3012,7 +3326,7 @@ mod tests {
                 while let Ok((stream, _)) = listener.accept().await {
                     let session = Arc::clone(&session);
                     tokio::spawn(async move {
-                        let _ = serve_client(stream, session, "version".into()).await;
+                        let _ = serve_client(stream, session).await;
                     });
                 }
             })
@@ -3065,5 +3379,123 @@ mod tests {
         accept.abort();
         let _ = fs::remove_file(&socket);
         let _ = fs::remove_dir(&directory);
+    }
+    #[tokio::test]
+    async fn subscribe_streams_agent_state_changes() {
+        let directory =
+            std::env::temp_dir().join(format!("kodade-cli-events-{}", std::process::id()));
+        fs::create_dir_all(&directory).expect("create test directory");
+        let socket = directory.join("events.sock");
+        let _ = fs::remove_file(&socket);
+        let listener = UnixListener::bind(&socket).expect("bind test socket");
+        let session = Arc::new(Session::spawn(80, 24, "events".into()).expect("spawn session"));
+        let accept = {
+            let session = Arc::clone(&session);
+            tokio::spawn(async move {
+                while let Ok((stream, _)) = listener.accept().await {
+                    let session = Arc::clone(&session);
+                    tokio::spawn(async move {
+                        let _ = serve_client(stream, session).await;
+                    });
+                }
+            })
+        };
+
+        // Subscriber: the reply snapshot also settles the pane's baseline state.
+        let (reader, mut writer) = UnixStream::connect(&socket)
+            .await
+            .expect("connect subscriber")
+            .into_split();
+        let mut lines = BufReader::new(reader).lines();
+        writer
+            .write_all(&encode(&ClientMessage::Subscribe).unwrap())
+            .await
+            .expect("subscribe");
+        let pane = match next_server_message(&mut lines).await {
+            ServerMessage::Layout(layout) => layout.panes[0].id,
+            other => panic!("expected the subscribe reply layout, got {other:?}"),
+        };
+
+        // A hook-style connection reports the pane blocked.
+        let (_r, mut reporter) = UnixStream::connect(&socket)
+            .await
+            .expect("connect reporter")
+            .into_split();
+        reporter
+            .write_all(
+                &encode(&ClientMessage::AgentState {
+                    pane,
+                    state: AgentStateKind::Blocked,
+                    source: "test".into(),
+                })
+                .unwrap(),
+            )
+            .await
+            .expect("report blocked");
+
+        let event = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let ServerMessage::Event(Event::AgentStateChanged { pane, from, to }) =
+                    next_server_message(&mut lines).await
+                {
+                    break (pane, from, to);
+                }
+            }
+        })
+        .await
+        .expect("agent state change arrives within 2s");
+        assert_eq!(event.0, pane);
+        assert_eq!(event.2, AgentStateKind::Blocked);
+
+        accept.abort();
+        let _ = fs::remove_file(&socket);
+        let _ = fs::remove_dir(&directory);
+    }
+
+    #[tokio::test]
+    async fn applying_an_exported_layout_keeps_live_panes() {
+        let session = Session::spawn(80, 24, "apply".into()).expect("spawn session");
+        session
+            .handle(ClientMessage::SplitRight)
+            .expect("split the first pane");
+        let exported = session.build_file();
+        let before: Vec<PaneId> = {
+            let panes = session.panes.lock().expect("pane lock");
+            let mut ids: Vec<_> = panes.keys().copied().collect();
+            ids.sort_by_key(|id| id.0);
+            ids
+        };
+        assert_eq!(before.len(), 2);
+
+        // Re-applying the same file is a no-op for live panes.
+        session
+            .handle(ClientMessage::ApplyLayout(exported.clone()))
+            .expect("apply the exported layout");
+        let after: Vec<PaneId> = {
+            let panes = session.panes.lock().expect("pane lock");
+            let mut ids: Vec<_> = panes.keys().copied().collect();
+            ids.sort_by_key(|id| id.0);
+            ids
+        };
+        assert_eq!(before, after);
+
+        // Dropping a pane from the file closes it and rebuilds the tree.
+        let mut trimmed = exported;
+        let tab = &mut trimmed.workspaces[0].tabs[0];
+        let keep = before[0];
+        tab.tree = LayoutTree::Leaf { pane: keep };
+        tab.focused = keep.0;
+        tab.panes.retain(|pane| pane.id == keep.0);
+        session
+            .handle(ClientMessage::ApplyLayout(trimmed))
+            .expect("apply the trimmed layout");
+        let remaining: Vec<PaneId> = session
+            .panes
+            .lock()
+            .expect("pane lock")
+            .keys()
+            .copied()
+            .collect();
+        assert_eq!(remaining, vec![keep]);
     }
 }

@@ -168,20 +168,32 @@ for the installed version. The scripting commands are:
   pane and print the new pane id.
 - `kodade-cli new-tab [-w NAME] [--name NAME]` — open a new tab and print its
   pane id.
+- `kodade-cli pane ls|read|send-keys|kill|focus|zoom|swap|move|resize|wait-output` —
+  inspect and drive panes.
+- `kodade-cli pane read PANE [--lines N] [--scrollback]` — print a pane's text
+  (visible screen by default; `--scrollback` includes the full history, `--lines N`
+  keeps only the last N lines).
+- `kodade-cli tab ls|new|close|rename|select` — tabs of the active workspace
+  (TAB is a name or an id).
+- `kodade-cli workspace ls|new|close|rename|select` — workspaces (WS is a name
+  or an id); `new` is the same as the top-level `new`.
+- `kodade-cli session ls|path|kill [NAME]|rename NAME` — every session on this
+  machine; `ls` probes each socket and marks it `(restored)` or `(dead)`, and
+  `path` prints the daemon socket path (`--remote` prints the host's). With
+  `--remote` every `session` verb runs on the host.
+- `kodade-cli layout export [FILE]|apply FILE` — save and restore a layout.
+- `kodade-cli events [--json]` — stream session events until interrupted.
+- `kodade-cli completion zsh|bash|fish` — print a completion script.
 - `kodade-cli agent ls` — list recognized agents and states.
 - `kodade-cli agent attach PANE` — focus a pane and attach the TUI.
 - `kodade-cli agent rename PANE NAME` — rename a pane.
 - `kodade-cli agent explain PANE` — print a pane's state, reason, and the bottom-8-line window it matched.
+- `kodade-cli agent wait PANE --state STATE [--timeout S]` — block until a pane
+  reaches a state; exits 0 when it does and 2 on timeout.
 - `kodade-cli agent report PANE STATE` — report an agent state to the daemon.
 - `kodade-cli agent update-manifests` — opt-in refresh of agent-detection manifests from GitHub.
 - `kodade-cli send PANE TEXT` — send text followed by a newline (`--no-newline` is also supported).
-- `kodade-cli pane read PANE [--lines N] [--scrollback]` — print a pane's text
-  (visible screen by default; `--scrollback` includes the full history, `--lines N`
-  keeps only the last N lines).
 - `kodade-cli kill-session` — stop the current session.
-- `kodade-cli session path` — print the daemon socket path for the session
-  (`--remote` prints the host's path). The `session` group grows `ls`, `kill`,
-  and `rename` verbs.
 - `kodade-cli config path|show|validate` — print the config path, the effective
   config as TOML, or check the file (exits non-zero on problems).
 
@@ -194,8 +206,35 @@ directory (`new -w NAME PATH` or the `prefix W` prompt); new panes, splits, and
 tabs start in the focused pane's live working directory, falling back to the
 workspace root, so agents keep landing in the right repo.
 
-`ls`, `agent ls`, and `agent explain` also accept `--json`, which prints the
-matching protocol snapshots for scripts.
+`ls`, `agent ls`, `agent explain`, `pane ls`, `tab ls`, `workspace ls`, and
+`session ls` also accept `--json`, which prints the matching protocol snapshots
+for scripts.
+
+Scripts wait on agents instead of polling by hand:
+
+```bash
+# Block until pane 3 needs you, then read the last five lines it printed.
+kodade-cli agent wait 3 --state blocked && kodade-cli pane read 3 | tail -5
+
+# The full session snapshot, for jq.
+kodade-cli ls --json | jq '.panes[] | {id: .id, state: .state}'
+
+# React to every state change as it happens.
+kodade-cli events --json | jq -r 'select(.AgentStateChanged) | .AgentStateChanged.pane'
+```
+
+`pane wait-output PANE --match TEXT` waits for text on a pane's screen. The
+match is a plain substring, not a regular expression — Ködade CLI ships without
+a regex dependency, so `--match` is documented as text rather than `REGEX`.
+
+`pane send-keys` accepts tmux-style key names (`Enter`, `Escape`, `C-c`, `Up`)
+and sends anything else as literal text: `kodade-cli pane send-keys 3 "npm test" Enter`.
+
+Panes a session spawns get `KODADE_PANE`, `KODADE_SESSION`, `KODADE_SOCKET`,
+and `KODADE_BIN` in their environment, which is everything a custom agent needs
+to report its own state. The socket protocol itself — framing, every message,
+the `Subscribe` event stream, and the schema query — is documented in
+[docs/SOCKET-API.md](docs/SOCKET-API.md).
 
 ## Remote
 
@@ -233,6 +272,7 @@ is standard on current macOS and Linux.
 [docs/AGENT-DETECTION.md](docs/AGENT-DETECTION.md) for details.
 
 See [docs/CONFIG.md](docs/CONFIG.md), [docs/AGENT-DETECTION.md](docs/AGENT-DETECTION.md),
+[docs/SOCKET-API.md](docs/SOCKET-API.md),
 [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md), and [docs/RELEASING.md](docs/RELEASING.md)
 for reference and contributor details. The product direction is in
 [docs/PRD.md](docs/PRD.md).

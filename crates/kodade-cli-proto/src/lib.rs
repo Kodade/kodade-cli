@@ -13,9 +13,16 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 /// `Welcome`) so a stale binary fails fast instead of misbehaving (#23).
 pub const PROTOCOL_VERSION: u32 = 1;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+// No `Eq`: `ApplyLayout` carries the split ratios, which are floats.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ClientMessage {
     Query(QueryKind),
+    /// Turn this connection into an event stream: every later `Event` raised by
+    /// the session is pushed as `ServerMessage::Event` (#16).
+    Subscribe,
+    /// Replace the session layout with a persisted one. Panes whose ids are
+    /// still alive are kept; the rest are spawned fresh (`layout apply`).
+    ApplyLayout(SessionFile),
     Hello {
         cols: u16,
         rows: u16,
@@ -139,6 +146,17 @@ pub enum ClientMessage {
         lines: Option<usize>,
     },
     ZoomPane,
+    /// Move a pane out of its tab and into an existing one, splitting that
+    /// tab's focused pane (`pane move PANE --tab TAB`).
+    MovePaneToTab {
+        pane: PaneId,
+        tab: TabId,
+    },
+    /// Rename the live session: the socket file and the state file move with it
+    /// (`session rename NAME`).
+    RenameSession {
+        name: String,
+    },
     AgentState {
         pane: PaneId,
         state: AgentStateKind,
@@ -158,6 +176,10 @@ pub enum QueryKind {
     /// Cheap version probe: the daemon replies with `ServerMessage::Version` and
     /// nothing else, so `--remote` can check compatibility before attaching (#23).
     Version,
+    /// The persisted-layout view of the session (`layout export`).
+    Session,
+    /// The protocol schema: version plus the message names this daemon knows.
+    Schema,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -174,8 +196,9 @@ pub enum ServerMessage {
         version: u32,
     },
     Layout(LayoutSnapshot),
-    /// Pushed to every attached client when a known agent transitions into
-    /// `blocked` or `done` (#10). Older daemons never send it.
+    /// Pushed to every attached client that has not subscribed when a known
+    /// agent transitions into `blocked` or `done` (#10). Subscribed clients get
+    /// the same payload as `Event::Notification` instead.
     Notification(Notification),
     /// Reply to `ReadPane`: `text` is the joined pane text and `scrollback_lines`
     /// is the number of lines it contains (after any `lines` truncation).
@@ -184,10 +207,58 @@ pub enum ServerMessage {
         text: String,
         scrollback_lines: usize,
     },
+    /// Pushed only to connections that sent `Subscribe` (#16).
+    Event(Event),
+    /// Reply to `Query(QueryKind::Session)` — the persisted layout.
+    Session(SessionFile),
+    /// Reply to `Query(QueryKind::Schema)`.
+    Schema {
+        version: u32,
+        client_messages: Vec<String>,
+        server_messages: Vec<String>,
+    },
     Error {
         message: String,
     },
     Shutdown,
+}
+
+/// Session events delivered on a subscribed connection. Ids are resolved
+/// against the latest `LayoutSnapshot` by the client.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Event {
+    AgentStateChanged {
+        pane: PaneId,
+        from: AgentStateKind,
+        to: AgentStateKind,
+    },
+    PaneOpened {
+        pane: PaneId,
+    },
+    PaneClosed {
+        pane: PaneId,
+    },
+    TabOpened {
+        tab: TabId,
+    },
+    TabClosed {
+        tab: TabId,
+    },
+    TabRenamed {
+        tab: TabId,
+        name: String,
+    },
+    WorkspaceOpened {
+        workspace: WorkspaceId,
+    },
+    WorkspaceClosed {
+        workspace: WorkspaceId,
+    },
+    WorkspaceRenamed {
+        workspace: WorkspaceId,
+        name: String,
+    },
+    Notification(Notification),
 }
 
 /// A single agent-state alert. Workspace/tab are carried as ids; the client
@@ -369,6 +440,261 @@ pub struct Screen {
     pub mouse_reporting: bool,
 }
 
+/// Persisted-session file version understood by this build (#9).
+pub const SESSION_FILE_VERSION: u32 = 1;
+
+/// A persisted session layout. Lives in the proto crate because it travels on
+/// the wire too (`layout export` / `layout apply`, #16). Unknown fields are
+/// ignored and every field has a default so a partially written or older file
+/// still loads.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionFile {
+    pub version: u32,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub active_workspace: u64,
+    #[serde(default)]
+    pub workspaces: Vec<WorkspaceFile>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WorkspaceFile {
+    #[serde(default)]
+    pub id: u64,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub root: Option<PathBuf>,
+    /// Sidebar swatch color as `#rrggbb`, if the user set one (#19).
+    #[serde(default)]
+    pub color: Option<String>,
+    #[serde(default)]
+    pub active_tab: u64,
+    #[serde(default)]
+    pub tabs: Vec<TabFile>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TabFile {
+    #[serde(default)]
+    pub id: u64,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub zoomed: bool,
+    #[serde(default)]
+    pub focused: u64,
+    /// Pane tree; its leaf ids reference the `panes` list below.
+    pub tree: LayoutTree,
+    #[serde(default)]
+    pub panes: Vec<PaneFile>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PaneFile {
+    #[serde(default)]
+    pub id: u64,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub cwd: Option<PathBuf>,
+    /// The command this pane was spawned with, if any (used for `resume_agents`).
+    #[serde(default)]
+    pub command: Option<Vec<String>>,
+}
+
+impl SessionFile {
+    /// A file is usable only if every tab's tree leaves have a matching pane
+    /// entry and there is at least one workspace/tab/pane. Focused / active ids
+    /// are tolerated (callers fall back), but a tree that names a missing pane
+    /// can't be rebuilt, so it counts as corrupt.
+    pub fn validate(&self) -> Result<()> {
+        if self.version != SESSION_FILE_VERSION {
+            anyhow::bail!("unsupported session file version {}", self.version);
+        }
+        if self.workspaces.is_empty() {
+            anyhow::bail!("session file has no workspaces");
+        }
+        for workspace in &self.workspaces {
+            if workspace.tabs.is_empty() {
+                anyhow::bail!("workspace {} has no tabs", workspace.id);
+            }
+            for tab in &workspace.tabs {
+                if tab.panes.is_empty() {
+                    anyhow::bail!("tab {} has no panes", tab.id);
+                }
+                let known: std::collections::HashSet<u64> =
+                    tab.panes.iter().map(|pane| pane.id).collect();
+                let mut leaves = Vec::new();
+                tree_leaves(&tab.tree, &mut leaves);
+                if leaves.is_empty() {
+                    anyhow::bail!("tab {} has an empty tree", tab.id);
+                }
+                for leaf in leaves {
+                    if !known.contains(&leaf) {
+                        anyhow::bail!("tab {} tree references unknown pane {leaf}", tab.id);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Collect the pane ids referenced by a tree's leaves.
+pub fn tree_leaves(tree: &LayoutTree, output: &mut Vec<u64>) {
+    match tree {
+        LayoutTree::Leaf { pane } => output.push(pane.0),
+        LayoutTree::Split { first, second, .. } => {
+            tree_leaves(first, output);
+            tree_leaves(second, output);
+        }
+    }
+}
+
+/// Socket schema version reported by `Query(QueryKind::Schema)`. Bump it when a
+/// message changes shape in a way an older client cannot ignore (#23).
+pub const SCHEMA_VERSION: u32 = 1;
+
+/// Every `ClientMessage` variant name, hand-maintained so the schema query is a
+/// stable contract. `client_message_name` keeps it honest at compile time and
+/// the schema test keeps the counts in sync.
+pub const CLIENT_MESSAGE_NAMES: &[&str] = &[
+    "Query",
+    "Subscribe",
+    "ApplyLayout",
+    "Hello",
+    "Input",
+    "Resize",
+    "SplitRight",
+    "SplitDown",
+    "ClosePane",
+    "CloseTab",
+    "CloseWorkspace",
+    "FocusPane",
+    "FocusPaneId",
+    "SendToPane",
+    "RenamePaneId",
+    "KillSession",
+    "RenameSession",
+    "NewTab",
+    "NextTab",
+    "PrevTab",
+    "SelectTab",
+    "SelectTabIndex",
+    "MoveTab",
+    "MovePaneToTab",
+    "SwapPane",
+    "BreakPane",
+    "EqualizeLayout",
+    "FocusPaneCycle",
+    "SelectWorkspaceDelta",
+    "RenameTabId",
+    "RenameWorkspaceId",
+    "NewWorkspace",
+    "NewPane",
+    "SelectWorkspace",
+    "RenamePane",
+    "RenameTab",
+    "RenameWorkspace",
+    "ResizePane",
+    "ScrollPane",
+    "ReadPane",
+    "ZoomPane",
+    "AgentState",
+    "SetWorkspaceColor",
+];
+
+/// Every `ServerMessage` variant name (see [`CLIENT_MESSAGE_NAMES`]).
+pub const SERVER_MESSAGE_NAMES: &[&str] = &[
+    "Welcome",
+    "Layout",
+    "Notification",
+    "PaneText",
+    "Version",
+    "Event",
+    "Session",
+    "Schema",
+    "Error",
+    "Shutdown",
+];
+
+/// Variant name of a client message. The exhaustive match makes a new variant a
+/// compile error until it is named here (and, via the test, in the list above).
+pub fn client_message_name(message: &ClientMessage) -> &'static str {
+    match message {
+        ClientMessage::Query(_) => "Query",
+        ClientMessage::Subscribe => "Subscribe",
+        ClientMessage::ApplyLayout(_) => "ApplyLayout",
+        ClientMessage::Hello { .. } => "Hello",
+        ClientMessage::Input { .. } => "Input",
+        ClientMessage::Resize { .. } => "Resize",
+        ClientMessage::SplitRight => "SplitRight",
+        ClientMessage::SplitDown => "SplitDown",
+        ClientMessage::ClosePane => "ClosePane",
+        ClientMessage::CloseTab { .. } => "CloseTab",
+        ClientMessage::CloseWorkspace { .. } => "CloseWorkspace",
+        ClientMessage::FocusPane { .. } => "FocusPane",
+        ClientMessage::FocusPaneId { .. } => "FocusPaneId",
+        ClientMessage::SendToPane { .. } => "SendToPane",
+        ClientMessage::RenamePaneId { .. } => "RenamePaneId",
+        ClientMessage::KillSession => "KillSession",
+        ClientMessage::RenameSession { .. } => "RenameSession",
+        ClientMessage::NewTab => "NewTab",
+        ClientMessage::NextTab => "NextTab",
+        ClientMessage::PrevTab => "PrevTab",
+        ClientMessage::SelectTab { .. } => "SelectTab",
+        ClientMessage::SelectTabIndex { .. } => "SelectTabIndex",
+        ClientMessage::MoveTab { .. } => "MoveTab",
+        ClientMessage::MovePaneToTab { .. } => "MovePaneToTab",
+        ClientMessage::SwapPane { .. } => "SwapPane",
+        ClientMessage::BreakPane => "BreakPane",
+        ClientMessage::EqualizeLayout => "EqualizeLayout",
+        ClientMessage::FocusPaneCycle { .. } => "FocusPaneCycle",
+        ClientMessage::SelectWorkspaceDelta { .. } => "SelectWorkspaceDelta",
+        ClientMessage::RenameTabId { .. } => "RenameTabId",
+        ClientMessage::RenameWorkspaceId { .. } => "RenameWorkspaceId",
+        ClientMessage::NewWorkspace { .. } => "NewWorkspace",
+        ClientMessage::NewPane { .. } => "NewPane",
+        ClientMessage::SelectWorkspace { .. } => "SelectWorkspace",
+        ClientMessage::RenamePane { .. } => "RenamePane",
+        ClientMessage::RenameTab { .. } => "RenameTab",
+        ClientMessage::RenameWorkspace { .. } => "RenameWorkspace",
+        ClientMessage::ResizePane { .. } => "ResizePane",
+        ClientMessage::ScrollPane { .. } => "ScrollPane",
+        ClientMessage::ReadPane { .. } => "ReadPane",
+        ClientMessage::ZoomPane => "ZoomPane",
+        ClientMessage::AgentState { .. } => "AgentState",
+        ClientMessage::SetWorkspaceColor { .. } => "SetWorkspaceColor",
+    }
+}
+
+/// Variant name of a server message (see [`client_message_name`]).
+pub fn server_message_name(message: &ServerMessage) -> &'static str {
+    match message {
+        ServerMessage::Welcome { .. } => "Welcome",
+        ServerMessage::Layout(_) => "Layout",
+        ServerMessage::Notification(_) => "Notification",
+        ServerMessage::PaneText { .. } => "PaneText",
+        ServerMessage::Version { .. } => "Version",
+        ServerMessage::Event(_) => "Event",
+        ServerMessage::Session(_) => "Session",
+        ServerMessage::Schema { .. } => "Schema",
+        ServerMessage::Error { .. } => "Error",
+        ServerMessage::Shutdown => "Shutdown",
+    }
+}
+
+/// The schema reply this build answers `Query(QueryKind::Schema)` with.
+pub fn schema_message() -> ServerMessage {
+    ServerMessage::Schema {
+        version: SCHEMA_VERSION,
+        client_messages: CLIENT_MESSAGE_NAMES.iter().map(|s| s.to_string()).collect(),
+        server_messages: SERVER_MESSAGE_NAMES.iter().map(|s| s.to_string()).collect(),
+    }
+}
+
 pub fn encode<T: Serialize>(message: &T) -> Result<Vec<u8>> {
     let mut encoded = serde_json::to_vec(message)?;
     encoded.push(b'\n');
@@ -481,5 +807,189 @@ mod tests {
             decode::<ServerMessage>(&encode(&reply).unwrap()).unwrap(),
             reply
         );
+    }
+
+    /// One value per `ClientMessage` variant. `client_message_name` is
+    /// exhaustive, so a new variant breaks the build there; this list plus the
+    /// count assertion below keeps the schema list in step with it.
+    fn every_client_message() -> Vec<ClientMessage> {
+        let pane = PaneId(1);
+        let tab = TabId(2);
+        let workspace = WorkspaceId(3);
+        vec![
+            ClientMessage::Query(QueryKind::Layout),
+            ClientMessage::Subscribe,
+            ClientMessage::ApplyLayout(SessionFile {
+                version: SESSION_FILE_VERSION,
+                name: "demo".into(),
+                active_workspace: 3,
+                workspaces: Vec::new(),
+            }),
+            ClientMessage::Hello {
+                cols: 80,
+                rows: 24,
+                version: PROTOCOL_VERSION,
+            },
+            ClientMessage::Input { bytes: vec![1] },
+            ClientMessage::Resize { cols: 80, rows: 24 },
+            ClientMessage::SplitRight,
+            ClientMessage::SplitDown,
+            ClientMessage::ClosePane,
+            ClientMessage::CloseTab { id: tab },
+            ClientMessage::CloseWorkspace { id: workspace },
+            ClientMessage::FocusPane {
+                direction: Direction::Up,
+            },
+            ClientMessage::FocusPaneId { id: pane },
+            ClientMessage::SendToPane {
+                id: pane,
+                bytes: vec![1],
+            },
+            ClientMessage::RenamePaneId {
+                id: pane,
+                name: "a".into(),
+            },
+            ClientMessage::KillSession,
+            ClientMessage::RenameSession { name: "a".into() },
+            ClientMessage::NewTab,
+            ClientMessage::NextTab,
+            ClientMessage::PrevTab,
+            ClientMessage::SelectTab { id: tab },
+            ClientMessage::SelectTabIndex { index: 1 },
+            ClientMessage::MoveTab { delta: 1 },
+            ClientMessage::MovePaneToTab { pane, tab },
+            ClientMessage::SwapPane {
+                direction: Direction::Left,
+            },
+            ClientMessage::BreakPane,
+            ClientMessage::EqualizeLayout,
+            ClientMessage::FocusPaneCycle { forward: true },
+            ClientMessage::SelectWorkspaceDelta { delta: 1 },
+            ClientMessage::RenameTabId {
+                id: tab,
+                name: "a".into(),
+            },
+            ClientMessage::RenameWorkspaceId {
+                id: workspace,
+                name: "a".into(),
+            },
+            ClientMessage::NewWorkspace {
+                name: "a".into(),
+                root: None,
+            },
+            ClientMessage::NewPane {
+                workspace: None,
+                tab: None,
+                split: None,
+                command: None,
+                name: None,
+            },
+            ClientMessage::SelectWorkspace { id: workspace },
+            ClientMessage::RenamePane { name: "a".into() },
+            ClientMessage::RenameTab { name: "a".into() },
+            ClientMessage::RenameWorkspace { name: "a".into() },
+            ClientMessage::ResizePane {
+                direction: Direction::Up,
+                cells: 1,
+            },
+            ClientMessage::ScrollPane { id: pane, delta: 1 },
+            ClientMessage::ReadPane {
+                id: pane,
+                scrollback: true,
+                lines: Some(5),
+            },
+            ClientMessage::ZoomPane,
+            ClientMessage::AgentState {
+                pane,
+                state: AgentStateKind::Idle,
+                source: "test".into(),
+            },
+            ClientMessage::SetWorkspaceColor {
+                id: workspace,
+                color: Some("#e7a33b".into()),
+            },
+        ]
+    }
+
+    fn every_server_message() -> Vec<ServerMessage> {
+        let notification = Notification {
+            pane: PaneId(1),
+            workspace: WorkspaceId(3),
+            tab: TabId(2),
+            agent: "codex".into(),
+            state: AgentStateKind::Blocked,
+            seq: 1,
+        };
+        vec![
+            ServerMessage::Welcome {
+                session: "demo".into(),
+                version: PROTOCOL_VERSION,
+            },
+            ServerMessage::Version {
+                version: PROTOCOL_VERSION,
+            },
+            ServerMessage::Layout(LayoutSnapshot {
+                active_workspace: WorkspaceId(3),
+                active_tab: TabId(2),
+                workspaces: Vec::new(),
+                tabs: Vec::new(),
+                tree: LayoutTree::Leaf { pane: PaneId(1) },
+                panes: Vec::new(),
+                zoomed: false,
+                restored: false,
+            }),
+            ServerMessage::Notification(notification.clone()),
+            ServerMessage::PaneText {
+                id: PaneId(1),
+                text: "hi".into(),
+                scrollback_lines: 1,
+            },
+            ServerMessage::Event(Event::Notification(notification)),
+            ServerMessage::Session(SessionFile {
+                version: SESSION_FILE_VERSION,
+                name: "demo".into(),
+                active_workspace: 3,
+                workspaces: Vec::new(),
+            }),
+            schema_message(),
+            ServerMessage::Error {
+                message: "boom".into(),
+            },
+            ServerMessage::Shutdown,
+        ]
+    }
+
+    #[test]
+    fn schema_lists_every_message_exactly_once() {
+        let client = every_client_message();
+        assert_eq!(client.len(), CLIENT_MESSAGE_NAMES.len());
+        for message in &client {
+            let name = client_message_name(message);
+            assert!(
+                CLIENT_MESSAGE_NAMES.contains(&name),
+                "{name} missing from CLIENT_MESSAGE_NAMES"
+            );
+        }
+        let server = every_server_message();
+        assert_eq!(server.len(), SERVER_MESSAGE_NAMES.len());
+        for message in &server {
+            let name = server_message_name(message);
+            assert!(
+                SERVER_MESSAGE_NAMES.contains(&name),
+                "{name} missing from SERVER_MESSAGE_NAMES"
+            );
+        }
+    }
+
+    #[test]
+    fn every_message_round_trips_through_json() {
+        for message in every_client_message() {
+            let encoded = encode(&message).expect("encode");
+            assert_eq!(decode::<ClientMessage>(&encoded).expect("decode"), message);
+        }
+        for message in every_server_message() {
+            let encoded = encode(&message).expect("encode");
+            assert_eq!(decode::<ServerMessage>(&encoded).expect("decode"), message);
+        }
     }
 }

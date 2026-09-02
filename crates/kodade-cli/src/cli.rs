@@ -6,8 +6,8 @@
 
 use std::path::PathBuf;
 
-use clap::{Parser, Subcommand};
-use kodade_cli_proto::{AgentStateKind, PaneId};
+use clap::{Parser, Subcommand, ValueEnum};
+use kodade_cli_proto::{AgentStateKind, Direction, PaneId};
 
 pub const DEFAULT_SESSION: &str = "default";
 
@@ -55,11 +55,6 @@ pub enum Command {
     Agent {
         #[command(subcommand)]
         command: AgentCommand,
-    },
-    /// Work with a pane's contents. #16 extends this group with more verbs.
-    Pane {
-        #[command(subcommand)]
-        command: PaneCommand,
     },
     /// Send text to a pane, followed by a newline.
     Send {
@@ -116,11 +111,6 @@ pub enum Command {
         #[arg(long = "name", value_name = "NAME")]
         name: Option<String>,
     },
-    /// Inspect sessions. #16 extends this group with `ls`, `kill`, and `rename`.
-    Session {
-        #[command(subcommand)]
-        command: SessionCommand,
-    },
     /// Stop the session and its daemon.
     KillSession,
     /// Inspect the configuration file.
@@ -139,6 +129,247 @@ pub enum Command {
         #[command(subcommand)]
         target: IntegrateCommand,
     },
+    /// Inspect and control panes.
+    Pane {
+        #[command(subcommand)]
+        command: PaneCommand,
+    },
+    /// Inspect and control tabs (TAB is a name or an id).
+    Tab {
+        #[command(subcommand)]
+        command: TabCommand,
+    },
+    /// Inspect and control workspaces (WS is a name or an id).
+    Workspace {
+        #[command(subcommand)]
+        command: WorkspaceCommand,
+    },
+    /// Inspect and control sessions.
+    Session {
+        #[command(subcommand)]
+        command: SessionCommand,
+    },
+    /// Export or apply a session layout (the persistence JSON).
+    Layout {
+        #[command(subcommand)]
+        command: LayoutCommand,
+    },
+    /// Stream session events until interrupted.
+    Events {
+        /// Print each event as a JSON object instead of a text line.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Print a shell completion script.
+    Completion {
+        #[arg(value_name = "SHELL")]
+        shell: clap_complete::Shell,
+    },
+}
+
+#[derive(Debug, Subcommand, PartialEq, Eq)]
+pub enum PaneCommand {
+    /// Print a pane's text. Defaults to the visible screen; `--scrollback`
+    /// includes the full history and `--lines N` keeps only the last N lines.
+    Read {
+        #[arg(value_name = "PANE", value_parser = pane_id)]
+        pane: PaneId,
+        /// Keep only the last N lines.
+        #[arg(long, value_name = "N")]
+        lines: Option<usize>,
+        /// Include the full scrollback, not just the visible screen.
+        #[arg(long)]
+        scrollback: bool,
+    },
+    /// List the panes of the active tab.
+    Ls {
+        /// Print the pane snapshots as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Send key names (`Enter`, `C-c`, `Escape`) or literal text to a pane.
+    SendKeys {
+        #[arg(value_name = "PANE", value_parser = pane_id)]
+        pane: PaneId,
+        #[arg(value_name = "KEYS", required = true, allow_hyphen_values = true)]
+        keys: Vec<String>,
+    },
+    /// Close a pane.
+    Kill {
+        #[arg(value_name = "PANE", value_parser = pane_id)]
+        pane: PaneId,
+    },
+    /// Focus a pane, activating its tab and workspace.
+    Focus {
+        #[arg(value_name = "PANE", value_parser = pane_id)]
+        pane: PaneId,
+    },
+    /// Toggle zoom on a pane's tab, with that pane focused.
+    Zoom {
+        #[arg(value_name = "PANE", value_parser = pane_id)]
+        pane: PaneId,
+    },
+    /// Swap a pane with its neighbour in a direction.
+    Swap {
+        #[arg(value_name = "PANE", value_parser = pane_id)]
+        pane: PaneId,
+        #[arg(value_name = "DIRECTION")]
+        direction: DirectionArg,
+    },
+    /// Move a pane into another tab.
+    Move {
+        #[arg(value_name = "PANE", value_parser = pane_id)]
+        pane: PaneId,
+        /// Destination tab name or id.
+        #[arg(short = 't', long = "tab", value_name = "TAB")]
+        tab: String,
+    },
+    /// Resize a pane by N cells in a direction.
+    Resize {
+        #[arg(value_name = "PANE", value_parser = pane_id)]
+        pane: PaneId,
+        #[arg(value_name = "DIRECTION")]
+        direction: DirectionArg,
+        #[arg(value_name = "N", allow_hyphen_values = true)]
+        cells: i16,
+    },
+    /// Wait until a pane's visible screen contains TEXT.
+    ///
+    /// The match is a plain substring, not a regular expression: Ködade CLI
+    /// ships without a regex dependency.
+    WaitOutput {
+        #[arg(value_name = "PANE", value_parser = pane_id)]
+        pane: PaneId,
+        #[arg(long = "match", value_name = "TEXT", allow_hyphen_values = true)]
+        text: String,
+        /// Give up after S seconds and exit 2.
+        #[arg(long, value_name = "S")]
+        timeout: Option<u64>,
+    },
+}
+
+#[derive(Debug, Subcommand, PartialEq, Eq)]
+pub enum TabCommand {
+    /// List the tabs of the active workspace.
+    Ls {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Open a new tab; prints its pane id.
+    New {
+        /// Workspace name or id (defaults to the active workspace).
+        #[arg(short = 'w', long = "workspace", value_name = "NAME")]
+        workspace: Option<String>,
+        /// Pane title for the new tab.
+        #[arg(long = "name", value_name = "NAME")]
+        name: Option<String>,
+    },
+    /// Close a tab and its panes.
+    Close {
+        #[arg(value_name = "TAB")]
+        tab: String,
+    },
+    /// Rename a tab.
+    Rename {
+        #[arg(value_name = "TAB")]
+        tab: String,
+        #[arg(value_name = "NAME", allow_hyphen_values = true)]
+        name: String,
+    },
+    /// Activate a tab.
+    Select {
+        #[arg(value_name = "TAB")]
+        tab: String,
+    },
+}
+
+#[derive(Debug, Subcommand, PartialEq, Eq)]
+pub enum WorkspaceCommand {
+    /// List workspaces.
+    Ls {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Create a workspace with an optional root directory; prints its id.
+    New {
+        #[arg(value_name = "NAME")]
+        name: String,
+        #[arg(value_name = "PATH")]
+        path: Option<PathBuf>,
+    },
+    /// Close a workspace and its tabs.
+    Close {
+        #[arg(value_name = "WS")]
+        workspace: String,
+    },
+    /// Rename a workspace.
+    Rename {
+        #[arg(value_name = "WS")]
+        workspace: String,
+        #[arg(value_name = "NAME", allow_hyphen_values = true)]
+        name: String,
+    },
+    /// Activate a workspace.
+    Select {
+        #[arg(value_name = "WS")]
+        workspace: String,
+    },
+}
+
+#[derive(Debug, Subcommand, PartialEq, Eq)]
+pub enum SessionCommand {
+    /// Print the daemon socket path for the session. `--remote` prints the
+    /// remote host's path (used to set up the forwarded socket).
+    Path,
+    /// List every session socket in the runtime directory and probe it.
+    Ls {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Stop a session (defaults to the current one).
+    Kill {
+        #[arg(value_name = "NAME")]
+        name: Option<String>,
+    },
+    /// Rename the current session; its socket and state file move with it.
+    Rename {
+        #[arg(value_name = "NAME")]
+        name: String,
+    },
+}
+
+#[derive(Debug, Subcommand, PartialEq, Eq)]
+pub enum LayoutCommand {
+    /// Write the session layout as JSON to FILE (default: stdout).
+    Export {
+        #[arg(value_name = "FILE")]
+        file: Option<PathBuf>,
+    },
+    /// Rebuild the session layout from a file written by `layout export`.
+    Apply {
+        #[arg(value_name = "FILE")]
+        file: PathBuf,
+    },
+}
+
+/// Direction words accepted by `pane swap` / `pane resize`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum DirectionArg {
+    Up,
+    Down,
+    Left,
+    Right,
+}
+
+impl From<DirectionArg> for Direction {
+    fn from(value: DirectionArg) -> Self {
+        match value {
+            DirectionArg::Up => Direction::Up,
+            DirectionArg::Down => Direction::Down,
+            DirectionArg::Left => Direction::Left,
+            DirectionArg::Right => Direction::Right,
+        }
+    }
 }
 
 #[derive(Debug, Subcommand, PartialEq, Eq)]
@@ -171,6 +402,17 @@ pub enum AgentCommand {
     },
     /// Refresh agent-detection manifests from the repo (opt-in network call).
     UpdateManifests,
+    /// Wait until a pane reaches an agent state; exits 2 on timeout.
+    Wait {
+        #[arg(value_name = "PANE", value_parser = pane_id)]
+        pane: PaneId,
+        /// One of: blocked, working, done, idle, unknown.
+        #[arg(long, value_name = "STATE", value_parser = agent_state)]
+        state: AgentStateKind,
+        /// Give up after S seconds and exit 2.
+        #[arg(long, value_name = "S")]
+        timeout: Option<u64>,
+    },
     /// Report an agent state to the daemon (used by agent hooks).
     Report {
         #[arg(value_name = "PANE", value_parser = pane_id)]
@@ -181,29 +423,6 @@ pub enum AgentCommand {
         /// Name recorded as the source of the report.
         #[arg(long, value_name = "NAME", default_value = "cli")]
         source: String,
-    },
-}
-
-#[derive(Debug, Subcommand, PartialEq, Eq)]
-pub enum SessionCommand {
-    /// Print the daemon socket path for the session. `--remote` prints the
-    /// remote host's path (used to set up the forwarded socket).
-    Path,
-}
-
-#[derive(Debug, Subcommand, PartialEq, Eq)]
-pub enum PaneCommand {
-    /// Print a pane's text. Defaults to the visible screen; `--scrollback`
-    /// includes the full history and `--lines N` keeps only the last N lines.
-    Read {
-        #[arg(value_name = "PANE", value_parser = pane_id)]
-        pane: PaneId,
-        /// Keep only the last N lines.
-        #[arg(long, value_name = "N")]
-        lines: Option<usize>,
-        /// Include the full scrollback, not just the visible screen.
-        #[arg(long)]
-        scrollback: bool,
     },
 }
 
@@ -492,6 +711,254 @@ mod tests {
             Some(Command::Agent {
                 command: AgentCommand::UpdateManifests
             })
+        );
+    }
+    #[test]
+    fn parses_every_pane_verb() {
+        assert_eq!(
+            parse(&["kodade-cli", "pane", "ls", "--json"]).command,
+            Some(Command::Pane {
+                command: PaneCommand::Ls { json: true }
+            })
+        );
+        assert_eq!(
+            parse(&["kodade-cli", "pane", "send-keys", "3", "codex", "Enter"]).command,
+            Some(Command::Pane {
+                command: PaneCommand::SendKeys {
+                    pane: PaneId(3),
+                    keys: vec!["codex".into(), "Enter".into()],
+                }
+            })
+        );
+        assert_eq!(
+            parse(&["kodade-cli", "pane", "kill", "3"]).command,
+            Some(Command::Pane {
+                command: PaneCommand::Kill { pane: PaneId(3) }
+            })
+        );
+        assert_eq!(
+            parse(&["kodade-cli", "pane", "focus", "3"]).command,
+            Some(Command::Pane {
+                command: PaneCommand::Focus { pane: PaneId(3) }
+            })
+        );
+        assert_eq!(
+            parse(&["kodade-cli", "pane", "zoom", "3"]).command,
+            Some(Command::Pane {
+                command: PaneCommand::Zoom { pane: PaneId(3) }
+            })
+        );
+        assert_eq!(
+            parse(&["kodade-cli", "pane", "swap", "3", "left"]).command,
+            Some(Command::Pane {
+                command: PaneCommand::Swap {
+                    pane: PaneId(3),
+                    direction: DirectionArg::Left,
+                }
+            })
+        );
+        assert_eq!(
+            parse(&["kodade-cli", "pane", "move", "3", "--tab", "agents"]).command,
+            Some(Command::Pane {
+                command: PaneCommand::Move {
+                    pane: PaneId(3),
+                    tab: "agents".into(),
+                }
+            })
+        );
+        assert_eq!(
+            parse(&["kodade-cli", "pane", "resize", "3", "up", "-2"]).command,
+            Some(Command::Pane {
+                command: PaneCommand::Resize {
+                    pane: PaneId(3),
+                    direction: DirectionArg::Up,
+                    cells: -2,
+                }
+            })
+        );
+        assert_eq!(
+            parse(&[
+                "kodade-cli",
+                "pane",
+                "wait-output",
+                "3",
+                "--match",
+                "done",
+                "--timeout",
+                "5"
+            ])
+            .command,
+            Some(Command::Pane {
+                command: PaneCommand::WaitOutput {
+                    pane: PaneId(3),
+                    text: "done".into(),
+                    timeout: Some(5),
+                }
+            })
+        );
+        // `--match` is a substring, so a regex-looking value is still literal.
+        assert!(Cli::try_parse_from(["kodade-cli", "pane", "swap", "3", "sideways"]).is_err());
+    }
+
+    #[test]
+    fn parses_tab_and_workspace_verbs() {
+        assert_eq!(
+            parse(&["kodade-cli", "tab", "ls"]).command,
+            Some(Command::Tab {
+                command: TabCommand::Ls { json: false }
+            })
+        );
+        assert_eq!(
+            parse(&["kodade-cli", "tab", "new", "-w", "repo", "--name", "agents"]).command,
+            Some(Command::Tab {
+                command: TabCommand::New {
+                    workspace: Some("repo".into()),
+                    name: Some("agents".into()),
+                }
+            })
+        );
+        assert_eq!(
+            parse(&["kodade-cli", "tab", "rename", "2", "agents"]).command,
+            Some(Command::Tab {
+                command: TabCommand::Rename {
+                    tab: "2".into(),
+                    name: "agents".into(),
+                }
+            })
+        );
+        assert_eq!(
+            parse(&["kodade-cli", "tab", "close", "agents"]).command,
+            Some(Command::Tab {
+                command: TabCommand::Close {
+                    tab: "agents".into()
+                }
+            })
+        );
+        assert_eq!(
+            parse(&["kodade-cli", "tab", "select", "agents"]).command,
+            Some(Command::Tab {
+                command: TabCommand::Select {
+                    tab: "agents".into()
+                }
+            })
+        );
+        assert_eq!(
+            parse(&["kodade-cli", "workspace", "new", "repo", "/tmp/repo"]).command,
+            Some(Command::Workspace {
+                command: WorkspaceCommand::New {
+                    name: "repo".into(),
+                    path: Some(PathBuf::from("/tmp/repo")),
+                }
+            })
+        );
+        assert_eq!(
+            parse(&["kodade-cli", "workspace", "ls", "--json"]).command,
+            Some(Command::Workspace {
+                command: WorkspaceCommand::Ls { json: true }
+            })
+        );
+        assert_eq!(
+            parse(&["kodade-cli", "workspace", "rename", "1", "repo"]).command,
+            Some(Command::Workspace {
+                command: WorkspaceCommand::Rename {
+                    workspace: "1".into(),
+                    name: "repo".into(),
+                }
+            })
+        );
+        assert_eq!(
+            parse(&["kodade-cli", "workspace", "close", "repo"]).command,
+            Some(Command::Workspace {
+                command: WorkspaceCommand::Close {
+                    workspace: "repo".into()
+                }
+            })
+        );
+        assert_eq!(
+            parse(&["kodade-cli", "workspace", "select", "repo"]).command,
+            Some(Command::Workspace {
+                command: WorkspaceCommand::Select {
+                    workspace: "repo".into()
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn parses_session_layout_event_and_completion_verbs() {
+        assert_eq!(
+            parse(&["kodade-cli", "session", "ls", "--json"]).command,
+            Some(Command::Session {
+                command: SessionCommand::Ls { json: true }
+            })
+        );
+        assert_eq!(
+            parse(&["kodade-cli", "session", "kill", "work"]).command,
+            Some(Command::Session {
+                command: SessionCommand::Kill {
+                    name: Some("work".into())
+                }
+            })
+        );
+        assert_eq!(
+            parse(&["kodade-cli", "session", "rename", "work"]).command,
+            Some(Command::Session {
+                command: SessionCommand::Rename {
+                    name: "work".into()
+                }
+            })
+        );
+        assert_eq!(
+            parse(&["kodade-cli", "layout", "export"]).command,
+            Some(Command::Layout {
+                command: LayoutCommand::Export { file: None }
+            })
+        );
+        assert_eq!(
+            parse(&["kodade-cli", "layout", "apply", "layout.json"]).command,
+            Some(Command::Layout {
+                command: LayoutCommand::Apply {
+                    file: PathBuf::from("layout.json")
+                }
+            })
+        );
+        assert_eq!(
+            parse(&["kodade-cli", "events", "--json"]).command,
+            Some(Command::Events { json: true })
+        );
+        assert_eq!(
+            parse(&["kodade-cli", "completion", "zsh"]).command,
+            Some(Command::Completion {
+                shell: clap_complete::Shell::Zsh
+            })
+        );
+        assert!(Cli::try_parse_from(["kodade-cli", "completion", "csh"]).is_err());
+    }
+
+    #[test]
+    fn parses_agent_wait() {
+        assert_eq!(
+            parse(&[
+                "kodade-cli",
+                "agent",
+                "wait",
+                "3",
+                "--state",
+                "blocked",
+                "--timeout",
+                "10"
+            ])
+            .command,
+            Some(Command::Agent {
+                command: AgentCommand::Wait {
+                    pane: PaneId(3),
+                    state: AgentStateKind::Blocked,
+                    timeout: Some(10),
+                }
+            })
+        );
+        assert!(
+            Cli::try_parse_from(["kodade-cli", "agent", "wait", "3", "--state", "busy"]).is_err()
         );
     }
 }

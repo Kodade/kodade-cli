@@ -235,6 +235,25 @@ pub async fn run_session(host: &str, session: &str, command: &cli::SessionComman
     let (remote_args, prefix): (Vec<&str>, bool) = match command {
         // `-s NAME` keeps the remote path scoped to the requested session.
         cli::SessionCommand::Path => (vec!["session", "path", "-s", session], false),
+        // `ls` describes the host's sessions, so prefix each line with it.
+        cli::SessionCommand::Ls { json } => {
+            let mut args = vec!["session", "ls"];
+            if *json {
+                args.push("--json");
+            }
+            (args, !json)
+        }
+        cli::SessionCommand::Kill { name } => {
+            let mut args = vec!["session", "kill"];
+            if let Some(name) = name {
+                args.push(name);
+            }
+            args.extend(["-s", session]);
+            (args, false)
+        }
+        cli::SessionCommand::Rename { name } => {
+            (vec!["session", "rename", name, "-s", session], false)
+        }
     };
     let output = ssh_output(&run_args(&control, host, &remote_args)).await?;
     if !output.status.success() {

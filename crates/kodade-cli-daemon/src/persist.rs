@@ -9,129 +9,21 @@
 #[cfg(test)]
 use std::time::Instant;
 use std::{
-    collections::HashSet,
     env, fs,
     path::{Path, PathBuf},
     time::Duration,
 };
 
-use anyhow::{bail, Context, Result};
-use kodade_cli_proto::LayoutTree;
-use serde::{Deserialize, Serialize};
+use anyhow::{Context, Result};
+use serde::Deserialize;
 
 /// Debounce window: layout changes within this span collapse into one write.
 pub const DEBOUNCE: Duration = Duration::from_millis(500);
 
-/// The only version this daemon understands. A different value is treated as a
-/// foreign/corrupt file and degrades to a clean start.
-const VERSION: u32 = 1;
-
-/// A persisted session. Unknown fields are ignored and every field has a
-/// sensible default so a partially written or older file still loads.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct SessionFile {
-    pub version: u32,
-    #[serde(default)]
-    pub name: String,
-    #[serde(default)]
-    pub active_workspace: u64,
-    #[serde(default)]
-    pub workspaces: Vec<WorkspaceFile>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct WorkspaceFile {
-    #[serde(default)]
-    pub id: u64,
-    #[serde(default)]
-    pub name: String,
-    #[serde(default)]
-    pub root: Option<PathBuf>,
-    /// Sidebar swatch color as `#rrggbb`, if the user set one (#19).
-    #[serde(default)]
-    pub color: Option<String>,
-    #[serde(default)]
-    pub active_tab: u64,
-    #[serde(default)]
-    pub tabs: Vec<TabFile>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct TabFile {
-    #[serde(default)]
-    pub id: u64,
-    #[serde(default)]
-    pub name: String,
-    #[serde(default)]
-    pub zoomed: bool,
-    #[serde(default)]
-    pub focused: u64,
-    /// Pane tree; its leaf ids reference the `panes` list below.
-    pub tree: LayoutTree,
-    #[serde(default)]
-    pub panes: Vec<PaneFile>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct PaneFile {
-    #[serde(default)]
-    pub id: u64,
-    #[serde(default)]
-    pub title: String,
-    #[serde(default)]
-    pub cwd: Option<PathBuf>,
-    /// The command this pane was spawned with, if any (used for `resume_agents`).
-    #[serde(default)]
-    pub command: Option<Vec<String>>,
-}
-
-impl SessionFile {
-    /// A file is usable only if every tab's tree leaves have a matching pane
-    /// entry and there is at least one workspace/tab/pane. Focused / active ids
-    /// are tolerated (callers fall back), but a tree that names a missing pane
-    /// can't be rebuilt, so it counts as corrupt.
-    pub fn validate(&self) -> Result<()> {
-        if self.version != VERSION {
-            bail!("unsupported session file version {}", self.version);
-        }
-        if self.workspaces.is_empty() {
-            bail!("session file has no workspaces");
-        }
-        for workspace in &self.workspaces {
-            if workspace.tabs.is_empty() {
-                bail!("workspace {} has no tabs", workspace.id);
-            }
-            for tab in &workspace.tabs {
-                if tab.panes.is_empty() {
-                    bail!("tab {} has no panes", tab.id);
-                }
-                let known: HashSet<u64> = tab.panes.iter().map(|pane| pane.id).collect();
-                let mut leaves = Vec::new();
-                tree_leaves(&tab.tree, &mut leaves);
-                if leaves.is_empty() {
-                    bail!("tab {} has an empty tree", tab.id);
-                }
-                for leaf in leaves {
-                    if !known.contains(&leaf) {
-                        bail!("tab {} tree references unknown pane {leaf}", tab.id);
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
-}
-
-/// Collect the pane ids referenced by a tree's leaves.
-pub fn tree_leaves(tree: &LayoutTree, output: &mut Vec<u64>) {
-    match tree {
-        LayoutTree::Leaf { pane } => output.push(pane.0),
-        LayoutTree::Split { first, second, .. } => {
-            tree_leaves(first, output);
-            tree_leaves(second, output);
-        }
-    }
-}
+/// The session-file types now live in the proto crate so `layout export` /
+/// `layout apply` can carry them on the wire (#16); persistence keeps using
+/// them under these names.
+pub use kodade_cli_proto::{PaneFile, SessionFile, TabFile, WorkspaceFile};
 
 /// State directory for the current platform, honoring `XDG_STATE_HOME`.
 pub fn state_dir() -> Option<PathBuf> {
@@ -268,7 +160,7 @@ fn debounced_writes(changes: &[Instant], window: Duration) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kodade_cli_proto::{PaneId, SplitAxis};
+    use kodade_cli_proto::{LayoutTree, PaneId, SplitAxis, SESSION_FILE_VERSION as VERSION};
 
     fn sample_file() -> SessionFile {
         // Two workspaces, three tabs, four panes: ws "one" has a split tab of
