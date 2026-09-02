@@ -120,6 +120,14 @@ pub enum ClientMessage {
         id: PaneId,
         delta: i16,
     },
+    /// Read a pane's text for copy mode / `pane read`. When `scrollback`, the
+    /// reply carries the full scrollback plus the visible screen; otherwise only
+    /// the visible screen. `lines` keeps just the last N lines when set.
+    ReadPane {
+        id: PaneId,
+        scrollback: bool,
+        lines: Option<usize>,
+    },
     ZoomPane,
     AgentState {
         pane: PaneId,
@@ -142,6 +150,13 @@ pub enum ServerMessage {
     /// Pushed to every attached client when a known agent transitions into
     /// `blocked` or `done` (#10). Older daemons never send it.
     Notification(Notification),
+    /// Reply to `ReadPane`: `text` is the joined pane text and `scrollback_lines`
+    /// is the number of lines it contains (after any `lines` truncation).
+    PaneText {
+        id: PaneId,
+        text: String,
+        scrollback_lines: usize,
+    },
     Error {
         message: String,
     },

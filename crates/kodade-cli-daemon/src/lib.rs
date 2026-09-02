@@ -814,9 +814,27 @@ impl Session {
         self.resize(cols, rows)
     }
 
+    /// Read a pane's text for the client's copy mode / `pane read` (see
+    /// `Pane::read_text`). Errors when the pane id is unknown.
+    fn read_pane_text(
+        &self,
+        id: PaneId,
+        scrollback: bool,
+        lines: Option<usize>,
+    ) -> Result<(String, usize)> {
+        let panes = self
+            .panes
+            .lock()
+            .map_err(|_| anyhow!("pane lock poisoned"))?;
+        let pane = panes.get(&id).ok_or_else(|| anyhow!("no pane #{}", id.0))?;
+        Ok(pane.read_text(scrollback, lines))
+    }
+
     fn handle(&self, message: ClientMessage) -> Result<()> {
         match message {
             ClientMessage::Query(QueryKind::Layout) => {}
+            // Handled directly in `serve_client`, which replies with `PaneText`.
+            ClientMessage::ReadPane { .. } => {}
             ClientMessage::Hello { cols, rows } | ClientMessage::Resize { cols, rows } => {
                 self.resize(cols, rows)?
             }
@@ -1681,6 +1699,42 @@ impl Pane {
         *offset = parser.screen().scrollback();
         snapshot(&parser)
     }
+    /// Full pane text for copy mode / `pane read`. With `scrollback`, walks the
+    /// vt100 history and appends the visible screen; otherwise just the visible
+    /// screen. `lines` keeps the last N lines. Returns the text and its line
+    /// count. The pane's live scroll offset is saved and restored.
+    fn read_text(&self, scrollback: bool, lines: Option<usize>) -> (String, usize) {
+        let offset = *self
+            .scroll_offset
+            .lock()
+            .expect("scroll offset lock poisoned");
+        let mut parser = self.parser.lock().expect("PTY parser lock poisoned");
+        let mut history = if scrollback {
+            read_history(&mut parser)
+        } else {
+            parser.screen_mut().set_scrollback(offset);
+            parser
+                .screen()
+                .contents()
+                .lines()
+                .map(String::from)
+                .collect()
+        };
+        // Restore the live view the client scrolled to.
+        parser.screen_mut().set_scrollback(offset);
+        drop(parser);
+        // Drop trailing blank rows so `pane read` line counts track real output.
+        while history.last().is_some_and(|line| line.is_empty()) {
+            history.pop();
+        }
+        if let Some(n) = lines {
+            if history.len() > n {
+                history.drain(0..history.len() - n);
+            }
+        }
+        let count = history.len();
+        (history.join("\n"), count)
+    }
     fn resize(&self, cols: u16, rows: u16) -> Result<()> {
         self.master
             .lock()
@@ -1981,6 +2035,39 @@ fn read_pty(
         }
     });
 }
+/// Collect the pane's full scrollback plus visible screen as plain-text lines,
+/// oldest first. Walks the vt100 scrollback in screen-height windows from the
+/// top down; the caller restores the live scroll offset afterward. Pure over the
+/// parser so it can be unit-tested on a synthetic buffer.
+fn read_history(parser: &mut PtyParser) -> Vec<String> {
+    let (rows, cols) = parser.screen().size();
+    let rows = rows as usize;
+    parser.screen_mut().set_scrollback(usize::MAX);
+    let max = parser.screen().scrollback();
+    let total = max + rows;
+    let mut lines: Vec<String> = Vec::with_capacity(total);
+    while lines.len() < total {
+        let filled = lines.len();
+        // Offset so the window's top row is the next line we still need.
+        parser
+            .screen_mut()
+            .set_scrollback(max.saturating_sub(filled));
+        let offset = parser.screen().scrollback();
+        let window_top = max - offset;
+        let before = lines.len();
+        for (r, line) in parser.screen().rows(0, cols).enumerate() {
+            // Only append rows that continue the sequence (skip re-seen overlap).
+            if window_top + r == lines.len() {
+                lines.push(line);
+            }
+        }
+        // Guard against a clamp that makes no forward progress.
+        if lines.len() == before {
+            break;
+        }
+    }
+    lines
+}
 /// Build a wire `Screen` from the pane's terminal state: plain `contents` for
 /// copy mode plus one styled run list per visible row (#7).
 fn snapshot(parser: &PtyParser) -> Screen {
@@ -2122,6 +2209,19 @@ async fn serve_client(stream: UnixStream, session: Arc<Session>, name: String) -
             line = reader.next_line() => {
                 let Some(line) = line? else { return Ok(()); };
                 let message = decode::<ClientMessage>(line.as_bytes())?;
+                // `ReadPane` replies with pane text, not a layout snapshot.
+                if let ClientMessage::ReadPane { id, scrollback, lines } = message {
+                    match session.read_pane_text(id, scrollback, lines) {
+                        Ok((text, scrollback_lines)) => {
+                            write_server(&mut writer, &ServerMessage::PaneText { id, text, scrollback_lines }).await?;
+                        }
+                        Err(error) => {
+                            write_server(&mut writer, &ServerMessage::Error { message: error.to_string() }).await?;
+                            return Ok(());
+                        }
+                    }
+                    continue;
+                }
                 let hello = matches!(message, ClientMessage::Hello { .. });
                 let kill = matches!(message, ClientMessage::KillSession);
                 match session.handle(message) {
@@ -2225,6 +2325,26 @@ mod tests {
         let mut parser = PtyParser::new_with_callbacks(3, 10, 100, PtyCallbacks::default());
         parser.process(b"hello\r\nworld");
         assert!(snapshot(&parser).contents.contains("hello"));
+    }
+    #[test]
+    fn read_history_recovers_full_scrollback() {
+        // A 24-row screen with plenty of scrollback fed 3000 numbered lines.
+        let mut parser = PtyParser::new_with_callbacks(24, 20, 10_000, PtyCallbacks::default());
+        for n in 1..=3000 {
+            parser.process(format!("{n}\r\n").as_bytes());
+        }
+        let lines = read_history(&mut parser);
+        let numbers: Vec<&str> = lines
+            .iter()
+            .filter(|line| !line.is_empty())
+            .map(String::as_str)
+            .collect();
+        // Every line survives in order, oldest first, none dropped.
+        assert_eq!(numbers.len(), 3000);
+        assert_eq!(numbers.first(), Some(&"1"));
+        assert_eq!(numbers.last(), Some(&"3000"));
+        // A mid-history line is present at its expected position.
+        assert_eq!(numbers[1499], "1500");
     }
     /// Paint an 80x24-style sample with the escape sequences a colored `ls`,
     /// a prompt, and a 256/RGB-color TUI would emit.

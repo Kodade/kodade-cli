@@ -268,6 +268,7 @@ pub fn layout(reply: ServerMessage) -> Result<LayoutSnapshot> {
         ServerMessage::Shutdown => bail!("daemon shut down"),
         ServerMessage::Welcome { .. } => bail!("daemon sent an unexpected welcome"),
         ServerMessage::Notification(_) => bail!("daemon sent an unexpected notification"),
+        ServerMessage::PaneText { .. } => bail!("daemon sent unexpected pane text"),
         ServerMessage::Error { message } => bail!("{message}"),
     }
 }
