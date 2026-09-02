@@ -29,6 +29,11 @@ pub struct Cli {
     )]
     pub session: String,
 
+    /// Attach to or query a daemon on `USER@HOST` over an SSH-forwarded socket
+    /// instead of the local one (#23). Requires `kodade-cli` on the remote host.
+    #[arg(long = "remote", global = true, value_name = "USER@HOST")]
+    pub remote: Option<String>,
+
     #[command(subcommand)]
     pub command: Option<Command>,
 }
@@ -111,6 +116,11 @@ pub enum Command {
         #[arg(long = "name", value_name = "NAME")]
         name: Option<String>,
     },
+    /// Inspect sessions. #16 extends this group with `ls`, `kill`, and `rename`.
+    Session {
+        #[command(subcommand)]
+        command: SessionCommand,
+    },
     /// Stop the session and its daemon.
     KillSession,
     /// Inspect the configuration file.
@@ -172,6 +182,13 @@ pub enum AgentCommand {
         #[arg(long, value_name = "NAME", default_value = "cli")]
         source: String,
     },
+}
+
+#[derive(Debug, Subcommand, PartialEq, Eq)]
+pub enum SessionCommand {
+    /// Print the daemon socket path for the session. `--remote` prints the
+    /// remote host's path (used to set up the forwarded socket).
+    Path,
 }
 
 #[derive(Debug, Subcommand, PartialEq, Eq)]
@@ -402,6 +419,24 @@ mod tests {
                     scrollback: false,
                 }
             })
+        );
+    }
+
+    #[test]
+    fn parses_remote_flag_and_session_path() {
+        let cli = parse(&["kodade-cli", "--remote", "user@host", "-s", "work", "ls"]);
+        assert_eq!(cli.remote.as_deref(), Some("user@host"));
+        assert_eq!(cli.session, "work");
+        assert_eq!(
+            parse(&["kodade-cli", "session", "path"]).command,
+            Some(Command::Session {
+                command: SessionCommand::Path
+            })
+        );
+        // The global flag also parses after the subcommand.
+        assert_eq!(
+            parse(&["kodade-cli", "session", "path", "--remote", "host"]).remote,
+            Some("host".into())
         );
     }
 

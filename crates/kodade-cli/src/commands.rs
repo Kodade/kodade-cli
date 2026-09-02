@@ -243,11 +243,13 @@ pub fn parse_state(value: &str) -> Result<AgentStateKind> {
     }
 }
 
-pub async fn request(session: &str, message: ClientMessage) -> Result<ServerMessage> {
-    let path = kodade_cli_daemon::socket_path(session);
-    let stream = UnixStream::connect(&path)
+/// Send one message to the daemon at `socket` and return its reply. The socket
+/// is resolved by the caller (`remote::resolve_socket`) so `--remote` transparently
+/// redirects every scripting command through the forwarded local socket (#23).
+pub async fn request(socket: &Path, message: ClientMessage) -> Result<ServerMessage> {
+    let stream = UnixStream::connect(socket)
         .await
-        .with_context(|| format!("no Ködade CLI daemon for session '{session}'"))?;
+        .with_context(|| format!("no Ködade CLI daemon at {}", socket.display()))?;
     let (reader, mut writer) = stream.into_split();
     writer.write_all(&encode(&message)?).await?;
     let mut lines = BufReader::new(reader).lines();
@@ -267,6 +269,7 @@ pub fn layout(reply: ServerMessage) -> Result<LayoutSnapshot> {
         ServerMessage::Layout(layout) => Ok(layout),
         ServerMessage::Shutdown => bail!("daemon shut down"),
         ServerMessage::Welcome { .. } => bail!("daemon sent an unexpected welcome"),
+        ServerMessage::Version { .. } => bail!("daemon sent an unexpected version reply"),
         ServerMessage::Notification(_) => bail!("daemon sent an unexpected notification"),
         ServerMessage::PaneText { .. } => bail!("daemon sent unexpected pane text"),
         ServerMessage::Error { message } => bail!("{message}"),

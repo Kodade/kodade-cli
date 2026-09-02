@@ -23,7 +23,7 @@ use kodade_cli_proto::{
     decode, encode, AgentInfo, AgentStateKind, CellColor, ClientMessage, Direction, LayoutSnapshot,
     LayoutTree, Notification, PaneId, PaneSnapshot, QueryKind, Run, Screen, ServerMessage,
     SidebarTabInfo, SplitAxis, TabId, TabInfo, WorkspaceId, WorkspaceInfo, ATTR_BOLD, ATTR_DIM,
-    ATTR_INVERSE, ATTR_ITALIC, ATTR_UNDERLINE,
+    ATTR_INVERSE, ATTR_ITALIC, ATTR_UNDERLINE, PROTOCOL_VERSION,
 };
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use tokio::{
@@ -832,12 +832,16 @@ impl Session {
 
     fn handle(&self, message: ClientMessage) -> Result<()> {
         match message {
-            ClientMessage::Query(QueryKind::Layout) => {}
+            // `Version` is answered directly in `serve_client`.
+            ClientMessage::Query(_) => {}
             // Handled directly in `serve_client`, which replies with `PaneText`.
             ClientMessage::ReadPane { .. } => {}
-            ClientMessage::Hello { cols, rows } | ClientMessage::Resize { cols, rows } => {
-                self.resize(cols, rows)?
+            ClientMessage::Hello {
+                cols,
+                rows,
+                version: _,
             }
+            | ClientMessage::Resize { cols, rows } => self.resize(cols, rows)?,
             ClientMessage::Input { bytes } => {
                 let state = self
                     .state
@@ -2209,6 +2213,24 @@ async fn serve_client(stream: UnixStream, session: Arc<Session>, name: String) -
             line = reader.next_line() => {
                 let Some(line) = line? else { return Ok(()); };
                 let message = decode::<ClientMessage>(line.as_bytes())?;
+                // Version probe: answer and keep the connection open so a caller
+                // can follow up on the same socket.
+                if let ClientMessage::Query(QueryKind::Version) = message {
+                    write_server(&mut writer, &ServerMessage::Version { version: PROTOCOL_VERSION }).await?;
+                    continue;
+                }
+                // A client whose protocol version differs cannot be served; tell
+                // it plainly and close so it fails fast instead of misbehaving.
+                if let ClientMessage::Hello { version, .. } = message {
+                    if version != PROTOCOL_VERSION {
+                        write_server(&mut writer, &ServerMessage::Error {
+                            message: format!(
+                                "protocol version mismatch: client {version}, daemon {PROTOCOL_VERSION} — upgrade kodade-cli on both ends"
+                            ),
+                        }).await?;
+                        return Ok(());
+                    }
+                }
                 // `ReadPane` replies with pane text, not a layout snapshot.
                 if let ClientMessage::ReadPane { id, scrollback, lines } = message {
                     match session.read_pane_text(id, scrollback, lines) {
@@ -2227,7 +2249,7 @@ async fn serve_client(stream: UnixStream, session: Arc<Session>, name: String) -
                 match session.handle(message) {
                     Ok(()) if hello => {
                         initialized = true;
-                        write_server(&mut writer, &ServerMessage::Welcome { session: name.clone() }).await?;
+                        write_server(&mut writer, &ServerMessage::Welcome { session: name.clone(), version: PROTOCOL_VERSION }).await?;
                         // The first client attach sees `restored: true`; clear it
                         // afterward so later snapshots (and `ls`) report normally.
                         write_server(&mut writer, &ServerMessage::Layout(session.snapshot()?)).await?;
@@ -2838,7 +2860,14 @@ mod tests {
             .into_split();
         let mut lines = BufReader::new(reader).lines();
         writer
-            .write_all(&encode(&ClientMessage::Hello { cols: 80, rows: 24 }).unwrap())
+            .write_all(
+                &encode(&ClientMessage::Hello {
+                    cols: 80,
+                    rows: 24,
+                    version: PROTOCOL_VERSION,
+                })
+                .unwrap(),
+            )
             .await
             .expect("send hello");
         assert!(matches!(
@@ -2881,6 +2910,76 @@ mod tests {
         .expect("notification arrives within 1s");
         assert_eq!(notification.pane, pane);
         assert_eq!(notification.state, AgentStateKind::Blocked);
+
+        accept.abort();
+        let _ = fs::remove_file(&socket);
+        let _ = fs::remove_dir(&directory);
+    }
+
+    #[tokio::test]
+    async fn version_mismatch_is_rejected_and_probe_answered() {
+        let directory =
+            std::env::temp_dir().join(format!("kodade-cli-version-{}", std::process::id()));
+        fs::create_dir_all(&directory).expect("create test directory");
+        let socket = directory.join("version.sock");
+        let _ = fs::remove_file(&socket);
+        let listener = UnixListener::bind(&socket).expect("bind test socket");
+        let session = Arc::new(Session::spawn(80, 24, "version".into()).expect("spawn session"));
+        let accept = {
+            let session = Arc::clone(&session);
+            tokio::spawn(async move {
+                while let Ok((stream, _)) = listener.accept().await {
+                    let session = Arc::clone(&session);
+                    tokio::spawn(async move {
+                        let _ = serve_client(stream, session, "version".into()).await;
+                    });
+                }
+            })
+        };
+
+        // A Hello carrying the wrong version gets an Error and the socket closes.
+        let (reader, mut writer) = UnixStream::connect(&socket)
+            .await
+            .expect("connect client")
+            .into_split();
+        let mut lines = BufReader::new(reader).lines();
+        writer
+            .write_all(
+                &encode(&ClientMessage::Hello {
+                    cols: 80,
+                    rows: 24,
+                    version: PROTOCOL_VERSION + 1,
+                })
+                .unwrap(),
+            )
+            .await
+            .expect("send hello");
+        match next_server_message(&mut lines).await {
+            ServerMessage::Error { message } => {
+                assert!(message.contains("protocol version mismatch"));
+                assert!(message.contains(&format!("daemon {PROTOCOL_VERSION}")));
+            }
+            other => panic!("expected an error, got {other:?}"),
+        }
+        // The daemon closed the connection after the mismatch.
+        assert!(lines.next_line().await.expect("read").is_none());
+
+        // A fresh connection can probe the version cheaply.
+        let (reader, mut writer) = UnixStream::connect(&socket)
+            .await
+            .expect("connect probe")
+            .into_split();
+        let mut lines = BufReader::new(reader).lines();
+        writer
+            .write_all(&encode(&ClientMessage::Query(QueryKind::Version)).unwrap())
+            .await
+            .expect("send probe");
+        assert_eq!(
+            next_server_message(&mut lines).await,
+            ServerMessage::Version {
+                version: PROTOCOL_VERSION
+            }
+        );
 
         accept.abort();
         let _ = fs::remove_file(&socket);
