@@ -173,6 +173,10 @@ pub enum ClientMessage {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum QueryKind {
     Layout,
+    /// One pane's snapshot, wherever it lives. Unlike `Layout` (active tab
+    /// only) this reaches panes in background tabs and workspaces, which is
+    /// what `agent wait` / `pane wait-output` poll (#16).
+    Pane(PaneId),
     /// Cheap version probe: the daemon replies with `ServerMessage::Version` and
     /// nothing else, so `--remote` can check compatibility before attaching (#23).
     Version,
@@ -209,6 +213,8 @@ pub enum ServerMessage {
     },
     /// Pushed only to connections that sent `Subscribe` (#16).
     Event(Event),
+    /// Reply to `Query(QueryKind::Pane(_))`.
+    Pane(PaneSnapshot),
     /// Reply to `Query(QueryKind::Session)` — the persisted layout.
     Session(SessionFile),
     /// Reply to `Query(QueryKind::Schema)`.
@@ -259,6 +265,13 @@ pub enum Event {
         name: String,
     },
     Notification(Notification),
+    /// The session was renamed: `socket` is the path clients must use from now
+    /// on (the old socket file is gone). Shells spawned before the rename keep
+    /// the old `KODADE_SESSION` / `KODADE_SOCKET` values.
+    SessionRenamed {
+        name: String,
+        socket: PathBuf,
+    },
 }
 
 /// A single agent-state alert. Workspace/tab are carried as ids; the client
@@ -505,35 +518,63 @@ pub struct PaneFile {
 }
 
 impl SessionFile {
-    /// A file is usable only if every tab's tree leaves have a matching pane
-    /// entry and there is at least one workspace/tab/pane. Focused / active ids
-    /// are tolerated (callers fall back), but a tree that names a missing pane
-    /// can't be rebuilt, so it counts as corrupt.
+    /// A file is usable only if it describes one unambiguous layout: at least
+    /// one workspace/tab/pane, every tree leaf backed by a pane entry, every
+    /// pane entry reachable from its tab's tree, and no id reused anywhere in
+    /// the file. Ids must be unique across the whole file because `layout
+    /// apply` adopts them verbatim — a duplicate would silently merge two
+    /// panes. Focused / active ids are still tolerated (callers fall back).
     pub fn validate(&self) -> Result<()> {
+        use std::collections::HashSet;
+
         if self.version != SESSION_FILE_VERSION {
             anyhow::bail!("unsupported session file version {}", self.version);
         }
         if self.workspaces.is_empty() {
             anyhow::bail!("session file has no workspaces");
         }
+        let mut workspace_ids = HashSet::new();
+        let mut tab_ids = HashSet::new();
+        let mut pane_ids = HashSet::new();
         for workspace in &self.workspaces {
+            if !workspace_ids.insert(workspace.id) {
+                anyhow::bail!("duplicate workspace id {}", workspace.id);
+            }
             if workspace.tabs.is_empty() {
                 anyhow::bail!("workspace {} has no tabs", workspace.id);
             }
             for tab in &workspace.tabs {
+                if !tab_ids.insert(tab.id) {
+                    anyhow::bail!("duplicate tab id {}", tab.id);
+                }
                 if tab.panes.is_empty() {
                     anyhow::bail!("tab {} has no panes", tab.id);
                 }
-                let known: std::collections::HashSet<u64> =
-                    tab.panes.iter().map(|pane| pane.id).collect();
+                let mut known = HashSet::new();
+                for pane in &tab.panes {
+                    if !pane_ids.insert(pane.id) {
+                        anyhow::bail!("duplicate pane id {}", pane.id);
+                    }
+                    known.insert(pane.id);
+                }
                 let mut leaves = Vec::new();
                 tree_leaves(&tab.tree, &mut leaves);
                 if leaves.is_empty() {
                     anyhow::bail!("tab {} has an empty tree", tab.id);
                 }
-                for leaf in leaves {
-                    if !known.contains(&leaf) {
+                let reachable: HashSet<u64> = leaves.iter().copied().collect();
+                if reachable.len() != leaves.len() {
+                    anyhow::bail!("tab {} names a pane twice in its tree", tab.id);
+                }
+                for leaf in &leaves {
+                    if !known.contains(leaf) {
                         anyhow::bail!("tab {} tree references unknown pane {leaf}", tab.id);
+                    }
+                }
+                // An entry no tree names would be spawned and never drawn.
+                for pane in &tab.panes {
+                    if !reachable.contains(&pane.id) {
+                        anyhow::bail!("tab {} has pane {} outside its tree", tab.id, pane.id);
                     }
                 }
             }
@@ -612,6 +653,7 @@ pub const SERVER_MESSAGE_NAMES: &[&str] = &[
     "Layout",
     "Notification",
     "PaneText",
+    "Pane",
     "Version",
     "Event",
     "Session",
@@ -677,6 +719,7 @@ pub fn server_message_name(message: &ServerMessage) -> &'static str {
         ServerMessage::Layout(_) => "Layout",
         ServerMessage::Notification(_) => "Notification",
         ServerMessage::PaneText { .. } => "PaneText",
+        ServerMessage::Pane(_) => "Pane",
         ServerMessage::Version { .. } => "Version",
         ServerMessage::Event(_) => "Event",
         ServerMessage::Session(_) => "Session",
@@ -944,6 +987,18 @@ mod tests {
                 text: "hi".into(),
                 scrollback_lines: 1,
             },
+            ServerMessage::Pane(PaneSnapshot {
+                id: PaneId(1),
+                title: "zsh".into(),
+                focused: true,
+                scroll_offset: 0,
+                screen: Screen::default(),
+                agent: None,
+                state: AgentStateKind::Idle,
+                state_reason: "no agent process".into(),
+                state_age_secs: 0,
+                cwd: None,
+            }),
             ServerMessage::Event(Event::Notification(notification)),
             ServerMessage::Session(SessionFile {
                 version: SESSION_FILE_VERSION,
@@ -991,5 +1046,86 @@ mod tests {
             let encoded = encode(&message).expect("encode");
             assert_eq!(decode::<ServerMessage>(&encoded).expect("decode"), message);
         }
+    }
+    /// A two-workspace file with a split tab, used by the validation tests.
+    fn sample_session_file() -> SessionFile {
+        SessionFile {
+            version: SESSION_FILE_VERSION,
+            name: "demo".into(),
+            active_workspace: 1,
+            workspaces: vec![WorkspaceFile {
+                id: 1,
+                name: "one".into(),
+                root: None,
+                color: None,
+                active_tab: 2,
+                tabs: vec![TabFile {
+                    id: 2,
+                    name: "agents".into(),
+                    zoomed: false,
+                    focused: 3,
+                    tree: LayoutTree::Split {
+                        axis: SplitAxis::Horizontal,
+                        ratio: 0.5,
+                        first: Box::new(LayoutTree::Leaf { pane: PaneId(3) }),
+                        second: Box::new(LayoutTree::Leaf { pane: PaneId(4) }),
+                    },
+                    panes: vec![
+                        PaneFile {
+                            id: 3,
+                            title: "codex".into(),
+                            cwd: None,
+                            command: None,
+                        },
+                        PaneFile {
+                            id: 4,
+                            title: "shell".into(),
+                            cwd: None,
+                            command: None,
+                        },
+                    ],
+                }],
+            }],
+        }
+    }
+
+    #[test]
+    fn validate_rejects_duplicate_ids_anywhere_in_the_file() {
+        sample_session_file().validate().expect("sample is valid");
+
+        // Two workspaces sharing an id would collapse into one on apply.
+        let mut file = sample_session_file();
+        let mut second = file.workspaces[0].clone();
+        second.tabs[0].id = 20;
+        second.tabs[0].panes[0].id = 30;
+        second.tabs[0].panes[1].id = 40;
+        second.tabs[0].focused = 30;
+        second.tabs[0].tree = LayoutTree::Split {
+            axis: SplitAxis::Horizontal,
+            ratio: 0.5,
+            first: Box::new(LayoutTree::Leaf { pane: PaneId(30) }),
+            second: Box::new(LayoutTree::Leaf { pane: PaneId(40) }),
+        };
+        file.workspaces.push(second);
+        assert!(file.validate().is_err(), "duplicate workspace id accepted");
+
+        // Same for a repeated pane id in two different tabs.
+        let mut file = sample_session_file();
+        let mut second = file.workspaces[0].clone();
+        second.id = 10;
+        second.tabs[0].id = 20;
+        file.workspaces.push(second);
+        let error = file.validate().expect_err("duplicate pane id accepted");
+        assert!(error.to_string().contains("duplicate pane id"), "{error}");
+    }
+
+    #[test]
+    fn validate_rejects_panes_outside_the_tree() {
+        let mut file = sample_session_file();
+        // Drop the second leaf but keep its pane entry: it would be spawned and
+        // never drawn.
+        file.workspaces[0].tabs[0].tree = LayoutTree::Leaf { pane: PaneId(3) };
+        let error = file.validate().expect_err("orphan pane accepted");
+        assert!(error.to_string().contains("outside its tree"), "{error}");
     }
 }

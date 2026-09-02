@@ -175,13 +175,16 @@ for the installed version. The scripting commands are:
   keeps only the last N lines).
 - `kodade-cli tab ls|new|close|rename|select` — tabs of the active workspace
   (TAB is a name or an id).
-- `kodade-cli workspace ls|new|close|rename|select` — workspaces (WS is a name
-  or an id); `new` is the same as the top-level `new`.
+- `kodade-cli workspace ls|new|close|rename|select|color WS HEX|off` —
+  workspaces (WS is a name or an id); `new` is the same as the top-level `new`,
+  and `color` sets the sidebar swatch.
 - `kodade-cli session ls|path|kill [NAME]|rename NAME` — every session on this
   machine; `ls` probes each socket and marks it `(restored)` or `(dead)`, and
   `path` prints the daemon socket path (`--remote` prints the host's). With
   `--remote` every `session` verb runs on the host.
 - `kodade-cli layout export [FILE]|apply FILE` — save and restore a layout.
+  **`apply` runs the commands saved in the file** (through the login shell, in
+  each pane's saved directory), so only apply layout files you trust.
 - `kodade-cli events [--json]` — stream session events until interrupted.
 - `kodade-cli completion zsh|bash|fish` — print a completion script.
 - `kodade-cli agent ls` — list recognized agents and states.
@@ -223,12 +226,24 @@ kodade-cli ls --json | jq '.panes[] | {id: .id, state: .state}'
 kodade-cli events --json | jq -r 'select(.AgentStateChanged) | .AgentStateChanged.pane'
 ```
 
-`pane wait-output PANE --match TEXT` waits for text on a pane's screen. The
-match is a plain substring, not a regular expression — Ködade CLI ships without
-a regex dependency, so `--match` is documented as text rather than `REGEX`.
+`pane wait-output PANE --match TEXT` waits for text on a pane's **visible
+screen** (not its scrollback), so text that has already scrolled off is not
+matched. The match is a plain substring, not a regular expression — Ködade CLI
+ships without a regex dependency, so `--match` is documented as text rather than
+`REGEX`. Both waits work on panes in background tabs and workspaces.
 
-`pane send-keys` accepts tmux-style key names (`Enter`, `Escape`, `C-c`, `Up`)
-and sends anything else as literal text: `kodade-cli pane send-keys 3 "npm test" Enter`.
+`pane send-keys` accepts tmux-style key names — `Enter`, `Escape`, `Tab`,
+`Space`, `BSpace`, arrows, `Home`, `End`, `PageUp`, `PageDown`, `Insert`,
+`Delete`, `F1`–`F12`, `C-c` (control) and `M-x` (alt) — and sends anything else
+as literal text: `kodade-cli pane send-keys 3 "npm test" Enter`. A capitalized
+word that is not a known key name is rejected rather than typed, so a typo like
+`Entr` fails loudly; use `--literal` to send such text verbatim
+(`kodade-cli pane send-keys 3 --literal "Hello there"`).
+
+`session rename NAME` moves the live session's socket, so the same daemon and
+panes answer under the new name. Shells that were already running keep the old
+`KODADE_SESSION` / `KODADE_SOCKET` values, and attaching with the old name
+starts a new empty session.
 
 Panes a session spawns get `KODADE_PANE`, `KODADE_SESSION`, `KODADE_SOCKET`,
 and `KODADE_BIN` in their environment, which is everything a custom agent needs

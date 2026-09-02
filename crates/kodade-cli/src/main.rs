@@ -4,6 +4,7 @@ mod commands;
 mod config;
 mod help;
 mod input;
+mod keys;
 mod mode;
 mod notify;
 mod overlay;
@@ -23,7 +24,8 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use kodade_cli_proto::{
-    decode, encode, ClientMessage, Direction, QueryKind, ServerMessage, SplitAxis, PROTOCOL_VERSION,
+    decode, encode, ClientMessage, Direction, Event, QueryKind, ServerMessage, SplitAxis,
+    PROTOCOL_VERSION,
 };
 use ratatui::{backend::CrosstermBackend, Terminal};
 use std::{env, path::Path, process::Stdio, time::Duration};
@@ -267,16 +269,18 @@ async fn pane(socket: &Path, command: cli::PaneCommand) -> Result<()> {
             }
             Ok(())
         }
-        cli::PaneCommand::SendKeys { pane, keys } => {
+        cli::PaneCommand::SendKeys {
+            pane,
+            keys,
+            literal,
+        } => {
+            let bytes = if literal {
+                keys::literal(&keys)
+            } else {
+                keys::parse_all(&keys)?
+            };
             commands::layout(
-                commands::request(
-                    socket,
-                    ClientMessage::SendToPane {
-                        id: pane,
-                        bytes: commands::keys_to_bytes(&keys),
-                    },
-                )
-                .await?,
+                commands::request(socket, ClientMessage::SendToPane { id: pane, bytes }).await?,
             )?;
             Ok(())
         }
@@ -316,7 +320,7 @@ async fn pane(socket: &Path, command: cli::PaneCommand) -> Result<()> {
         cli::PaneCommand::Move { pane, tab } => {
             let layout =
                 commands::layout(commands::request(socket, commands::layout_query()).await?)?;
-            let tab = commands::resolve_tab(&layout, None, &tab)?;
+            let tab = commands::resolve_tab_anywhere(&layout, &tab)?;
             commands::layout(
                 commands::request(socket, ClientMessage::MovePaneToTab { pane, tab }).await?,
             )?;
@@ -327,11 +331,8 @@ async fn pane(socket: &Path, command: cli::PaneCommand) -> Result<()> {
             text,
             timeout,
         } => {
-            let reached = commands::poll_until(socket, timeout, |layout| {
-                Ok(commands::find_pane(layout, pane)?
-                    .screen
-                    .contents
-                    .contains(&text))
+            let reached = commands::poll_pane(socket, pane, timeout, |snapshot| {
+                snapshot.screen.contents.contains(&text)
             })
             .await?;
             if !reached {
@@ -430,6 +431,15 @@ async fn workspace(socket: &Path, command: cli::WorkspaceCommand) -> Result<()> 
             let id = resolve_workspace_name(socket, &workspace).await?;
             commands::layout(
                 commands::request(socket, ClientMessage::RenameWorkspaceId { id, name }).await?,
+            )?;
+            Ok(())
+        }
+        cli::WorkspaceCommand::Color { workspace, color } => {
+            let id = resolve_workspace_name(socket, &workspace).await?;
+            // `off` clears the override; the daemon validates the hex form.
+            let color = (color != "off").then_some(color);
+            commands::layout(
+                commands::request(socket, ClientMessage::SetWorkspaceColor { id, color }).await?,
             )?;
             Ok(())
         }
@@ -653,10 +663,9 @@ async fn agent(
             state,
             timeout,
         } => {
-            let reached = commands::poll_until(socket, timeout, |layout| {
-                Ok(commands::find_pane(layout, pane)?.state == state)
-            })
-            .await?;
+            let reached =
+                commands::poll_pane(socket, pane, timeout, |snapshot| snapshot.state == state)
+                    .await?;
             if !reached {
                 std::process::exit(2);
             }
@@ -744,6 +753,12 @@ async fn tui(
         })?)
         .await?;
     handshake(&mut lines, &mut state).await?;
+    // Subscribe so the TUI learns about session-level changes (a rename moves
+    // the socket under it). Subscribed connections receive notifications as
+    // `Event::Notification` instead of `ServerMessage::Notification`.
+    writer
+        .write_all(&encode(&ClientMessage::Subscribe)?)
+        .await?;
     let (tx, mut rx) = mpsc::channel(16);
     tokio::spawn(async move {
         while let Ok(Some(line)) = lines.next_line().await {
@@ -752,6 +767,12 @@ async fn tui(
                 Ok(ServerMessage::Welcome { session, .. }) => app::Update::Session(session),
                 Ok(ServerMessage::Notification(notification)) => {
                     app::Update::Notification(notification)
+                }
+                Ok(ServerMessage::Event(Event::Notification(notification))) => {
+                    app::Update::Notification(notification)
+                }
+                Ok(ServerMessage::Event(Event::SessionRenamed { name, socket })) => {
+                    app::Update::SessionRenamed { name, socket }
                 }
                 _ => continue,
             };

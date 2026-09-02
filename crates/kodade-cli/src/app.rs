@@ -58,6 +58,12 @@ pub enum Update {
     Layout(LayoutSnapshot),
     Session(String),
     Notification(Notification),
+    /// `session rename` moved the daemon's socket; the client follows it so
+    /// one-shot requests (copy mode's `ReadPane`) keep working (#16).
+    SessionRenamed {
+        name: String,
+        socket: PathBuf,
+    },
 }
 
 /// What the event loop should do after handling an event.
@@ -524,6 +530,10 @@ impl App {
                     Update::Session(session) => self.handle_session(session),
                     Update::Notification(notification) => {
                         self.handle_notification(notification, term)?
+                    }
+                    Update::SessionRenamed { name, socket } => {
+                        self.handle_session(name);
+                        self.socket = socket;
                     }
                 }
             }
@@ -2186,28 +2196,8 @@ pub fn bytes(k: KeyEvent) -> Option<Vec<u8>> {
             vec![(c.to_ascii_lowercase() as u8) & 0x1f]
         }
         KeyCode::Char(c) => c.to_string().into_bytes(),
-        KeyCode::Enter => vec![b'\r'],
-        KeyCode::Backspace => vec![127],
-        KeyCode::Tab => vec![b'\t'],
-        KeyCode::Esc => vec![27],
-        KeyCode::Up => b"\x1b[A".to_vec(),
-        KeyCode::Down => b"\x1b[B".to_vec(),
-        KeyCode::Right => b"\x1b[C".to_vec(),
-        KeyCode::Left => b"\x1b[D".to_vec(),
-        KeyCode::Home => b"\x1b[H".to_vec(),
-        KeyCode::End => b"\x1b[F".to_vec(),
-        KeyCode::PageUp => b"\x1b[5~".to_vec(),
-        KeyCode::PageDown => b"\x1b[6~".to_vec(),
-        KeyCode::Delete => b"\x1b[3~".to_vec(),
-        KeyCode::F(1) => b"\x1bOP".to_vec(),
-        KeyCode::F(2) => b"\x1bOQ".to_vec(),
-        KeyCode::F(3) => b"\x1bOR".to_vec(),
-        KeyCode::F(4) => b"\x1bOS".to_vec(),
-        KeyCode::F(n @ 5..=12) => {
-            let code = [15, 17, 18, 19, 20, 21, 23, 24][(n - 5) as usize];
-            format!("\x1b[{code}~").into_bytes()
-        }
-        _ => return None,
+        // Every other key comes from the table `pane send-keys` also uses.
+        code => crate::keys::from_code(code)?.to_vec(),
     };
     if alt {
         b.insert(0, 27)

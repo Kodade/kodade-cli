@@ -39,6 +39,7 @@ printf '%s\n' '{"Query":"Layout"}' | nc -U /tmp/kodade-cli-$UID/default.sock
 | Message | Example | Reply |
 | --- | --- | --- |
 | `Query(Layout)` | `{"Query":"Layout"}` | `Layout` |
+| `Query(Pane)` | `{"Query":{"Pane":3}}` | `Pane` |
 | `Query(Session)` | `{"Query":"Session"}` | `Session` |
 | `Query(Version)` | `{"Query":"Version"}` | `Version` |
 | `Query(Schema)` | `{"Query":"Schema"}` | `Schema` |
@@ -65,6 +66,7 @@ printf '%s\n' '{"Query":"Layout"}' | nc -U /tmp/kodade-cli-$UID/default.sock
 | `SelectTabIndex` | `{"SelectTabIndex":{"index":1}}` | `Layout` |
 | `MoveTab` | `{"MoveTab":{"delta":1}}` | `Layout` |
 | `MovePaneToTab` | `{"MovePaneToTab":{"pane":3,"tab":2}}` | `Layout` |
+| `SetWorkspaceColor` | `{"SetWorkspaceColor":{"id":1,"color":"#e7a33b"}}` | `Layout` |
 | `SwapPane` | `{"SwapPane":{"direction":"Right"}}` | `Layout` |
 | `BreakPane` | `"BreakPane"` | `Layout` |
 | `EqualizeLayout` | `"EqualizeLayout"` | `Layout` |
@@ -78,6 +80,18 @@ printf '%s\n' '{"Query":"Layout"}' | nc -U /tmp/kodade-cli-$UID/default.sock
 | `ZoomPane` | `"ZoomPane"` | `Layout` |
 | `AgentState` | `{"AgentState":{"pane":3,"state":"blocked","source":"hook"}}` | `Layout` |
 
+`MovePaneToTab` accepts a tab in any workspace (tab ids are global). A
+cross-workspace move follows the pane: the target workspace and tab become
+active, as `FocusPaneId` would. A workspace whose last tab is emptied by the
+move receives a fresh shell tab, because a workspace always has at least one.
+
+`ApplyLayout` **executes code**: every pane the file names that is not already
+alive is spawned with the saved `command`, through the login shell, in the saved
+`cwd`. Treat a layout file like a shell script and only apply files you trust.
+The file must also be internally consistent — no id used twice, every tree leaf
+backed by a pane entry, and no pane entry outside its tab's tree — or the daemon
+answers `Error` and changes nothing.
+
 Messages that act on "the focused pane" (`ClosePane`, `ZoomPane`, `SwapPane`,
 `ResizePane`, `BreakPane`, …) have no id argument: send `FocusPaneId` first.
 That is exactly what `kodade-cli pane kill|zoom|swap|resize` does.
@@ -87,6 +101,9 @@ That is exactly what `kodade-cli pane kill|zoom|swap|resize` does.
 - `Welcome` — `{"Welcome":{"session":"default","version":1}}`. Sent once, in
   reply to `Hello`.
 - `Version` — `{"Version":{"version":1}}`. Reply to `Query(Version)`.
+- `Pane` — `{"Pane":{…PaneSnapshot…}}`. Reply to `Query(Pane)`. Unlike `Layout`,
+  which only carries the active tab's panes, this reaches any pane in the
+  session; an unknown id answers `Error`.
 - `Layout` — `{"Layout":{…LayoutSnapshot…}}`. The full session state: active
   workspace and tab, the workspace/tab lists used by the sidebar, the pane
   tree, and one `PaneSnapshot` per visible pane (title, focus, agent, state,
@@ -126,12 +143,16 @@ snapshot (so ids in later events can be resolved) and then pushes a
 {"Event":{"WorkspaceClosed":{"workspace":6}}}
 {"Event":{"WorkspaceRenamed":{"workspace":6,"name":"repo"}}}
 {"Event":{"Notification":{"pane":3,"workspace":1,"tab":2,"agent":"codex","state":"blocked","seq":7}}}
+{"Event":{"SessionRenamed":{"name":"work","socket":"/run/kodade-cli/work.sock"}}}
 ```
 
 Notes:
 
 - Nothing is buffered. A connection only receives events raised after it
   subscribed; there is no replay and no cursor.
+- `AgentStateChanged` is raised by agent detection, which runs when the session
+  snapshots. While at least one connection is subscribed the daemon snapshots
+  every 2 s on its own, so an events stream works with no client attached.
 - A subscriber that stops reading is dropped from the backlog rather than
   stalling the session — it silently misses events. Re-read state with
   `Query(Layout)` after a gap.
@@ -183,6 +204,22 @@ path with `ssh -L` and then speaks this exact protocol over it — a forwarded
 socket is indistinguishable from a local one. `kodade-cli session path [-s NAME]`
 prints the socket path a client should connect to, which is how the forward is
 set up. See [DEVELOPMENT.md](DEVELOPMENT.md#remote-mode-23).
+
+## Renaming a live session
+
+`RenameSession` links the bound socket to the new path and unlinks the old one,
+so the same daemon (and the same PTYs) answers at `<new-name>.sock`. Everything
+already connected keeps working; subscribers get
+`Event::SessionRenamed { name, socket }` and should switch any stored path to
+the new one.
+
+Two caveats worth passing to users:
+
+- `KODADE_SESSION` and `KODADE_SOCKET` in shells that were already running are
+  **stale** — they still name the old session and socket. A hook that reports
+  state with the old `-s` value will fail until the pane restarts.
+- Nothing answers at the old path anymore. Attaching with the old `-s NAME`
+  starts a brand-new empty daemon rather than reattaching.
 
 ## Environment inside a pane
 

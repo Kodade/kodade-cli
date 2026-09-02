@@ -17,6 +17,10 @@ const POLL: Duration = Duration::from_millis(250);
 /// How long `session ls` waits for a socket to answer before calling it dead.
 const PROBE_TIMEOUT: Duration = Duration::from_millis(250);
 
+/// Ceiling on one request (connect plus the first reply line) so a half-open
+/// daemon cannot hang a scripting verb forever.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Integrations that install a lifecycle hook / notify entry for a known agent.
 pub const INTEGRATIONS: &[&str] = &["claude-code", "codex", "gemini-cli"];
 
@@ -254,16 +258,27 @@ pub fn parse_state(value: &str) -> Result<AgentStateKind> {
 /// is resolved by the caller (`remote::resolve_socket`) so `--remote` transparently
 /// redirects every scripting command through the forwarded local socket (#23).
 pub async fn request(socket: &Path, message: ClientMessage) -> Result<ServerMessage> {
-    let stream = UnixStream::connect(socket)
+    let exchange = async {
+        let stream = UnixStream::connect(socket)
+            .await
+            .with_context(|| format!("no Ködade CLI daemon at {}", socket.display()))?;
+        let (reader, mut writer) = stream.into_split();
+        writer.write_all(&encode(&message)?).await?;
+        let mut lines = BufReader::new(reader).lines();
+        lines
+            .next_line()
+            .await?
+            .ok_or_else(|| anyhow!("daemon closed the connection"))
+    };
+    let line = tokio::time::timeout(REQUEST_TIMEOUT, exchange)
         .await
-        .with_context(|| format!("no Ködade CLI daemon at {}", socket.display()))?;
-    let (reader, mut writer) = stream.into_split();
-    writer.write_all(&encode(&message)?).await?;
-    let mut lines = BufReader::new(reader).lines();
-    let line = lines
-        .next_line()
-        .await?
-        .ok_or_else(|| anyhow!("daemon closed the connection"))?;
+        .map_err(|_| {
+            anyhow!(
+                "timed out after {}s waiting for the daemon at {}",
+                REQUEST_TIMEOUT.as_secs(),
+                socket.display()
+            )
+        })??;
     let reply = decode::<ServerMessage>(line.as_bytes())?;
     if let ServerMessage::Error { message } = &reply {
         bail!("{message}");
@@ -275,6 +290,15 @@ pub fn layout(reply: ServerMessage) -> Result<LayoutSnapshot> {
     match reply {
         ServerMessage::Layout(layout) => Ok(layout),
         ServerMessage::Shutdown => bail!("daemon shut down"),
+        ServerMessage::Error { message } => bail!("{message}"),
+        other => bail!("daemon sent an unexpected {}", server_message_name(&other)),
+    }
+}
+
+/// Extract the `Pane` reply of a `Query(QueryKind::Pane(_))`.
+pub fn pane_snapshot(reply: ServerMessage) -> Result<PaneSnapshot> {
+    match reply {
+        ServerMessage::Pane(pane) => Ok(pane),
         ServerMessage::Error { message } => bail!("{message}"),
         other => bail!("daemon sent an unexpected {}", server_message_name(&other)),
     }
@@ -343,52 +367,20 @@ pub fn format_workspaces(workspaces: &[WorkspaceInfo]) -> String {
         .join("\n")
 }
 
-/// One `pane send-keys` argument turned into bytes. Key names follow tmux
-/// (`Enter`, `Escape`, `C-c`); anything else is sent as literal text.
-pub fn key_bytes(key: &str) -> Vec<u8> {
-    let literal = match key {
-        "Enter" | "C-m" | "Return" => "\r",
-        "Escape" | "Esc" => "\x1b",
-        "Tab" => "\t",
-        "Space" => " ",
-        "BSpace" | "BackSpace" => "\x7f",
-        "Up" => "\x1b[A",
-        "Down" => "\x1b[B",
-        "Right" => "\x1b[C",
-        "Left" => "\x1b[D",
-        other => {
-            // `C-x`: the control byte for an ASCII letter or `@`..`_`.
-            if let Some(rest) = other.strip_prefix("C-") {
-                let mut chars = rest.chars();
-                if let (Some(c), None) = (chars.next(), chars.next()) {
-                    let upper = c.to_ascii_uppercase() as u8;
-                    if (b'@'..=b'_').contains(&upper) {
-                        return vec![upper - 64];
-                    }
-                }
-            }
-            return other.as_bytes().to_vec();
-        }
-    };
-    literal.as_bytes().to_vec()
-}
-
-/// Every `send-keys` argument concatenated in order.
-pub fn keys_to_bytes(keys: &[String]) -> Vec<u8> {
-    keys.iter().flat_map(|key| key_bytes(key)).collect()
-}
-
-/// Poll the session until `check` accepts a snapshot. Returns false on timeout
-/// (the caller exits 2); `None` waits forever.
-pub async fn poll_until(
+/// Poll one pane until `check` accepts its snapshot. Returns false on timeout
+/// (the caller exits 2); `None` waits forever. Polls `Query(Pane)` rather than
+/// the layout so a pane in a background tab or workspace is still visible.
+pub async fn poll_pane(
     socket: &Path,
+    pane: PaneId,
     timeout: Option<u64>,
-    mut check: impl FnMut(&LayoutSnapshot) -> Result<bool>,
+    mut check: impl FnMut(&PaneSnapshot) -> bool,
 ) -> Result<bool> {
     let deadline = timeout.map(|secs| std::time::Instant::now() + Duration::from_secs(secs));
     loop {
-        let snapshot = layout(request(socket, layout_query()).await?)?;
-        if check(&snapshot)? {
+        let snapshot =
+            pane_snapshot(request(socket, ClientMessage::Query(QueryKind::Pane(pane))).await?)?;
+        if check(&snapshot) {
             return Ok(true);
         }
         if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
@@ -510,6 +502,9 @@ pub fn format_event(event: &Event) -> String {
         }
         Event::WorkspaceRenamed { workspace, name } => {
             format!("workspace_renamed  workspace {}  {name}", workspace.0)
+        }
+        Event::SessionRenamed { name, socket } => {
+            format!("session_renamed  {name}  {}", socket.display())
         }
         Event::Notification(notification) => format!(
             "notification  pane {}  {}  {}",
@@ -671,6 +666,34 @@ pub fn resolve_tab(
         .find(|tab| tab.name == needle)
         .map(|tab| tab.id)
         .ok_or_else(|| anyhow!("tab '{needle}' not found"))
+}
+
+/// Resolve a tab name or id anywhere in the session. Tab ids are global and a
+/// pane can move between workspaces, so `pane move --tab` cannot be scoped to
+/// the active workspace the way `-t` on `run` is.
+pub fn resolve_tab_anywhere(layout: &LayoutSnapshot, needle: &str) -> Result<TabId> {
+    if let Ok(id) = needle.parse::<u64>() {
+        if layout
+            .workspaces
+            .iter()
+            .flat_map(|workspace| workspace.tabs.iter())
+            .any(|tab| tab.id == TabId(id))
+        {
+            return Ok(TabId(id));
+        }
+    }
+    let mut matches = layout
+        .workspaces
+        .iter()
+        .flat_map(|workspace| workspace.tabs.iter())
+        .filter(|tab| tab.name == needle);
+    let first = matches
+        .next()
+        .ok_or_else(|| anyhow!("tab '{needle}' not found"))?;
+    if matches.next().is_some() {
+        bail!("tab name '{needle}' is ambiguous; use its id");
+    }
+    Ok(first.id)
 }
 
 /// The focused pane in a snapshot — used to report the pane a `NewPane` reply
@@ -862,22 +885,6 @@ mod tests {
         fs::remove_dir_all(temp).unwrap();
     }
     #[test]
-    fn send_keys_maps_key_names_and_passes_text_through() {
-        assert_eq!(keys_to_bytes(&["hello".into()]), b"hello".to_vec());
-        assert_eq!(keys_to_bytes(&["Enter".into()]), b"\r".to_vec());
-        assert_eq!(keys_to_bytes(&["Escape".into()]), b"\x1b".to_vec());
-        assert_eq!(keys_to_bytes(&["C-c".into()]), vec![3]);
-        assert_eq!(keys_to_bytes(&["Up".into()]), b"\x1b[A".to_vec());
-        // Arguments concatenate in order, so text plus Enter is one write.
-        assert_eq!(
-            keys_to_bytes(&["ls".into(), "Enter".into()]),
-            b"ls\r".to_vec()
-        );
-        // An unknown multi-character name stays literal rather than erroring.
-        assert_eq!(keys_to_bytes(&["C-".into()]), b"C-".to_vec());
-    }
-
-    #[test]
     fn formats_pane_tab_and_workspace_listings() {
         let layout = fixture();
         let panes = format_panes(&layout);
@@ -949,5 +956,35 @@ mod tests {
             }),
             "tab_renamed  tab 2  agents"
         );
+    }
+    #[test]
+    fn tab_names_and_ids_resolve_across_workspaces() {
+        let mut layout = fixture();
+        // A second workspace with its own tab, as `pane move --tab` would see.
+        layout.workspaces.push(WorkspaceInfo {
+            id: WorkspaceId(9),
+            name: "other".into(),
+            active: false,
+            state: AgentStateKind::Idle,
+            root: None,
+            color: None,
+            tabs: vec![SidebarTabInfo {
+                id: TabId(11),
+                name: "notes".into(),
+                state: AgentStateKind::Idle,
+                agents: vec![],
+            }],
+        });
+        assert_eq!(
+            resolve_tab_anywhere(&layout, "notes").expect("name in another workspace"),
+            TabId(11)
+        );
+        assert_eq!(
+            resolve_tab_anywhere(&layout, "11").expect("id in another workspace"),
+            TabId(11)
+        );
+        // The active-workspace resolver used by `-t` cannot see it.
+        assert!(resolve_tab(&layout, None, "notes").is_err());
+        assert!(resolve_tab_anywhere(&layout, "nope").is_err());
     }
 }

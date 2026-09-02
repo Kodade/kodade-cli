@@ -187,10 +187,16 @@ pub enum PaneCommand {
         #[arg(long)]
         json: bool,
     },
-    /// Send key names (`Enter`, `C-c`, `Escape`) or literal text to a pane.
+    /// Send key names (`Enter`, `C-c`, `M-x`, `F5`) or literal text to a pane.
+    ///
+    /// A capitalized word that is not a known key name is an error; pass
+    /// `--literal` to send such text verbatim.
     SendKeys {
         #[arg(value_name = "PANE", value_parser = pane_id)]
         pane: PaneId,
+        /// Send every argument as text, joined by spaces (no key names).
+        #[arg(short = 'l', long)]
+        literal: bool,
         #[arg(value_name = "KEYS", required = true, allow_hyphen_values = true)]
         keys: Vec<String>,
     },
@@ -313,6 +319,14 @@ pub enum WorkspaceCommand {
     Select {
         #[arg(value_name = "WS")]
         workspace: String,
+    },
+    /// Set a workspace's sidebar color, or `off` to clear it (#19).
+    Color {
+        #[arg(value_name = "WS")]
+        workspace: String,
+        /// A `#rrggbb` hex color, or `off`.
+        #[arg(value_name = "HEX|off")]
+        color: String,
     },
 }
 
@@ -726,7 +740,26 @@ mod tests {
             Some(Command::Pane {
                 command: PaneCommand::SendKeys {
                     pane: PaneId(3),
+                    literal: false,
                     keys: vec!["codex".into(), "Enter".into()],
+                }
+            })
+        );
+        assert_eq!(
+            parse(&[
+                "kodade-cli",
+                "pane",
+                "send-keys",
+                "3",
+                "--literal",
+                "Hello there"
+            ])
+            .command,
+            Some(Command::Pane {
+                command: PaneCommand::SendKeys {
+                    pane: PaneId(3),
+                    literal: true,
+                    keys: vec!["Hello there".into()],
                 }
             })
         );
@@ -871,6 +904,24 @@ mod tests {
             Some(Command::Workspace {
                 command: WorkspaceCommand::Close {
                     workspace: "repo".into()
+                }
+            })
+        );
+        assert_eq!(
+            parse(&["kodade-cli", "workspace", "color", "repo", "#e7a33b"]).command,
+            Some(Command::Workspace {
+                command: WorkspaceCommand::Color {
+                    workspace: "repo".into(),
+                    color: "#e7a33b".into(),
+                }
+            })
+        );
+        assert_eq!(
+            parse(&["kodade-cli", "workspace", "color", "repo", "off"]).command,
+            Some(Command::Workspace {
+                command: WorkspaceCommand::Color {
+                    workspace: "repo".into(),
+                    color: "off".into(),
                 }
             })
         );
