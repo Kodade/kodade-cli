@@ -12,10 +12,10 @@ use crossterm::{
     execute,
 };
 use kodade_cli_proto::{
-    AgentStateKind, ClientMessage, Direction, LayoutSnapshot, PaneId, Screen, SidebarTabInfo,
-    WorkspaceInfo,
+    AgentStateKind, ClientMessage, Direction, LayoutSnapshot, Notification, PaneId, Screen,
+    SidebarTabInfo, WorkspaceInfo,
 };
-use ratatui::{backend::CrosstermBackend, layout::Rect, Frame, Terminal};
+use ratatui::{backend::CrosstermBackend, layout::Rect, style::Color, Frame, Terminal};
 use std::{
     io::Write,
     path::{Path, PathBuf},
@@ -25,7 +25,7 @@ use std::{
 use tokio::{io::AsyncWriteExt, net::unix::OwnedWriteHalf, sync::mpsc};
 
 use crate::{
-    config, help, input, mode,
+    config, help, input, mode, notify,
     overlay::{self, Overlay, OverlayEvent, OverlayTarget},
     paste, render,
     selection::{self, Selection, SelectionMode},
@@ -38,6 +38,8 @@ const MULTI_CLICK: Duration = Duration::from_millis(400);
 const NOTE_TTL: Duration = Duration::from_secs(5);
 /// Pace a multi-chunk paste so the socket writer does not flood the daemon.
 const PASTE_CHUNK_GAP: Duration = Duration::from_millis(5);
+/// Notification toasts linger a little longer than ordinary notes (#10).
+const TOAST_TTL: Duration = Duration::from_secs(6);
 
 type Term = Terminal<CrosstermBackend<std::io::Stdout>>;
 
@@ -45,6 +47,7 @@ type Term = Terminal<CrosstermBackend<std::io::Stdout>>;
 pub enum Update {
     Layout(LayoutSnapshot),
     Session(String),
+    Notification(Notification),
 }
 
 /// What the event loop should do after handling an event.
@@ -58,6 +61,13 @@ pub enum Flow {
 struct Confirm {
     message: String,
     on_yes: ClientMessage,
+}
+
+/// A status-bar note (or notification toast) and how it is drawn.
+struct Note {
+    text: String,
+    expiry: Instant,
+    color: Color,
 }
 
 /// An in-progress border drag started by a left mouse press.
@@ -95,10 +105,12 @@ pub struct App {
     /// hint and is persisted to the state file (#6).
     help_seen: bool,
     /// Status-bar note and the instant it stops being shown.
-    note: Option<(String, Instant)>,
+    note: Option<Note>,
     /// Last sanitized paste, copy-mode yank, or mouse selection; re-sent by
     /// the `paste_buffer` action (#21).
     paste_buffer: String,
+    /// Agent notifications: unread stack and effect computation (#10).
+    notifier: notify::Notifier,
     /// Session reported by the daemon's `Welcome`; shown in the status bar (#11).
     session_name: String,
     /// `prefix q` pane-id flash expiry (#11).
@@ -126,6 +138,13 @@ const SIDEBAR_HINT: Duration = Duration::from_secs(3);
 
 impl App {
     pub fn new(config: &config::Config, session: &str) -> Self {
+        // The toast tells the user which chord jumps to the pane, so read the
+        // live binding (defaults to `N` per #14's o/O collision).
+        let jump_hint = config
+            .chords_for(config::Action::NotificationJump)
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| "N".to_string());
         Self {
             layout: None,
             prefix: false,
@@ -147,6 +166,7 @@ impl App {
             help_seen: help::state_seen(),
             note: None,
             paste_buffer: String::new(),
+            notifier: notify::Notifier::new(config, jump_hint),
             session_name: session.to_string(),
             flash_until: None,
             sidebar_hidden_at: None,
@@ -160,17 +180,27 @@ impl App {
         }
     }
 
-    /// Sets the status-bar note; it clears itself after `NOTE_TTL`.
+    /// Sets the status-bar note in the default color; clears after `NOTE_TTL`.
     fn set_note(&mut self, text: impl Into<String>) {
-        self.note = Some((text.into(), Instant::now() + NOTE_TTL));
+        let color = self.theme.done;
+        self.set_note_full(text, NOTE_TTL, color);
     }
 
-    // The note, unless it has expired.
-    fn note(&self) -> Option<&str> {
+    /// Sets a note with an explicit lifetime and color (notification toasts).
+    fn set_note_full(&mut self, text: impl Into<String>, ttl: Duration, color: Color) {
+        self.note = Some(Note {
+            text: text.into(),
+            expiry: Instant::now() + ttl,
+            color,
+        });
+    }
+
+    // The note text and color, unless it has expired.
+    fn note(&self) -> Option<(&str, Color)> {
         self.note
             .as_ref()
-            .filter(|(_, expiry)| *expiry > Instant::now())
-            .map(|(text, _)| text.as_str())
+            .filter(|note| note.expiry > Instant::now())
+            .map(|note| (note.text.as_str(), note.color))
     }
 
     /// Pane width for the current sidebar state, used by `Hello` and `Resize`.
@@ -211,6 +241,55 @@ impl App {
 
     pub fn handle_session(&mut self, session: String) {
         self.session_name = session;
+    }
+
+    /// Applies one agent notification: computes its effects and performs them
+    /// (toast, bell, system OSC, sound). Never blocks the render loop.
+    fn handle_notification(&mut self, notification: Notification, term: &mut Term) -> Result<()> {
+        let effects = {
+            let Some(layout) = self.layout.as_ref() else {
+                return Ok(());
+            };
+            self.notifier.handle(&notification, layout)
+        };
+        let color = note_color(&self.theme, notification.state);
+        for effect in effects {
+            match effect {
+                notify::Effect::Toast(text) => self.set_note_full(text, TOAST_TTL, color),
+                notify::Effect::Bell => {
+                    execute!(term.backend_mut(), crossterm::style::Print("\x07"))?;
+                }
+                notify::Effect::Osc777 { title, body } => {
+                    // OSC 777 (rxvt/foot) and OSC 9 (iTerm2/WezTerm) cover the
+                    // common desktop-notification escapes.
+                    execute!(
+                        term.backend_mut(),
+                        crossterm::style::Print(format!("\x1b]777;notify;{title};{body}\x07")),
+                        crossterm::style::Print(format!("\x1b]9;{body}\x07")),
+                    )?;
+                }
+                notify::Effect::Sound(command) => spawn_sound(&command),
+            }
+        }
+        Ok(())
+    }
+
+    /// `prefix N`: focus the pane of the most recent unread notification and
+    /// mark it read; an empty stack just says so.
+    async fn notification_jump(&mut self, writer: &mut OwnedWriteHalf) -> Result<()> {
+        match self.notifier.pop_unread() {
+            Some(notification) => {
+                write(
+                    writer,
+                    &ClientMessage::FocusPaneId {
+                        id: notification.pane,
+                    },
+                )
+                .await?;
+            }
+            None => self.set_note(" no notifications"),
+        }
+        Ok(())
     }
 
     pub fn draw(&self, frame: &mut Frame) {
@@ -314,6 +393,9 @@ impl App {
                 match update {
                     Update::Layout(layout) => self.handle_layout(layout),
                     Update::Session(session) => self.handle_session(session),
+                    Update::Notification(notification) => {
+                        self.handle_notification(notification, term)?
+                    }
                 }
             }
             self.sync_title(term)?;
@@ -752,6 +834,7 @@ impl App {
                     self.send_paste(&text, writer).await?;
                 }
             }
+            config::Action::NotificationJump => self.notification_jump(writer).await?,
             other => {
                 if let Some(message) = other.message() {
                     write(writer, &message).await?
@@ -1535,6 +1618,28 @@ async fn write(writer: &mut OwnedWriteHalf, message: &ClientMessage) -> Result<(
         .write_all(&kodade_cli_proto::encode(message)?)
         .await?;
     Ok(())
+}
+
+/// Status-bar color for a notification's state, matching the pane borders.
+fn note_color(theme: &config::Theme, state: AgentStateKind) -> Color {
+    match state {
+        AgentStateKind::Blocked => theme.blocked,
+        AgentStateKind::Working => theme.working,
+        AgentStateKind::Done => theme.done,
+        AgentStateKind::Idle | AgentStateKind::Unknown => theme.idle,
+    }
+}
+
+/// Fire-and-forget: runs the sound command through `sh -c`, fully detached with
+/// null stdio so it never touches the TUI or blocks the render loop.
+fn spawn_sound(command: &str) {
+    let _ = Command::new("sh")
+        .arg("-c")
+        .arg(command)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
 }
 
 /// Translates a key event into the bytes a PTY application expects.

@@ -65,6 +65,7 @@ The default prefix is `ctrl+b`. After the prefix, the default actions are:
 | `s` / `ctrl+r` | Settings menu / reload config and theme |
 | `]` | Paste the internal buffer (last paste, copy-mode yank, or mouse selection) |
 | `m` | Toggle mouse capture (hands the mouse back to the host terminal) |
+| `N` | Jump to the most recent unread agent notification |
 
 The status bar shows `session · workspace · tab` on the left and configurable
 widgets on the right (`[zoom]`, a `● N blocked` counter, hostname, time — set
@@ -95,6 +96,13 @@ sanitized by default (`paste.sanitize`): CRLF is normalized, embedded escape
 sequences — including a smuggled OSC 52 or CSI — are dropped, and control bytes
 other than tab and newline are stripped. Large pastes are chunked and paced.
 The last paste (or yank) is kept in a buffer that `]` re-sends.
+
+When an agent transitions into `blocked` or `done`, the daemon notifies every
+attached client: a status-bar toast in the state's color, a terminal bell, and
+optionally a host-terminal desktop notification (`notify.toast = "system"`) or a
+sound command (`notify.sound`). `prefix N` jumps to the pane of the most recent
+unread notification. Notifications are configurable and can be turned off
+entirely; see [docs/CONFIG.md](docs/CONFIG.md#configuration).
 
 Bindings accept a chord or an array of chords, in any modifier order
 (`split_right = ["%", "ctrl+alt+v"]`). A `ctrl`/`alt` chord that is not written

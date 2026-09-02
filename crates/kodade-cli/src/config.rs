@@ -1,7 +1,7 @@
 use std::{collections::HashMap, fmt::Write as _, fs, io::Write, path::PathBuf};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use kodade_cli_proto::{ClientMessage, Direction};
+use kodade_cli_proto::{AgentStateKind, ClientMessage, Direction};
 use ratatui::style::Color;
 use serde::Deserialize;
 
@@ -23,8 +23,19 @@ pub struct Config {
     pub clear_on_output: bool,
     /// `ui.link_command` — program that opens a ctrl-clicked URL (#12).
     pub link_command: String,
-    /// `notify.enabled` — consumed by the notification work (#10).
+    /// `notify.enabled` — the master switch for agent notifications (#10).
     pub notify: bool,
+    /// States that raise a notification (`notify.on`).
+    pub notify_on: Vec<AgentStateKind>,
+    /// How a notification surfaces (`notify.toast`).
+    pub notify_toast: NotifyToast,
+    /// Ring the terminal bell (`notify.bell`).
+    pub notify_bell: bool,
+    /// Command run via `sh -c` when a notification fires (`notify.sound`).
+    pub notify_sound: String,
+    /// Only notify when the pane is not the focused one on screen
+    /// (`notify.only_when_unfocused`).
+    pub notify_only_when_unfocused: bool,
     /// `paste.sanitize` — strip escape sequences and control bytes from pastes (#21).
     pub paste_sanitize: bool,
     pub prefix: KeyEvent,
@@ -59,6 +70,58 @@ impl StatusWidget {
             "time" => Self::Time,
             _ => return None,
         })
+    }
+}
+
+/// How a fired notification is surfaced to the user (#10).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotifyToast {
+    /// Status-bar toast for a few seconds (default).
+    Status,
+    /// No visible toast; bell/sound may still fire.
+    Off,
+    /// Emit OSC 777 / OSC 9 so the host terminal raises a desktop notification.
+    System,
+}
+
+impl NotifyToast {
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "status" => Some(Self::Status),
+            "off" => Some(Self::Off),
+            "system" => Some(Self::System),
+            _ => None,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Status => "status",
+            Self::Off => "off",
+            Self::System => "system",
+        }
+    }
+}
+
+/// Parses a `notify.on` state name; only the states a notification can carry
+/// are accepted.
+fn parse_notify_state(name: &str) -> Option<AgentStateKind> {
+    match name {
+        "blocked" => Some(AgentStateKind::Blocked),
+        "done" => Some(AgentStateKind::Done),
+        "working" => Some(AgentStateKind::Working),
+        "idle" => Some(AgentStateKind::Idle),
+        _ => None,
+    }
+}
+
+fn notify_state_name(state: AgentStateKind) -> &'static str {
+    match state {
+        AgentStateKind::Blocked => "blocked",
+        AgentStateKind::Working => "working",
+        AgentStateKind::Done => "done",
+        AgentStateKind::Idle => "idle",
+        AgentStateKind::Unknown => "unknown",
     }
 }
 
@@ -124,6 +187,8 @@ pub enum Action {
     MouseToggle,
     // Help overlay (#6).
     Help,
+    // Notifications (#10): jump to the most recent unread notification.
+    NotificationJump,
 }
 
 /// Every remappable action and its config name. Single source of truth for
@@ -183,6 +248,7 @@ const ACTIONS: &[(&str, Action)] = &[
     ("paste_buffer", Action::PasteBuffer),
     ("mouse_toggle", Action::MouseToggle),
     ("help", Action::Help),
+    ("notification_jump", Action::NotificationJump),
 ];
 
 impl Action {
@@ -282,7 +348,8 @@ impl Action {
             | Self::Settings
             | Self::PasteBuffer
             | Self::MouseToggle
-            | Self::Help => return None,
+            | Self::Help
+            | Self::NotificationJump => return None,
         })
     }
 }
@@ -339,6 +406,11 @@ struct MouseTable {
 #[derive(Debug, Deserialize, Default)]
 struct NotifyTable {
     enabled: Option<bool>,
+    on: Option<Vec<String>>,
+    toast: Option<String>,
+    bell: Option<bool>,
+    sound: Option<String>,
+    only_when_unfocused: Option<bool>,
     #[serde(flatten)]
     extra: HashMap<String, toml::Value>,
 }
@@ -427,6 +499,8 @@ impl Default for Config {
             ("]", Action::PasteBuffer),
             ("m", Action::MouseToggle),
             ("?", Action::Help),
+            // #14 took `o`/`O` for next/prev pane, so notification jump uses `N`.
+            ("N", Action::NotificationJump),
         ] {
             bindings.insert(
                 parse_key_chord(binding).expect("built-in key is valid"),
@@ -450,6 +524,11 @@ impl Default for Config {
             clear_on_output: false,
             link_command: default_link_command().into(),
             notify: true,
+            notify_on: vec![AgentStateKind::Blocked, AgentStateKind::Done],
+            notify_toast: NotifyToast::Status,
+            notify_bell: true,
+            notify_sound: String::new(),
+            notify_only_when_unfocused: true,
             paste_sanitize: true,
             prefix: parse_key_chord("ctrl+b").expect("built-in prefix is valid"),
             status_right: vec![StatusWidget::Zoom, StatusWidget::Blocked],
@@ -517,6 +596,33 @@ impl Config {
             Some(Section::Enabled(enabled)) => config.notify = enabled,
             Some(Section::Table(table)) => {
                 config.notify = table.enabled.unwrap_or(config.notify);
+                if let Some(states) = table.on {
+                    config.notify_on = states
+                        .iter()
+                        .filter_map(|name| match parse_notify_state(name) {
+                            Some(state) => Some(state),
+                            None => {
+                                config
+                                    .warnings
+                                    .push(format!("unknown notify.on state {name}"));
+                                None
+                            }
+                        })
+                        .collect();
+                }
+                if let Some(toast) = table.toast {
+                    match NotifyToast::parse(&toast) {
+                        Some(value) => config.notify_toast = value,
+                        None => config
+                            .warnings
+                            .push(format!("unknown notify.toast {toast}")),
+                    }
+                }
+                config.notify_bell = table.bell.unwrap_or(config.notify_bell);
+                config.notify_sound = table.sound.unwrap_or(config.notify_sound);
+                config.notify_only_when_unfocused = table
+                    .only_when_unfocused
+                    .unwrap_or(config.notify_only_when_unfocused);
                 config.warn_unknown("notify.", &table.extra);
             }
             None => {}
@@ -698,6 +804,21 @@ impl Config {
         let _ = writeln!(out, "link_command = {}", toml_string(&self.link_command));
         let _ = writeln!(out, "\n[notify]");
         let _ = writeln!(out, "enabled = {}", self.notify);
+        let states = self
+            .notify_on
+            .iter()
+            .map(|state| toml_string(notify_state_name(*state)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let _ = writeln!(out, "on = [{states}]");
+        let _ = writeln!(out, "toast = {}", toml_string(self.notify_toast.name()));
+        let _ = writeln!(out, "bell = {}", self.notify_bell);
+        let _ = writeln!(out, "sound = {}", toml_string(&self.notify_sound));
+        let _ = writeln!(
+            out,
+            "only_when_unfocused = {}",
+            self.notify_only_when_unfocused
+        );
         let _ = writeln!(out, "\n[paste]");
         let _ = writeln!(out, "sanitize = {}", self.paste_sanitize);
         let _ = writeln!(out, "\n[keys]");

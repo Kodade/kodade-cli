@@ -36,6 +36,9 @@ pub struct Detection {
     pub agent: Option<String>,
     pub state: AgentStateKind,
     pub reason: String,
+    /// True when a live hook report drove the state. Notifications (#10) treat a
+    /// hook as proof an agent is present even without a manifest match.
+    pub from_hook: bool,
 }
 
 pub fn detect(
@@ -64,6 +67,7 @@ pub fn detect(
                 hook.age.as_secs(),
                 hook.source
             ),
+            from_hook: true,
         };
     }
     let Some(manifest) = manifest else {
@@ -79,6 +83,7 @@ pub fn detect(
                 "process {} is not a known agent",
                 process.unwrap_or("shell")
             ),
+            from_hook: false,
         };
     };
     if let Some(rule) = matching_rule(manifest, screen, SCREEN_LINES) {
@@ -91,6 +96,7 @@ pub fn detect(
             agent: Some(manifest.display.clone()),
             state: rule.state.into(),
             reason: format!("manifest rule '{needle}' matched"),
+            from_hook: false,
         };
     }
     let (state, reason) = if output_age < OUTPUT_WORKING_WINDOW {
@@ -106,6 +112,7 @@ pub fn detect(
             process.unwrap_or("title"),
             output_age.as_secs()
         ),
+        from_hook: false,
     }
 }
 

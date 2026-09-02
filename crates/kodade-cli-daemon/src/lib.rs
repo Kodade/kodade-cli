@@ -21,9 +21,9 @@ use std::{
 use anyhow::{anyhow, bail, Context, Result};
 use kodade_cli_proto::{
     decode, encode, AgentInfo, AgentStateKind, CellColor, ClientMessage, Direction, LayoutSnapshot,
-    LayoutTree, PaneId, PaneSnapshot, QueryKind, Run, Screen, ServerMessage, SidebarTabInfo,
-    SplitAxis, TabId, TabInfo, WorkspaceId, WorkspaceInfo, ATTR_BOLD, ATTR_DIM, ATTR_INVERSE,
-    ATTR_ITALIC, ATTR_UNDERLINE,
+    LayoutTree, Notification, PaneId, PaneSnapshot, QueryKind, Run, Screen, ServerMessage,
+    SidebarTabInfo, SplitAxis, TabId, TabInfo, WorkspaceId, WorkspaceInfo, ATTR_BOLD, ATTR_DIM,
+    ATTR_INVERSE, ATTR_ITALIC, ATTR_UNDERLINE,
 };
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use tokio::{
@@ -48,6 +48,12 @@ struct Session {
     /// True from a cold restore until the first client `Hello`; surfaced as
     /// `LayoutSnapshot.restored` so `ls` can print `(restored)`.
     restored: AtomicBool,
+    /// Ring of recent agent notifications (#10), newest last, capped at 64.
+    /// Each attached client drains it by `seq` after its next snapshot.
+    notifications: Mutex<Vec<Notification>>,
+    /// Monotonic high-water mark for `Notification.seq`; also the id a freshly
+    /// attached client uses so it never replays the backlog.
+    notify_seq: AtomicU64,
 }
 struct SessionState {
     workspaces: Vec<Workspace>,
@@ -270,6 +276,8 @@ impl Session {
             manifests: manifest::load()?,
             layout_generation: AtomicU64::new(0),
             restored: AtomicBool::new(false),
+            notifications: Mutex::new(Vec::new()),
+            notify_seq: AtomicU64::new(0),
         };
         let pane = session.new_pane("shell", None, None)?;
         let tab = Tab {
@@ -315,6 +323,8 @@ impl Session {
             manifests: manifest::load()?,
             layout_generation: AtomicU64::new(0),
             restored: AtomicBool::new(true),
+            notifications: Mutex::new(Vec::new()),
+            notify_seq: AtomicU64::new(0),
         };
         let mut workspaces = Vec::new();
         let mut workspace_ids: HashMap<u64, WorkspaceId> = HashMap::new();
@@ -648,10 +658,28 @@ impl Session {
             .map(|(id, pane)| (*id, pane.detect(&self.manifests, now)))
             .collect();
         // Age is tracked once per snapshot, after detection settles on a state.
-        let ages: HashMap<_, _> = panes
-            .iter()
-            .map(|(id, pane)| (*id, pane.track_state(detections[id].state, now)))
-            .collect();
+        // The same pass spots transitions into blocked/done and queues a
+        // notification once (track_state's mutation makes it idempotent across
+        // the concurrent snapshot calls of every attached client).
+        let mut ages = HashMap::new();
+        for (id, pane) in panes.iter() {
+            let detection = &detections[id];
+            let previous = pane.last_state();
+            let age = pane.track_state(detection.state, now);
+            ages.insert(*id, age);
+            let agent_known = detection.agent.is_some() || detection.from_hook;
+            if should_notify(previous, detection.state, agent_known) {
+                if let Some((workspace, tab)) = locate_pane(&state, *id) {
+                    // Prefer the manifest display; a hook-only agent falls back to
+                    // its pane title so the toast still names something useful.
+                    let agent = detection
+                        .agent
+                        .clone()
+                        .unwrap_or_else(|| pane.title.lock().expect("title lock poisoned").clone());
+                    self.push_notification(*id, workspace, tab, agent, detection.state);
+                }
+            }
+        }
         let snapshots = ids
             .into_iter()
             .filter_map(|id| {
@@ -707,6 +735,49 @@ impl Session {
             zoomed: tab.zoomed,
             restored: self.restored.load(Ordering::Relaxed),
         })
+    }
+
+    /// Queues a notification with the next sequence number, capping the ring at
+    /// 64 so a long-lived session never grows the queue without bound.
+    fn push_notification(
+        &self,
+        pane: PaneId,
+        workspace: WorkspaceId,
+        tab: TabId,
+        agent: String,
+        state: AgentStateKind,
+    ) {
+        let seq = self.notify_seq.fetch_add(1, Ordering::Relaxed) + 1;
+        let mut queue = self.notifications.lock().expect("notify lock poisoned");
+        queue.push(Notification {
+            pane,
+            workspace,
+            tab,
+            agent,
+            state,
+            seq,
+        });
+        let overflow = queue.len().saturating_sub(64);
+        if overflow > 0 {
+            queue.drain(0..overflow);
+        }
+    }
+
+    /// Highest sequence handed out so far. A client records this at attach time
+    /// so it only ever receives notifications raised after it connected.
+    fn notify_high_water(&self) -> u64 {
+        self.notify_seq.load(Ordering::Relaxed)
+    }
+
+    /// Notifications newer than `after`, oldest first.
+    fn notifications_since(&self, after: u64) -> Vec<Notification> {
+        self.notifications
+            .lock()
+            .expect("notify lock poisoned")
+            .iter()
+            .filter(|item| item.seq > after)
+            .cloned()
+            .collect()
     }
 
     fn resize(&self, cols: u16, rows: u16) -> Result<()> {
@@ -1698,6 +1769,12 @@ impl Pane {
         )
     }
 
+    /// The last state `track_state` recorded, or `None` before the first
+    /// detection. Read before `track_state` so a transition can be spotted.
+    fn last_state(&self) -> Option<AgentStateKind> {
+        *self.last_state.lock().expect("state lock poisoned")
+    }
+
     /// Records a state transition and returns how many seconds the current state
     /// has held. `state_since` only resets when the detected state actually changes.
     fn track_state(&self, state: AgentStateKind, now: Instant) -> u64 {
@@ -1834,6 +1911,28 @@ fn tab_state(tab: &Tab, detections: &HashMap<PaneId, agent::Detection>) -> Agent
             .into_iter()
             .filter_map(|id| detections.get(&id).map(|item| item.state)),
     )
+}
+
+/// Whether a state change should raise a notification (#10). Only genuine
+/// transitions into `blocked`/`done` for a pane with a known agent qualify; the
+/// initial detection at spawn (`last` is `None`) and same-state ticks never do.
+fn should_notify(last: Option<AgentStateKind>, next: AgentStateKind, agent_known: bool) -> bool {
+    agent_known
+        && matches!(next, AgentStateKind::Blocked | AgentStateKind::Done)
+        && last.is_some()
+        && last != Some(next)
+}
+
+/// Finds the workspace and tab that currently own `pane`, if any.
+fn locate_pane(state: &SessionState, pane: PaneId) -> Option<(WorkspaceId, TabId)> {
+    for workspace in &state.workspaces {
+        for tab in &workspace.tabs {
+            if layout::contains(&tab.tree, pane) {
+                return Some((workspace.id, tab.id));
+            }
+        }
+    }
+    None
 }
 
 /// `state_since` moves to `now` only when the detected state changes; an
@@ -2015,6 +2114,9 @@ async fn serve_client(stream: UnixStream, session: Arc<Session>, name: String) -
     process_timer.tick().await;
     let mut last_snapshot = Instant::now() - Duration::from_millis(16);
     let mut initialized = false;
+    // A fresh client only hears about transitions raised after it attached, so
+    // the spawn-time backlog never replays.
+    let mut last_notify_seq = session.notify_high_water();
     loop {
         tokio::select! {
             line = reader.next_line() => {
@@ -2029,13 +2131,17 @@ async fn serve_client(stream: UnixStream, session: Arc<Session>, name: String) -
                         // The first client attach sees `restored: true`; clear it
                         // afterward so later snapshots (and `ls`) report normally.
                         write_server(&mut writer, &ServerMessage::Layout(session.snapshot()?)).await?;
+                        send_notifications(&mut writer, &session, &mut last_notify_seq).await?;
                         session.clear_restored();
                     }
                     Ok(()) if kill => {
                         write_server(&mut writer, &ServerMessage::Shutdown).await?;
                         return Ok(());
                     }
-                    Ok(()) => write_server(&mut writer, &ServerMessage::Layout(session.snapshot()?)).await?,
+                    Ok(()) => {
+                        write_server(&mut writer, &ServerMessage::Layout(session.snapshot()?)).await?;
+                        send_notifications(&mut writer, &session, &mut last_notify_seq).await?;
+                    }
                     Err(error) => {
                         write_server(&mut writer, &ServerMessage::Error { message: error.to_string() }).await?;
                         return Ok(());
@@ -2050,6 +2156,7 @@ async fn serve_client(stream: UnixStream, session: Arc<Session>, name: String) -
                     let remaining = Duration::from_millis(16).saturating_sub(last_snapshot.elapsed());
                     if !remaining.is_zero() { tokio::time::sleep(remaining).await; }
                     write_server(&mut writer, &ServerMessage::Layout(session.snapshot()?)).await?;
+                    send_notifications(&mut writer, &session, &mut last_notify_seq).await?;
                     last_snapshot = Instant::now();
                 }
                 Err(broadcast::error::RecvError::Closed) => return Ok(()),
@@ -2057,6 +2164,7 @@ async fn serve_client(stream: UnixStream, session: Arc<Session>, name: String) -
             _ = process_timer.tick() => {
                 if initialized {
                     write_server(&mut writer, &ServerMessage::Layout(session.snapshot()?)).await?;
+                    send_notifications(&mut writer, &session, &mut last_notify_seq).await?;
                     last_snapshot = Instant::now();
                 }
             }
@@ -2072,6 +2180,20 @@ async fn write_server(
     message: &ServerMessage,
 ) -> Result<()> {
     writer.write_all(&encode(message)?).await?;
+    Ok(())
+}
+
+/// Flushes any notifications this client has not seen yet, always after a fresh
+/// snapshot so the client can resolve workspace/tab names from it.
+async fn send_notifications(
+    writer: &mut tokio::net::unix::OwnedWriteHalf,
+    session: &Arc<Session>,
+    last_seq: &mut u64,
+) -> Result<()> {
+    for notification in session.notifications_since(*last_seq) {
+        *last_seq = (*last_seq).max(notification.seq);
+        write_server(writer, &ServerMessage::Notification(notification)).await?;
+    }
     Ok(())
 }
 
@@ -2533,5 +2655,115 @@ mod tests {
             .expect("remove stale socket");
         assert!(!socket.exists());
         fs::remove_dir(&directory).expect("remove test directory");
+    }
+
+    #[test]
+    fn should_notify_only_on_transitions_into_alert_states() {
+        use AgentStateKind::*;
+        // The initial detection at spawn (last is None) never notifies.
+        assert!(!should_notify(None, Blocked, true));
+        assert!(!should_notify(None, Done, true));
+        // Genuine transitions into blocked/done for a known agent notify.
+        assert!(should_notify(Some(Working), Blocked, true));
+        assert!(should_notify(Some(Idle), Done, true));
+        assert!(should_notify(Some(Done), Blocked, true));
+        // An unknown agent never notifies, however it transitions.
+        assert!(!should_notify(Some(Working), Blocked, false));
+        // Staying in the same state does not re-notify.
+        assert!(!should_notify(Some(Blocked), Blocked, true));
+        // Transitions into non-alert states never notify.
+        assert!(!should_notify(Some(Blocked), Idle, true));
+        assert!(!should_notify(Some(Done), Working, true));
+    }
+
+    async fn next_server_message(
+        lines: &mut tokio::io::Lines<BufReader<tokio::net::unix::OwnedReadHalf>>,
+    ) -> ServerMessage {
+        let line = lines
+            .next_line()
+            .await
+            .expect("read line")
+            .expect("stream open");
+        decode::<ServerMessage>(line.as_bytes()).expect("decode server message")
+    }
+
+    #[tokio::test]
+    async fn blocked_transition_reaches_attached_client() {
+        let directory =
+            std::env::temp_dir().join(format!("kodade-cli-notify-{}", std::process::id()));
+        fs::create_dir_all(&directory).expect("create test directory");
+        let socket = directory.join("notify.sock");
+        let _ = fs::remove_file(&socket);
+        let listener = UnixListener::bind(&socket).expect("bind test socket");
+        let session = Arc::new(Session::spawn(80, 24, "notify".into()).expect("spawn session"));
+        // Accept loop: serve every client that connects, just like `run`.
+        let accept = {
+            let session = Arc::clone(&session);
+            tokio::spawn(async move {
+                while let Ok((stream, _)) = listener.accept().await {
+                    let session = Arc::clone(&session);
+                    tokio::spawn(async move {
+                        let _ = serve_client(stream, session, "notify".into()).await;
+                    });
+                }
+            })
+        };
+
+        // Attached client: Hello, then read Welcome + the first Layout, which
+        // settles the pane's baseline state (idle) so the later report is a
+        // genuine transition.
+        let (reader, mut writer) = UnixStream::connect(&socket)
+            .await
+            .expect("connect client")
+            .into_split();
+        let mut lines = BufReader::new(reader).lines();
+        writer
+            .write_all(&encode(&ClientMessage::Hello { cols: 80, rows: 24 }).unwrap())
+            .await
+            .expect("send hello");
+        assert!(matches!(
+            next_server_message(&mut lines).await,
+            ServerMessage::Welcome { .. }
+        ));
+        let pane = match next_server_message(&mut lines).await {
+            ServerMessage::Layout(layout) => layout.panes[0].id,
+            other => panic!("expected first layout, got {other:?}"),
+        };
+
+        // A second connection reports the pane blocked, as an agent hook would.
+        let (_r, mut reporter) = UnixStream::connect(&socket)
+            .await
+            .expect("connect reporter")
+            .into_split();
+        reporter
+            .write_all(
+                &encode(&ClientMessage::AgentState {
+                    pane,
+                    state: AgentStateKind::Blocked,
+                    source: "test".into(),
+                })
+                .unwrap(),
+            )
+            .await
+            .expect("report blocked");
+
+        // The attached client must see a Notification within a second.
+        let notification = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let ServerMessage::Notification(notification) =
+                    next_server_message(&mut lines).await
+                {
+                    break notification;
+                }
+            }
+        })
+        .await
+        .expect("notification arrives within 1s");
+        assert_eq!(notification.pane, pane);
+        assert_eq!(notification.state, AgentStateKind::Blocked);
+
+        accept.abort();
+        let _ = fs::remove_file(&socket);
+        let _ = fs::remove_dir(&directory);
     }
 }
