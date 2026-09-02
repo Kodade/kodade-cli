@@ -62,7 +62,9 @@ pub struct Ui<'a> {
     pub confirm: Option<&'a str>,
     /// Settings menu (#20); the help overlay and pickers reuse the same widget.
     pub settings: Option<&'a Overlay>,
-    pub note: Option<&'a str>,
+    /// Status-bar note text and the color it is drawn in (#10 toasts use the
+    /// agent-state color; ordinary notes use `done`).
+    pub note: Option<(&'a str, Color)>,
     /// Real session name for the status bar left segment (#11).
     pub session: &'a str,
     /// Right-side status widgets to draw, in order (#11).
@@ -209,9 +211,9 @@ pub fn render(frame: &mut Frame, layout: &LayoutSnapshot, ui: &Ui, theme: &Theme
             areas[2],
         );
     }
-    if let Some(note) = note {
+    if let Some((note, color)) = note {
         frame.render_widget(
-            Paragraph::new(note).style(Style::default().fg(theme.done).bg(theme.status_bg)),
+            Paragraph::new(note).style(Style::default().fg(color).bg(theme.status_bg)),
             areas[2],
         );
     }

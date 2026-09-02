@@ -267,6 +267,7 @@ pub fn layout(reply: ServerMessage) -> Result<LayoutSnapshot> {
         ServerMessage::Layout(layout) => Ok(layout),
         ServerMessage::Shutdown => bail!("daemon shut down"),
         ServerMessage::Welcome { .. } => bail!("daemon sent an unexpected welcome"),
+        ServerMessage::Notification(_) => bail!("daemon sent an unexpected notification"),
         ServerMessage::Error { message } => bail!("{message}"),
     }
 }

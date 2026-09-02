@@ -356,7 +356,9 @@ fn group_of(action: Action) -> Group {
             Group::Workspaces
         }
         Navigate | CopyMode | ResizeMode | Settings | Help => Group::Modes,
-        Detach | SidebarToggle | ReloadConfig | PasteBuffer | MouseToggle => Group::Other,
+        Detach | SidebarToggle | ReloadConfig | PasteBuffer | MouseToggle | NotificationJump => {
+            Group::Other
+        }
     }
 }
 
@@ -410,6 +412,7 @@ fn label_of(action: Action) -> String {
         DisplayPanes => "show pane ids".into(),
         PasteBuffer => "paste buffer".into(),
         MouseToggle => "toggle mouse capture".into(),
+        NotificationJump => "jump to notification".into(),
     }
 }
 

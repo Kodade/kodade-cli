@@ -5,6 +5,7 @@ mod config;
 mod help;
 mod input;
 mod mode;
+mod notify;
 mod overlay;
 mod paste;
 mod render;
@@ -354,6 +355,9 @@ async fn tui(stream: UnixStream, config: &config::Config, session: &str) -> Resu
             let update = match decode(line.as_bytes()) {
                 Ok(ServerMessage::Layout(layout)) => app::Update::Layout(layout),
                 Ok(ServerMessage::Welcome { session }) => app::Update::Session(session),
+                Ok(ServerMessage::Notification(notification)) => {
+                    app::Update::Notification(notification)
+                }
                 _ => continue,
             };
             if tx.send(update).await.is_err() {

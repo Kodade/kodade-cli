@@ -17,12 +17,33 @@ TOML, or omitted setting uses the defaults below.
 | `mouse.clear_on_output` | `false` | Drop a selection when its pane redraws. |
 | `sidebar` | `true` | Show the sidebar when the TUI starts. |
 | `notify` | `true` | Agent-state notifications. Accepts a boolean or a `[notify]` table. |
-| `notify.enabled` | `true` | Table form of `notify`. |
+| `notify.enabled` | `true` | Master switch for notifications (table form of `notify`). |
+| `notify.on` | `["blocked", "done"]` | Which agent states raise a notification. |
+| `notify.toast` | `"status"` | How a notification shows: `"status"` (status-bar toast), `"off"` (no toast), or `"system"` (host-terminal desktop notification via OSC 777 / OSC 9). |
+| `notify.bell` | `true` | Ring the terminal bell when a notification fires. |
+| `notify.sound` | `""` | Command run through `sh -c` (detached) on each notification, e.g. `"afplay /System/Library/Sounds/Glass.aiff"`. Empty means no sound. |
+| `notify.only_when_unfocused` | `true` | Skip the notification when its pane is already the focused pane on screen. |
 | `paste.sanitize` | `true` | Strip escape sequences and control bytes from pasted text before it reaches a pane. Off leaves only bracketed-paste wrapping (no stripping). Accepts a `[paste]` table or a boolean. |
 | `keys.prefix` | `"ctrl+b"` | Prefix key pressed before a remappable action. |
 | `status.right` | `["zoom", "blocked"]` | Right-side status bar widgets, in order. See [Status bar](#status-bar). |
 | `ui.window_title` | `"Ködade · {workspace} · {tab}"` | Host terminal title template (OSC 0). See [Window title](#window-title). |
 | `ui.link_command` | `"open"` (macOS), `"xdg-open"` elsewhere | Program run with the URL of a ctrl/cmd-clicked link. See [Mouse](#mouse). |
+
+When an agent transitions into a state listed in `notify.on`, the toast reads
+`● codex blocked in kodade-cli/agents · prefix N to jump`; `prefix N`
+(`notification_jump`; `N` because `o`/`O` are next/prev pane) focuses the pane
+of the most recent unread notification and repeated presses walk back through
+the stack.
+
+```toml
+[notify]
+enabled = true
+on = ["blocked", "done"]
+toast = "status"
+bell = true
+sound = ""
+only_when_unfocused = true
+```
 
 `mouse = true` and `[mouse]` are both valid, so a pre-0.2 config keeps working:
 
@@ -166,6 +187,7 @@ modifier (`ctrl+…`/`alt+…`) fires globally.
 | `reload_config` | `prefix+ctrl+r` |
 | `paste_buffer` | `]` |
 | `mouse_toggle` | `m` |
+| `notification_jump` | `N` |
 <!-- keys:end -->
 
 `close_tab` asks for confirmation in the status bar when a pane in the tab is

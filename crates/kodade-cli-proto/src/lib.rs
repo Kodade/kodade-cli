@@ -135,10 +135,31 @@ pub enum QueryKind {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ServerMessage {
-    Welcome { session: String },
+    Welcome {
+        session: String,
+    },
     Layout(LayoutSnapshot),
-    Error { message: String },
+    /// Pushed to every attached client when a known agent transitions into
+    /// `blocked` or `done` (#10). Older daemons never send it.
+    Notification(Notification),
+    Error {
+        message: String,
+    },
     Shutdown,
+}
+
+/// A single agent-state alert. Workspace/tab are carried as ids; the client
+/// resolves their display names from the current `LayoutSnapshot`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Notification {
+    pub pane: PaneId,
+    pub workspace: WorkspaceId,
+    pub tab: TabId,
+    /// Agent display name (e.g. `codex`).
+    pub agent: String,
+    pub state: AgentStateKind,
+    /// Monotonic per-session sequence so clients can drop duplicates.
+    pub seq: u64,
 }
 
 macro_rules! id_type {
