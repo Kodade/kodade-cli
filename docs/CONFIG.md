@@ -15,7 +15,12 @@ TOML, or omitted setting uses the defaults below.
 | `mouse.scroll_lines` | `3` | Rows scrolled per wheel notch (1–100). |
 | `mouse.passthrough` | `true` | Send mouse events to pane apps that ask for the mouse (vim, lazygit, htop). |
 | `mouse.clear_on_output` | `false` | Drop a selection when its pane redraws. |
-| `sidebar` | `true` | Show the sidebar when the TUI starts. |
+| `sidebar` | `true` | Show the sidebar when the TUI starts. Accepts a boolean (alias for `[sidebar] show`) or a `[sidebar]` table. |
+| `sidebar.show` | `true` | Table form of `sidebar`. |
+| `sidebar.width` | `24` | Sidebar width in columns, clamped to 16–40. |
+| `sidebar.collapsed` | `"compact"` | What `prefix b` and auto-hide collapse to: `"compact"` (a 3-column rail of workspace dots) or `"hidden"` (a 1-column gutter). |
+| `sidebar.auto_hide_below` | `100` | Collapse the sidebar when the terminal is narrower than this many columns; restore it when widened. |
+| `sidebar.agents_panel` | `true` | Show the agents panel below the workspaces list. |
 | `notify` | `true` | Agent-state notifications. Accepts a boolean or a `[notify]` table. |
 | `notify.enabled` | `true` | Master switch for notifications (table form of `notify`). |
 | `notify.on` | `["blocked", "done"]` | Which agent states raise a notification. |
@@ -84,6 +89,30 @@ borders, and ctrl/cmd-clicks always stay with Ködade CLI.
 hands the mouse back to the host terminal for its own selection and
 right-click menu. The status bar confirms with
 `mouse capture off · prefix m to re-enable`.
+
+## Sidebar
+
+The sidebar follows the same alias rule: a bare `sidebar = true` still works, or
+use the `[sidebar]` table for the 0.2 options.
+
+```toml
+sidebar = true          # still supported (alias for [sidebar] show)
+
+[sidebar]               # equivalent, plus the new keys
+show = true
+width = 24              # columns, clamped 16–40
+collapsed = "compact"   # "compact" rail or "hidden" gutter
+auto_hide_below = 100   # collapse under this terminal width
+agents_panel = true
+```
+
+`prefix b` cycles the sidebar full → compact → hidden → full. Compact is a
+3-column rail of one state dot per workspace; clicking a dot selects it. In the
+full sidebar, `prefix n` (navigate) moves with `j`/`k`, `enter` folds/unfolds a
+workspace (and selects it), `*` expands all, and the agents panel below the
+workspaces lists every agent pane by urgency. Right-click a workspace for a
+`Color…` menu that cycles its swatch through 8 presets; collapsed workspaces are
+remembered per session in `~/.config/kodade-cli/state`.
 
 Key overrides live under `[keys]`. Setting an action replaces its default
 binding; the action's other default aliases are removed, and an empty array

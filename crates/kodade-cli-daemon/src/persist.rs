@@ -47,6 +47,9 @@ pub struct WorkspaceFile {
     pub name: String,
     #[serde(default)]
     pub root: Option<PathBuf>,
+    /// Sidebar swatch color as `#rrggbb`, if the user set one (#19).
+    #[serde(default)]
+    pub color: Option<String>,
     #[serde(default)]
     pub active_tab: u64,
     #[serde(default)]
@@ -279,6 +282,7 @@ mod tests {
                     id: 10,
                     name: "one".into(),
                     root: Some(PathBuf::from("/tmp")),
+                    color: Some("#e7a33b".into()),
                     active_tab: 20,
                     tabs: vec![
                         TabFile {
@@ -326,6 +330,7 @@ mod tests {
                     id: 11,
                     name: "two".into(),
                     root: None,
+                    color: None,
                     active_tab: 22,
                     tabs: vec![TabFile {
                         id: 22,

@@ -250,6 +250,7 @@ mod tests {
                 active: true,
                 state: AgentStateKind::Idle,
                 root: Some("/home/keith/repos/alpha-src".into()),
+                color: None,
                 tabs: vec![SidebarTabInfo {
                     id: TabId(1),
                     name: "edit".into(),
@@ -266,6 +267,7 @@ mod tests {
                 active: false,
                 state: AgentStateKind::Blocked,
                 root: None,
+                color: None,
                 tabs: vec![
                     SidebarTabInfo {
                         id: TabId(2),

@@ -67,6 +67,8 @@ struct Workspace {
     active_tab: TabId,
     /// Directory new panes in this workspace fall back to (PRD §5.1).
     root: Option<PathBuf>,
+    /// Sidebar swatch color as `#rrggbb`, when the user set one (#19).
+    color: Option<String>,
 }
 struct Tab {
     id: TabId,
@@ -298,6 +300,7 @@ impl Session {
                 active_tab: tab.id,
                 tabs: vec![tab],
                 root: None,
+                color: None,
             });
         Ok(session)
     }
@@ -370,6 +373,7 @@ impl Session {
                 tabs,
                 active_tab,
                 root: saved.root.clone(),
+                color: saved.color.clone(),
             });
         }
         let active_workspace = workspace_ids
@@ -396,6 +400,7 @@ impl Session {
                 id: workspace.id.0,
                 name: workspace.name.clone(),
                 root: workspace.root.clone(),
+                color: workspace.color.clone(),
                 active_tab: workspace.active_tab.0,
                 tabs: workspace
                     .tabs
@@ -716,6 +721,7 @@ impl Session {
                         active: item.id == workspace.id,
                         state: agent::rollup(tabs.iter().map(|tab| tab.state)),
                         root: item.root.clone(),
+                        color: item.color.clone(),
                         tabs,
                     }
                 })
@@ -1143,6 +1149,23 @@ impl Session {
                 drop(state);
                 self.notify();
             }
+            ClientMessage::SetWorkspaceColor { id, color } => {
+                // Reject anything that is not `#` + 6 hex digits; `None` clears it.
+                if let Some(hex) = &color {
+                    if !is_hex_color(hex) {
+                        bail!("workspace color must be #rrggbb, got {hex:?}");
+                    }
+                }
+                let mut state = self
+                    .state
+                    .lock()
+                    .map_err(|_| anyhow!("state lock poisoned"))?;
+                if let Some(workspace) = state.workspaces.iter_mut().find(|item| item.id == id) {
+                    workspace.color = color;
+                }
+                drop(state);
+                self.notify();
+            }
             ClientMessage::NewWorkspace { name, root } => {
                 // A workspace root seeds its first pane's cwd; later panes inherit.
                 let pane = self.new_pane("shell", root.clone(), None)?;
@@ -1164,6 +1187,7 @@ impl Session {
                         zoomed: false,
                     }],
                     root,
+                    color: None,
                 });
                 state.active_workspace = id;
                 drop(state);
@@ -2017,6 +2041,13 @@ fn scroll_offset_after_delta(offset: usize, delta: i16, available: usize) -> usi
     next.min(available)
 }
 
+/// A `#rrggbb` color literal: a leading `#` and exactly six hex digits (#19).
+fn is_hex_color(value: &str) -> bool {
+    value
+        .strip_prefix('#')
+        .is_some_and(|rest| rest.len() == 6 && rest.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
 /// PTY reading blocks, so parser ownership stays in Tokio's blocking pool.
 fn read_pty(
     mut reader: Box<dyn Read + Send>,
@@ -2520,6 +2551,7 @@ mod tests {
                     name: "one".into(),
                     active_tab: TabId(2),
                     root: None,
+                    color: None,
                     tabs: vec![Tab {
                         id: TabId(2),
                         name: "shell".into(),
@@ -2533,6 +2565,7 @@ mod tests {
                     name: "two".into(),
                     active_tab: TabId(5),
                     root: None,
+                    color: None,
                     tabs: vec![Tab {
                         id: TabId(5),
                         name: "agents".into(),
@@ -2559,6 +2592,7 @@ mod tests {
                 name: "one".into(),
                 active_tab: TabId(2),
                 root: None,
+                color: None,
                 tabs: vec![Tab {
                     id: TabId(2),
                     name: "agents".into(),
@@ -2621,6 +2655,7 @@ mod tests {
                     id: 10,
                     name: "one".into(),
                     root: Some(PathBuf::from("/tmp")),
+                    color: Some("#e7a33b".into()),
                     active_tab: 20,
                     tabs: vec![
                         persist::TabFile {
@@ -2668,6 +2703,7 @@ mod tests {
                     id: 11,
                     name: "two".into(),
                     root: None,
+                    color: None,
                     active_tab: 22,
                     tabs: vec![persist::TabFile {
                         id: 22,
@@ -2827,6 +2863,51 @@ mod tests {
             .expect("read line")
             .expect("stream open");
         decode::<ServerMessage>(line.as_bytes()).expect("decode server message")
+    }
+
+    #[test]
+    fn is_hex_color_requires_hash_and_six_hex_digits() {
+        assert!(is_hex_color("#001122"));
+        assert!(is_hex_color("#AbCdEf"));
+        assert!(!is_hex_color("#0011"));
+        assert!(!is_hex_color("#00112g"));
+        assert!(!is_hex_color("001122"));
+        assert!(!is_hex_color("red"));
+    }
+
+    #[tokio::test]
+    async fn set_workspace_color_validates_and_clears() {
+        let session = Session::spawn(80, 24, "color".into()).expect("spawn session");
+        let id = session.snapshot().expect("snapshot").workspaces[0].id;
+        // Bad values are rejected without mutating the workspace.
+        assert!(session
+            .handle(ClientMessage::SetWorkspaceColor {
+                id,
+                color: Some("red".into()),
+            })
+            .is_err());
+        assert!(session
+            .handle(ClientMessage::SetWorkspaceColor {
+                id,
+                color: Some("#12345".into()),
+            })
+            .is_err());
+        assert_eq!(session.snapshot().unwrap().workspaces[0].color, None);
+        // A valid `#rrggbb` sticks and `None` clears it again.
+        session
+            .handle(ClientMessage::SetWorkspaceColor {
+                id,
+                color: Some("#AbCdEf".into()),
+            })
+            .expect("valid color accepted");
+        assert_eq!(
+            session.snapshot().unwrap().workspaces[0].color.as_deref(),
+            Some("#AbCdEf")
+        );
+        session
+            .handle(ClientMessage::SetWorkspaceColor { id, color: None })
+            .expect("clear accepted");
+        assert_eq!(session.snapshot().unwrap().workspaces[0].color, None);
     }
 
     #[tokio::test]

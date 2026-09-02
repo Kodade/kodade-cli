@@ -451,6 +451,7 @@ mod tests {
                 active: true,
                 state: AgentStateKind::Blocked,
                 root: None,
+                color: None,
                 tabs: vec![SidebarTabInfo {
                     id: TabId(2),
                     name: "agents".into(),

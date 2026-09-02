@@ -13,10 +13,11 @@ use crossterm::{
 };
 use kodade_cli_proto::{
     AgentStateKind, ClientMessage, Direction, LayoutSnapshot, Notification, PaneId, Screen,
-    ServerMessage, SidebarTabInfo, SplitAxis, WorkspaceInfo,
+    ServerMessage, SidebarTabInfo, SplitAxis, WorkspaceId, WorkspaceInfo,
 };
 use ratatui::{backend::CrosstermBackend, layout::Rect, style::Color, Frame, Terminal};
 use std::{
+    collections::HashSet,
     io::Write,
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -30,12 +31,19 @@ use crate::{
     paste,
     picker::{self, PickTarget},
     render,
+    render::SidebarMode,
     selection::{self, Selection, SelectionMode},
-    settings,
+    settings, state,
 };
 
 /// Two left clicks on the same cell inside this window are a double click (#12).
 const MULTI_CLICK: Duration = Duration::from_millis(400);
+
+/// The 8 preset swatch colors the right-click `Color…` menu cycles through (#19).
+const WORKSPACE_COLORS: [&str; 8] = [
+    "#e7a33b", "#d95b5b", "#a8c87f", "#7aa2f7", "#bb9af7", "#7dcfff", "#e0af68", "#9ece6a",
+];
+
 /// How long a status-bar note stays up.
 const NOTE_TTL: Duration = Duration::from_secs(5);
 /// Pace a multi-chunk paste so the socket writer does not flood the daemon.
@@ -88,7 +96,17 @@ pub struct App {
     name: String,
     rename_target: Option<mode::MenuTarget>,
     drag: Option<DragState>,
-    sidebar: bool,
+    /// Full / compact rail / hidden gutter (#19).
+    sidebar_mode: SidebarMode,
+    /// Workspaces the user collapsed in the sidebar list (#19).
+    collapsed: HashSet<WorkspaceId>,
+    /// Persisted UI state (collapsed workspaces, help_seen); loaded once (#19).
+    ui_state: state::State,
+    /// Workspace ids already reconciled against the persisted collapse set, so a
+    /// newly appearing workspace is seeded but existing ones are left alone (#19).
+    seeded_ids: HashSet<WorkspaceId>,
+    /// True when auto-hide collapsed the sidebar, so widening restores it (#19).
+    auto_hidden: bool,
     navigate: Option<usize>,
     copy: Option<mode::CopyMode>,
     menu: Option<mode::Menu>,
@@ -161,7 +179,15 @@ impl App {
             name: String::new(),
             rename_target: None,
             drag: None,
-            sidebar: config.sidebar,
+            sidebar_mode: if config.sidebar {
+                SidebarMode::Full
+            } else {
+                config_collapsed_mode(config)
+            },
+            collapsed: HashSet::new(),
+            ui_state: state::State::load(),
+            seeded_ids: HashSet::new(),
+            auto_hidden: false,
             navigate: None,
             copy: None,
             menu: None,
@@ -213,9 +239,30 @@ impl App {
             .map(|note| (note.text.as_str(), note.color))
     }
 
+    /// Effective sidebar width for the current mode and config.
+    fn sidebar_width(&self) -> u16 {
+        render::sidebar_width(self.sidebar_mode, &self.config)
+    }
+
+    /// Collapse a full sidebar under the auto-hide column threshold, and restore
+    /// it once the terminal is wide enough again (#19).
+    pub fn apply_auto_hide(&mut self, cols: u16) {
+        let below = cols < self.config.sidebar_auto_hide_below;
+        if below && self.sidebar_mode == SidebarMode::Full {
+            self.sidebar_mode = config_collapsed_mode(&self.config);
+            self.auto_hidden = true;
+            if self.sidebar_mode == SidebarMode::Hidden {
+                self.sidebar_hidden_at = Some(Instant::now());
+            }
+        } else if !below && self.auto_hidden {
+            self.sidebar_mode = SidebarMode::Full;
+            self.auto_hidden = false;
+        }
+    }
+
     /// Pane width for the current sidebar state, used by `Hello` and `Resize`.
     pub fn pane_cols(&self, cols: u16) -> u16 {
-        pane_cols(cols, self.sidebar)
+        pane_cols(cols, self.sidebar_width())
     }
 
     /// Stores a new snapshot. Copy mode refreshes its full-history buffer
@@ -243,6 +290,39 @@ impl App {
             self.clear_selection();
         }
         self.layout = Some(layout);
+        self.seed_collapsed();
+    }
+
+    /// Map persisted collapsed workspace names to ids so the sidebar reopens
+    /// with the same workspaces folded. Runs every snapshot but only seeds ids
+    /// it has not seen yet, so a workspace that first appears later is still
+    /// reconciled while ones the user has since toggled are left alone (#19).
+    fn seed_collapsed(&mut self) {
+        let Some(layout) = &self.layout else { return };
+        let ids: HashSet<WorkspaceId> = layout.workspaces.iter().map(|w| w.id).collect();
+        let names = self.ui_state.collapsed_for(&self.session_name);
+        for workspace in &layout.workspaces {
+            if self.seeded_ids.insert(workspace.id) && names.contains(&workspace.name) {
+                self.collapsed.insert(workspace.id);
+            }
+        }
+        // Drop bookkeeping for workspaces that have gone away.
+        self.seeded_ids.retain(|id| ids.contains(id));
+        self.collapsed.retain(|id| ids.contains(id));
+    }
+
+    /// Persist the current collapsed set as workspace names for this session.
+    fn persist_collapsed(&mut self) {
+        let Some(layout) = &self.layout else { return };
+        let names = layout
+            .workspaces
+            .iter()
+            .filter(|workspace| self.collapsed.contains(&workspace.id))
+            .map(|workspace| workspace.name.clone())
+            .collect();
+        // Reload first so a concurrently written `help_seen` (#6) is preserved.
+        self.ui_state = state::State::load();
+        self.ui_state.set_collapsed(&self.session_name, names);
     }
 
     pub fn handle_session(&mut self, session: String) {
@@ -343,7 +423,10 @@ impl App {
             frame,
             layout,
             &render::Ui {
-                sidebar: self.sidebar,
+                sidebar_mode: self.sidebar_mode,
+                sidebar_width: self.sidebar_width(),
+                collapsed: &self.collapsed,
+                agents_panel: self.config.sidebar_agents_panel,
                 prefix: self.prefix,
                 rename: self.rename,
                 new_workspace: self.new_workspace,
@@ -385,7 +468,7 @@ impl App {
 
     /// Whether the timed `prefix b · sidebar` hint should show (sidebar hidden).
     fn sidebar_hint_active(&self) -> bool {
-        !self.sidebar
+        self.sidebar_mode == SidebarMode::Hidden
             && self
                 .sidebar_hidden_at
                 .is_some_and(|at| at.elapsed() < SIDEBAR_HINT)
@@ -456,6 +539,7 @@ impl App {
             }
             match event::read()? {
                 Event::Resize(cols, rows) => {
+                    self.apply_auto_hide(cols);
                     let cols = self.pane_cols(cols);
                     write(writer, &ClientMessage::Resize { cols, rows }).await?
                 }
@@ -499,7 +583,7 @@ impl App {
         } else if self.picker.is_some() {
             self.handle_picker_key(key, writer).await?;
         } else if let Some(current) = self.navigate {
-            self.handle_navigate_key(key, current, writer).await?;
+            self.handle_navigate_key(key, current, writer, term).await?;
         } else if self.resize {
             self.handle_resize_key(key, writer).await?;
         } else if self.prefix {
@@ -832,35 +916,53 @@ impl App {
         Ok(())
     }
 
-    // Navigate mode: move through sidebar rows and activate one.
+    // Navigate mode: move through selectable sidebar rows (headings skipped),
+    // toggle a workspace's collapse on enter, or activate a tab/pane.
     async fn handle_navigate_key(
         &mut self,
         key: KeyEvent,
         current: usize,
         writer: &mut OwnedWriteHalf,
+        term: &mut Term,
     ) -> Result<()> {
-        let rows = render::sidebar_rows(self.layout.as_ref().expect("navigate has layout"));
-        let targets = rows
-            .iter()
-            .map(|row| row.target.clone())
-            .collect::<Vec<_>>();
+        let rows = self.sidebar_flat();
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => {
                 self.navigate = None;
                 if !self.config.sidebar {
-                    self.sidebar = false;
+                    // Restoring the collapsed shape shrinks the sidebar, so tell
+                    // the daemon the new pane width.
+                    self.sidebar_mode = config_collapsed_mode(&self.config);
+                    self.send_resize(writer, term).await?;
                 }
             }
             KeyCode::Up | KeyCode::Char('k') => {
-                self.navigate = mode::navigate(&targets, Some(current), -1)
+                self.navigate = self.move_selectable(&rows, current, true);
             }
             KeyCode::Down | KeyCode::Char('j') => {
-                self.navigate = mode::navigate(&targets, Some(current), 1)
+                self.navigate = self.move_selectable(&rows, current, false);
+            }
+            // `*` expands every workspace.
+            KeyCode::Char('*') => {
+                self.collapsed.clear();
+                self.persist_collapsed();
             }
             KeyCode::Enter => {
-                self.activate_sidebar(writer, rows[current].target.clone())
-                    .await?;
-                self.navigate = None;
+                let Some(target) = rows.get(current).and_then(|row| row.target.clone()) else {
+                    return Ok(());
+                };
+                match target {
+                    // Enter on a workspace folds/unfolds it and selects it,
+                    // staying in navigate so the user can keep moving.
+                    render::SidebarTarget::Workspace(id) => {
+                        self.toggle_collapsed(id);
+                        write(writer, &ClientMessage::SelectWorkspace { id }).await?;
+                    }
+                    other => {
+                        self.activate_sidebar(writer, other).await?;
+                        self.navigate = None;
+                    }
+                }
             }
             // `?` opens the help overlay from navigate mode (#6).
             KeyCode::Char('?') => {
@@ -870,6 +972,60 @@ impl App {
             _ => {}
         }
         Ok(())
+    }
+
+    /// Flat sidebar rows (workspaces then agents) for the current layout.
+    fn sidebar_flat(&self) -> Vec<render::SidebarRow> {
+        match &self.layout {
+            Some(layout) => {
+                render::sidebar_rows(layout, &self.collapsed, self.config.sidebar_agents_panel)
+                    .into_flat()
+            }
+            None => Vec::new(),
+        }
+    }
+
+    /// First selectable (non-heading) row index, if any.
+    fn first_selectable_row(&self) -> Option<usize> {
+        self.sidebar_flat()
+            .iter()
+            .position(|row| row.target.is_some())
+    }
+
+    /// Next selectable row from `current` in the given direction, skipping
+    /// headings and clamping at the ends.
+    fn move_selectable(
+        &self,
+        rows: &[render::SidebarRow],
+        current: usize,
+        up: bool,
+    ) -> Option<usize> {
+        let mut index = current;
+        loop {
+            index = if up {
+                match index.checked_sub(1) {
+                    Some(i) => i,
+                    None => return Some(current),
+                }
+            } else {
+                let next = index + 1;
+                if next >= rows.len() {
+                    return Some(current);
+                }
+                next
+            };
+            if rows.get(index).is_some_and(|row| row.target.is_some()) {
+                return Some(index);
+            }
+        }
+    }
+
+    /// Fold or unfold a workspace in the sidebar and persist the change.
+    fn toggle_collapsed(&mut self, id: WorkspaceId) {
+        if !self.collapsed.insert(id) {
+            self.collapsed.remove(&id);
+        }
+        self.persist_collapsed();
     }
 
     // Prefix mode: the key after the prefix selects a bound action.
@@ -920,9 +1076,12 @@ impl App {
                 });
             }
             config::Action::SidebarToggle => {
-                self.sidebar = !self.sidebar;
-                // Start the timed gutter hint when the sidebar just went away.
-                if !self.sidebar {
+                // Cycle full → compact → hidden → full (#19). A deliberate choice
+                // clears the auto-hide flag so a later widening resize does not
+                // override it.
+                self.sidebar_mode = self.sidebar_mode.next();
+                self.auto_hidden = false;
+                if self.sidebar_mode == SidebarMode::Hidden {
                     self.sidebar_hidden_at = Some(Instant::now());
                 }
                 self.send_resize(writer, term).await?;
@@ -949,8 +1108,15 @@ impl App {
                 }
             }
             config::Action::Navigate => {
-                self.sidebar = true;
-                self.navigate = Some(0);
+                // Opening navigate forces the full sidebar; tell the daemon the
+                // new pane width when that actually widened the sidebar.
+                let widened = self.sidebar_mode != SidebarMode::Full;
+                self.sidebar_mode = SidebarMode::Full;
+                self.auto_hidden = false;
+                self.navigate = self.first_selectable_row();
+                if widened {
+                    self.send_resize(writer, term).await?;
+                }
             }
             config::Action::CopyMode => {
                 // Freeze the focused pane's full history; viewport height comes
@@ -1194,7 +1360,13 @@ impl App {
                 set_mouse_capture(term, self.mouse_capture)?;
             }
             settings::Setting::Sidebar => {
-                self.sidebar = self.config.sidebar;
+                // A deliberate toggle clears auto-hide so a later resize keeps it.
+                self.sidebar_mode = if self.config.sidebar {
+                    SidebarMode::Full
+                } else {
+                    config_collapsed_mode(&self.config)
+                };
+                self.auto_hidden = false;
                 self.send_resize(writer, term).await?;
             }
             settings::Setting::CopyOnSelect | settings::Setting::Notify => {}
@@ -1379,29 +1551,39 @@ impl App {
         }
         let size = term.size()?;
         let frame_area = Rect::new(0, 0, size.width, size.height);
-        let content_area = render::content_area(frame_area, self.sidebar);
-        let current = self.layout.as_ref().expect("layout present");
+        let content_area = render::content_area(frame_area, self.sidebar_mode, &self.config);
+        // A click inside the sidebar column stays local to the sidebar (#19).
         if mouse.column < content_area.x {
-            if self.sidebar {
-                if let Some(row) = render::sidebar_row_at(&render::sidebar_rows(current), mouse.row)
-                {
-                    let message = sidebar_message(row.target.clone());
-                    write(writer, &message).await?;
+            match self.sidebar_mode {
+                SidebarMode::Full => {
+                    let layout = self.layout.as_ref().expect("layout present");
+                    let model = render::sidebar_rows(
+                        layout,
+                        &self.collapsed,
+                        self.config.sidebar_agents_panel,
+                    );
+                    let place = render::sidebar_layout(size.height, &model, self.navigate);
+                    if let Some((_, row)) = render::sidebar_row_at(&model, &place, mouse.row) {
+                        if let Some(target) = row.target.clone() {
+                            write(writer, &sidebar_message(target)).await?;
+                        }
+                    }
                 }
-            } else {
-                self.sidebar = true;
-                let cols = self.pane_cols(size.width);
-                write(
-                    writer,
-                    &ClientMessage::Resize {
-                        cols,
-                        rows: size.height,
-                    },
-                )
-                .await?;
+                SidebarMode::Compact => {
+                    // A click on a rail dot selects that workspace.
+                    let layout = self.layout.as_ref().expect("layout present");
+                    if let Some(id) = render::rail_workspace_at(layout, mouse.row) {
+                        write(writer, &ClientMessage::SelectWorkspace { id }).await?;
+                    }
+                }
+                SidebarMode::Hidden => {
+                    self.sidebar_mode = SidebarMode::Full;
+                    self.send_resize(writer, term).await?;
+                }
             }
             return Ok(());
         }
+        let current = self.layout.as_ref().expect("layout present");
         let rects = render::pane_rects_for(current, content_area);
         if let Some(border) = input::border_at(&rects, mouse.column, mouse.row) {
             write(writer, &ClientMessage::FocusPaneId { id: border.pane }).await?;
@@ -1667,17 +1849,30 @@ impl App {
 
     // Right click: open the context menu for the pane or sidebar row under it.
     fn mouse_right_down(&mut self, mouse: MouseEvent, term: &mut Term) -> Result<()> {
-        let content = self.content_area(term)?;
-        let current = self.layout.as_ref().expect("layout present");
-        let target = if self.sidebar && mouse.column < content.x {
-            render::sidebar_row_at(&render::sidebar_rows(current), mouse.row).map(|row| {
-                match row.target {
+        let size = term.size()?;
+        let content = render::content_area(
+            Rect::new(0, 0, size.width, size.height),
+            self.sidebar_mode,
+            &self.config,
+        );
+        let in_sidebar = mouse.column < content.x;
+        let target = if in_sidebar && self.sidebar_mode == SidebarMode::Full {
+            let layout = self.layout.as_ref().expect("layout present");
+            let model =
+                render::sidebar_rows(layout, &self.collapsed, self.config.sidebar_agents_panel);
+            let place = render::sidebar_layout(size.height, &model, self.navigate);
+            render::sidebar_row_at(&model, &place, mouse.row)
+                .and_then(|(_, row)| row.target.clone())
+                .map(|target| match target {
                     render::SidebarTarget::Workspace(id) => mode::MenuTarget::Workspace(id),
                     render::SidebarTarget::Tab(id) => mode::MenuTarget::Tab(id),
                     render::SidebarTarget::Pane(id) => mode::MenuTarget::Pane(id),
-                }
-            })
+                })
+        } else if in_sidebar && self.sidebar_mode == SidebarMode::Compact {
+            let layout = self.layout.as_ref().expect("layout present");
+            render::rail_workspace_at(layout, mouse.row).map(mode::MenuTarget::Workspace)
         } else {
+            let current = self.layout.as_ref().expect("layout present");
             input::pane_at(
                 &render::pane_rects_for(current, content),
                 mouse.column,
@@ -1731,6 +1926,13 @@ impl App {
                     write(writer, &ClientMessage::MoveTab { delta }).await?;
                 }
             }
+            mode::MenuAction::Color => {
+                // Cycle the workspace swatch through the 8 presets.
+                if let mode::MenuTarget::Workspace(id) = menu.target {
+                    let color = self.next_workspace_color(id);
+                    write(writer, &ClientMessage::SetWorkspaceColor { id, color }).await?;
+                }
+            }
             mode::MenuAction::Close => {
                 let message = match menu.target {
                     mode::MenuTarget::Pane(_) => ClientMessage::ClosePane,
@@ -1742,6 +1944,23 @@ impl App {
             mode::MenuAction::Help => self.open_help(),
         }
         Ok(())
+    }
+
+    /// The next preset swatch color for a workspace, cycling from its current
+    /// one (or the first preset when it has none / an off-list color).
+    fn next_workspace_color(&self, id: WorkspaceId) -> Option<String> {
+        let current = self
+            .layout
+            .as_ref()?
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.id == id)
+            .and_then(|workspace| workspace.color.as_deref());
+        let index = current
+            .and_then(|hex| WORKSPACE_COLORS.iter().position(|preset| *preset == hex))
+            .map(|position| (position + 1) % WORKSPACE_COLORS.len())
+            .unwrap_or(0);
+        Some(WORKSPACE_COLORS[index].to_string())
     }
 
     // Active workspace in the newest snapshot, if any.
@@ -1767,7 +1986,8 @@ impl App {
         let size = term.size()?;
         Ok(render::content_area(
             Rect::new(0, 0, size.width, size.height),
-            self.sidebar,
+            self.sidebar_mode,
+            &self.config,
         ))
     }
 }
@@ -1815,9 +2035,18 @@ fn set_mouse_capture(term: &mut Term, enabled: bool) -> Result<()> {
     Ok(())
 }
 
-/// Pane width for a terminal width and sidebar state.
-pub fn pane_cols(cols: u16, sidebar: bool) -> u16 {
-    cols.saturating_sub(render::sidebar_width(sidebar)).max(1)
+/// Pane width for a terminal width and effective sidebar width.
+pub fn pane_cols(cols: u16, sidebar_width: u16) -> u16 {
+    cols.saturating_sub(sidebar_width).max(1)
+}
+
+/// The sidebar mode a collapsed/hidden config maps to when the sidebar is not
+/// shown at startup (or after auto-hide).
+fn config_collapsed_mode(config: &config::Config) -> SidebarMode {
+    match config.sidebar_collapsed {
+        config::CollapsedMode::Compact => SidebarMode::Compact,
+        config::CollapsedMode::Hidden => SidebarMode::Hidden,
+    }
 }
 
 /// Prompt text for closing a tab, or `None` when no pane in it is working.
@@ -1991,12 +2220,93 @@ mod tests {
     use super::*;
 
     #[test]
-    fn pane_cols_reserve_the_sidebar() {
-        assert_eq!(
-            pane_cols(100, true),
-            100 - render::sidebar_width(true).min(100)
+    fn auto_hide_collapses_at_80_columns_and_restores_when_widened() {
+        let config = config::Config::default();
+        let mut app = App::new(&config, "work", PathBuf::from("/tmp/kodade-test.sock"));
+        // Default auto_hide_below is 100 columns; 80 is under it.
+        app.apply_auto_hide(80);
+        assert_eq!(app.sidebar_mode, SidebarMode::Compact);
+        assert!(app.auto_hidden);
+        // Widening back over the threshold restores the full sidebar.
+        app.apply_auto_hide(120);
+        assert_eq!(app.sidebar_mode, SidebarMode::Full);
+        assert!(!app.auto_hidden);
+    }
+
+    #[test]
+    fn sidebar_toggle_cycles_full_compact_hidden() {
+        let config = config::Config::default();
+        let mut app = App::new(&config, "work", PathBuf::from("/tmp/kodade-test.sock"));
+        assert_eq!(app.sidebar_mode, SidebarMode::Full);
+        app.sidebar_mode = app.sidebar_mode.next();
+        assert_eq!(app.sidebar_mode, SidebarMode::Compact);
+        app.sidebar_mode = app.sidebar_mode.next();
+        assert_eq!(app.sidebar_mode, SidebarMode::Hidden);
+        app.sidebar_mode = app.sidebar_mode.next();
+        assert_eq!(app.sidebar_mode, SidebarMode::Full);
+    }
+
+    // A layout with the named workspaces; workspace i gets `WorkspaceId(i+1)`.
+    fn layout_named(names: &[&str]) -> LayoutSnapshot {
+        let workspaces = names
+            .iter()
+            .enumerate()
+            .map(|(i, name)| WorkspaceInfo {
+                id: kodade_cli_proto::WorkspaceId(i as u64 + 1),
+                name: (*name).into(),
+                active: i == 0,
+                state: AgentStateKind::Idle,
+                root: None,
+                color: None,
+                tabs: Vec::new(),
+            })
+            .collect();
+        LayoutSnapshot {
+            active_workspace: kodade_cli_proto::WorkspaceId(1),
+            active_tab: kodade_cli_proto::TabId(1),
+            workspaces,
+            tabs: Vec::new(),
+            tree: kodade_cli_proto::LayoutTree::Leaf { pane: PaneId(1) },
+            panes: Vec::new(),
+            zoomed: false,
+            restored: false,
+        }
+    }
+
+    #[test]
+    fn seed_collapsed_reconciles_newly_appearing_workspaces() {
+        use kodade_cli_proto::WorkspaceId;
+        let config = config::Config::default();
+        let mut app = App::new(
+            &config,
+            "seed-test-session",
+            PathBuf::from("/tmp/kodade-test.sock"),
         );
-        assert_eq!(pane_cols(1, true), 1);
+        // Persisted collapse names a workspace that has not appeared yet.
+        app.ui_state
+            .collapsed
+            .insert("seed-test-session".into(), vec!["beta".into()]);
+        // First snapshot has only alpha; beta absent, so nothing collapses.
+        app.handle_layout(layout_named(&["alpha"]));
+        assert!(app.collapsed.is_empty());
+        // beta appears in a later snapshot and is seeded from the persisted set.
+        app.handle_layout(layout_named(&["alpha", "beta"]));
+        assert!(app.collapsed.contains(&WorkspaceId(2)));
+        // A workspace the user expands stays expanded across later snapshots.
+        app.collapsed.remove(&WorkspaceId(2));
+        app.handle_layout(layout_named(&["alpha", "beta"]));
+        assert!(!app.collapsed.contains(&WorkspaceId(2)));
+        // A workspace that goes away is dropped from the collapsed set.
+        app.collapsed.insert(WorkspaceId(2));
+        app.handle_layout(layout_named(&["alpha"]));
+        assert!(!app.collapsed.contains(&WorkspaceId(2)));
+    }
+
+    #[test]
+    fn pane_cols_reserve_the_sidebar() {
+        let width = render::sidebar_width(SidebarMode::Full, &config::Config::default());
+        assert_eq!(pane_cols(100, width), 100 - width.min(100));
+        assert_eq!(pane_cols(1, width), 1);
     }
 
     fn agent(state: AgentStateKind) -> kodade_cli_proto::AgentInfo {
@@ -2028,6 +2338,7 @@ mod tests {
             active: true,
             state: AgentStateKind::Blocked,
             root: None,
+            color: None,
             tabs: vec![tab(&[AgentStateKind::Blocked, AgentStateKind::Idle])],
         };
         assert_eq!(close_tab_prompt(&workspace.tabs[0]), None);
