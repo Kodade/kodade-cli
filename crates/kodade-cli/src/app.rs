@@ -240,7 +240,7 @@ impl App {
             self.handle_resize_key(key, writer).await?;
         } else if self.prefix {
             return self.handle_prefix_key(key, writer, term).await;
-        } else if key == self.config.prefix {
+        } else if config::normalize_key(key) == self.config.prefix {
             self.prefix = true;
         } else if let Some(action) = self.config.global_action(key) {
             // Global chords (ctrl/alt, no `prefix+`) fire before the pane sees the key.
@@ -486,7 +486,7 @@ impl App {
         term: &mut Term,
     ) -> Result<Flow> {
         self.prefix = false;
-        if key == self.config.prefix {
+        if config::normalize_key(key) == self.config.prefix {
             write(
                 writer,
                 &ClientMessage::Input {
@@ -642,6 +642,9 @@ impl App {
             settings::Setting::Theme => {
                 let config = self.config.clone();
                 self.apply_theme(&config);
+                if config.theme == config::ThemeChoice::Auto {
+                    self.set_note(" auto resolves on next start");
+                }
             }
             settings::Setting::Mouse => set_mouse_capture(term, self.config.mouse)?,
             settings::Setting::Sidebar => {
@@ -704,6 +707,10 @@ impl App {
     ) -> Result<()> {
         if !self.config.mouse || self.layout.is_none() {
             return Ok(());
+        }
+        // The settings overlay owns the mouse while it is up.
+        if self.settings.is_some() {
+            return self.settings_mouse(mouse, writer, term).await;
         }
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
@@ -806,6 +813,40 @@ impl App {
             }
         } else if let Some(id) = input::pane_at(&rects, mouse.column, mouse.row) {
             write(writer, &ClientMessage::FocusPaneId { id }).await?;
+        }
+        Ok(())
+    }
+
+    // Clicks while the settings overlay is open: a row activates, anything
+    // else closes it. Nothing falls through to panes, tabs, or the sidebar.
+    async fn settings_mouse(
+        &mut self,
+        mouse: MouseEvent,
+        writer: &mut OwnedWriteHalf,
+        term: &mut Term,
+    ) -> Result<()> {
+        if !matches!(
+            mouse.kind,
+            MouseEventKind::Down(MouseButton::Left) | MouseEventKind::Down(MouseButton::Right)
+        ) {
+            return Ok(());
+        }
+        let size = term.size()?;
+        let area = Rect::new(0, 0, size.width, size.height);
+        let menu = self.settings.as_ref().expect("settings overlay open");
+        let row = matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+            .then(|| overlay::row_at(area, menu, mouse.column, mouse.row))
+            .flatten();
+        match row {
+            Some(index) => {
+                if let Some(menu) = &mut self.settings {
+                    menu.selected = index;
+                }
+                // Reuse the enter path so a click and a keypress behave alike.
+                self.handle_settings_key(KeyEvent::from(KeyCode::Enter), writer, term)
+                    .await?;
+            }
+            None => self.settings = None,
         }
         Ok(())
     }

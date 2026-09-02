@@ -158,7 +158,8 @@ pub fn render(frame: &mut Frame, layout: &LayoutSnapshot, ui: &Ui, theme: &Theme
     } else if navigate.is_some() {
         " navigate · j/k move · enter activate · esc exit".into()
     } else if prefix {
-        " prefix: % \" b hjkl c n p s w W x z d r · 1-9 X T R D o O ; ! = alt+hjkl alt+r".into()
+        " prefix: % \" b hjkl c n p s w W x z d r · 1-9 X T R D o O ; ! = alt+hjkl alt+r ctrl+r"
+            .into()
     } else {
         format!(" session · {workspace}")
     };

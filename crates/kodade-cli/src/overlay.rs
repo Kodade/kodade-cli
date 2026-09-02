@@ -47,6 +47,9 @@ impl OverlayRow {
     }
 }
 
+/// The overlay carries no scroll state: the visible window is derived from
+/// `selected` at render time (`window_start`), so key handling stays pure and
+/// the selection is always on screen.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Overlay {
     pub title: String,
@@ -54,7 +57,6 @@ pub struct Overlay {
     pub filter: Option<String>,
     pub rows: Vec<OverlayRow>,
     pub selected: usize,
-    pub scroll: usize,
 }
 
 impl Overlay {
@@ -64,7 +66,6 @@ impl Overlay {
             filter: None,
             rows,
             selected: 0,
-            scroll: 0,
         }
     }
 
@@ -73,7 +74,7 @@ impl Overlay {
         self.rows.get(self.selected)
     }
 
-    // Moves the selection and keeps `scroll` following it.
+    // Moves the selection, clamped to the row list.
     fn move_by(&mut self, delta: isize) {
         if self.rows.is_empty() {
             return;
@@ -83,9 +84,6 @@ impl Overlay {
             d if d < 0 => self.selected.saturating_sub(d.unsigned_abs()),
             d => (self.selected + d as usize).min(last),
         };
-        if self.selected < self.scroll {
-            self.scroll = self.selected;
-        }
     }
 }
 
@@ -133,7 +131,9 @@ pub fn overlay_key(overlay: &mut Overlay, key: KeyEvent) -> OverlayEvent {
             overlay.move_by(1);
             OverlayEvent::Moved
         }
-        KeyCode::Char('q') if !filtering => OverlayEvent::Cancel,
+        KeyCode::Char('q') if !filtering && !ctrl && !key.modifiers.contains(KeyModifiers::ALT) => {
+            OverlayEvent::Cancel
+        }
         KeyCode::Backspace => match &mut overlay.filter {
             Some(filter) => {
                 filter.pop();
@@ -154,22 +154,67 @@ pub fn overlay_key(overlay: &mut Overlay, key: KeyEvent) -> OverlayEvent {
     }
 }
 
-/// Draws the overlay centered in `area`.
-pub fn render_overlay(frame: &mut Frame, area: Rect, overlay: &Overlay, theme: &Theme) {
+/// The centered box the overlay occupies inside `area`.
+pub fn overlay_rect(area: Rect, overlay: &Overlay) -> Rect {
     let rows = overlay.rows.len() as u16;
+    let chrome = if overlay.filter.is_some() { 4 } else { 3 };
     let width = area.width.saturating_sub(4).clamp(8, 72);
     let height = area
         .height
         .saturating_sub(2)
-        .min(rows.saturating_add(4))
+        .min(rows.saturating_add(chrome))
         .max(3);
-
-    let rect = Rect::new(
+    Rect::new(
         area.x + (area.width.saturating_sub(width)) / 2,
         area.y + (area.height.saturating_sub(height)) / 2,
         width,
         height,
-    );
+    )
+}
+
+// The row list inside the border, below the filter line when there is one.
+fn list_area(rect: Rect, overlay: &Overlay) -> Rect {
+    let filter = u16::from(overlay.filter.is_some());
+    Rect::new(
+        rect.x + 1,
+        rect.y + 1 + filter,
+        rect.width.saturating_sub(2),
+        rect.height.saturating_sub(2 + filter),
+    )
+}
+
+/// First visible row for a viewport `height`; keeps `selected` on screen.
+pub fn window_start(selected: usize, height: usize) -> usize {
+    if height == 0 || selected < height {
+        0
+    } else {
+        selected + 1 - height
+    }
+}
+
+/// Row index under a click, or `None` when the click misses the row list.
+pub fn row_at(area: Rect, overlay: &Overlay, column: u16, row: u16) -> Option<usize> {
+    if !contains(area, overlay, column, row) {
+        return None;
+    }
+    let list = list_area(overlay_rect(area, overlay), overlay);
+    if row < list.y || row >= list.y + list.height {
+        return None;
+    }
+    let offset = (row - list.y) as usize;
+    let index = window_start(overlay.selected, list.height as usize) + offset;
+    (index < overlay.rows.len()).then_some(index)
+}
+
+/// True when a click lands inside the overlay box (border included).
+pub fn contains(area: Rect, overlay: &Overlay, column: u16, row: u16) -> bool {
+    let rect = overlay_rect(area, overlay);
+    column >= rect.x && column < rect.x + rect.width && row >= rect.y && row < rect.y + rect.height
+}
+
+/// Draws the overlay centered in `area`.
+pub fn render_overlay(frame: &mut Frame, area: Rect, overlay: &Overlay, theme: &Theme) {
+    let rect = overlay_rect(area, overlay);
     frame.render_widget(Clear, rect);
     frame.render_widget(
         Block::default()
@@ -179,39 +224,23 @@ pub fn render_overlay(frame: &mut Frame, area: Rect, overlay: &Overlay, theme: &
             .style(Style::default().fg(theme.menu_fg).bg(theme.menu_bg)),
         rect,
     );
-    let inner = Rect::new(
-        rect.x + 1,
-        rect.y + 1,
-        rect.width.saturating_sub(2),
-        rect.height.saturating_sub(2),
-    );
-    if inner.width == 0 || inner.height == 0 {
+    let inner_width = rect.width.saturating_sub(2);
+    if inner_width == 0 || rect.height <= 2 {
         return;
     }
-    let mut y = inner.y;
     if let Some(filter) = &overlay.filter {
         frame.render_widget(
             Paragraph::new(format!("> {filter}")).style(Style::default().fg(theme.accent)),
-            Rect::new(inner.x, y, inner.width, 1),
+            Rect::new(rect.x + 1, rect.y + 1, inner_width, 1),
         );
-        y += 1;
     }
-    let list_height = inner.height.saturating_sub(y - inner.y) as usize;
-    if list_height == 0 {
+    let list = list_area(rect, overlay);
+    let height = list.height as usize;
+    if height == 0 {
         return;
     }
-    // `scroll` is a hint; the window always keeps the selection visible.
-    let mut start = overlay.scroll.min(overlay.selected);
-    if overlay.selected >= start + list_height {
-        start = overlay.selected + 1 - list_height;
-    }
-    for (offset, row) in overlay
-        .rows
-        .iter()
-        .skip(start)
-        .take(list_height)
-        .enumerate()
-    {
+    let start = window_start(overlay.selected, height);
+    for (offset, row) in overlay.rows.iter().skip(start).take(height).enumerate() {
         let index = start + offset;
         let style = if index == overlay.selected {
             // Selected row is inverted against the menu colors.
@@ -219,30 +248,35 @@ pub fn render_overlay(frame: &mut Frame, area: Rect, overlay: &Overlay, theme: &
         } else {
             Style::default().fg(theme.menu_fg).bg(theme.menu_bg)
         };
-        let hint_width = row.hint.chars().count().min(inner.width as usize);
-        let label_width = inner.width as usize - hint_width;
-        let label = clip(&row.label, label_width);
-        let pad = label_width - label.chars().count();
+        // Widths are display cells, so wide (CJK) labels cannot overflow the border.
+        let (hint, hint_width) = clip(&row.hint, list.width as usize);
+        let (label, label_width) = clip(&row.label, list.width as usize - hint_width);
+        let pad = list.width as usize - hint_width - label_width;
         frame.render_widget(
             Paragraph::new(Line::from(vec![
                 Span::raw(label),
                 Span::raw(" ".repeat(pad)),
-                Span::raw(clip(&row.hint, hint_width)),
+                Span::raw(hint),
             ]))
             .style(style),
-            Rect::new(
-                inner.x,
-                inner.y + (y - inner.y) + offset as u16,
-                inner.width,
-                1,
-            ),
+            Rect::new(list.x, list.y + offset as u16, list.width, 1),
         );
     }
 }
 
-// Truncates to a cell width without panicking on multi-byte characters.
-fn clip(text: &str, width: usize) -> String {
-    text.chars().take(width).collect()
+// Truncates to a display width, returning the text and the cells it uses.
+fn clip(text: &str, width: usize) -> (String, usize) {
+    let mut clipped = String::new();
+    let mut used = 0;
+    for character in text.chars() {
+        let cells = Span::raw(character.to_string()).width();
+        if used + cells > width {
+            break;
+        }
+        clipped.push(character);
+        used += cells;
+    }
+    (clipped, used)
 }
 
 #[cfg(test)]
@@ -317,6 +351,56 @@ mod tests {
             OverlayEvent::Moved
         );
         assert_eq!(overlay.selected, 2);
+    }
+
+    #[test]
+    fn window_follows_the_selection_and_clicks_hit_rows() {
+        let mut overlay = Overlay::new(
+            "long",
+            (0..20)
+                .map(|index| {
+                    OverlayRow::new(format!("row {index}"), "", OverlayTarget::Index(index))
+                })
+                .collect(),
+        );
+        assert_eq!(window_start(0, 5), 0);
+        assert_eq!(window_start(4, 5), 0);
+        assert_eq!(window_start(9, 5), 5);
+        // A click maps to the row drawn under it, scrolled window included.
+        let area = Rect::new(0, 0, 40, 12);
+        overlay.selected = 19;
+        let rect = overlay_rect(area, &overlay);
+        let list = list_area(rect, &overlay);
+        let first = row_at(area, &overlay, rect.x + 2, list.y).expect("row under the click");
+        assert_eq!(first, window_start(19, list.height as usize));
+        // Outside the box, and on the border, there is no row.
+        assert!(row_at(area, &overlay, 0, 0).is_none());
+        assert!(row_at(area, &overlay, rect.x, rect.y).is_none());
+        assert!(contains(area, &overlay, rect.x, rect.y));
+        assert!(!contains(area, &overlay, 0, 0));
+    }
+
+    #[test]
+    fn wide_characters_stay_inside_the_border() {
+        let theme = Theme::kodade_dark();
+        let overlay = Overlay::new(
+            "テーマ",
+            vec![OverlayRow::new(
+                " 日本語のとても長いラベルです日本語のとても長いラベルです",
+                "オン ",
+                OverlayTarget::Index(0),
+            )],
+        );
+        let mut terminal = Terminal::new(TestBackend::new(30, 8)).expect("test terminal");
+        terminal
+            .draw(|frame| render_overlay(frame, frame.area(), &overlay, &theme))
+            .expect("frame renders");
+        let buffer = terminal.backend().buffer();
+        let rect = overlay_rect(Rect::new(0, 0, 30, 8), &overlay);
+        // The right border survives: the label was clipped by display width.
+        let right = rect.x + rect.width - 1;
+        let list = list_area(rect, &overlay);
+        assert_eq!(buffer[(right, list.y)].symbol(), "│");
     }
 
     #[test]

@@ -214,6 +214,11 @@ fn config_command(command: cli::ConfigCommand) {
         },
         cli::ConfigCommand::Validate => {
             let path = config::config_path();
+            // No file at all is a normal state: the defaults apply.
+            if !path.exists() {
+                println!("{}: not found (defaults in use)", path.display());
+                return;
+            }
             match config::Config::load_checked() {
                 Ok(config) if config.warnings.is_empty() => println!("{}: ok", path.display()),
                 Ok(config) => {

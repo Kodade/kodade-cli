@@ -27,9 +27,11 @@ copy_on_select = false
 ```
 
 Key overrides live under `[keys]`. Setting an action replaces its default
-binding; the action's other default aliases are removed. Unknown action names
-and invalid chords are ignored with a warning (see
-[`config validate`](#config-subcommands)).
+binding; the action's other default aliases are removed, and an empty array
+(`zoom = []`) unbinds it. Unknown settings, unknown action names, invalid
+chords, and a chord that takes a key away from another action are all reported
+as warnings (see [`config validate`](#config-subcommands)); the rest of the
+file still loads.
 
 ## Remappable actions
 
@@ -142,6 +144,10 @@ Built-in defaults are always prefix-relative, including the ones printed as
 `alt+k` in the table above. To rebind one and keep it behind the prefix, write
 `prefix+alt+k`; writing `alt+k` makes it global.
 
+Global chords are inert while a mode or overlay is active — rename, copy mode,
+navigate, resize mode, a context menu, a confirmation, or the settings menu all
+see the key first.
+
 ## Live reload
 
 `prefix ctrl+r` (`reload_config`) re-reads `config.toml` and the theme file
@@ -168,7 +174,22 @@ not exist yet. `j`/`k`, arrows, or ctrl+n/ctrl+p move, `esc` or `q` closes.
 |---|---|
 | `kodade-cli config path` | Prints the config file path. |
 | `kodade-cli config show` | Prints the effective config (defaults merged) as TOML. |
-| `kodade-cli config validate` | Prints every warning and exits `1` when the file has problems, `0` when it is clean. |
+| `kodade-cli config validate` | Prints every warning and exits `1` when the file has problems, `0` when it is clean. A missing file prints `not found (defaults in use)` and exits `0`. |
+
+## Upgrading from 0.1
+
+The chord grammar changed, so three things behave differently:
+
+- **Bare modifier chords are now global.** `focus_left = "alt+h"` used to mean
+  `prefix alt+h`; it now fires without the prefix, and `prefix alt+h` falls
+  through to its default, `swap_left`. Write `focus_left = "prefix+alt+h"` to
+  keep the 0.1 behavior.
+- **`prefix = "ctrl+space"` now works.** Multi-character key names are
+  supported, so this no longer falls back to `ctrl+b`.
+- **`F0` is gone.** Function keys are `F1` through `F12`.
+
+Everything else is compatible: `mouse = true`, single-chord strings, and
+uppercase letters (`L`) all keep their meaning.
 
 ## Themes
 

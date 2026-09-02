@@ -6,7 +6,7 @@
 
 use std::{fs, path::Path};
 
-use toml_edit::{value, DocumentMut, Item, Table, TableLike};
+use toml_edit::{value, DocumentMut, Item, Table, TableLike, Value};
 
 use crate::{
     config::{theme_names, Config},
@@ -100,8 +100,9 @@ pub fn write(path: &Path, config: &Config) -> Result<(), String> {
     let mut doc = source
         .parse::<DocumentMut>()
         .map_err(|error| format!("{}: {error}", path.display()))?;
-    doc["theme"] = value(config.theme_name());
-    doc["sidebar"] = value(config.sidebar);
+    let root = doc.as_table_mut();
+    set(root, "theme", config.theme_name().into());
+    set(root, "sidebar", config.sidebar.into());
     // Keep whatever shape the file already uses: a bare `mouse = true` stays a
     // boolean unless copy_on_select needs the table form.
     let mouse_is_table = doc.get("mouse").is_some_and(Item::is_table_like);
@@ -110,21 +111,37 @@ pub fn write(path: &Path, config: &Config) -> Result<(), String> {
             doc.remove("mouse");
         }
         let mouse = table_mut(&mut doc, "mouse");
-        mouse.insert("enabled", value(config.mouse));
-        mouse.insert("copy_on_select", value(config.copy_on_select));
+        set(mouse, "enabled", config.mouse.into());
+        set(mouse, "copy_on_select", config.copy_on_select.into());
     } else {
-        doc["mouse"] = value(config.mouse);
+        set(doc.as_table_mut(), "mouse", config.mouse.into());
     }
-    // `notify = true` stays a boolean; anything else gets the `[notify]` table.
-    if doc.get("notify").is_some_and(Item::is_value) {
-        doc["notify"] = value(config.notify);
+    // Same rule for notify: a bare boolean unless the file already uses a table.
+    if doc.get("notify").is_some_and(Item::is_table_like) {
+        set(
+            table_mut(&mut doc, "notify"),
+            "enabled",
+            config.notify.into(),
+        );
     } else {
-        table_mut(&mut doc, "notify").insert("enabled", value(config.notify));
+        set(doc.as_table_mut(), "notify", config.notify.into());
     }
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|error| format!("{}: {error}", parent.display()))?;
     }
     fs::write(path, doc.to_string()).map_err(|error| format!("{}: {error}", path.display()))
+}
+
+// Sets `key`, reusing the existing value's decor so surrounding comments and
+// spacing survive; a missing key is appended.
+fn set(table: &mut dyn TableLike, key: &str, new: Value) {
+    if let Some(existing) = table.get_mut(key).and_then(Item::as_value_mut) {
+        let decor = existing.decor().clone();
+        *existing = new;
+        *existing.decor_mut() = decor;
+        return;
+    }
+    table.insert(key, value(new));
 }
 
 // Returns `key` as a table, creating a real `[key]` table when it is missing
@@ -189,9 +206,23 @@ mod tests {
         assert!(written.contains("future_key = 7"));
         assert!(written.contains("split_right = \"s\""));
         assert!(written.contains("mouse = false"));
-        assert!(written.contains("[notify]"));
+        assert!(written.contains("notify = true"));
         // Round-trips as valid TOML.
         written.parse::<DocumentMut>().expect("valid toml");
+    }
+
+    #[test]
+    fn write_keeps_an_existing_notify_table() {
+        let dir = temp_dir("notify-table");
+        let path = dir.join("config.toml");
+        fs::write(&path, "[notify]\n# keep me\nenabled = true\n").expect("seed config");
+        let mut config = Config::default();
+        config.notify = false;
+        write(&path, &config).expect("write succeeds");
+        let written = fs::read_to_string(&path).expect("read back");
+        assert!(written.contains("[notify]"));
+        assert!(written.contains("# keep me"));
+        assert!(written.contains("enabled = false"));
     }
 
     #[test]
@@ -205,5 +236,7 @@ mod tests {
         assert!(written.contains("[mouse]"));
         assert!(written.contains("copy_on_select = false"));
         assert!(written.contains("enabled = true"));
+        // notify has no extra keys, so it stays a plain boolean.
+        assert!(written.contains("notify = true"));
     }
 }

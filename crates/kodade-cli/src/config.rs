@@ -145,6 +145,15 @@ impl Action {
             .map(|(_, action)| *action)
     }
 
+    /// Config name for this action, used in warnings and `config show`.
+    pub fn name(self) -> &'static str {
+        ACTIONS
+            .iter()
+            .find(|(_, candidate)| *candidate == self)
+            .map(|(name, _)| *name)
+            .unwrap_or("unknown")
+    }
+
     pub fn message(self) -> Option<ClientMessage> {
         Some(match self {
             Self::SplitRight => ClientMessage::SplitRight,
@@ -232,6 +241,10 @@ struct FileConfig {
     sidebar: Option<bool>,
     notify: Option<Section<NotifyTable>>,
     keys: Option<HashMap<String, Chords>>,
+    /// Anything this version does not know: reported as a warning so typos
+    /// like `sidbar = true` do not silently do nothing.
+    #[serde(flatten)]
+    extra: HashMap<String, toml::Value>,
 }
 
 /// A setting that accepts either a bare `key = true` boolean (the pre-0.2
@@ -247,11 +260,15 @@ enum Section<T> {
 struct MouseTable {
     enabled: Option<bool>,
     copy_on_select: Option<bool>,
+    #[serde(flatten)]
+    extra: HashMap<String, toml::Value>,
 }
 
 #[derive(Debug, Deserialize, Default)]
 struct NotifyTable {
     enabled: Option<bool>,
+    #[serde(flatten)]
+    extra: HashMap<String, toml::Value>,
 }
 
 /// A binding value: one chord or a list of chords.
@@ -390,17 +407,22 @@ impl Config {
         if let Some(theme) = file.theme {
             config.set_theme(&theme);
         }
+        config.warn_unknown("", &file.extra);
         match file.mouse {
             Some(Section::Enabled(enabled)) => config.mouse = enabled,
             Some(Section::Table(table)) => {
                 config.mouse = table.enabled.unwrap_or(config.mouse);
                 config.copy_on_select = table.copy_on_select.unwrap_or(config.copy_on_select);
+                config.warn_unknown("mouse.", &table.extra);
             }
             None => {}
         }
         match file.notify {
             Some(Section::Enabled(enabled)) => config.notify = enabled,
-            Some(Section::Table(table)) => config.notify = table.enabled.unwrap_or(config.notify),
+            Some(Section::Table(table)) => {
+                config.notify = table.enabled.unwrap_or(config.notify);
+                config.warn_unknown("notify.", &table.extra);
+            }
             None => {}
         }
         config.sidebar = file.sidebar.unwrap_or(config.sidebar);
@@ -428,8 +450,14 @@ impl Config {
             self.warnings.push(format!("unknown key action {name}"));
             return;
         };
-        let parsed = chords
-            .list()
+        let listed = chords.list();
+        // An empty array unbinds the action.
+        if listed.is_empty() {
+            self.bindings.retain(|_, mapped| *mapped != action);
+            self.globals.retain(|_, mapped| *mapped != action);
+            return;
+        }
+        let parsed = listed
             .into_iter()
             .filter_map(|chord| match parse_binding(chord) {
                 Ok(binding) => Some(binding),
@@ -439,6 +467,7 @@ impl Config {
                 }
             })
             .collect::<Vec<_>>();
+        // Every chord was rejected: keep the defaults rather than unbind.
         if parsed.is_empty() {
             return;
         }
@@ -446,11 +475,31 @@ impl Config {
         self.bindings.retain(|_, mapped| *mapped != action);
         self.globals.retain(|_, mapped| *mapped != action);
         for binding in parsed {
-            if binding.global {
-                self.globals.insert(binding.key, action);
+            let map = if binding.global {
+                &mut self.globals
             } else {
-                self.bindings.insert(binding.key, action);
+                &mut self.bindings
+            };
+            // Taking a chord away from another action is easy to do by accident.
+            if let Some(displaced) = map.insert(binding.key, action) {
+                if displaced != action {
+                    let chord = render_chord(binding.key);
+                    self.warnings.push(format!(
+                        "key {chord} for {name} replaces {}",
+                        displaced.name()
+                    ));
+                }
             }
+        }
+    }
+
+    // Reports every setting this version does not recognize.
+    fn warn_unknown(&mut self, prefix: &str, extra: &HashMap<String, toml::Value>) {
+        let mut names = extra.keys().cloned().collect::<Vec<_>>();
+        names.sort();
+        for name in names {
+            self.warnings
+                .push(format!("unknown setting {prefix}{name}"));
         }
     }
 
@@ -1427,6 +1476,54 @@ red = \"#abcdef\"
     }
 
     #[test]
+    fn an_empty_array_unbinds_an_action() {
+        let config = Config::from_file(keys(vec![("zoom", Chords::Many(Vec::new()))]));
+        assert_eq!(config.action(parse_key_chord("z").unwrap()), None);
+        assert!(config.chords_for(Action::Zoom).is_empty());
+        assert!(config.warnings.is_empty());
+        // All-invalid values are a typo, not an unbind: the default survives.
+        let broken = Config::from_file(keys(vec![("zoom", "nope".into())]));
+        assert_eq!(
+            broken.action(parse_key_chord("z").unwrap()),
+            Some(Action::Zoom)
+        );
+    }
+
+    #[test]
+    fn taking_a_chord_from_another_action_warns() {
+        // The v0.1 docs example now displaces the settings menu.
+        let config = Config::from_file(keys(vec![("split_right", "s".into())]));
+        assert_eq!(
+            config.warnings,
+            vec!["key s for split_right replaces settings".to_string()]
+        );
+        assert_eq!(
+            config.action(parse_key_chord("s").unwrap()),
+            Some(Action::SplitRight)
+        );
+    }
+
+    #[test]
+    fn unknown_settings_are_reported() {
+        let file = toml::from_str::<FileConfig>(
+            "sidbar = true\n\n[mouse]\ncopy_on_selct = false\n\n[notify]\nenabld = true\n",
+        )
+        .expect("typo config still parses");
+        let config = Config::from_file(file);
+        assert_eq!(
+            config.warnings,
+            vec![
+                "unknown setting sidbar".to_string(),
+                "unknown setting mouse.copy_on_selct".to_string(),
+                "unknown setting notify.enabld".to_string(),
+            ]
+        );
+        // The known settings keep their defaults.
+        assert!(config.sidebar);
+        assert!(config.copy_on_select);
+    }
+
+    #[test]
     fn effective_config_prints_as_toml() {
         let toml_text = Config::default().to_toml();
         assert!(toml_text.contains("theme = \"auto\""));
@@ -1436,7 +1533,10 @@ red = \"#abcdef\"
         assert!(toml_text.contains("[notify]"));
         assert!(toml_text.contains("prefix = \"ctrl+b\""));
         assert!(toml_text.contains("split_right = [\"%\"]"));
-        // Round-trips into the loader.
-        toml::from_str::<FileConfig>(&toml_text).expect("effective config parses");
+        // Round-trips exactly: loading the printed config prints the same text.
+        let file = toml::from_str::<FileConfig>(&toml_text).expect("effective config parses");
+        let reloaded = Config::from_file(file);
+        assert!(reloaded.warnings.is_empty(), "{:?}", reloaded.warnings);
+        assert_eq!(reloaded.to_toml(), toml_text);
     }
 }
