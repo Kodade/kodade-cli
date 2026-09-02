@@ -110,6 +110,21 @@ focus_left = "prefix+alt+h"         # keep it behind the prefix
 copy_mode = "F5"
 ```
 
+## Session persistence
+
+The daemon persists each session's layout and restores it on a cold start (see
+[DEVELOPMENT.md](DEVELOPMENT.md#session-persistence-and-restore)). One key in
+the same `config.toml`, read by the daemon, controls restore behavior:
+
+| Setting | Default | Description |
+|---|---|---|
+| `session.resume_agents` | `false` | When `true`, a restored pane whose saved command matches an agent manifest with a `resume` string re-runs that resume command (e.g. `codex resume --last`) instead of starting a plain shell. Panes with no matching manifest always restore as shells. |
+
+```toml
+[session]
+resume_agents = true
+```
+
 ## Key-chord syntax
 
 A chord is `[prefix+][ctrl+][alt+][shift+]key`; modifiers may appear in any

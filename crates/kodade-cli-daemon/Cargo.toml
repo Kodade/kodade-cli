@@ -10,6 +10,7 @@ dirs.workspace = true
 kodade-cli-proto = { path = "../kodade-cli-proto" }
 portable-pty.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 tokio.workspace = true
 toml.workspace = true
 vt100.workspace = true

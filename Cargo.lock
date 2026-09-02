@@ -728,6 +728,7 @@ dependencies = [
  "kodade-cli-proto",
  "portable-pty",
  "serde",
+ "serde_json",
  "tokio",
  "toml",
  "vt100",

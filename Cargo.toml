@@ -36,6 +36,6 @@ toml = "0.8"
 # `toml_edit` merges the Codex `notify` entry into config.toml without dropping user comments (#20 reuses it).
 toml_edit = "0.22"
 # Tokio multiplexes clients while the blocking PTY reader uses its blocking pool.
-tokio = { version = "1", features = ["io-util", "macros", "net", "process", "rt-multi-thread", "sync", "time"] }
+tokio = { version = "1", features = ["io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 # vt100 makes the daemon the durable owner of screen and scrollback state.
 vt100 = "0.16"

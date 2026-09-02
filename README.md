@@ -80,6 +80,13 @@ as `prefix+…` is global: it fires without the prefix. `prefix ctrl+r` reloads
 writes your choices back to `config.toml` without disturbing comments. See
 [docs/CONFIG.md](docs/CONFIG.md) for all bindings and configuration.
 
+Sessions survive a daemon restart: the layout (workspaces, tabs, pane trees,
+names, cwds, and zoom — never scrollback) is saved under
+`~/.local/state/kodade-cli/sessions/` (macOS: `~/Library/Application Support/…`)
+and rebuilt with fresh panes on the next cold start; a corrupt file degrades to
+a clean start and `kodade-cli ls` marks a restored session `(restored)`. Set
+`[session] resume_agents = true` to re-run an agent's resume command on restore.
+
 The CLI ships the Ködade look: warm neutrals with the amber accent `#E7A33B`
 and a purple-free ANSI palette, matching the desktop app. `theme = "auto"`
 (the default) picks `kodade-dark` or `kodade-light` from the terminal
