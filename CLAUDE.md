@@ -8,7 +8,7 @@ binary that a Ködade user can run over SSH or in any terminal and manage
 several agent panes without the desktop app.
 
 ## Status
-v0.1.0 released (M0–M4 complete: multiplexer, mouse, agent detection, sidebar, scripting CLI, config/themes, copy mode, release pipeline) — last touched 2026-09-01
+v0.1.0 released (M0–M4 complete: multiplexer, mouse, agent detection, sidebar, scripting CLI, config/themes, copy mode, release pipeline). v0.2.0 milestone opened 2026-09-02 with issues #6–#24 (herdr/desktop parity review: help overlay, colored panes, Ködade theme, persistence, notifications). — last touched 2026-09-02
 
 ## Commands
 ```bash
