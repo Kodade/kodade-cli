@@ -3,6 +3,8 @@
 //! Each JSON message is UTF-8 and terminated by one newline. Message payloads
 //! that contain byte streams use serde's JSON byte-array representation.
 
+use std::path::PathBuf;
+
 use anyhow::Result;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
@@ -84,6 +86,18 @@ pub enum ClientMessage {
     },
     NewWorkspace {
         name: String,
+        /// Root directory new panes in this workspace start in.
+        root: Option<PathBuf>,
+    },
+    /// Create a pane; `split: None` opens a new tab, otherwise it splits the
+    /// focused pane. The new pane becomes focused so the reply snapshot names it.
+    NewPane {
+        workspace: Option<WorkspaceId>,
+        tab: Option<TabId>,
+        split: Option<SplitAxis>,
+        /// Run this command through the login shell instead of an interactive one.
+        command: Option<Vec<String>>,
+        name: Option<String>,
     },
     SelectWorkspace {
         id: WorkspaceId,
@@ -181,6 +195,8 @@ pub struct WorkspaceInfo {
     pub name: String,
     pub active: bool,
     pub state: AgentStateKind,
+    /// Root directory new panes in this workspace start in, if one is set.
+    pub root: Option<PathBuf>,
     /// Metadata for every tab, including panes outside the active screen.
     pub tabs: Vec<SidebarTabInfo>,
 }
@@ -224,6 +240,9 @@ pub struct PaneSnapshot {
     /// Seconds the current state has held (see daemon state_since tracking).
     #[serde(default)]
     pub state_age_secs: u64,
+    /// Live working directory of the pane's foreground process, when known.
+    /// #11 shows the basename; the full path travels on the wire.
+    pub cwd: Option<PathBuf>,
 }
 
 /// A daemon-owned tree with terminal-independent pane contents. Clients choose pixels.
@@ -303,6 +322,7 @@ mod tests {
                 name: "main".into(),
                 active: true,
                 state: AgentStateKind::Idle,
+                root: Some(PathBuf::from("/tmp/repo")),
                 tabs: vec![SidebarTabInfo {
                     id: TabId(2),
                     name: "shell".into(),
@@ -345,6 +365,7 @@ mod tests {
                 state: AgentStateKind::Idle,
                 state_reason: "no agent process".into(),
                 state_age_secs: 12,
+                cwd: Some(PathBuf::from("/tmp/repo")),
             }],
             zoomed: false,
         });

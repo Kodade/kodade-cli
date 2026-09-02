@@ -12,7 +12,7 @@ use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use kodade_cli_proto::{decode, encode, ClientMessage, ServerMessage};
+use kodade_cli_proto::{decode, encode, ClientMessage, ServerMessage, SplitAxis};
 use ratatui::{backend::CrosstermBackend, Terminal};
 use std::{env, process::Stdio, time::Duration};
 use tokio::{
@@ -58,6 +58,98 @@ async fn main() -> Result<()> {
             )?;
             Ok(())
         }
+        Some(cli::Command::New { workspace, path }) => {
+            let layout =
+                commands::layout(commands::request(&session, commands::layout_query()).await?)?;
+            // Selecting an existing name is idempotent; otherwise create it.
+            if let Ok(id) = commands::resolve_workspace(&layout, &workspace) {
+                commands::request(&session, ClientMessage::SelectWorkspace { id }).await?;
+                println!("{}", id.0);
+            } else {
+                let reply = commands::layout(
+                    commands::request(
+                        &session,
+                        ClientMessage::NewWorkspace {
+                            name: workspace,
+                            root: path,
+                        },
+                    )
+                    .await?,
+                )?;
+                println!("{}", reply.active_workspace.0);
+            }
+            Ok(())
+        }
+        Some(cli::Command::Run {
+            workspace,
+            tab,
+            name,
+            command,
+        }) => {
+            let (ws, tab) = resolve_target(&session, workspace, tab).await?;
+            let reply = commands::layout(
+                commands::request(
+                    &session,
+                    ClientMessage::NewPane {
+                        workspace: ws,
+                        tab,
+                        split: None,
+                        command: Some(command),
+                        name,
+                    },
+                )
+                .await?,
+            )?;
+            println!("{}", commands::focused_pane(&reply)?.0);
+            Ok(())
+        }
+        Some(cli::Command::Split {
+            down,
+            pane,
+            command,
+        }) => {
+            if let Some(pane) = pane {
+                commands::request(&session, ClientMessage::FocusPaneId { id: pane }).await?;
+            }
+            let axis = if down {
+                SplitAxis::Vertical
+            } else {
+                SplitAxis::Horizontal
+            };
+            let reply = commands::layout(
+                commands::request(
+                    &session,
+                    ClientMessage::NewPane {
+                        workspace: None,
+                        tab: None,
+                        split: Some(axis),
+                        command: (!command.is_empty()).then_some(command),
+                        name: None,
+                    },
+                )
+                .await?,
+            )?;
+            println!("{}", commands::focused_pane(&reply)?.0);
+            Ok(())
+        }
+        Some(cli::Command::NewTab { workspace, name }) => {
+            let (ws, _) = resolve_target(&session, workspace, None).await?;
+            let reply = commands::layout(
+                commands::request(
+                    &session,
+                    ClientMessage::NewPane {
+                        workspace: ws,
+                        tab: None,
+                        split: None,
+                        command: None,
+                        name,
+                    },
+                )
+                .await?,
+            )?;
+            println!("{}", commands::focused_pane(&reply)?.0);
+            Ok(())
+        }
         Some(cli::Command::KillSession) => {
             match commands::request(&session, ClientMessage::KillSession).await? {
                 ServerMessage::Shutdown => Ok(()),
@@ -73,6 +165,31 @@ async fn main() -> Result<()> {
             }
         },
     }
+}
+
+/// Resolve optional `-w`/`-t` names to ids, fetching one layout snapshot only
+/// when a name is actually given.
+async fn resolve_target(
+    session: &str,
+    workspace: Option<String>,
+    tab: Option<String>,
+) -> Result<(
+    Option<kodade_cli_proto::WorkspaceId>,
+    Option<kodade_cli_proto::TabId>,
+)> {
+    if workspace.is_none() && tab.is_none() {
+        return Ok((None, None));
+    }
+    let layout = commands::layout(commands::request(session, commands::layout_query()).await?)?;
+    let ws = workspace
+        .as_deref()
+        .map(|name| commands::resolve_workspace(&layout, name))
+        .transpose()?;
+    let tab = tab
+        .as_deref()
+        .map(|name| commands::resolve_tab(&layout, ws, name))
+        .transpose()?;
+    Ok((ws, tab))
 }
 
 /// `agent` subcommands: read pane state or report it back to the daemon.

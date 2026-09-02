@@ -4,6 +4,8 @@
 //! parsed tree. Every read command accepts `--json` so scripts can consume the
 //! proto snapshots directly.
 
+use std::path::PathBuf;
+
 use clap::{Parser, Subcommand};
 use kodade_cli_proto::{AgentStateKind, PaneId};
 
@@ -58,6 +60,51 @@ pub enum Command {
         /// Send the text without a trailing newline.
         #[arg(long)]
         no_newline: bool,
+    },
+    /// Create a workspace with an optional root directory; prints its id.
+    New {
+        /// Workspace name. Selects the workspace if one already has this name.
+        #[arg(short = 'w', long = "workspace", value_name = "NAME")]
+        workspace: String,
+        /// Root directory new panes in the workspace start in.
+        #[arg(value_name = "PATH")]
+        path: Option<PathBuf>,
+    },
+    /// Run a command in a new pane through the login shell; prints the pane id.
+    Run {
+        /// Workspace name or id to run in (defaults to the active workspace).
+        #[arg(short = 'w', long = "workspace", value_name = "NAME")]
+        workspace: Option<String>,
+        /// Tab name or id to run in (defaults to a new tab).
+        #[arg(short = 't', long = "tab", value_name = "TAB")]
+        tab: Option<String>,
+        /// Pane title (defaults to the command's basename).
+        #[arg(long = "name", value_name = "NAME")]
+        name: Option<String>,
+        /// The command and its arguments, after `--`.
+        #[arg(last = true, required = true, value_name = "CMD")]
+        command: Vec<String>,
+    },
+    /// Split the focused (or given) pane into a new pane; prints the pane id.
+    Split {
+        /// Split downward instead of to the right.
+        #[arg(long)]
+        down: bool,
+        /// Pane to split (defaults to the focused pane).
+        #[arg(short = 'p', long = "pane", value_name = "PANE", value_parser = pane_id)]
+        pane: Option<PaneId>,
+        /// Optional command to run in the new pane, after `--`.
+        #[arg(last = true, value_name = "CMD")]
+        command: Vec<String>,
+    },
+    /// Open a new tab in a workspace; prints the new pane id.
+    NewTab {
+        /// Workspace name or id (defaults to the active workspace).
+        #[arg(short = 'w', long = "workspace", value_name = "NAME")]
+        workspace: Option<String>,
+        /// Pane title for the new tab.
+        #[arg(long = "name", value_name = "NAME")]
+        name: Option<String>,
     },
     /// Stop the session and its daemon.
     KillSession,

@@ -3,13 +3,13 @@
 mod agent;
 mod layout;
 mod manifest;
+mod proc;
 
 use std::{
     collections::HashMap,
     env, fs,
     io::{Read, Write},
     path::{Path, PathBuf},
-    process::Command,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
@@ -47,6 +47,8 @@ struct Workspace {
     name: String,
     tabs: Vec<Tab>,
     active_tab: TabId,
+    /// Directory new panes in this workspace fall back to (PRD §5.1).
+    root: Option<PathBuf>,
 }
 struct Tab {
     id: TabId,
@@ -91,6 +93,7 @@ struct ReportedHook {
 
 struct ProcessEvidence {
     name: Option<String>,
+    cwd: Option<PathBuf>,
     checked_at: Instant,
 }
 
@@ -193,7 +196,7 @@ impl Session {
             size: Mutex::new((cols, rows)),
             manifests: manifest::load()?,
         };
-        let pane = session.new_pane("shell")?;
+        let pane = session.new_pane("shell", None, None)?;
         let tab = Tab {
             id: session.tab_id(),
             name: "shell".into(),
@@ -211,6 +214,7 @@ impl Session {
                 name: "default".into(),
                 active_tab: tab.id,
                 tabs: vec![tab],
+                root: None,
             });
         Ok(session)
     }
@@ -230,7 +234,12 @@ impl Session {
         WorkspaceId(self.next_id())
     }
 
-    fn new_pane(&self, title: &str) -> Result<PaneId> {
+    fn new_pane(
+        &self,
+        title: &str,
+        cwd: Option<PathBuf>,
+        command: Option<Vec<String>>,
+    ) -> Result<PaneId> {
         let id = self.pane_id();
         let (cols, rows) = *self.size.lock().expect("size lock poisoned");
         let pane = Arc::new(Pane::spawn(
@@ -240,12 +249,118 @@ impl Session {
             rows,
             self.name.clone(),
             self.updates.clone(),
+            cwd,
+            command,
         )?);
         self.panes
             .lock()
             .expect("pane lock poisoned")
             .insert(id, pane);
         Ok(id)
+    }
+
+    /// The cwd a new pane should inherit: the focused pane's live cwd, then the
+    /// workspace root. `explicit` short-circuits both. Never holds the state or
+    /// pane lock while `lsof`/`ps` run.
+    fn inherit_cwd(
+        &self,
+        workspace: WorkspaceId,
+        tab: Option<TabId>,
+        explicit: Option<PathBuf>,
+    ) -> Option<PathBuf> {
+        if explicit.is_some() {
+            return explicit;
+        }
+        let (focused, root) = {
+            let state = self.state.lock().expect("state lock poisoned");
+            let workspace = state.workspaces.iter().find(|item| item.id == workspace)?;
+            let tab_id = tab.unwrap_or(workspace.active_tab);
+            let focused = workspace
+                .tabs
+                .iter()
+                .find(|item| item.id == tab_id)
+                .map(|item| item.focused);
+            (focused, workspace.root.clone())
+        };
+        let live = focused.and_then(|id| {
+            let pane = self
+                .panes
+                .lock()
+                .expect("pane lock poisoned")
+                .get(&id)
+                .cloned();
+            pane.and_then(|pane| pane.cwd(Instant::now()))
+        });
+        live.or(root)
+    }
+
+    /// Handle `NewPane`: spawn into a workspace (default: active), either as a
+    /// new tab (`split: None`) or by splitting a tab's focused pane. The new
+    /// pane and its tab/workspace become active so the reply snapshot names it.
+    fn new_pane_message(
+        &self,
+        workspace: Option<WorkspaceId>,
+        tab: Option<TabId>,
+        split: Option<SplitAxis>,
+        command: Option<Vec<String>>,
+        name: Option<String>,
+    ) -> Result<()> {
+        let target = {
+            let state = self
+                .state
+                .lock()
+                .map_err(|_| anyhow!("state lock poisoned"))?;
+            let target = workspace.unwrap_or(state.active_workspace);
+            if !state.workspaces.iter().any(|item| item.id == target) {
+                bail!("workspace {} not found", target.0);
+            }
+            target
+        };
+        let cwd = self.inherit_cwd(target, tab, None);
+        let title = pane_title(name.as_deref(), command.as_deref());
+        let pane = self.new_pane(&title, cwd, command)?;
+        // Allocate the tab id up front; `tab_id` locks state and must not be
+        // called while the guard below is held.
+        let new_tab_id = self.tab_id();
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow!("state lock poisoned"))?;
+        state.active_workspace = target;
+        let workspace = state
+            .workspaces
+            .iter_mut()
+            .find(|item| item.id == target)
+            .expect("target workspace exists");
+        match split {
+            Some(axis) => {
+                // Split the requested tab when it exists, else the active one.
+                let tab_id = tab
+                    .filter(|id| workspace.tabs.iter().any(|item| item.id == *id))
+                    .unwrap_or(workspace.active_tab);
+                let tab_ref = workspace
+                    .tabs
+                    .iter_mut()
+                    .find(|item| item.id == tab_id)
+                    .expect("resolved tab exists");
+                let focused = tab_ref.focused;
+                layout::split(&mut tab_ref.tree, focused, axis, pane);
+                tab_ref.focused = pane;
+                workspace.active_tab = tab_id;
+            }
+            None => {
+                workspace.tabs.push(Tab {
+                    id: new_tab_id,
+                    name: title,
+                    tree: LayoutTree::Leaf { pane },
+                    focused: pane,
+                    zoomed: false,
+                });
+                workspace.active_tab = new_tab_id;
+            }
+        }
+        drop(state);
+        self.resize_current()
     }
 
     fn active_tab_mut(state: &mut SessionState) -> &mut Tab {
@@ -321,6 +436,8 @@ impl Session {
                     state: detections[&id].state,
                     state_reason: detections[&id].reason.clone(),
                     state_age_secs: ages[&id],
+                    // `detect` already refreshed this pane's cache this tick.
+                    cwd: pane.cwd(now),
                 })
             })
             .collect();
@@ -341,6 +458,7 @@ impl Session {
                         name: item.name.clone(),
                         active: item.id == workspace.id,
                         state: agent::rollup(tabs.iter().map(|tab| tab.state)),
+                        root: item.root.clone(),
                         tabs,
                     }
                 })
@@ -425,7 +543,13 @@ impl Session {
                 } else {
                     SplitAxis::Vertical
                 };
-                let pane = self.new_pane("shell")?;
+                let active = self
+                    .state
+                    .lock()
+                    .map_err(|_| anyhow!("state lock poisoned"))?
+                    .active_workspace;
+                let cwd = self.inherit_cwd(active, None, None);
+                let pane = self.new_pane("shell", cwd, None)?;
                 let mut state = self
                     .state
                     .lock()
@@ -493,13 +617,18 @@ impl Session {
                 let _ = self.shutdown.send(());
             }
             ClientMessage::NewTab => {
-                let pane = self.new_pane("shell")?;
+                let active = self
+                    .state
+                    .lock()
+                    .map_err(|_| anyhow!("state lock poisoned"))?
+                    .active_workspace;
+                let cwd = self.inherit_cwd(active, None, None);
+                let pane = self.new_pane("shell", cwd, None)?;
                 let id = self.tab_id();
                 let mut state = self
                     .state
                     .lock()
                     .map_err(|_| anyhow!("state lock poisoned"))?;
-                let active = state.active_workspace;
                 let workspace = state
                     .workspaces
                     .iter_mut()
@@ -516,6 +645,13 @@ impl Session {
                 drop(state);
                 self.resize_current()?;
             }
+            ClientMessage::NewPane {
+                workspace,
+                tab,
+                split,
+                command,
+                name,
+            } => self.new_pane_message(workspace, tab, split, command, name)?,
             ClientMessage::NextTab | ClientMessage::PrevTab => {
                 let next = matches!(message, ClientMessage::NextTab);
                 let mut state = self
@@ -684,8 +820,9 @@ impl Session {
                 drop(state);
                 self.notify();
             }
-            ClientMessage::NewWorkspace { name } => {
-                let pane = self.new_pane("shell")?;
+            ClientMessage::NewWorkspace { name, root } => {
+                // A workspace root seeds its first pane's cwd; later panes inherit.
+                let pane = self.new_pane("shell", root.clone(), None)?;
                 let tab_id = self.tab_id();
                 let id = self.workspace_id();
                 let mut state = self
@@ -703,6 +840,7 @@ impl Session {
                         focused: pane,
                         zoomed: false,
                     }],
+                    root,
                 });
                 state.active_workspace = id;
                 drop(state);
@@ -844,7 +982,9 @@ impl Session {
             workspace.tabs.len() == 1 && matches!(tab.tree, LayoutTree::Leaf { .. })
         };
         // Spawn before taking the state lock: id allocation also reads session state.
-        let fresh_pane = needs_fresh.then(|| self.new_pane("shell")).transpose()?;
+        let fresh_pane = needs_fresh
+            .then(|| self.new_pane("shell", None, None))
+            .transpose()?;
         let removed;
         {
             let mut state = self
@@ -908,7 +1048,9 @@ impl Session {
                 .iter()
                 .any(|workspace| workspace.tabs.len() == 1 && workspace.tabs[0].id == id)
         };
-        let fresh = needs_fresh.then(|| self.new_pane("shell")).transpose()?;
+        let fresh = needs_fresh
+            .then(|| self.new_pane("shell", None, None))
+            .transpose()?;
         let fresh_tab = needs_fresh.then(|| self.tab_id());
         let pane_ids = {
             let mut state = self
@@ -964,7 +1106,9 @@ impl Session {
             state.workspaces.len() == 1
                 && state.workspaces.iter().any(|workspace| workspace.id == id)
         };
-        let fresh = needs_fresh.then(|| self.new_pane("shell")).transpose()?;
+        let fresh = needs_fresh
+            .then(|| self.new_pane("shell", None, None))
+            .transpose()?;
         let fresh_tab = needs_fresh.then(|| self.tab_id());
         let pane_ids = {
             let mut state = self
@@ -1141,6 +1285,9 @@ fn focus_pane_id(state: &mut SessionState, pane: PaneId) -> bool {
 }
 
 impl Pane {
+    // Panes carry a lot of spawn context (size, session, cwd, command); grouping
+    // it into a struct would not make the single caller clearer.
+    #[allow(clippy::too_many_arguments)]
     fn spawn(
         id: PaneId,
         title: &str,
@@ -1148,6 +1295,8 @@ impl Pane {
         rows: u16,
         session: String,
         updates: broadcast::Sender<()>,
+        cwd: Option<PathBuf>,
+        run: Option<Vec<String>>,
     ) -> Result<Self> {
         let pty_system = native_pty_system();
         let pair = pty_system.openpty(PtySize {
@@ -1157,13 +1306,30 @@ impl Pane {
             pixel_height: 0,
         })?;
         let shell = env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_owned());
-        let spawn_process = Path::new(&shell)
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("sh")
-            .to_owned();
+        // With a command, the detection fallback name is the command basename;
+        // otherwise it's the login shell's.
+        let spawn_process = run
+            .as_ref()
+            .and_then(|args| args.first())
+            .and_then(|arg| proc::process_basename(arg))
+            .unwrap_or_else(|| {
+                Path::new(&shell)
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("sh")
+                    .to_owned()
+            });
         let mut command = CommandBuilder::new(&shell);
         command.arg("-l");
+        // Commands run through the login shell so agent CLIs keep their env and
+        // credentials handling; `exec` replaces the shell with the target.
+        if let Some(args) = &run {
+            command.arg("-c");
+            command.arg(format!("exec {}", proc::shell_command(args)));
+        }
+        if let Some(dir) = &cwd {
+            command.cwd(dir);
+        }
         command.env("KODADE_PANE", id.0.to_string());
         command.env("KODADE_SESSION", session);
         pair.slave
@@ -1195,6 +1361,7 @@ impl Pane {
             spawn_process,
             process: Mutex::new(ProcessEvidence {
                 name: None,
+                cwd: None,
                 checked_at: Instant::now() - Duration::from_secs(2),
             }),
             last_state: Mutex::new(None),
@@ -1310,28 +1477,59 @@ impl Pane {
     }
 
     fn process_name(&self, now: Instant) -> Option<String> {
-        let mut process = self.process.lock().expect("process lock poisoned");
-        if now.saturating_duration_since(process.checked_at) >= Duration::from_secs(2) {
-            process.name = self
-                .master
-                .lock()
-                .expect("PTY master lock poisoned")
-                .process_group_leader()
-                .and_then(|pid| {
-                    let output = Command::new("ps")
-                        .args(["-p", &pid.to_string(), "-o", "comm="])
-                        .output()
-                        .ok()?;
-                    let path = String::from_utf8(output.stdout).ok()?;
-                    Path::new(path.trim())
-                        .file_name()?
-                        .to_str()
-                        .map(str::to_owned)
-                });
-            process.checked_at = now;
-        }
-        process.name.clone()
+        self.refresh_process(now);
+        self.process
+            .lock()
+            .expect("process lock poisoned")
+            .name
+            .clone()
     }
+
+    fn cwd(&self, now: Instant) -> Option<PathBuf> {
+        self.refresh_process(now);
+        self.process
+            .lock()
+            .expect("process lock poisoned")
+            .cwd
+            .clone()
+    }
+
+    /// Refresh the cached foreground-process name and cwd at most once per 2 s.
+    /// The pid comes from the PTY's process-group leader; one `ps` and one
+    /// `lsof` (or one procfs read) per pane per tick.
+    fn refresh_process(&self, now: Instant) {
+        let mut process = self.process.lock().expect("process lock poisoned");
+        if now.saturating_duration_since(process.checked_at) < Duration::from_secs(2) {
+            return;
+        }
+        let pid = self
+            .master
+            .lock()
+            .expect("PTY master lock poisoned")
+            .process_group_leader();
+        if let Some(pid) = pid {
+            process.name = proc::command_of(pid)
+                .as_deref()
+                .and_then(proc::process_basename);
+            process.cwd = proc::cwd_of(pid);
+        } else {
+            process.name = None;
+            process.cwd = None;
+        }
+        process.checked_at = now;
+    }
+}
+
+/// Title for a new pane: the explicit name, else the run command's basename,
+/// else the interactive shell.
+fn pane_title(name: Option<&str>, command: Option<&[String]>) -> String {
+    if let Some(name) = name {
+        return name.to_owned();
+    }
+    command
+        .and_then(|args| args.first())
+        .and_then(|arg| proc::process_basename(arg))
+        .unwrap_or_else(|| "shell".to_owned())
 }
 
 fn tab_state(tab: &Tab, detections: &HashMap<PaneId, agent::Detection>) -> AgentStateKind {
@@ -1760,6 +1958,7 @@ mod tests {
                     id: WorkspaceId(1),
                     name: "one".into(),
                     active_tab: TabId(2),
+                    root: None,
                     tabs: vec![Tab {
                         id: TabId(2),
                         name: "shell".into(),
@@ -1772,6 +1971,7 @@ mod tests {
                     id: WorkspaceId(4),
                     name: "two".into(),
                     active_tab: TabId(5),
+                    root: None,
                     tabs: vec![Tab {
                         id: TabId(5),
                         name: "agents".into(),
@@ -1797,6 +1997,7 @@ mod tests {
                 id: WorkspaceId(1),
                 name: "one".into(),
                 active_tab: TabId(2),
+                root: None,
                 tabs: vec![Tab {
                     id: TabId(2),
                     name: "agents".into(),

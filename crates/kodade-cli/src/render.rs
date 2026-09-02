@@ -43,6 +43,8 @@ pub struct Ui<'a> {
     pub sidebar: bool,
     pub prefix: bool,
     pub rename: bool,
+    /// The `prefix W` name/path prompt shares the rename text buffer.
+    pub new_workspace: bool,
     pub name: &'a str,
     pub navigate: Option<usize>,
     pub copy: Option<&'a CopyMode>,
@@ -59,6 +61,7 @@ pub fn render(frame: &mut Frame, layout: &LayoutSnapshot, ui: &Ui, theme: &Theme
         sidebar,
         prefix,
         rename,
+        new_workspace,
         name,
         navigate,
         copy,
@@ -144,6 +147,8 @@ pub fn render(frame: &mut Frame, layout: &LayoutSnapshot, ui: &Ui, theme: &Theme
         format!(" rename pane: {name}")
     } else if resize {
         " resize · hjkl 1 · HJKL 5 · esc".into()
+    } else if new_workspace {
+        format!(" new workspace: {name}")
     } else if copy.is_some() {
         " copy mode · v select · y copy · esc exit".into()
     } else if navigate.is_some() {
@@ -330,13 +335,21 @@ pub fn content_area(area: Rect, sidebar: bool) -> Rect {
 pub fn sidebar_rows(layout: &LayoutSnapshot) -> Vec<SidebarRow> {
     let mut rows = Vec::new();
     for workspace in &layout.workspaces {
+        // Show the root basename after the name when it differs (#19 restructures
+        // this into its own styled column later; for now it lives in the label).
+        let root = workspace
+            .root
+            .as_deref()
+            .and_then(std::path::Path::file_name)
+            .and_then(|name| name.to_str())
+            .filter(|base| *base != workspace.name);
+        let name = match root {
+            Some(base) => format!("{}  {}", workspace.name, base),
+            None => workspace.name.clone(),
+        };
         rows.push(SidebarRow {
             target: SidebarTarget::Workspace(workspace.id),
-            label: format!(
-                "{} {}",
-                if workspace.active { "▾" } else { "▸" },
-                workspace.name
-            ),
+            label: format!("{} {}", if workspace.active { "▾" } else { "▸" }, name),
             state: workspace.state,
         });
         if workspace.active {
@@ -593,6 +606,7 @@ mod tests {
                     name: "active".into(),
                     active: true,
                     state: AgentStateKind::Blocked,
+                    root: Some("/Users/keith/src/active".into()),
                     tabs: vec![SidebarTabInfo {
                         id: TabId(2),
                         name: "agents".into(),
@@ -610,6 +624,7 @@ mod tests {
                     name: "other".into(),
                     active: false,
                     state: AgentStateKind::Done,
+                    root: None,
                     tabs: vec![SidebarTabInfo {
                         id: TabId(5),
                         name: "hidden".into(),
@@ -646,6 +661,18 @@ mod tests {
             Some(&SidebarTarget::Pane(PaneId(3)))
         );
         assert_eq!(sidebar_row_at(&rows, 5), None);
+    }
+
+    #[test]
+    fn workspace_row_appends_a_differing_root_basename() {
+        let mut layout = snapshot();
+        layout.workspaces[0].name = "app".into();
+        layout.workspaces[0].root = Some("/Users/keith/src/webapp".into());
+        let rows = sidebar_rows(&layout);
+        assert_eq!(rows[0].label, "▾ app  webapp");
+        // A basename equal to the name is not repeated.
+        layout.workspaces[0].root = Some("/Users/keith/src/app".into());
+        assert_eq!(sidebar_rows(&layout)[0].label, "▾ app");
     }
 
     #[test]
@@ -772,11 +799,13 @@ mod tests {
             state: AgentStateKind::Idle,
             state_reason: String::new(),
             state_age_secs: 0,
+            cwd: None,
         }];
         let ui = Ui {
             sidebar: false,
             prefix: false,
             rename: false,
+            new_workspace: false,
             name: "",
             navigate: None,
             copy: None,

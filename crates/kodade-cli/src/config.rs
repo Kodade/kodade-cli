@@ -132,8 +132,11 @@ impl Action {
             Self::NextTab => ClientMessage::NextTab,
             Self::PrevTab => ClientMessage::PrevTab,
             Self::Zoom => ClientMessage::ZoomPane,
+            // `prefix W` opens a name/path prompt in the client instead of
+            // firing this directly, but keep a sensible default for completeness.
             Self::NewWorkspace => ClientMessage::NewWorkspace {
                 name: "workspace".into(),
+                root: None,
             },
             Self::FocusUp => ClientMessage::FocusPane {
                 direction: Direction::Up,

@@ -1,7 +1,7 @@
 use anyhow::{anyhow, bail, Context, Result};
 use kodade_cli_proto::{
     decode, encode, AgentStateKind, ClientMessage, LayoutSnapshot, PaneId, PaneSnapshot, QueryKind,
-    ServerMessage,
+    ServerMessage, TabId, WorkspaceId,
 };
 use serde_json::{json, Value};
 use std::{fs, path::Path};
@@ -351,6 +351,62 @@ fn bottom_lines(contents: &str, lines: usize) -> String {
     all[start..].join("\n")
 }
 
+/// Resolve a `-w` value (workspace name or numeric id) to a workspace id.
+pub fn resolve_workspace(layout: &LayoutSnapshot, needle: &str) -> Result<WorkspaceId> {
+    if let Ok(id) = needle.parse::<u64>() {
+        if layout
+            .workspaces
+            .iter()
+            .any(|item| item.id == WorkspaceId(id))
+        {
+            return Ok(WorkspaceId(id));
+        }
+    }
+    layout
+        .workspaces
+        .iter()
+        .find(|item| item.name == needle)
+        .map(|item| item.id)
+        .ok_or_else(|| anyhow!("workspace '{needle}' not found"))
+}
+
+/// Resolve a `-t` value (tab name or numeric id) within a workspace (or the
+/// active one when `workspace` is `None`).
+pub fn resolve_tab(
+    layout: &LayoutSnapshot,
+    workspace: Option<WorkspaceId>,
+    needle: &str,
+) -> Result<TabId> {
+    let target = workspace.unwrap_or(layout.active_workspace);
+    let workspace = layout
+        .workspaces
+        .iter()
+        .find(|item| item.id == target)
+        .ok_or_else(|| anyhow!("workspace not found"))?;
+    if let Ok(id) = needle.parse::<u64>() {
+        if workspace.tabs.iter().any(|tab| tab.id == TabId(id)) {
+            return Ok(TabId(id));
+        }
+    }
+    workspace
+        .tabs
+        .iter()
+        .find(|tab| tab.name == needle)
+        .map(|tab| tab.id)
+        .ok_or_else(|| anyhow!("tab '{needle}' not found"))
+}
+
+/// The focused pane in a snapshot — used to report the pane a `NewPane` reply
+/// just created (the daemon focuses new panes).
+pub fn focused_pane(layout: &LayoutSnapshot) -> Result<PaneId> {
+    layout
+        .panes
+        .iter()
+        .find(|pane| pane.focused)
+        .map(|pane| pane.id)
+        .ok_or_else(|| anyhow!("no focused pane in reply"))
+}
+
 pub fn find_pane(layout: &LayoutSnapshot, id: PaneId) -> Result<&kodade_cli_proto::PaneSnapshot> {
     layout
         .panes
@@ -376,7 +432,9 @@ pub fn layout_query() -> ClientMessage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kodade_cli_proto::{LayoutTree, Screen, TabId, TabInfo, WorkspaceId, WorkspaceInfo};
+    use kodade_cli_proto::{
+        LayoutTree, Screen, SidebarTabInfo, TabId, TabInfo, WorkspaceId, WorkspaceInfo,
+    };
 
     fn fixture() -> LayoutSnapshot {
         LayoutSnapshot {
@@ -387,7 +445,13 @@ mod tests {
                 name: "repo".into(),
                 active: true,
                 state: AgentStateKind::Blocked,
-                tabs: vec![],
+                root: None,
+                tabs: vec![SidebarTabInfo {
+                    id: TabId(2),
+                    name: "agents".into(),
+                    state: AgentStateKind::Blocked,
+                    agents: vec![],
+                }],
             }],
             tabs: vec![TabInfo {
                 id: TabId(2),
@@ -406,9 +470,25 @@ mod tests {
                 state: AgentStateKind::Blocked,
                 state_reason: "manifest rule 'Allow?' matched".into(),
                 state_age_secs: 0,
+                cwd: None,
             }],
             zoomed: false,
         }
+    }
+
+    #[test]
+    fn resolves_workspaces_and_tabs_by_name_or_id() {
+        let layout = fixture();
+        assert_eq!(resolve_workspace(&layout, "repo").unwrap(), WorkspaceId(1));
+        assert_eq!(resolve_workspace(&layout, "1").unwrap(), WorkspaceId(1));
+        assert!(resolve_workspace(&layout, "missing").is_err());
+        assert_eq!(resolve_tab(&layout, None, "agents").unwrap(), TabId(2));
+        assert_eq!(
+            resolve_tab(&layout, Some(WorkspaceId(1)), "2").unwrap(),
+            TabId(2)
+        );
+        assert!(resolve_tab(&layout, None, "nope").is_err());
+        assert_eq!(focused_pane(&layout).unwrap(), PaneId(7));
     }
 
     #[test]
