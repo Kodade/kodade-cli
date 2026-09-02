@@ -11,7 +11,9 @@ use crossterm::{
     },
     execute,
 };
-use kodade_cli_proto::{ClientMessage, Direction, LayoutSnapshot};
+use kodade_cli_proto::{
+    AgentStateKind, ClientMessage, Direction, LayoutSnapshot, PaneId, SidebarTabInfo, WorkspaceInfo,
+};
 use ratatui::{backend::CrosstermBackend, layout::Rect, Frame, Terminal};
 use std::{io::Write, time::Duration};
 use tokio::{io::AsyncWriteExt, net::unix::OwnedWriteHalf, sync::mpsc};
@@ -35,6 +37,12 @@ pub enum Flow {
     Detach,
 }
 
+/// A yes/no prompt shown in the status bar; `y` sends `on_yes`, anything else cancels.
+struct Confirm {
+    message: String,
+    on_yes: ClientMessage,
+}
+
 /// An in-progress border drag started by a left mouse press.
 struct DragState {
     direction: Direction,
@@ -53,6 +61,12 @@ pub struct App {
     navigate: Option<usize>,
     copy: Option<mode::CopyMode>,
     menu: Option<mode::Menu>,
+    confirm: Option<Confirm>,
+    /// Persistent resize mode (`prefix alt+r`): hjkl 1 cell, HJKL 5, esc exits.
+    resize: bool,
+    /// Focused pane in the newest snapshot and the one before it (`last_pane`).
+    focused_pane: Option<PaneId>,
+    last_pane: Option<PaneId>,
     note: Option<String>,
     /// Session reported by the daemon's `Welcome`; the status bar uses it in #11.
     #[allow(dead_code)]
@@ -74,6 +88,10 @@ impl App {
             navigate: None,
             copy: None,
             menu: None,
+            confirm: None,
+            resize: false,
+            focused_pane: None,
+            last_pane: None,
             note: None,
             session_name: session.to_string(),
             theme: config.resolve_theme(),
@@ -92,6 +110,14 @@ impl App {
             if let Some(pane) = layout.panes.iter().find(|pane| pane.id == copy_mode.pane) {
                 copy_mode.refresh(pane.screen.clone());
             }
+        }
+        // Remember the previously focused pane so `last_pane` can jump back.
+        let focused = layout.panes.iter().find(|pane| pane.focused).map(|p| p.id);
+        if focused != self.focused_pane {
+            if let Some(previous) = self.focused_pane {
+                self.last_pane = Some(previous);
+            }
+            self.focused_pane = focused;
         }
         self.layout = Some(layout);
     }
@@ -113,6 +139,8 @@ impl App {
                 navigate: self.navigate,
                 copy: self.copy.as_ref(),
                 menu: self.menu.as_ref(),
+                resize: self.resize,
+                confirm: self.confirm.as_ref().map(|c| c.message.as_str()),
                 note: self.note.as_deref(),
             },
             &self.theme,
@@ -162,7 +190,9 @@ impl App {
         writer: &mut OwnedWriteHalf,
         term: &mut Term,
     ) -> Result<Flow> {
-        if self.rename {
+        if self.confirm.is_some() {
+            self.handle_confirm_key(key, writer).await?;
+        } else if self.rename {
             self.handle_rename_key(key, writer).await?;
         } else if self.copy.is_some() {
             self.handle_copy_key(key, writer, term).await?;
@@ -170,6 +200,8 @@ impl App {
             self.handle_menu_key(key, writer).await?;
         } else if let Some(current) = self.navigate {
             self.handle_navigate_key(key, current, writer).await?;
+        } else if self.resize {
+            self.handle_resize_key(key, writer).await?;
         } else if self.prefix {
             return self.handle_prefix_key(key, writer, term).await;
         } else if key == self.config.prefix {
@@ -191,13 +223,9 @@ impl App {
                 let name = std::mem::take(&mut self.name);
                 let message = match self.rename_target.take() {
                     Some(mode::MenuTarget::Pane(id)) => ClientMessage::RenamePaneId { id, name },
-                    Some(mode::MenuTarget::Tab(id)) => {
-                        write(writer, &ClientMessage::SelectTab { id }).await?;
-                        ClientMessage::RenameTab { name }
-                    }
+                    Some(mode::MenuTarget::Tab(id)) => ClientMessage::RenameTabId { id, name },
                     Some(mode::MenuTarget::Workspace(id)) => {
-                        write(writer, &ClientMessage::SelectWorkspace { id }).await?;
-                        ClientMessage::RenameWorkspace { name }
+                        ClientMessage::RenameWorkspaceId { id, name }
                     }
                     None => ClientMessage::RenamePane { name },
                 };
@@ -215,6 +243,43 @@ impl App {
             _ => {}
         }
         Ok(())
+    }
+
+    // Confirm prompt: `y` runs the pending message, anything else cancels.
+    async fn handle_confirm_key(
+        &mut self,
+        key: KeyEvent,
+        writer: &mut OwnedWriteHalf,
+    ) -> Result<()> {
+        let confirm = self.confirm.take().expect("confirm exists");
+        if matches!(key.code, KeyCode::Char('y') | KeyCode::Char('Y')) {
+            write(writer, &confirm.on_yes).await?;
+        }
+        Ok(())
+    }
+
+    // Resize mode: stays active until esc/enter; hjkl move 1 cell, HJKL move 5.
+    async fn handle_resize_key(
+        &mut self,
+        key: KeyEvent,
+        writer: &mut OwnedWriteHalf,
+    ) -> Result<()> {
+        let (direction, cells) = match key.code {
+            KeyCode::Esc | KeyCode::Enter => {
+                self.resize = false;
+                return Ok(());
+            }
+            KeyCode::Char('h') | KeyCode::Left => (Direction::Left, 1),
+            KeyCode::Char('j') | KeyCode::Down => (Direction::Down, 1),
+            KeyCode::Char('k') | KeyCode::Up => (Direction::Up, 1),
+            KeyCode::Char('l') | KeyCode::Right => (Direction::Right, 1),
+            KeyCode::Char('H') => (Direction::Left, 5),
+            KeyCode::Char('J') => (Direction::Down, 5),
+            KeyCode::Char('K') => (Direction::Up, 5),
+            KeyCode::Char('L') => (Direction::Right, 5),
+            _ => return Ok(()),
+        };
+        write(writer, &ClientMessage::ResizePane { direction, cells }).await
     }
 
     // Copy mode: vi-style movement, `v` anchors, `y` copies through OSC 52.
@@ -386,16 +451,60 @@ impl App {
             }
             config::Action::Rename => self.rename = true,
             config::Action::Detach => return Ok(Flow::Detach),
-            config::Action::WorkspaceNext => {
-                if let Some(current) = &self.layout {
-                    let index = current
-                        .workspaces
-                        .iter()
-                        .position(|workspace| workspace.active)
-                        .unwrap_or(0);
-                    let next = (index + 1) % current.workspaces.len();
-                    let id = current.workspaces[next].id;
-                    write(writer, &ClientMessage::SelectWorkspace { id }).await?
+            config::Action::ResizeMode => self.resize = true,
+            config::Action::RenameTab => {
+                if let Some(id) = self.active_tab().map(|tab| tab.id) {
+                    self.rename = true;
+                    self.rename_target = Some(mode::MenuTarget::Tab(id));
+                }
+            }
+            config::Action::RenameWorkspace => {
+                if let Some(id) = self.active_workspace().map(|workspace| workspace.id) {
+                    self.rename = true;
+                    self.rename_target = Some(mode::MenuTarget::Workspace(id));
+                }
+            }
+            config::Action::CloseTab => {
+                if let Some(prompt) = self.active_tab().map(|tab| {
+                    (
+                        ClientMessage::CloseTab { id: tab.id },
+                        close_tab_prompt(tab),
+                    )
+                }) {
+                    let (message, prompt) = prompt;
+                    match prompt {
+                        Some(prompt) => {
+                            self.confirm = Some(Confirm {
+                                message: prompt,
+                                on_yes: message,
+                            })
+                        }
+                        None => write(writer, &message).await?,
+                    }
+                }
+            }
+            config::Action::CloseWorkspace => {
+                if let Some(prompt) = self.active_workspace().map(|workspace| {
+                    (
+                        ClientMessage::CloseWorkspace { id: workspace.id },
+                        close_workspace_prompt(workspace),
+                    )
+                }) {
+                    let (message, prompt) = prompt;
+                    match prompt {
+                        Some(prompt) => {
+                            self.confirm = Some(Confirm {
+                                message: prompt,
+                                on_yes: message,
+                            })
+                        }
+                        None => write(writer, &message).await?,
+                    }
+                }
+            }
+            config::Action::LastPane => {
+                if let Some(id) = self.last_pane {
+                    write(writer, &ClientMessage::FocusPaneId { id }).await?
                 }
             }
             other => {
@@ -574,6 +683,20 @@ impl App {
             mode::MenuAction::SplitRight => write(writer, &ClientMessage::SplitRight).await?,
             mode::MenuAction::SplitDown => write(writer, &ClientMessage::SplitDown).await?,
             mode::MenuAction::Zoom => write(writer, &ClientMessage::ZoomPane).await?,
+            mode::MenuAction::BreakToTab => write(writer, &ClientMessage::BreakPane).await?,
+            mode::MenuAction::Equalize => write(writer, &ClientMessage::EqualizeLayout).await?,
+            mode::MenuAction::MoveLeft | mode::MenuAction::MoveRight => {
+                // Tab moves apply to the active tab, so select the target first.
+                if let mode::MenuTarget::Tab(id) = menu.target {
+                    write(writer, &ClientMessage::SelectTab { id }).await?;
+                    let delta = if matches!(menu.action(), mode::MenuAction::MoveLeft) {
+                        -1
+                    } else {
+                        1
+                    };
+                    write(writer, &ClientMessage::MoveTab { delta }).await?;
+                }
+            }
             mode::MenuAction::Close => {
                 let message = match menu.target {
                     mode::MenuTarget::Pane(_) => ClientMessage::ClosePane,
@@ -584,6 +707,24 @@ impl App {
             }
         }
         Ok(())
+    }
+
+    // Active workspace in the newest snapshot, if any.
+    fn active_workspace(&self) -> Option<&WorkspaceInfo> {
+        self.layout
+            .as_ref()?
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.active)
+    }
+
+    // Active tab of the active workspace, with its agent list.
+    fn active_tab(&self) -> Option<&SidebarTabInfo> {
+        let layout = self.layout.as_ref()?;
+        self.active_workspace()?
+            .tabs
+            .iter()
+            .find(|tab| tab.id == layout.active_tab)
     }
 
     // Terminal area left for panes once the sidebar is subtracted.
@@ -599,6 +740,52 @@ impl App {
 /// Pane width for a terminal width and sidebar state.
 pub fn pane_cols(cols: u16, sidebar: bool) -> u16 {
     cols.saturating_sub(render::sidebar_width(sidebar)).max(1)
+}
+
+/// Prompt text for closing a tab, or `None` when no pane in it is working.
+fn close_tab_prompt(tab: &SidebarTabInfo) -> Option<String> {
+    let working = tab
+        .agents
+        .iter()
+        .filter(|agent| agent.state == AgentStateKind::Working)
+        .count();
+    (working > 0).then(|| {
+        format!(
+            "close tab \"{}\" with {working} working {}? y/n",
+            tab.name,
+            plural(working)
+        )
+    })
+}
+
+/// Prompt text for closing a workspace, or `None` when nothing is active.
+fn close_workspace_prompt(workspace: &WorkspaceInfo) -> Option<String> {
+    let active = workspace
+        .tabs
+        .iter()
+        .flat_map(|tab| &tab.agents)
+        .filter(|agent| {
+            matches!(
+                agent.state,
+                AgentStateKind::Working | AgentStateKind::Blocked
+            )
+        })
+        .count();
+    (active > 0).then(|| {
+        format!(
+            "close workspace \"{}\" with {active} active {}? y/n",
+            workspace.name,
+            plural(active)
+        )
+    })
+}
+
+fn plural(count: usize) -> &'static str {
+    if count == 1 {
+        "agent"
+    } else {
+        "agents"
+    }
 }
 
 // Selecting a sidebar row means focusing its workspace, tab, or pane.
@@ -666,6 +853,43 @@ mod tests {
             100 - render::sidebar_width(true).min(100)
         );
         assert_eq!(pane_cols(1, true), 1);
+    }
+
+    fn agent(state: AgentStateKind) -> kodade_cli_proto::AgentInfo {
+        kodade_cli_proto::AgentInfo {
+            pane: PaneId(1),
+            name: "claude".into(),
+            state,
+            state_age_secs: 0,
+        }
+    }
+
+    #[test]
+    fn close_prompts_appear_only_for_busy_agents() {
+        let tab = |states: &[AgentStateKind]| SidebarTabInfo {
+            id: kodade_cli_proto::TabId(2),
+            name: "agents".into(),
+            state: AgentStateKind::Idle,
+            agents: states.iter().copied().map(agent).collect(),
+        };
+        assert_eq!(close_tab_prompt(&tab(&[AgentStateKind::Idle])), None);
+        assert_eq!(
+            close_tab_prompt(&tab(&[AgentStateKind::Working, AgentStateKind::Working])),
+            Some("close tab \"agents\" with 2 working agents? y/n".into())
+        );
+        // Blocked panes do not block a tab close, but they do a workspace close.
+        let workspace = WorkspaceInfo {
+            id: kodade_cli_proto::WorkspaceId(1),
+            name: "main".into(),
+            active: true,
+            state: AgentStateKind::Blocked,
+            tabs: vec![tab(&[AgentStateKind::Blocked, AgentStateKind::Idle])],
+        };
+        assert_eq!(close_tab_prompt(&workspace.tabs[0]), None);
+        assert_eq!(
+            close_workspace_prompt(&workspace),
+            Some("close workspace \"main\" with 1 active agent? y/n".into())
+        );
     }
 
     #[test]

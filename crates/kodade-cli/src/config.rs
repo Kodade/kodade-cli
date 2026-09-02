@@ -49,10 +49,36 @@ pub enum Action {
     ResizeRight,
     Navigate,
     CopyMode,
+    // Layout management (#14). The payload is the one-based tab position.
+    SelectTabIndex(u8),
+    CloseTab,
+    RenameTab,
+    RenameWorkspace,
+    CloseWorkspace,
+    SwapUp,
+    SwapDown,
+    SwapLeft,
+    SwapRight,
+    MoveTabLeft,
+    MoveTabRight,
+    NextPane,
+    PrevPane,
+    LastPane,
+    WorkspacePrev,
+    ResizeMode,
+    BreakPane,
+    LayoutEven,
 }
 
 impl Action {
     fn parse(name: &str) -> Option<Self> {
+        // `select_tab_1` .. `select_tab_9` share one parametrised action.
+        if let Some(index) = name.strip_prefix("select_tab_") {
+            return match index.parse::<u8>() {
+                Ok(index @ 1..=9) => Some(Self::SelectTabIndex(index)),
+                _ => None,
+            };
+        }
         Some(match name {
             "split_right" => Self::SplitRight,
             "split_down" => Self::SplitDown,
@@ -76,6 +102,23 @@ impl Action {
             "resize_right" => Self::ResizeRight,
             "navigate" => Self::Navigate,
             "copy_mode" => Self::CopyMode,
+            "close_tab" => Self::CloseTab,
+            "rename_tab" => Self::RenameTab,
+            "rename_workspace" => Self::RenameWorkspace,
+            "close_workspace" => Self::CloseWorkspace,
+            "swap_up" => Self::SwapUp,
+            "swap_down" => Self::SwapDown,
+            "swap_left" => Self::SwapLeft,
+            "swap_right" => Self::SwapRight,
+            "move_tab_left" => Self::MoveTabLeft,
+            "move_tab_right" => Self::MoveTabRight,
+            "next_pane" => Self::NextPane,
+            "prev_pane" => Self::PrevPane,
+            "last_pane" => Self::LastPane,
+            "workspace_prev" => Self::WorkspacePrev,
+            "resize_mode" => Self::ResizeMode,
+            "break_pane" => Self::BreakPane,
+            "layout_even" => Self::LayoutEven,
             _ => return None,
         })
     }
@@ -120,9 +163,37 @@ impl Action {
                 direction: Direction::Right,
                 cells: 2,
             },
-            Self::Detach | Self::Rename | Self::WorkspaceNext | Self::SidebarToggle => return None,
+            Self::WorkspaceNext => ClientMessage::SelectWorkspaceDelta { delta: 1 },
+            Self::WorkspacePrev => ClientMessage::SelectWorkspaceDelta { delta: -1 },
+            Self::SelectTabIndex(index) => ClientMessage::SelectTabIndex { index },
+            Self::SwapUp => ClientMessage::SwapPane {
+                direction: Direction::Up,
+            },
+            Self::SwapDown => ClientMessage::SwapPane {
+                direction: Direction::Down,
+            },
+            Self::SwapLeft => ClientMessage::SwapPane {
+                direction: Direction::Left,
+            },
+            Self::SwapRight => ClientMessage::SwapPane {
+                direction: Direction::Right,
+            },
+            Self::MoveTabLeft => ClientMessage::MoveTab { delta: -1 },
+            Self::MoveTabRight => ClientMessage::MoveTab { delta: 1 },
+            Self::NextPane => ClientMessage::FocusPaneCycle { forward: true },
+            Self::PrevPane => ClientMessage::FocusPaneCycle { forward: false },
+            Self::BreakPane => ClientMessage::BreakPane,
+            Self::LayoutEven => ClientMessage::EqualizeLayout,
+            Self::Detach | Self::Rename | Self::SidebarToggle => return None,
             // M3b reserves these names without introducing their modes early.
             Self::Navigate | Self::CopyMode => return None,
+            // Handled in `App`: these need snapshot context or a prompt.
+            Self::CloseTab
+            | Self::CloseWorkspace
+            | Self::RenameTab
+            | Self::RenameWorkspace
+            | Self::LastPane
+            | Self::ResizeMode => return None,
         })
     }
 }
@@ -165,10 +236,32 @@ impl Default for Config {
             ("J", Action::ResizeDown),
             ("H", Action::ResizeLeft),
             ("L", Action::ResizeRight),
+            // Layout management (#14). move_tab_* and workspace_prev ship unbound.
+            ("X", Action::CloseTab),
+            ("T", Action::RenameTab),
+            ("R", Action::RenameWorkspace),
+            ("D", Action::CloseWorkspace),
+            ("alt+k", Action::SwapUp),
+            ("alt+j", Action::SwapDown),
+            ("alt+h", Action::SwapLeft),
+            ("alt+l", Action::SwapRight),
+            ("o", Action::NextPane),
+            ("O", Action::PrevPane),
+            (";", Action::LastPane),
+            ("alt+r", Action::ResizeMode),
+            ("!", Action::BreakPane),
+            ("=", Action::LayoutEven),
         ] {
             bindings.insert(
                 parse_key_chord(binding).expect("built-in key is valid"),
                 action,
+            );
+        }
+        // Digits 1–9 jump straight to that tab position.
+        for index in 1..=9_u8 {
+            bindings.insert(
+                parse_key_chord(&index.to_string()).expect("digit key is valid"),
+                Action::SelectTabIndex(index),
             );
         }
         Self {
@@ -707,6 +800,101 @@ red = \"#abcdef\"
             Ok(KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE))
         );
         assert!(parse_key_chord("shift+x").is_err());
+    }
+
+    #[test]
+    fn layout_management_actions_have_default_chords() {
+        let config = Config::default();
+        for (chord, action) in [
+            ("1", Action::SelectTabIndex(1)),
+            ("9", Action::SelectTabIndex(9)),
+            ("X", Action::CloseTab),
+            ("T", Action::RenameTab),
+            ("R", Action::RenameWorkspace),
+            ("D", Action::CloseWorkspace),
+            ("alt+h", Action::SwapLeft),
+            ("alt+j", Action::SwapDown),
+            ("alt+k", Action::SwapUp),
+            ("alt+l", Action::SwapRight),
+            ("o", Action::NextPane),
+            ("O", Action::PrevPane),
+            (";", Action::LastPane),
+            ("alt+r", Action::ResizeMode),
+            ("!", Action::BreakPane),
+            ("=", Action::LayoutEven),
+        ] {
+            assert_eq!(
+                config.action(parse_key_chord(chord).unwrap()),
+                Some(action),
+                "{chord}"
+            );
+        }
+        // move_tab_* and workspace_prev ship unbound but remain remappable.
+        assert!(!config.bindings.values().any(|action| matches!(
+            action,
+            Action::MoveTabLeft | Action::MoveTabRight | Action::WorkspacePrev
+        )));
+        let remapped = Config::from_file(FileConfig {
+            keys: Some(HashMap::from([
+                ("move_tab_left".into(), "<".into()),
+                ("workspace_prev".into(), "alt+w".into()),
+                ("select_tab_3".into(), "F3".into()),
+            ])),
+            ..FileConfig::default()
+        });
+        assert_eq!(
+            remapped.action(parse_key_chord("<").unwrap()),
+            Some(Action::MoveTabLeft)
+        );
+        assert_eq!(
+            remapped.action(parse_key_chord("alt+w").unwrap()),
+            Some(Action::WorkspacePrev)
+        );
+        assert_eq!(
+            remapped.action(parse_key_chord("F3").unwrap()),
+            Some(Action::SelectTabIndex(3))
+        );
+        // The replaced default chord is gone; the other digits stay.
+        assert_eq!(remapped.action(parse_key_chord("3").unwrap()), None);
+        assert_eq!(
+            remapped.action(parse_key_chord("4").unwrap()),
+            Some(Action::SelectTabIndex(4))
+        );
+        assert!(Action::parse("select_tab_0").is_none());
+    }
+
+    #[test]
+    fn layout_actions_map_to_their_messages() {
+        assert_eq!(
+            Action::SelectTabIndex(7).message(),
+            Some(ClientMessage::SelectTabIndex { index: 7 })
+        );
+        assert_eq!(
+            Action::SwapLeft.message(),
+            Some(ClientMessage::SwapPane {
+                direction: Direction::Left
+            })
+        );
+        assert_eq!(
+            Action::MoveTabRight.message(),
+            Some(ClientMessage::MoveTab { delta: 1 })
+        );
+        assert_eq!(
+            Action::PrevPane.message(),
+            Some(ClientMessage::FocusPaneCycle { forward: false })
+        );
+        assert_eq!(
+            Action::WorkspacePrev.message(),
+            Some(ClientMessage::SelectWorkspaceDelta { delta: -1 })
+        );
+        assert_eq!(Action::BreakPane.message(), Some(ClientMessage::BreakPane));
+        assert_eq!(
+            Action::LayoutEven.message(),
+            Some(ClientMessage::EqualizeLayout)
+        );
+        // Prompt- and snapshot-driven actions are resolved by `App`.
+        assert!(Action::CloseTab.message().is_none());
+        assert!(Action::ResizeMode.message().is_none());
     }
 
     #[test]

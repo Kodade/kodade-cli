@@ -47,6 +47,10 @@ pub struct Ui<'a> {
     pub navigate: Option<usize>,
     pub copy: Option<&'a CopyMode>,
     pub menu: Option<&'a Menu>,
+    /// Persistent resize mode (#14).
+    pub resize: bool,
+    /// Pending yes/no prompt text (#14).
+    pub confirm: Option<&'a str>,
     pub note: Option<&'a str>,
 }
 
@@ -59,6 +63,8 @@ pub fn render(frame: &mut Frame, layout: &LayoutSnapshot, ui: &Ui, theme: &Theme
         navigate,
         copy,
         menu,
+        resize,
+        confirm,
         note,
     } = *ui;
     let areas = Layout::default()
@@ -132,14 +138,18 @@ pub fn render(frame: &mut Frame, layout: &LayoutSnapshot, ui: &Ui, theme: &Theme
             }
         }
     }
-    let status = if rename {
+    let status = if let Some(confirm) = confirm {
+        format!(" {confirm}")
+    } else if rename {
         format!(" rename pane: {name}")
+    } else if resize {
+        " resize · hjkl 1 · HJKL 5 · esc".into()
     } else if copy.is_some() {
         " copy mode · v select · y copy · esc exit".into()
     } else if navigate.is_some() {
         " navigate · j/k move · enter activate · esc exit".into()
     } else if prefix {
-        " prefix: % \" b hjkl c n p w W x z d r".into()
+        " prefix: % \" b hjkl c n p w W x z d r · 1-9 X T R D o O ; ! = alt+hjkl alt+r".into()
     } else {
         format!(" session · {workspace}")
     };
@@ -425,6 +435,10 @@ fn render_menu(frame: &mut Frame, menu: &Menu, area: Rect, theme: &Theme) {
             MenuAction::Rename => "Rename",
             MenuAction::Zoom => "Zoom",
             MenuAction::Close => "Close",
+            MenuAction::BreakToTab => "Break to tab",
+            MenuAction::Equalize => "Equalize",
+            MenuAction::MoveLeft => "Move left",
+            MenuAction::MoveRight => "Move right",
         })
         .collect::<Vec<_>>();
     let width = 14.min(area.width.saturating_sub(menu.x));
@@ -767,6 +781,8 @@ mod tests {
             navigate: None,
             copy: None,
             menu: None,
+            resize: false,
+            confirm: None,
             note: None,
         };
         let mut terminal = Terminal::new(TestBackend::new(40, 10)).expect("test terminal");

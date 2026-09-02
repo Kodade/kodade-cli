@@ -64,6 +64,59 @@ pub fn contains(tree: &LayoutTree, target: PaneId) -> bool {
     }
 }
 
+/// Exchanges two leaves in place, wherever they sit in the tree.
+pub fn swap(tree: &mut LayoutTree, a: PaneId, b: PaneId) -> bool {
+    if a == b || !contains(tree, a) || !contains(tree, b) {
+        return false;
+    }
+    swap_inner(tree, a, b);
+    true
+}
+fn swap_inner(tree: &mut LayoutTree, a: PaneId, b: PaneId) {
+    match tree {
+        LayoutTree::Leaf { pane } => {
+            if *pane == a {
+                *pane = b;
+            } else if *pane == b {
+                *pane = a;
+            }
+        }
+        LayoutTree::Split { first, second, .. } => {
+            swap_inner(first, a, b);
+            swap_inner(second, a, b);
+        }
+    }
+}
+
+/// Resets every split ratio so sibling panes get equal space.
+pub fn equalize(tree: &mut LayoutTree) {
+    if let LayoutTree::Split {
+        ratio,
+        first,
+        second,
+        ..
+    } = tree
+    {
+        *ratio = 0.5;
+        equalize(first);
+        equalize(second);
+    }
+}
+
+/// Next / previous leaf in tree order, wrapping at the ends.
+pub fn cycle(tree: &LayoutTree, current: PaneId, forward: bool) -> Option<PaneId> {
+    let mut panes = Vec::new();
+    leaves(tree, &mut panes);
+    let index = panes.iter().position(|pane| *pane == current)?;
+    let count = panes.len();
+    let next = if forward {
+        (index + 1) % count
+    } else {
+        (index + count - 1) % count
+    };
+    Some(panes[next])
+}
+
 pub fn resize(tree: &mut LayoutTree, target: PaneId, direction: Direction, delta: f32) -> bool {
     resize_inner(tree, target, direction, delta).is_some()
 }
@@ -246,6 +299,83 @@ mod tests {
             Some(PaneId(2))
         );
     }
+    /// `1 | (2 / (3 | 4))` — three levels deep, uneven ratios.
+    fn nested() -> LayoutTree {
+        LayoutTree::Split {
+            axis: SplitAxis::Horizontal,
+            ratio: 0.3,
+            first: Box::new(leaf(1)),
+            second: Box::new(LayoutTree::Split {
+                axis: SplitAxis::Vertical,
+                ratio: 0.8,
+                first: Box::new(leaf(2)),
+                second: Box::new(LayoutTree::Split {
+                    axis: SplitAxis::Horizontal,
+                    ratio: 0.2,
+                    first: Box::new(leaf(3)),
+                    second: Box::new(leaf(4)),
+                }),
+            }),
+        }
+    }
+
+    #[test]
+    fn swap_exchanges_leaves_across_nested_splits() {
+        let mut tree = nested();
+        assert!(swap(&mut tree, PaneId(1), PaneId(4)));
+        let mut order = Vec::new();
+        leaves(&tree, &mut order);
+        assert_eq!(order, vec![PaneId(4), PaneId(2), PaneId(3), PaneId(1)]);
+        // Unknown panes and self-swaps are no-ops.
+        assert!(!swap(&mut tree, PaneId(1), PaneId(1)));
+        assert!(!swap(&mut tree, PaneId(1), PaneId(99)));
+    }
+
+    #[test]
+    fn swap_targets_come_from_the_focus_neighbor() {
+        let mut tree = leaf(1);
+        split(&mut tree, PaneId(1), SplitAxis::Horizontal, PaneId(2));
+        let target =
+            focus_neighbor(&tree, PaneId(1), Direction::Right).expect("right neighbor exists");
+        assert!(swap(&mut tree, PaneId(1), target));
+        let mut order = Vec::new();
+        leaves(&tree, &mut order);
+        assert_eq!(order, vec![PaneId(2), PaneId(1)]);
+    }
+
+    #[test]
+    fn equalize_resets_every_ratio_in_a_deep_tree() {
+        let mut tree = nested();
+        equalize(&mut tree);
+        let mut ratios = Vec::new();
+        fn collect(tree: &LayoutTree, output: &mut Vec<f32>) {
+            if let LayoutTree::Split {
+                ratio,
+                first,
+                second,
+                ..
+            } = tree
+            {
+                output.push(*ratio);
+                collect(first, output);
+                collect(second, output);
+            }
+        }
+        collect(&tree, &mut ratios);
+        assert_eq!(ratios, vec![0.5, 0.5, 0.5]);
+    }
+
+    #[test]
+    fn cycle_wraps_in_both_directions() {
+        let tree = nested();
+        assert_eq!(cycle(&tree, PaneId(1), true), Some(PaneId(2)));
+        assert_eq!(cycle(&tree, PaneId(4), true), Some(PaneId(1)));
+        assert_eq!(cycle(&tree, PaneId(1), false), Some(PaneId(4)));
+        assert_eq!(cycle(&tree, PaneId(99), true), None);
+        // A single pane cycles to itself.
+        assert_eq!(cycle(&leaf(7), PaneId(7), true), Some(PaneId(7)));
+    }
+
     #[test]
     fn resize_clamps_ratio() {
         let mut tree = LayoutTree::Split {

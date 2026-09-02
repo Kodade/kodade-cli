@@ -54,10 +54,18 @@ The default prefix is `ctrl+b`. After the prefix, the default actions are:
 | `b` / `[` | Toggle sidebar / copy mode |
 | `h` `j` `k` `l` or arrows | Focus left, down, up, right |
 | `H` `J` `K` `L` | Resize left, down, up, right |
+| `1`–`9` | Jump to that tab |
+| `X` / `T` | Close / rename tab |
+| `D` / `R` | Close / rename workspace |
+| `alt+h` `alt+j` `alt+k` `alt+l` | Swap the pane with its neighbour |
+| `o` / `O` / `;` | Next / previous / last pane |
+| `!` / `=` | Break pane to a new tab / equalize the layout |
+| `alt+r` | Resize mode (`hjkl` 1 cell, `HJKL` 5, `esc` exits) |
 
 Mouse is enabled by default: click panes, tabs, and sidebar rows to focus;
 drag pane borders to resize; scroll over a pane to scroll; right-click a pane,
-tab, or workspace for its menu. In navigate mode, `j`/`k` move through the
+tab, or workspace for its menu; the pane menu can break a pane out to its own
+tab or equalize the layout, and the tab menu can reorder tabs. In navigate mode, `j`/`k` move through the
 sidebar and `enter` activates a row; `esc` exits.
 
 Copy mode uses `v` to set a selection anchor, movement keys to select, and `y`

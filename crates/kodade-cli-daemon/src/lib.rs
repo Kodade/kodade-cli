@@ -559,6 +559,131 @@ impl Session {
                 drop(state);
                 self.resize_current()?;
             }
+            ClientMessage::SelectTabIndex { index } => {
+                let mut state = self
+                    .state
+                    .lock()
+                    .map_err(|_| anyhow!("state lock poisoned"))?;
+                let active = state.active_workspace;
+                let workspace = state
+                    .workspaces
+                    .iter_mut()
+                    .find(|item| item.id == active)
+                    .expect("active workspace exists");
+                // The wire index is one-based; out-of-range positions do nothing.
+                if let Some(tab) = index
+                    .checked_sub(1)
+                    .and_then(|index| workspace.tabs.get(index as usize))
+                {
+                    workspace.active_tab = tab.id;
+                }
+                drop(state);
+                self.resize_current()?;
+            }
+            ClientMessage::MoveTab { delta } => {
+                let mut state = self
+                    .state
+                    .lock()
+                    .map_err(|_| anyhow!("state lock poisoned"))?;
+                let active = state.active_workspace;
+                let workspace = state
+                    .workspaces
+                    .iter_mut()
+                    .find(|item| item.id == active)
+                    .expect("active workspace exists");
+                move_tab(workspace, delta);
+                drop(state);
+                self.notify();
+            }
+            ClientMessage::SwapPane { direction } => {
+                let mut state = self
+                    .state
+                    .lock()
+                    .map_err(|_| anyhow!("state lock poisoned"))?;
+                let tab = Self::active_tab_mut(&mut state);
+                // Focus follows the pane, so only the tree changes.
+                if let Some(target) = layout::focus_neighbor(&tab.tree, tab.focused, direction) {
+                    let focused = tab.focused;
+                    layout::swap(&mut tab.tree, focused, target);
+                }
+                drop(state);
+                self.resize_current()?;
+            }
+            ClientMessage::BreakPane => {
+                let mut state = self
+                    .state
+                    .lock()
+                    .map_err(|_| anyhow!("state lock poisoned"))?;
+                break_pane(&mut state);
+                drop(state);
+                self.resize_current()?;
+            }
+            ClientMessage::EqualizeLayout => {
+                let mut state = self
+                    .state
+                    .lock()
+                    .map_err(|_| anyhow!("state lock poisoned"))?;
+                layout::equalize(&mut Self::active_tab_mut(&mut state).tree);
+                drop(state);
+                self.resize_current()?;
+            }
+            ClientMessage::FocusPaneCycle { forward } => {
+                let mut state = self
+                    .state
+                    .lock()
+                    .map_err(|_| anyhow!("state lock poisoned"))?;
+                let tab = Self::active_tab_mut(&mut state);
+                if !tab.zoomed {
+                    if let Some(pane) = layout::cycle(&tab.tree, tab.focused, forward) {
+                        tab.focused = pane;
+                    }
+                }
+                self.notify();
+            }
+            ClientMessage::SelectWorkspaceDelta { delta } => {
+                let mut state = self
+                    .state
+                    .lock()
+                    .map_err(|_| anyhow!("state lock poisoned"))?;
+                let count = state.workspaces.len();
+                let index = state
+                    .workspaces
+                    .iter()
+                    .position(|item| item.id == state.active_workspace)
+                    .unwrap_or(0);
+                // Wrap in both directions without going negative.
+                let next = (index as isize + delta as isize).rem_euclid(count as isize) as usize;
+                state.active_workspace = state.workspaces[next].id;
+                drop(state);
+                self.resize_current()?;
+            }
+            ClientMessage::RenameTabId { id, name } => {
+                let mut state = self
+                    .state
+                    .lock()
+                    .map_err(|_| anyhow!("state lock poisoned"))?;
+                if let Some(tab) = state
+                    .workspaces
+                    .iter_mut()
+                    .flat_map(|workspace| workspace.tabs.iter_mut())
+                    .find(|tab| tab.id == id)
+                {
+                    tab.name = name;
+                }
+                drop(state);
+                self.notify();
+            }
+            ClientMessage::RenameWorkspaceId { id, name } => {
+                let mut state = self
+                    .state
+                    .lock()
+                    .map_err(|_| anyhow!("state lock poisoned"))?;
+                if let Some(workspace) = state.workspaces.iter_mut().find(|item| item.id == id) {
+                    workspace.name = name;
+                }
+                drop(state);
+                self.notify();
+            }
             ClientMessage::NewWorkspace { name } => {
                 let pane = self.new_pane("shell")?;
                 let tab_id = self.tab_id();
@@ -922,6 +1047,71 @@ fn sidebar_tab_info(
             })
             .collect(),
     }
+}
+
+/// Reorder the active tab by `delta` positions, clamped to the ends.
+fn move_tab(workspace: &mut Workspace, delta: i8) -> bool {
+    let Some(index) = workspace
+        .tabs
+        .iter()
+        .position(|tab| tab.id == workspace.active_tab)
+    else {
+        return false;
+    };
+    let last = workspace.tabs.len().saturating_sub(1);
+    let target = (index as isize + delta as isize).clamp(0, last as isize) as usize;
+    if target == index {
+        return false;
+    }
+    let tab = workspace.tabs.remove(index);
+    workspace.tabs.insert(target, tab);
+    true
+}
+
+/// Move the focused pane into a new tab of its own, keeping its PTY alive.
+/// A tab holding a single pane has nothing to break out, so it is a no-op.
+fn break_pane(state: &mut SessionState) -> bool {
+    let active = state.active_workspace;
+    let Some(workspace) = state.workspaces.iter_mut().find(|item| item.id == active) else {
+        return false;
+    };
+    let Some(index) = workspace
+        .tabs
+        .iter()
+        .position(|tab| tab.id == workspace.active_tab)
+    else {
+        return false;
+    };
+    let source = &mut workspace.tabs[index];
+    let pane = source.focused;
+    let Some(tree) = layout::close(source.tree.clone(), pane) else {
+        return false;
+    };
+    source.tree = tree;
+    source.zoomed = false;
+    let mut remaining = Vec::new();
+    layout::leaves(&source.tree, &mut remaining);
+    source.focused = remaining[0];
+    let name = source.name.clone();
+    state.next_id += 1;
+    let id = TabId(state.next_id);
+    let workspace = state
+        .workspaces
+        .iter_mut()
+        .find(|item| item.id == active)
+        .expect("active workspace exists");
+    workspace.tabs.insert(
+        index + 1,
+        Tab {
+            id,
+            name,
+            tree: LayoutTree::Leaf { pane },
+            focused: pane,
+            zoomed: false,
+        },
+    );
+    workspace.active_tab = id;
+    true
 }
 
 /// Focus a pane wherever it lives, activating its tab and workspace first.
@@ -1598,6 +1788,66 @@ mod tests {
         assert_eq!(state.workspaces[1].tabs[0].focused, PaneId(6));
         assert!(!focus_pane_id(&mut state, PaneId(99)));
     }
+    /// One workspace, one tab, two panes split side by side.
+    fn split_state() -> SessionState {
+        SessionState {
+            active_workspace: WorkspaceId(1),
+            next_id: 4,
+            workspaces: vec![Workspace {
+                id: WorkspaceId(1),
+                name: "one".into(),
+                active_tab: TabId(2),
+                tabs: vec![Tab {
+                    id: TabId(2),
+                    name: "agents".into(),
+                    tree: LayoutTree::Split {
+                        axis: SplitAxis::Horizontal,
+                        ratio: 0.5,
+                        first: Box::new(LayoutTree::Leaf { pane: PaneId(3) }),
+                        second: Box::new(LayoutTree::Leaf { pane: PaneId(4) }),
+                    },
+                    focused: PaneId(4),
+                    zoomed: false,
+                }],
+            }],
+        }
+    }
+
+    #[test]
+    fn break_pane_moves_the_focused_leaf_into_a_new_tab() {
+        let mut state = split_state();
+        assert!(break_pane(&mut state));
+        let workspace = &state.workspaces[0];
+        assert_eq!(workspace.tabs.len(), 2);
+        // Source tab keeps the remaining pane and focus lands on it.
+        assert_eq!(workspace.tabs[0].tree, LayoutTree::Leaf { pane: PaneId(3) });
+        assert_eq!(workspace.tabs[0].focused, PaneId(3));
+        // New tab holds the broken-out pane and becomes active.
+        assert_eq!(workspace.tabs[1].tree, LayoutTree::Leaf { pane: PaneId(4) });
+        assert_eq!(workspace.active_tab, workspace.tabs[1].id);
+        // A single-pane tab has nothing to break out.
+        assert!(!break_pane(&mut state));
+    }
+
+    #[test]
+    fn move_tab_reorders_and_clamps() {
+        let mut state = split_state();
+        let workspace = &mut state.workspaces[0];
+        workspace.tabs.push(Tab {
+            id: TabId(9),
+            name: "second".into(),
+            tree: LayoutTree::Leaf { pane: PaneId(9) },
+            focused: PaneId(9),
+            zoomed: false,
+        });
+        assert!(move_tab(workspace, 1));
+        assert_eq!(workspace.tabs[1].id, TabId(2));
+        // Already at the end: clamped, so nothing moves.
+        assert!(!move_tab(workspace, 1));
+        assert!(move_tab(workspace, -1));
+        assert_eq!(workspace.tabs[0].id, TabId(2));
+    }
+
     #[tokio::test]
     async fn stale_socket_file_is_removed_before_binding() {
         let directory =

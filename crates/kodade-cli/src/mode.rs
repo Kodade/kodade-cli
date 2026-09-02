@@ -141,6 +141,13 @@ pub enum MenuAction {
     Rename,
     Zoom,
     Close,
+    /// Pane → its own tab (#14).
+    BreakToTab,
+    /// Reset split ratios in the pane's tab (#14).
+    Equalize,
+    /// Reorder a tab (#14).
+    MoveLeft,
+    MoveRight,
 }
 #[derive(Debug, Clone)]
 pub struct Menu {
@@ -157,9 +164,17 @@ impl Menu {
                 MenuAction::SplitDown,
                 MenuAction::Rename,
                 MenuAction::Zoom,
+                MenuAction::BreakToTab,
+                MenuAction::Equalize,
                 MenuAction::Close,
             ],
-            _ => &[MenuAction::Rename, MenuAction::Close],
+            MenuTarget::Tab(_) => &[
+                MenuAction::Rename,
+                MenuAction::MoveLeft,
+                MenuAction::MoveRight,
+                MenuAction::Close,
+            ],
+            MenuTarget::Workspace(_) => &[MenuAction::Rename, MenuAction::Close],
         }
     }
     pub fn move_by(&mut self, delta: isize) {
