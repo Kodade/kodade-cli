@@ -384,7 +384,7 @@ pub struct Theme {
 }
 
 impl Theme {
-    fn kodade_dark() -> Self {
+    pub(crate) fn kodade_dark() -> Self {
         Self::parse(include_str!("../themes/kodade-dark.toml"))
             .expect("built-in kodade-dark theme is valid")
     }

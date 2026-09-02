@@ -114,6 +114,12 @@ The optional `[ansi]` table has sixteen keys: `black`, `red`, `green`,
 `bright_green`, `bright_yellow`, `bright_blue`, `bright_magenta`,
 `bright_cyan`, `bright_white`. Any missing key falls back to that xterm slot.
 
+`[ansi]` drives pane colors: the 16 basic colors a program prints inside a pane
+are drawn from this palette, so themes restyle terminal output without touching
+the program. Colors 16–255 use the terminal's own 256-color cube and 24-bit
+colors are passed through unchanged. A cell with no color set uses `text` on
+`bg`.
+
 The complete built-in `kodade-dark` theme:
 
 ```toml

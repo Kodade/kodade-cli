@@ -25,6 +25,15 @@ socket per session. Each message is one UTF-8 JSON value followed by a newline;
 PTY input bytes are represented by serde JSON byte arrays. The shared protocol
 types live in `kodade-cli-proto`.
 
+Pane contents travel in a `Screen`: a plain `contents` string (used by copy
+mode and `pane read`) plus `rows`, one styled run list per visible terminal
+row. A `Run` is a stretch of adjacent cells sharing foreground color,
+background color, and attribute bits (bold, italic, underline, dim, inverse);
+colors are `Default`, `Indexed(u8)`, or `Rgb`. Wide characters are emitted once
+and their continuation cell dropped, so a run's display width equals the
+columns it covers. `Screen` also carries the cursor position and visibility and
+the pane's bracketed-paste and mouse-reporting modes.
+
 Socket paths are selected in this order:
 
 1. `$XDG_RUNTIME_DIR/kodade-cli/SESSION.sock` when `XDG_RUNTIME_DIR` is set.
