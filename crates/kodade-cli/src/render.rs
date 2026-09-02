@@ -18,6 +18,7 @@ use crate::{
     input::{tab_spans, TabSpan},
     mode::{menu_origin_x, CopyMode, Menu, MenuAction, MENU_WIDTH},
     overlay::{render_overlay, Overlay},
+    selection::Selection,
 };
 
 /// Longest a single tab name is shown before ellipsis; the whole bar then
@@ -70,6 +71,8 @@ pub struct Ui<'a> {
     pub flash: bool,
     /// Show the `prefix b · sidebar` hint in the status bar (#24 gutter hint).
     pub sidebar_hint: bool,
+    /// Live mouse selection, highlighted in its own pane (#12).
+    pub selection: Option<&'a Selection>,
 }
 
 pub fn render(frame: &mut Frame, layout: &LayoutSnapshot, ui: &Ui, theme: &Theme) {
@@ -90,6 +93,7 @@ pub fn render(frame: &mut Frame, layout: &LayoutSnapshot, ui: &Ui, theme: &Theme
         status_right,
         flash,
         sidebar_hint,
+        selection,
     } = *ui;
     let areas = Layout::default()
         .direction(LayoutDirection::Horizontal)
@@ -132,8 +136,10 @@ pub fn render(frame: &mut Frame, layout: &LayoutSnapshot, ui: &Ui, theme: &Theme
                 .filter(|copy| copy.pane == pane.id)
                 .map(|copy| &copy.screen)
                 .unwrap_or(&pane.screen);
+            // A mouse selection highlights only in the pane it started in.
+            let selection = selection.filter(|selection| selection.pane == pane.id);
             frame.render_widget(
-                Paragraph::new(pane_lines(screen, theme))
+                Paragraph::new(pane_lines(screen, theme, selection))
                     .style(Style::default().fg(theme.text).bg(theme.bg))
                     .block(pane_block(pane, *rect, theme)),
                 *rect,
@@ -166,7 +172,7 @@ pub fn render(frame: &mut Frame, layout: &LayoutSnapshot, ui: &Ui, theme: &Theme
     } else if navigate.is_some() {
         " navigate · j/k move · enter activate · esc exit".into()
     } else if prefix {
-        " prefix: % \" b hjkl c n p s w W x z d r q · 1-9 X T R D o O ; ! = alt+hjkl alt+r ctrl+r"
+        " prefix: % \" b hjkl c m n p s w W x z d r q · 1-9 X T R D o O ; ! = alt+hjkl alt+r ctrl+r"
             .into()
     } else {
         let tab = active_tab_name(layout);
@@ -355,18 +361,59 @@ fn local_hh_mm() -> String {
 
 /// Convert a pane `Screen` into styled ratatui lines. Shared by the live pane
 /// draw and copy mode so both look the same.
-pub fn pane_lines<'a>(screen: &'a Screen, theme: &Theme) -> Vec<Line<'a>> {
+pub fn pane_lines<'a>(
+    screen: &'a Screen,
+    theme: &Theme,
+    selection: Option<&Selection>,
+) -> Vec<Line<'a>> {
     screen
         .rows
         .iter()
-        .map(|runs| {
-            Line::from(
-                runs.iter()
-                    .map(|run| run_span(run, theme))
-                    .collect::<Vec<_>>(),
-            )
+        .enumerate()
+        .map(|(row, runs)| {
+            let mut spans = Vec::with_capacity(runs.len());
+            let mut column = 0usize;
+            for run in runs {
+                let width = run.text.chars().count();
+                spans.extend(run_spans(run, theme, row, column, selection));
+                column += width;
+            }
+            Line::from(spans)
         })
         .collect()
+}
+
+/// One run as spans, split where the mouse selection starts or ends so the
+/// selected cells get `theme.selection` as their background (#12).
+fn run_spans<'a>(
+    run: &'a Run,
+    theme: &Theme,
+    row: usize,
+    column: usize,
+    selection: Option<&Selection>,
+) -> Vec<Span<'a>> {
+    let base = run_span(run, theme);
+    let Some(selection) = selection else {
+        return vec![base];
+    };
+    let highlight = base.style.bg(theme.selection);
+    let mut spans = Vec::new();
+    let mut chunk = String::new();
+    let mut selected = false;
+    for (offset, character) in run.text.chars().enumerate() {
+        let now = selection.contains(row, column + offset);
+        if now != selected && !chunk.is_empty() {
+            let style = if selected { highlight } else { base.style };
+            spans.push(Span::styled(std::mem::take(&mut chunk), style));
+        }
+        selected = now;
+        chunk.push(character);
+    }
+    if !chunk.is_empty() {
+        let style = if selected { highlight } else { base.style };
+        spans.push(Span::styled(chunk, style));
+    }
+    spans
 }
 
 fn run_span<'a>(run: &'a Run, theme: &Theme) -> Span<'a> {
@@ -999,7 +1046,7 @@ mod tests {
             ]],
             ..Screen::default()
         };
-        let lines = pane_lines(&screen, &theme);
+        let lines = pane_lines(&screen, &theme, None);
         let spans = &lines[0].spans;
         // 0–15 come from the theme palette; 16+ stay terminal-indexed.
         assert_eq!(spans[0].style.fg, Some(theme.ansi[2]));
@@ -1015,6 +1062,34 @@ mod tests {
         assert_eq!(spans[2].style.fg, Some(theme.text));
         assert_eq!(spans[2].style.bg, Some(theme.bg));
         assert_eq!(spans[2].style.add_modifier, Modifier::empty());
+    }
+
+    #[test]
+    fn selected_cells_take_the_theme_selection_background() {
+        use crate::selection::{Selection, SelectionMode};
+        let theme = Theme::kodade_dark();
+        let screen = Screen {
+            contents: "hello".into(),
+            rows: vec![vec![run(
+                "hello",
+                CellColor::Default,
+                CellColor::Default,
+                0,
+            )]],
+            ..Screen::default()
+        };
+        let mut selection = Selection::new(PaneId(1), (0, 1), SelectionMode::Char, &screen);
+        selection.set_head((0, 2), &screen);
+        let lines = pane_lines(&screen, &theme, Some(&selection));
+        let spans = &lines[0].spans;
+        // The run splits into before / selected / after.
+        assert_eq!(spans.len(), 3);
+        assert_eq!(spans[0].content.as_ref(), "h");
+        assert_eq!(spans[0].style.bg, Some(theme.bg));
+        assert_eq!(spans[1].content.as_ref(), "el");
+        assert_eq!(spans[1].style.bg, Some(theme.selection));
+        assert_eq!(spans[2].content.as_ref(), "lo");
+        assert_eq!(spans[2].style.bg, Some(theme.bg));
     }
 
     #[test]
@@ -1082,6 +1157,7 @@ mod tests {
             status_right: &[],
             flash: false,
             sidebar_hint: false,
+            selection: None,
         };
         let mut terminal = Terminal::new(TestBackend::new(40, 10)).expect("test terminal");
         terminal
@@ -1206,6 +1282,7 @@ mod tests {
             status_right: &[],
             flash: false,
             sidebar_hint: false,
+            selection: None,
         };
         let mut terminal = Terminal::new(TestBackend::new(80, 12)).expect("test terminal");
         terminal

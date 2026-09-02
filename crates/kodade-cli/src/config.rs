@@ -12,8 +12,17 @@ pub struct Config {
     pub theme: ThemeChoice,
     pub mouse: bool,
     pub sidebar: bool,
-    /// `mouse.copy_on_select` — consumed by the drag-selection work (#12).
+    /// `mouse.copy_on_select` — copy as soon as a mouse drag ends (#12).
     pub copy_on_select: bool,
+    /// `mouse.scroll_lines` — rows per wheel notch (#12).
+    pub scroll_lines: i16,
+    /// `mouse.passthrough` — forward events to pane apps that ask for the
+    /// mouse (vim, lazygit, htop) instead of selecting text (#12).
+    pub passthrough: bool,
+    /// `mouse.clear_on_output` — drop a selection when the pane redraws (#12).
+    pub clear_on_output: bool,
+    /// `ui.link_command` — program that opens a ctrl-clicked URL (#12).
+    pub link_command: String,
     /// `notify.enabled` — consumed by the notification work (#10).
     pub notify: bool,
     /// `paste.sanitize` — strip escape sequences and control bytes from pastes (#21).
@@ -111,6 +120,8 @@ pub enum Action {
     DisplayPanes,
     // Paste (#21): re-paste the internal buffer.
     PasteBuffer,
+    /// Toggle mouse capture at runtime so the host terminal can select (#12).
+    MouseToggle,
 }
 
 /// Every remappable action and its config name. Single source of truth for
@@ -168,6 +179,7 @@ const ACTIONS: &[(&str, Action)] = &[
     ("settings", Action::Settings),
     ("display_panes", Action::DisplayPanes),
     ("paste_buffer", Action::PasteBuffer),
+    ("mouse_toggle", Action::MouseToggle),
 ];
 
 impl Action {
@@ -263,7 +275,9 @@ impl Action {
             | Self::ResizeMode
             | Self::DisplayPanes => return None,
             // Client-side only: they never reach the daemon.
-            Self::ReloadConfig | Self::Settings | Self::PasteBuffer => return None,
+            Self::ReloadConfig | Self::Settings | Self::PasteBuffer | Self::MouseToggle => {
+                return None
+            }
         })
     }
 }
@@ -292,6 +306,7 @@ struct StatusFile {
 #[derive(Debug, Deserialize, Default)]
 struct UiFile {
     window_title: Option<String>,
+    link_command: Option<String>,
 }
 
 /// A setting that accepts either a bare `key = true` boolean (the pre-0.2
@@ -306,7 +321,12 @@ enum Section<T> {
 #[derive(Debug, Deserialize, Default)]
 struct MouseTable {
     enabled: Option<bool>,
+    /// Alias for `enabled`, matching the herdr naming (#12).
+    capture: Option<bool>,
     copy_on_select: Option<bool>,
+    scroll_lines: Option<i16>,
+    passthrough: Option<bool>,
+    clear_on_output: Option<bool>,
     #[serde(flatten)]
     extra: HashMap<String, toml::Value>,
 }
@@ -400,6 +420,7 @@ impl Default for Config {
             ("=", Action::LayoutEven),
             ("q", Action::DisplayPanes),
             ("]", Action::PasteBuffer),
+            ("m", Action::MouseToggle),
         ] {
             bindings.insert(
                 parse_key_chord(binding).expect("built-in key is valid"),
@@ -418,6 +439,10 @@ impl Default for Config {
             mouse: true,
             sidebar: true,
             copy_on_select: true,
+            scroll_lines: 3,
+            passthrough: true,
+            clear_on_output: false,
+            link_command: default_link_command().into(),
             notify: true,
             paste_sanitize: true,
             prefix: parse_key_chord("ctrl+b").expect("built-in prefix is valid"),
@@ -470,8 +495,14 @@ impl Config {
         match file.mouse {
             Some(Section::Enabled(enabled)) => config.mouse = enabled,
             Some(Section::Table(table)) => {
-                config.mouse = table.enabled.unwrap_or(config.mouse);
+                config.mouse = table.enabled.or(table.capture).unwrap_or(config.mouse);
                 config.copy_on_select = table.copy_on_select.unwrap_or(config.copy_on_select);
+                config.scroll_lines = table
+                    .scroll_lines
+                    .map(|lines| lines.clamp(1, 100))
+                    .unwrap_or(config.scroll_lines);
+                config.passthrough = table.passthrough.unwrap_or(config.passthrough);
+                config.clear_on_output = table.clear_on_output.unwrap_or(config.clear_on_output);
                 config.warn_unknown("mouse.", &table.extra);
             }
             None => {}
@@ -506,8 +537,13 @@ impl Config {
             }
             config.status_right = widgets;
         }
-        if let Some(title) = file.ui.and_then(|ui| ui.window_title) {
-            config.window_title = title;
+        if let Some(ui) = file.ui {
+            if let Some(title) = ui.window_title {
+                config.window_title = title;
+            }
+            if let Some(command) = ui.link_command {
+                config.link_command = command;
+            }
         }
         if let Some(keys) = file.keys {
             // Sorted so warnings and overrides are deterministic.
@@ -642,6 +678,12 @@ impl Config {
         let _ = writeln!(out, "\n[mouse]");
         let _ = writeln!(out, "enabled = {}", self.mouse);
         let _ = writeln!(out, "copy_on_select = {}", self.copy_on_select);
+        let _ = writeln!(out, "scroll_lines = {}", self.scroll_lines);
+        let _ = writeln!(out, "passthrough = {}", self.passthrough);
+        let _ = writeln!(out, "clear_on_output = {}", self.clear_on_output);
+        let _ = writeln!(out, "\n[ui]");
+        let _ = writeln!(out, "window_title = {}", toml_string(&self.window_title));
+        let _ = writeln!(out, "link_command = {}", toml_string(&self.link_command));
         let _ = writeln!(out, "\n[notify]");
         let _ = writeln!(out, "enabled = {}", self.notify);
         let _ = writeln!(out, "\n[paste]");
@@ -798,6 +840,15 @@ pub fn normalize_key(key: KeyEvent) -> KeyEvent {
             KeyEvent::new(KeyCode::Char(upper), key.modifiers - KeyModifiers::SHIFT)
         }
         _ => key,
+    }
+}
+
+/// Platform default for `ui.link_command` (#12).
+pub fn default_link_command() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
     }
 }
 
@@ -1507,6 +1558,7 @@ red = \"#abcdef\"
             }),
             ui: Some(UiFile {
                 window_title: Some("{session}:{tab}".into()),
+                link_command: None,
             }),
             ..FileConfig::default()
         });
@@ -1520,6 +1572,32 @@ red = \"#abcdef\"
             ]
         );
         assert_eq!(file.window_title, "{session}:{tab}");
+    }
+
+    #[test]
+    fn mouse_table_carries_the_selection_settings() {
+        let config = Config::from_file(
+            toml::from_str::<FileConfig>(
+                "[mouse]\ncapture = false\nscroll_lines = 7\npassthrough = false\nclear_on_output = true\n\n[ui]\nlink_command = \"firefox\"\n",
+            )
+            .expect("config parses"),
+        );
+        // `capture` is the herdr-compatible alias for `enabled`.
+        assert!(!config.mouse);
+        assert_eq!(config.scroll_lines, 7);
+        assert!(!config.passthrough);
+        assert!(config.clear_on_output);
+        assert_eq!(config.link_command, "firefox");
+        assert!(config.warnings.is_empty());
+        // Defaults, and `prefix m` toggles capture.
+        let defaults = Config::default();
+        assert_eq!(defaults.scroll_lines, 3);
+        assert!(defaults.passthrough);
+        assert!(!defaults.clear_on_output);
+        assert_eq!(
+            defaults.action(parse_key_chord("m").unwrap()),
+            Some(Action::MouseToggle)
+        );
     }
 
     #[test]

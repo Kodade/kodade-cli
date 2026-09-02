@@ -12,12 +12,14 @@ use crossterm::{
     execute,
 };
 use kodade_cli_proto::{
-    AgentStateKind, ClientMessage, Direction, LayoutSnapshot, PaneId, SidebarTabInfo, WorkspaceInfo,
+    AgentStateKind, ClientMessage, Direction, LayoutSnapshot, PaneId, Screen, SidebarTabInfo,
+    WorkspaceInfo,
 };
 use ratatui::{backend::CrosstermBackend, layout::Rect, Frame, Terminal};
 use std::{
     io::Write,
     path::{Path, PathBuf},
+    process::{Command, Stdio},
     time::{Duration, Instant},
 };
 use tokio::{io::AsyncWriteExt, net::unix::OwnedWriteHalf, sync::mpsc};
@@ -25,10 +27,13 @@ use tokio::{io::AsyncWriteExt, net::unix::OwnedWriteHalf, sync::mpsc};
 use crate::{
     config, input, mode,
     overlay::{self, Overlay, OverlayEvent, OverlayTarget},
-    paste, render, settings,
+    paste, render,
+    selection::{self, Selection, SelectionMode},
+    settings,
 };
 
-const SCROLL_STEP: i16 = 3;
+/// Two left clicks on the same cell inside this window are a double click (#12).
+const MULTI_CLICK: Duration = Duration::from_millis(400);
 /// How long a status-bar note stays up.
 const NOTE_TTL: Duration = Duration::from_secs(5);
 /// Pace a multi-chunk paste so the socket writer does not flood the daemon.
@@ -85,7 +90,8 @@ pub struct App {
     settings: Option<Overlay>,
     /// Status-bar note and the instant it stops being shown.
     note: Option<(String, Instant)>,
-    /// Last sanitized paste / copy-mode yank, re-sent by `paste_buffer` (#21).
+    /// Last sanitized paste, copy-mode yank, or mouse selection; re-sent by
+    /// the `paste_buffer` action (#21).
     paste_buffer: String,
     /// Session reported by the daemon's `Welcome`; shown in the status bar (#11).
     session_name: String,
@@ -95,6 +101,14 @@ pub struct App {
     sidebar_hidden_at: Option<Instant>,
     /// Last OSC-0 title written, so we only re-emit on change (#11).
     last_title: String,
+    /// Live mouse selection and whether the button is still held (#12).
+    selection: Option<Selection>,
+    selecting: bool,
+    /// Last left click (when, column, row, count) for double/triple clicks (#12).
+    last_click: Option<(Instant, u16, u16, u8)>,
+    /// Runtime mouse capture; `prefix m` toggles it without touching the
+    /// config so the host terminal can take the mouse back (#12).
+    mouse_capture: bool,
     config: config::Config,
     theme: config::Theme,
 }
@@ -129,6 +143,10 @@ impl App {
             flash_until: None,
             sidebar_hidden_at: None,
             last_title: String::new(),
+            selection: None,
+            selecting: false,
+            last_click: None,
+            mouse_capture: config.mouse,
             theme: config.resolve_theme(),
             config: config.clone(),
         }
@@ -159,6 +177,18 @@ impl App {
                 copy_mode.refresh(pane.screen.clone());
             }
         }
+        // A selection belongs to one pane's current output: drop it when focus
+        // moves, when its pane goes away, or (opt-in) when the pane redraws.
+        if let Some(selection) = &self.selection {
+            let pane = layout.panes.iter().find(|pane| pane.id == selection.pane);
+            let changed = self
+                .pane_screen(selection.pane)
+                .zip(pane)
+                .is_some_and(|(old, new)| old.contents != new.screen.contents);
+            if pane.is_none() || (changed && self.config.clear_on_output) {
+                self.clear_selection();
+            }
+        }
         // Remember the previously focused pane so `last_pane` can jump back.
         let focused = layout.panes.iter().find(|pane| pane.focused).map(|p| p.id);
         if focused != self.focused_pane {
@@ -166,6 +196,7 @@ impl App {
                 self.last_pane = Some(previous);
             }
             self.focused_pane = focused;
+            self.clear_selection();
         }
         self.layout = Some(layout);
     }
@@ -196,6 +227,7 @@ impl App {
                 status_right: &self.config.status_right,
                 flash: self.flash_active(),
                 sidebar_hint: self.sidebar_hint_active(),
+                selection: self.selection.as_ref(),
             },
             &self.theme,
         )
@@ -291,6 +323,8 @@ impl App {
         writer: &mut OwnedWriteHalf,
         term: &mut Term,
     ) -> Result<Flow> {
+        // Any keystroke ends a mouse selection (#12).
+        self.clear_selection();
         if self.confirm.is_some() {
             self.handle_confirm_key(key, writer).await?;
         } else if self.rename {
@@ -584,6 +618,15 @@ impl App {
             config::Action::DisplayPanes => {
                 self.flash_until = Some(Instant::now() + FLASH);
             }
+            config::Action::MouseToggle => {
+                self.mouse_capture = !self.mouse_capture;
+                set_mouse_capture(term, self.mouse_capture)?;
+                self.set_note(if self.mouse_capture {
+                    " mouse capture on"
+                } else {
+                    " mouse capture off · prefix m to re-enable"
+                });
+            }
             config::Action::SidebarToggle => {
                 self.sidebar = !self.sidebar;
                 // Start the timed gutter hint when the sidebar just went away.
@@ -732,7 +775,10 @@ impl App {
                     self.set_note(" auto resolves on next start");
                 }
             }
-            settings::Setting::Mouse => set_mouse_capture(term, self.config.mouse)?,
+            settings::Setting::Mouse => {
+                self.mouse_capture = self.config.mouse;
+                set_mouse_capture(term, self.mouse_capture)?;
+            }
             settings::Setting::Sidebar => {
                 self.sidebar = self.config.sidebar;
                 self.send_resize(writer, term).await?;
@@ -748,8 +794,9 @@ impl App {
         match config::Config::load_checked() {
             Ok(config) => {
                 self.apply_theme(&config);
-                if config.mouse != self.config.mouse {
-                    set_mouse_capture(term, config.mouse)?;
+                if config.mouse != self.mouse_capture {
+                    self.mouse_capture = config.mouse;
+                    set_mouse_capture(term, self.mouse_capture)?;
                 }
                 let note = match config.warnings.first() {
                     Some(warning) => format!(" config reloaded · {warning}"),
@@ -823,18 +870,25 @@ impl App {
         writer: &mut OwnedWriteHalf,
         term: &mut Term,
     ) -> Result<()> {
-        if !self.config.mouse || self.layout.is_none() {
+        if !self.mouse_capture || self.layout.is_none() {
             return Ok(());
         }
         // The settings overlay owns the mouse while it is up.
         if self.settings.is_some() {
             return self.settings_mouse(mouse, writer, term).await;
         }
+        // A pane app that turned mouse reporting on gets the event verbatim.
+        if self.passthrough(mouse, writer, term).await? {
+            return Ok(());
+        }
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
                 self.mouse_left_down(mouse, writer, term).await?
             }
             MouseEventKind::Down(MouseButton::Right) => self.mouse_right_down(mouse, term)?,
+            MouseEventKind::Drag(MouseButton::Left) if self.selecting => {
+                self.drag_selection(mouse, term)?;
+            }
             MouseEventKind::Drag(MouseButton::Left) => {
                 if let Some(dragging) = &mut self.drag {
                     let now = if dragging.vertical {
@@ -850,16 +904,20 @@ impl App {
                     }
                 }
             }
-            MouseEventKind::Up(MouseButton::Left) => self.drag = None,
+            MouseEventKind::Up(MouseButton::Left) => {
+                self.drag = None;
+                self.finish_selection(term)?;
+            }
             MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
                 let area = self.content_area(term)?;
                 let current = self.layout.as_ref().expect("layout present");
                 let rects = render::pane_rects_for(current, area);
                 if let Some(id) = input::pane_at(&rects, mouse.column, mouse.row) {
+                    let step = self.config.scroll_lines;
                     let delta = if matches!(mouse.kind, MouseEventKind::ScrollUp) {
-                        SCROLL_STEP
+                        step
                     } else {
-                        -SCROLL_STEP
+                        -step
                     };
                     write(writer, &ClientMessage::ScrollPane { id, delta }).await?;
                 }
@@ -929,10 +987,182 @@ impl App {
             {
                 write(writer, &ClientMessage::SelectTab { id }).await?;
             }
-        } else if let Some(id) = input::pane_at(&rects, mouse.column, mouse.row) {
+        } else if let Some((id, (col, row))) = pane_cell_at(&rects, mouse.column, mouse.row) {
             write(writer, &ClientMessage::FocusPaneId { id }).await?;
+            // Ctrl/cmd-click opens a link instead of starting a selection.
+            if mouse
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER)
+            {
+                self.clear_selection();
+                self.open_link(id, row as usize, col as usize);
+                return Ok(());
+            }
+            let mode = match self.click_count(mouse.column, mouse.row) {
+                2 => SelectionMode::Word,
+                3 => SelectionMode::Line,
+                _ => SelectionMode::Char,
+            };
+            let started = self
+                .pane_screen(id)
+                .map(|screen| Selection::new(id, (row as usize, col as usize), mode, screen));
+            self.selection = started;
+            self.selecting = self.selection.is_some();
+        } else if input::pane_at(&rects, mouse.column, mouse.row).is_none() {
+            self.clear_selection();
         }
         Ok(())
+    }
+
+    // Forwards a mouse event to a pane app that enabled mouse reporting, as
+    // SGR (1006) bytes. Returns true when the pane consumed it. The tab bar,
+    // sidebar, borders, the context menu, and ctrl/cmd-clicks stay local.
+    async fn passthrough(
+        &mut self,
+        mouse: MouseEvent,
+        writer: &mut OwnedWriteHalf,
+        term: &mut Term,
+    ) -> Result<bool> {
+        if !self.config.passthrough
+            || self.menu.is_some()
+            || self.copy.is_some()
+            || matches!(mouse.kind, MouseEventKind::Moved)
+            || mouse
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER)
+        {
+            return Ok(false);
+        }
+        let content = self.content_area(term)?;
+        let current = self.layout.as_ref().expect("layout present");
+        let rects = render::pane_rects_for(current, content);
+        let Some((id, (col, row))) = pane_cell_at(&rects, mouse.column, mouse.row) else {
+            return Ok(false);
+        };
+        if !current
+            .panes
+            .iter()
+            .any(|pane| pane.id == id && pane.screen.mouse_reporting)
+        {
+            return Ok(false);
+        }
+        let bytes = selection::sgr_mouse(mouse.kind, mouse.modifiers, col, row);
+        write(writer, &ClientMessage::SendToPane { id, bytes }).await?;
+        Ok(true)
+    }
+
+    // Extends the active selection to the cell under the pointer, clamped to
+    // the pane so dragging past an edge keeps selecting.
+    fn drag_selection(&mut self, mouse: MouseEvent, term: &mut Term) -> Result<()> {
+        let content = self.content_area(term)?;
+        let Some(mut selection) = self.selection.take() else {
+            self.selecting = false;
+            return Ok(());
+        };
+        let current = self.layout.as_ref().expect("layout present");
+        let rect = render::pane_rects_for(current, content)
+            .into_iter()
+            .find(|(id, _)| *id == selection.pane)
+            .map(|(_, rect)| rect);
+        if let Some((col, row)) = rect.map(|rect| clamped_cell(rect, mouse.column, mouse.row)) {
+            if let Some(screen) = self.pane_screen(selection.pane) {
+                selection.set_head((row as usize, col as usize), screen);
+            }
+        }
+        self.selection = Some(selection);
+        Ok(())
+    }
+
+    // Mouse up: a plain click clears, a real drag copies when
+    // `mouse.copy_on_select` is on and always fills the paste buffer.
+    fn finish_selection(&mut self, term: &mut Term) -> Result<()> {
+        self.selecting = false;
+        let Some(selection) = self.selection.clone() else {
+            return Ok(());
+        };
+        if selection.is_click() {
+            self.selection = None;
+            return Ok(());
+        }
+        let text = match self.pane_screen(selection.pane) {
+            Some(screen) => selection.text(screen),
+            None => String::new(),
+        };
+        if text.is_empty() {
+            self.selection = None;
+            return Ok(());
+        }
+        // Always fill the internal buffer so `prefix ]` can re-paste it (#21).
+        self.paste_buffer = text.clone();
+        if self.config.copy_on_select {
+            let (payload, truncated) = mode::osc52(&text);
+            execute!(term.backend_mut(), crossterm::style::Print(payload))?;
+            term.backend_mut().flush()?;
+            self.set_note(if truncated {
+                " copied (truncated to 100KB)"
+            } else {
+                " copied"
+            });
+        }
+        Ok(())
+    }
+
+    // Click count for double/triple clicks: same cell inside `MULTI_CLICK`.
+    fn click_count(&mut self, column: u16, row: u16) -> u8 {
+        let now = Instant::now();
+        let count = match self.last_click {
+            Some((at, last_column, last_row, count))
+                if last_column == column
+                    && last_row == row
+                    && now.duration_since(at) < MULTI_CLICK =>
+            {
+                (count + 1).min(3)
+            }
+            _ => 1,
+        };
+        self.last_click = Some((now, column, row, count));
+        count
+    }
+
+    // Ctrl/cmd-click: open the URL under the pointer with `ui.link_command`.
+    fn open_link(&mut self, pane: PaneId, row: usize, col: usize) {
+        let url = self
+            .pane_screen(pane)
+            .and_then(|screen| selection::link_at(screen, row, col));
+        let Some(url) = url else {
+            self.set_note(" no link here");
+            return;
+        };
+        // Detached: the opener owns the URL from here, we never wait on it.
+        let spawned = Command::new(&self.config.link_command)
+            .arg(&url)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn();
+        match spawned {
+            Ok(child) => {
+                drop(child);
+                self.set_note(format!(" opened {url}"));
+            }
+            Err(error) => self.set_note(format!(" open failed: {error}")),
+        }
+    }
+
+    // The newest screen for a pane, if it is still in the layout.
+    fn pane_screen(&self, pane: PaneId) -> Option<&Screen> {
+        self.layout
+            .as_ref()?
+            .panes
+            .iter()
+            .find(|candidate| candidate.id == pane)
+            .map(|candidate| &candidate.screen)
+    }
+
+    // Drops any mouse selection and its drag state.
+    fn clear_selection(&mut self) {
+        self.selection = None;
+        self.selecting = false;
     }
 
     // Clicks while the settings overlay is open: a row activates, anything
@@ -1073,6 +1303,39 @@ impl App {
             self.sidebar,
         ))
     }
+}
+
+/// Pane-relative cell under the pointer, or `None` on a border or outside.
+/// Panes draw a one-cell border, so the text grid starts at `rect + 1`.
+fn pane_cell_at(rects: &[(PaneId, Rect)], column: u16, row: u16) -> Option<(PaneId, (u16, u16))> {
+    rects.iter().find_map(|(id, rect)| {
+        let inner = inner_area(*rect);
+        inner
+            .contains((column, row).into())
+            .then(|| (*id, (column - inner.x, row - inner.y)))
+    })
+}
+
+/// Pane-relative cell, clamped into the pane so a drag past an edge still
+/// selects the last row or column.
+fn clamped_cell(rect: Rect, column: u16, row: u16) -> (u16, u16) {
+    let inner = inner_area(rect);
+    let last_column = inner.width.saturating_sub(1);
+    let last_row = inner.height.saturating_sub(1);
+    (
+        column.saturating_sub(inner.x).min(last_column),
+        row.saturating_sub(inner.y).min(last_row),
+    )
+}
+
+/// The text grid inside a pane's border.
+fn inner_area(rect: Rect) -> Rect {
+    Rect::new(
+        rect.x.saturating_add(1),
+        rect.y.saturating_add(1),
+        rect.width.saturating_sub(2),
+        rect.height.saturating_sub(2),
+    )
 }
 
 /// Turns terminal mouse reporting on or off after a settings change.
@@ -1318,6 +1581,19 @@ mod tests {
                 Some(PathBuf::from("/Users/keith/src/repo"))
             )
         );
+    }
+
+    #[test]
+    fn pane_cells_skip_the_border_and_clamp_on_overshoot() {
+        let rects = [(PaneId(1), Rect::new(0, 1, 20, 10))];
+        // The border ring belongs to drag-resize, not to the text grid.
+        assert_eq!(pane_cell_at(&rects, 0, 1), None);
+        assert_eq!(pane_cell_at(&rects, 1, 2), Some((PaneId(1), (0, 0))));
+        assert_eq!(pane_cell_at(&rects, 18, 9), Some((PaneId(1), (17, 7))));
+        assert_eq!(pane_cell_at(&rects, 19, 9), None);
+        // Dragging past an edge keeps selecting the last cell.
+        assert_eq!(clamped_cell(rects[0].1, 200, 200), (17, 7));
+        assert_eq!(clamped_cell(rects[0].1, 0, 0), (0, 0));
     }
 
     #[test]

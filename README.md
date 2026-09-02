@@ -63,7 +63,8 @@ The default prefix is `ctrl+b`. After the prefix, the default actions are:
 | `q` | Flash big pane ids (tmux `display-panes`) |
 | `alt+r` | Resize mode (`hjkl` 1 cell, `HJKL` 5, `esc` exits) |
 | `s` / `ctrl+r` | Settings menu / reload config and theme |
-| `]` | Paste the internal buffer (last paste or copy-mode yank) |
+| `]` | Paste the internal buffer (last paste, copy-mode yank, or mouse selection) |
+| `m` | Toggle mouse capture (hands the mouse back to the host terminal) |
 
 The status bar shows `session · workspace · tab` on the left and configurable
 widgets on the right (`[zoom]`, a `● N blocked` counter, hostname, time — set
@@ -76,6 +77,14 @@ drag pane borders to resize; scroll over a pane to scroll; right-click a pane,
 tab, or workspace for its menu; the pane menu can break a pane out to its own
 tab or equalize the layout, and the tab menu can reorder tabs. In navigate mode, `j`/`k` move through the
 sidebar and `enter` activates a row; `esc` exits.
+
+Dragging inside a pane selects text and copies it on release
+(`mouse.copy_on_select`, OSC 52 so it works over SSH); double-click selects a
+word, triple-click a line, and ctrl/cmd-click opens the URL under the pointer
+with `ui.link_command`. Panes running a mouse-aware program (vim, lazygit,
+htop) get the events themselves unless `mouse.passthrough = false`, and
+`prefix m` turns capture off when you want the terminal's own selection. See
+[docs/CONFIG.md](docs/CONFIG.md#mouse).
 
 Copy mode uses `v` to set a selection anchor, movement keys to select, and `y`
 to copy. Copying sends the selection through OSC 52, including over SSH; copy
