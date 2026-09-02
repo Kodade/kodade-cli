@@ -53,7 +53,7 @@ pub enum Command {
     Send {
         #[arg(value_name = "PANE", value_parser = pane_id)]
         pane: PaneId,
-        #[arg(value_name = "TEXT")]
+        #[arg(value_name = "TEXT", allow_hyphen_values = true)]
         text: String,
         /// Send the text without a trailing newline.
         #[arg(long)]
@@ -85,7 +85,7 @@ pub enum AgentCommand {
     Rename {
         #[arg(value_name = "PANE", value_parser = pane_id)]
         pane: PaneId,
-        #[arg(value_name = "NAME")]
+        #[arg(value_name = "NAME", allow_hyphen_values = true)]
         name: String,
     },
     /// Print a pane's agent state and the reason for it.
@@ -212,6 +212,54 @@ mod tests {
             parse(&["kodade-cli", "daemon", "work"]).command,
             Some(Command::Daemon {
                 session: Some("work".into())
+            })
+        );
+    }
+
+    #[test]
+    fn text_and_name_accept_leading_hyphens() {
+        // Agent CLIs are driven with values like `-y` or `--continue`, and the
+        // hand-rolled parser accepted them; `--no-newline` still wins on either side.
+        assert_eq!(
+            parse(&["kodade-cli", "send", "1", "-y"]).command,
+            Some(Command::Send {
+                pane: PaneId(1),
+                text: "-y".into(),
+                no_newline: false,
+            })
+        );
+        assert_eq!(
+            parse(&["kodade-cli", "send", "1", "--no-newline", "hi"]).command,
+            Some(Command::Send {
+                pane: PaneId(1),
+                text: "hi".into(),
+                no_newline: true,
+            })
+        );
+        assert_eq!(
+            parse(&["kodade-cli", "send", "1", "hi", "--no-newline"]).command,
+            Some(Command::Send {
+                pane: PaneId(1),
+                text: "hi".into(),
+                no_newline: true,
+            })
+        );
+        assert_eq!(
+            parse(&["kodade-cli", "agent", "rename", "1", "--foo"]).command,
+            Some(Command::Agent {
+                command: AgentCommand::Rename {
+                    pane: PaneId(1),
+                    name: "--foo".into(),
+                }
+            })
+        );
+        // `--` still forces the next value through verbatim.
+        assert_eq!(
+            parse(&["kodade-cli", "send", "1", "--", "--no-newline"]).command,
+            Some(Command::Send {
+                pane: PaneId(1),
+                text: "--no-newline".into(),
+                no_newline: false,
             })
         );
     }

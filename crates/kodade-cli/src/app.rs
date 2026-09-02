@@ -413,9 +413,9 @@ impl App {
         mouse: MouseEvent,
         writer: &mut OwnedWriteHalf,
         term: &mut Term,
-    ) -> Result<Flow> {
+    ) -> Result<()> {
         if !self.config.mouse || self.layout.is_none() {
-            return Ok(Flow::Continue);
+            return Ok(());
         }
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
@@ -453,7 +453,7 @@ impl App {
             }
             _ => {}
         }
-        Ok(Flow::Continue)
+        Ok(())
     }
 
     // Left click: menu selection, sidebar rows, pane borders, tabs, then panes.

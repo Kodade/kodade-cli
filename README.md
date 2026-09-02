@@ -83,6 +83,10 @@ for the installed version. The scripting commands are:
 - `kodade-cli send PANE TEXT` — send text followed by a newline (`--no-newline` is also supported).
 - `kodade-cli kill-session` — stop the current session.
 
+Text and names may start with `-` (`kodade-cli send 1 -y`), and `--` forces
+the next value through verbatim when it collides with a flag
+(`kodade-cli send 1 -- --no-newline`).
+
 `ls`, `agent ls`, and `agent explain` also accept `--json`, which prints the
 matching protocol snapshots for scripts.
 
