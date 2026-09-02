@@ -7,6 +7,7 @@ mod mode;
 mod overlay;
 mod paste;
 mod render;
+mod selection;
 mod settings;
 
 use anyhow::{Context, Result};

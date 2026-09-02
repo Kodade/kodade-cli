@@ -10,7 +10,11 @@ TOML, or omitted setting uses the defaults below.
 | `theme` | `"auto"` | `"auto"`, `"kodade-dark"`, `"kodade-light"`, `"tokyo-night"`, `"dark"`/`"light"` (aliases), or a user theme name. See [Themes](#themes). |
 | `mouse` | `true` | Enable mouse capture and mouse interaction. Accepts a boolean or a `[mouse]` table. |
 | `mouse.enabled` | `true` | Table form of `mouse`. |
+| `mouse.capture` | `true` | Alias for `mouse.enabled`. `prefix m` toggles it for the session. |
 | `mouse.copy_on_select` | `true` | Copy a mouse selection as soon as the drag ends. |
+| `mouse.scroll_lines` | `3` | Rows scrolled per wheel notch (1–100). |
+| `mouse.passthrough` | `true` | Send mouse events to pane apps that ask for the mouse (vim, lazygit, htop). |
+| `mouse.clear_on_output` | `false` | Drop a selection when its pane redraws. |
 | `sidebar` | `true` | Show the sidebar when the TUI starts. |
 | `notify` | `true` | Agent-state notifications. Accepts a boolean or a `[notify]` table. |
 | `notify.enabled` | `true` | Table form of `notify`. |
@@ -18,16 +22,47 @@ TOML, or omitted setting uses the defaults below.
 | `keys.prefix` | `"ctrl+b"` | Prefix key pressed before a remappable action. |
 | `status.right` | `["zoom", "blocked"]` | Right-side status bar widgets, in order. See [Status bar](#status-bar). |
 | `ui.window_title` | `"Ködade · {workspace} · {tab}"` | Host terminal title template (OSC 0). See [Window title](#window-title). |
+| `ui.link_command` | `"open"` (macOS), `"xdg-open"` elsewhere | Program run with the URL of a ctrl/cmd-clicked link. See [Mouse](#mouse). |
 
 `mouse = true` and `[mouse]` are both valid, so a pre-0.2 config keeps working:
 
 ```toml
 mouse = true            # still supported
 
-[mouse]                 # equivalent, plus the new key
+[mouse]                 # equivalent, plus the new keys
 enabled = true
 copy_on_select = false
 ```
+
+## Mouse
+
+With `mouse.enabled` on, the mouse drives the whole client: click a tab, a
+sidebar row, or a pane to focus it, drag a border to resize, right-click for
+the context menu, and scroll to page a pane's scrollback
+(`mouse.scroll_lines` rows per notch).
+
+Inside a pane:
+
+| Gesture | Result |
+|---|---|
+| Left drag | Selects text; the release copies it through OSC 52 when `mouse.copy_on_select` is on (works over SSH). |
+| Double click | Selects the word under the pointer (`A-Za-z0-9_./~-`). |
+| Triple click | Selects the whole line. |
+| Ctrl-click / cmd-click | Opens the `http(s)://` token under the pointer with `ui.link_command`. |
+| Single click | Focuses the pane and clears any selection. |
+
+A selection clears on the next keystroke, when focus moves to another pane,
+and — with `mouse.clear_on_output = true` — when the pane redraws.
+
+When the program in a pane turns on mouse reporting (vim, lazygit, htop) and
+`mouse.passthrough` is on, mouse events inside that pane are forwarded to it as
+SGR (1006) sequences instead of selecting text. The tab bar, sidebar, pane
+borders, and ctrl/cmd-clicks always stay with Ködade CLI.
+
+`prefix m` toggles capture for the session without editing the config, which
+hands the mouse back to the host terminal for its own selection and
+right-click menu. The status bar confirms with
+`mouse capture off · prefix m to re-enable`.
 
 Key overrides live under `[keys]`. Setting an action replaces its default
 binding; the action's other default aliases are removed, and an empty array
@@ -116,6 +151,7 @@ single-letter and arrow-key aliases.
 | `settings` | `s` |
 | `display_panes` | `q` |
 | `paste_buffer` | `]` |
+| `mouse_toggle` | `m` |
 
 `close_tab` asks for confirmation in the status bar when a pane in the tab is
 working, and `close_workspace` when any agent in it is working or blocked;
@@ -126,7 +162,7 @@ working, and `close_workspace` when any agent in it is working or blocked;
 `reload_config` re-reads this file and the theme in place, and `settings`
 opens the [settings menu](#settings-menu).
 
-`paste_buffer` re-sends the last paste (or copy-mode yank) into the focused
+`paste_buffer` re-sends the last paste (or copy-mode yank, or mouse selection) into the focused
 pane; it reports `paste buffer empty` when nothing has been copied yet. See
 [Paste](#paste).
 
@@ -139,6 +175,11 @@ sidebar = true
 [mouse]
 enabled = true
 copy_on_select = true
+scroll_lines = 3
+passthrough = true
+
+[ui]
+link_command = "open"
 
 [keys]
 prefix = "ctrl+space"
@@ -163,7 +204,7 @@ keeps the bracketed-paste framing but sends the text unchanged.
 sanitize = true         # default; false wraps only, no stripping
 ```
 
-The last paste (or copy-mode yank) is kept in an internal buffer that
+The last paste (or copy-mode yank, or mouse selection) is kept in an internal buffer that
 `paste_buffer` (`]` by default) re-sends into the focused pane.
 
 ## Session persistence
