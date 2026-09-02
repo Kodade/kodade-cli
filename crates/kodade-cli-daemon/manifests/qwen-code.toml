@@ -1,6 +1,6 @@
 # unverified: sourced from https://github.com/QwenLM/qwen-code (CLI not installed locally)
 # Identification only: no screen rules until a real session confirms its prompt strings.
+# No title matcher: the short title substring would false-positive (case-sensitive).
 name = "qwen-code"
 display = "Qwen Code"
 process = ["qwen"]
-title = ["Qwen"]

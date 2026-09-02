@@ -264,10 +264,14 @@ mod tests {
                 manifest.identifies(Some(process), ""),
                 "{process} identified by process name"
             );
-            assert!(
-                manifest.identifies(None, title),
-                "{process} identified by title substring"
-            );
+            // Some manifests are process-only: a short title substring (< 5 chars,
+            // e.g. "Amp"/"Pi") would false-positive, so title is intentionally absent.
+            if !manifest.title.is_empty() {
+                assert!(
+                    manifest.identifies(None, title),
+                    "{process} identified by title substring"
+                );
+            }
             // A sourced sample of routine agent output: no attention prompt present.
             let screen = "Working on your request...\nreading files\nediting src/main.rs\n";
             let detected = detect(

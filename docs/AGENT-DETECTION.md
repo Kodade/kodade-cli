@@ -9,11 +9,13 @@ then `working`, `done`, `idle`, and `unknown`.
   before producing this state.
 - `working`: The agent is actively producing output, or a hook or manifest
   explicitly reports this state.
-- `done`: A hook or manifest explicitly reports that the agent completed work.
-  The current built-in manifests do not define a `done` screen rule. A
-  hook-reported `done` *sticks*: unlike the other states it has no TTL and
-  stays until the pane prints new PTY output or the next hook report arrives
-  (see "Authority and fallback"). The sidebar shows how long it has held.
+- `done`: The agent's turn finished. Lifecycle "turn ended" hooks report this
+  (`Stop` for Claude Code and Gemini CLI, `notify` for Codex), so it marks a
+  completed turn rather than a decayed working state. The current built-in
+  manifests do not define a `done` screen rule. A hook-reported `done`
+  *sticks*: unlike the other states it has no TTL and stays until the pane
+  prints new PTY output or the next hook report arrives (see "Authority and
+  fallback"). The sidebar shows how long it has held.
 - `idle`: A recognized agent has no matching screen rule and has produced no
   output in the working window. An ordinary shell also uses `idle`.
 - `unknown`: The foreground process is not a recognized agent and is not one
@@ -198,19 +200,26 @@ state, so detection does not depend on screen strings alone.
 - `integrate list` — shows each known integration, its config file, and
   whether that config directory exists on this machine.
 - `integrate claude-code [--write]` — merges hook entries into
-  `~/.claude/settings.json` (`Stop` → idle, `UserPromptSubmit` → working,
-  `Notification` → blocked). Without `--write` it prints the snippet.
+  `~/.claude/settings.json` (`Stop` → done, `UserPromptSubmit` → working,
+  `Notification` → blocked). Without `--write` it prints the snippet. The
+  `Stop` event fires when the agent's turn ends, so it reports `done` (which
+  then sticks) rather than `idle`.
 - `integrate gemini-cli [--write]` — Gemini CLI exposes Claude-compatible
   hooks (it even ships `gemini hooks migrate`), so the same three events are
   merged into `~/.gemini/settings.json`.
 - `integrate codex [--write] [--force]` — Codex uses a single top-level
-  `notify` program. This merges `notify = ["sh", "-c", "<report idle>"]` into
+  `notify` program. Codex fires `notify` only when a turn completes, so this
+  merges `notify = ["sh", "-c", "<report done>"]` into
   `~/.codex/config.toml` with `toml_edit`, preserving comments. Codex appends a
   JSON payload as the program's last argument (`$0` for `sh -c`), which the
   report command ignores. If a `notify` entry already exists, Ködade refuses to
   overwrite it and prints instructions instead — pass `--force` to replace it.
 
-Merges are idempotent and never remove existing keys or hooks.
+Merges are idempotent and never remove unrelated keys or hooks. A previously
+installed Ködade report hook for the same event is upgraded in place (matched
+on the `kodade-cli agent report $KODADE_PANE ` command prefix), so users who
+installed the earlier `Stop` → `idle` hook are migrated to `done` without a
+duplicate.
 
 ### `agent update-manifests`
 

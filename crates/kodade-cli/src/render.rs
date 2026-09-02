@@ -757,6 +757,7 @@ mod tests {
             agent: None,
             state: AgentStateKind::Idle,
             state_reason: String::new(),
+            state_age_secs: 0,
         }];
         let ui = Ui {
             sidebar: false,

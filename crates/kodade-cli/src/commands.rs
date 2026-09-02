@@ -13,9 +13,13 @@ use tokio::{
 /// Integrations that install a lifecycle hook / notify entry for a known agent.
 pub const INTEGRATIONS: &[&str] = &["claude-code", "codex", "gemini-cli"];
 
+/// Prefix shared by every Ködade report hook/notify command, used to detect and
+/// replace a previously installed entry (e.g. migrating an old Stop->idle hook).
+const REPORT_PREFIX: &str = "kodade-cli agent report $KODADE_PANE ";
+
 /// Command each hook/notify entry runs; `state` is the state it reports.
 fn report_command(state: &str) -> String {
-    format!("kodade-cli agent report $KODADE_PANE {state} -s \"$KODADE_SESSION\"")
+    format!("{REPORT_PREFIX}{state} -s \"$KODADE_SESSION\"")
 }
 
 /// List every known integration and whether its config directory is present.
@@ -66,7 +70,7 @@ fn codex_notify() -> toml_edit::Array {
     let mut array = toml_edit::Array::new();
     array.push("sh");
     array.push("-c");
-    array.push(report_command("idle"));
+    array.push(report_command("done"));
     array
 }
 
@@ -125,7 +129,7 @@ fn notify_preview() -> String {
 /// migrate`), so we install the same Stop/UserPromptSubmit/Notification mapping.
 fn gemini_hooks() -> Value {
     json!({
-        "Stop": [{ "matcher": "*", "hooks": [{ "type": "command", "command": report_command("idle") }] }],
+        "Stop": [{ "matcher": "*", "hooks": [{ "type": "command", "command": report_command("done") }] }],
         "UserPromptSubmit": [{ "matcher": "*", "hooks": [{ "type": "command", "command": report_command("working") }] }],
         "Notification": [{ "matcher": "*", "hooks": [{ "type": "command", "command": report_command("blocked") }] }]
     })
@@ -178,9 +182,9 @@ fn curl(url: &str) -> Result<String> {
 
 fn claude_hooks() -> Value {
     json!({
-        "Stop": [{ "hooks": [{ "type": "command", "command": "kodade-cli agent report $KODADE_PANE idle -s \"$KODADE_SESSION\"" }] }],
-        "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "kodade-cli agent report $KODADE_PANE working -s \"$KODADE_SESSION\"" }] }],
-        "Notification": [{ "hooks": [{ "type": "command", "command": "kodade-cli agent report $KODADE_PANE blocked -s \"$KODADE_SESSION\"" }] }]
+        "Stop": [{ "hooks": [{ "type": "command", "command": report_command("done") }] }],
+        "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": report_command("working") }] }],
+        "Notification": [{ "hooks": [{ "type": "command", "command": report_command("blocked") }] }]
     })
 }
 
@@ -205,17 +209,18 @@ fn merge_hook_settings(path: &Path, new_hooks: &Value) -> Result<()> {
             .or_insert_with(|| json!([]))
             .as_array_mut()
             .ok_or_else(|| anyhow!("Claude hook event must be an array"))?;
-        let command = entries[0]["hooks"][0]["command"].as_str().expect("command");
-        let exists = destination.iter().any(|entry| {
-            entry["hooks"].as_array().is_some_and(|nested| {
-                nested
-                    .iter()
-                    .any(|hook| hook["command"].as_str() == Some(command))
+        // Drop any prior Ködade report hook for this event so an old command
+        // (e.g. the retired Stop->idle) is upgraded rather than duplicated.
+        destination.retain(|entry| {
+            !entry["hooks"].as_array().is_some_and(|nested| {
+                nested.iter().any(|hook| {
+                    hook["command"]
+                        .as_str()
+                        .is_some_and(|command| command.starts_with(REPORT_PREFIX))
+                })
             })
         });
-        if !exists {
-            destination.extend(entries.as_array().expect("entries").iter().cloned());
-        }
+        destination.extend(entries.as_array().expect("entries").iter().cloned());
     }
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -464,12 +469,33 @@ mod tests {
         let temp = std::env::temp_dir().join(format!("kodade-cli-hooks-{}", std::process::id()));
         let path = temp.join("settings.json");
         fs::create_dir_all(&temp).unwrap();
-        fs::write(&path, r#"{"theme":"dark","hooks":{"Stop":[]}}"#).unwrap();
+        // Seed a retired Stop->idle hook plus an unrelated user hook.
+        fs::write(
+            &path,
+            r#"{"theme":"dark","hooks":{"Stop":[{"hooks":[{"type":"command","command":"kodade-cli agent report $KODADE_PANE idle -s \"$KODADE_SESSION\""}]},{"hooks":[{"type":"command","command":"echo keep"}]}]}}"#,
+        )
+        .unwrap();
         merge_hook_settings(&path, &claude_hooks()).unwrap();
         merge_hook_settings(&path, &claude_hooks()).unwrap();
         let settings: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(settings["theme"], "dark");
-        assert_eq!(settings["hooks"]["Stop"].as_array().unwrap().len(), 1);
+        let stop = settings["hooks"]["Stop"].as_array().unwrap();
+        // The retired idle hook is replaced (not duplicated); the user hook stays.
+        assert_eq!(stop.len(), 2);
+        assert!(stop
+            .iter()
+            .any(|entry| entry["hooks"][0]["command"] == "echo keep"));
+        // The Ködade Stop hook now reports `done`, not the retired `idle`.
+        assert!(stop.iter().any(|entry| {
+            entry["hooks"][0]["command"]
+                .as_str()
+                .is_some_and(|c| c.contains(" done "))
+        }));
+        assert!(!stop.iter().any(|entry| {
+            entry["hooks"][0]["command"]
+                .as_str()
+                .is_some_and(|c| c.contains(" idle "))
+        }));
         assert_eq!(
             settings["hooks"]["Notification"].as_array().unwrap().len(),
             1
