@@ -473,6 +473,7 @@ mod tests {
                 cwd: None,
             }],
             zoomed: false,
+            restored: false,
         }
     }
 

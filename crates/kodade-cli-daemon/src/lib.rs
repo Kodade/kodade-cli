@@ -3,6 +3,7 @@
 mod agent;
 mod layout;
 mod manifest;
+mod persist;
 mod proc;
 
 use std::{
@@ -10,7 +11,10 @@ use std::{
     env, fs,
     io::{Read, Write},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc, Mutex,
+    },
     time::{Duration, Instant},
 };
 
@@ -36,6 +40,14 @@ struct Session {
     shutdown: broadcast::Sender<()>,
     size: Mutex<(u16, u16)>,
     manifests: Vec<manifest::Manifest>,
+    /// Bumped by every layout-changing mutation (via `notify`), never by PTY
+    /// output. The persist task watches this so scrollback churn is not saved.
+    /// Kept on `Session` (not `SessionState`) so `notify` can bump it without
+    /// re-locking state — several handlers call `notify` while holding the lock.
+    layout_generation: AtomicU64,
+    /// True from a cold restore until the first client `Hello`; surfaced as
+    /// `LayoutSnapshot.restored` so `ls` can print `(restored)`.
+    restored: AtomicBool,
 }
 struct SessionState {
     workspaces: Vec<Workspace>,
@@ -78,6 +90,10 @@ struct Pane {
     last_output: Arc<Mutex<Instant>>,
     hook: Mutex<Option<ReportedHook>>,
     spawn_process: String,
+    /// The command this pane was spawned with and the directory it started in,
+    /// kept so persistence can record them without inspecting the live process.
+    spawn_command: Option<Vec<String>>,
+    spawn_cwd: Option<PathBuf>,
     process: Mutex<ProcessEvidence>,
     // Tracks how long the current detected state has held, for sidebar age labels.
     last_state: Mutex<Option<AgentStateKind>>,
@@ -139,11 +155,26 @@ pub async fn run(session_name: String) -> Result<()> {
         remove_stale_socket(&socket).await?;
     }
     let listener = UnixListener::bind(&socket).context("bind Ködade CLI socket")?;
-    let session = Arc::new(Session::spawn(80, 24, session_name.clone())?);
+    // Binding succeeded, so no live daemon owns this session: safe to restore.
+    let session = Arc::new(load_session(&session_name)?);
     let mut shutdown = session.shutdown.subscribe();
+    // Debounced layout persistence runs alongside the accept loop.
+    tokio::spawn(persist_loop(Arc::clone(&session)));
+    // Flush state on SIGTERM so a stopped daemon (e.g. logout) can be restored.
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .context("install SIGTERM handler")?;
     loop {
         tokio::select! {
             _ = shutdown.recv() => {
+                // `kill-session` is deliberate: drop the state file so it does
+                // not resurrect on the next cold start.
+                persist::remove_session_file(&session_name);
+                drop(listener);
+                let _ = fs::remove_file(&socket);
+                return Ok(());
+            }
+            _ = sigterm.recv() => {
+                session.save();
                 drop(listener);
                 let _ = fs::remove_file(&socket);
                 return Ok(());
@@ -159,6 +190,48 @@ pub async fn run(session_name: String) -> Result<()> {
                 });
             }
         }
+    }
+}
+
+/// Restore this session from its state file when one is present and valid; a
+/// corrupt or foreign file is moved aside and a clean session starts instead.
+fn load_session(name: &str) -> Result<Session> {
+    if let Some(path) = persist::session_file_path(name) {
+        match persist::read_session_file(&path) {
+            Ok(Some(file)) => {
+                let resume_agents = persist::resume_agents_setting();
+                return Session::restore(file, resume_agents);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                eprintln!(
+                    "Ködade CLI could not read state file {}: {error:#} — starting clean",
+                    path.display()
+                );
+                persist::quarantine(&path);
+            }
+        }
+    }
+    Session::spawn(80, 24, name.to_owned())
+}
+
+/// Watch the update stream and persist the layout, debounced, whenever a real
+/// mutation (not PTY output) advances the generation counter.
+async fn persist_loop(session: Arc<Session>) {
+    let mut updates = session.updates.subscribe();
+    let mut last_saved = session.layout_generation.load(Ordering::Relaxed);
+    loop {
+        match updates.recv().await {
+            Ok(()) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+            Err(broadcast::error::RecvError::Closed) => return,
+        }
+        if session.layout_generation.load(Ordering::Relaxed) == last_saved {
+            continue; // PTY output or a no-op tick: nothing new to persist.
+        }
+        // Coalesce a burst of layout changes into a single write.
+        tokio::time::sleep(persist::DEBOUNCE).await;
+        session.save();
+        last_saved = session.layout_generation.load(Ordering::Relaxed);
     }
 }
 
@@ -195,6 +268,8 @@ impl Session {
             shutdown,
             size: Mutex::new((cols, rows)),
             manifests: manifest::load()?,
+            layout_generation: AtomicU64::new(0),
+            restored: AtomicBool::new(false),
         };
         let pane = session.new_pane("shell", None, None)?;
         let tab = Tab {
@@ -217,6 +292,151 @@ impl Session {
                 root: None,
             });
         Ok(session)
+    }
+
+    /// Rebuild a session from a persisted file: fresh panes spawned in each saved
+    /// cwd (falling back to the workspace root, then home), ids re-allocated so
+    /// they never collide with a stale file. `resume_agents` re-runs an agent's
+    /// resume command in place of the raw one. Trees are validated by the caller.
+    fn restore(file: persist::SessionFile, resume_agents: bool) -> Result<Self> {
+        let (updates, _) = broadcast::channel(64);
+        let (shutdown, _) = broadcast::channel(16);
+        let session = Self {
+            name: file.name.clone(),
+            state: Mutex::new(SessionState {
+                workspaces: Vec::new(),
+                active_workspace: WorkspaceId(1),
+                next_id: 0,
+            }),
+            panes: Mutex::new(HashMap::new()),
+            updates,
+            shutdown,
+            size: Mutex::new((80, 24)),
+            manifests: manifest::load()?,
+            layout_generation: AtomicU64::new(0),
+            restored: AtomicBool::new(true),
+        };
+        let mut workspaces = Vec::new();
+        let mut workspace_ids: HashMap<u64, WorkspaceId> = HashMap::new();
+        for saved in &file.workspaces {
+            let mut tabs = Vec::new();
+            let mut tab_ids: HashMap<u64, TabId> = HashMap::new();
+            for saved_tab in &saved.tabs {
+                // Spawn a fresh pane per saved pane, mapping old id -> new id so
+                // the tree and focus can be remapped afterwards.
+                let mut pane_ids: HashMap<PaneId, PaneId> = HashMap::new();
+                for saved_pane in &saved_tab.panes {
+                    let cwd = restore_cwd(saved_pane.cwd.clone(), saved.root.clone());
+                    let command = resume_command(saved_pane, resume_agents, &session.manifests);
+                    let new_id = session.new_pane(&saved_pane.title, cwd, command)?;
+                    pane_ids.insert(PaneId(saved_pane.id), new_id);
+                }
+                let tree = remap_tree(&saved_tab.tree, &pane_ids);
+                let mut leaves = Vec::new();
+                layout::leaves(&tree, &mut leaves);
+                let focused = pane_ids
+                    .get(&PaneId(saved_tab.focused))
+                    .copied()
+                    .unwrap_or_else(|| leaves[0]);
+                let new_tab_id = session.tab_id();
+                tab_ids.insert(saved_tab.id, new_tab_id);
+                tabs.push(Tab {
+                    id: new_tab_id,
+                    name: saved_tab.name.clone(),
+                    tree,
+                    focused,
+                    zoomed: saved_tab.zoomed,
+                });
+            }
+            let new_workspace_id = session.workspace_id();
+            let active_tab = tab_ids
+                .get(&saved.active_tab)
+                .copied()
+                .unwrap_or_else(|| tabs[0].id);
+            workspace_ids.insert(saved.id, new_workspace_id);
+            workspaces.push(Workspace {
+                id: new_workspace_id,
+                name: saved.name.clone(),
+                tabs,
+                active_tab,
+                root: saved.root.clone(),
+            });
+        }
+        let active_workspace = workspace_ids
+            .get(&file.active_workspace)
+            .copied()
+            .unwrap_or_else(|| workspaces[0].id);
+        {
+            let mut state = session.state.lock().expect("state lock poisoned");
+            state.workspaces = workspaces;
+            state.active_workspace = active_workspace;
+        }
+        Ok(session)
+    }
+
+    /// Snapshot the current layout into a serializable [`persist::SessionFile`].
+    /// Reads live pane titles and cached cwds; never blocks on process lookups.
+    fn build_file(&self) -> persist::SessionFile {
+        let state = self.state.lock().expect("state lock poisoned");
+        let panes = self.panes.lock().expect("pane lock poisoned");
+        let workspaces = state
+            .workspaces
+            .iter()
+            .map(|workspace| persist::WorkspaceFile {
+                id: workspace.id.0,
+                name: workspace.name.clone(),
+                root: workspace.root.clone(),
+                active_tab: workspace.active_tab.0,
+                tabs: workspace
+                    .tabs
+                    .iter()
+                    .map(|tab| {
+                        let mut ids = Vec::new();
+                        layout::leaves(&tab.tree, &mut ids);
+                        let pane_files = ids
+                            .into_iter()
+                            .filter_map(|id| {
+                                panes.get(&id).map(|pane| persist::PaneFile {
+                                    id: id.0,
+                                    title: pane.title.lock().expect("title lock poisoned").clone(),
+                                    cwd: pane.saved_cwd(),
+                                    command: pane.spawn_command.clone(),
+                                })
+                            })
+                            .collect();
+                        persist::TabFile {
+                            id: tab.id.0,
+                            name: tab.name.clone(),
+                            zoomed: tab.zoomed,
+                            focused: tab.focused.0,
+                            tree: tab.tree.clone(),
+                            panes: pane_files,
+                        }
+                    })
+                    .collect(),
+            })
+            .collect();
+        persist::SessionFile {
+            version: 1,
+            name: self.name.clone(),
+            active_workspace: state.active_workspace.0,
+            workspaces,
+        }
+    }
+
+    /// Persist the current layout to this session's state file. Best-effort:
+    /// errors are logged, never propagated to the client-facing loop.
+    fn save(&self) {
+        let Some(path) = persist::session_file_path(&self.name) else {
+            return;
+        };
+        let file = self.build_file();
+        if let Err(error) = persist::write_session_file(&path, &file) {
+            eprintln!(
+                "Ködade CLI could not persist session '{}': {error:#}",
+                self.name
+            );
+        }
     }
 
     fn next_id(&self) -> u64 {
@@ -388,7 +608,16 @@ impl Session {
             .expect("active tab exists")
     }
     fn notify(&self) {
+        // Every mutation funnels through here (directly or via `resize`), so this
+        // is the one place the persist generation needs to advance. PTY output
+        // sends on `updates` without calling `notify`, so it never bumps it.
+        self.layout_generation.fetch_add(1, Ordering::Relaxed);
         let _ = self.updates.send(());
+    }
+
+    /// Clear the restored flag once a client has attached (`Hello`).
+    fn clear_restored(&self) {
+        self.restored.store(false, Ordering::Relaxed);
     }
 
     fn snapshot(&self) -> Result<LayoutSnapshot> {
@@ -476,6 +705,7 @@ impl Session {
             tree,
             panes: snapshots,
             zoomed: tab.zoomed,
+            restored: self.restored.load(Ordering::Relaxed),
         })
     }
 
@@ -1359,6 +1589,8 @@ impl Pane {
             last_output,
             hook: Mutex::new(None),
             spawn_process,
+            spawn_command: run,
+            spawn_cwd: cwd,
             process: Mutex::new(ProcessEvidence {
                 name: None,
                 cwd: None,
@@ -1494,6 +1726,17 @@ impl Pane {
             .clone()
     }
 
+    /// Best cwd for persistence without forcing a fresh `ps`/`lsof`: the last
+    /// cached live cwd, falling back to the directory the pane was spawned in.
+    fn saved_cwd(&self) -> Option<PathBuf> {
+        self.process
+            .lock()
+            .expect("process lock poisoned")
+            .cwd
+            .clone()
+            .or_else(|| self.spawn_cwd.clone())
+    }
+
     /// Refresh the cached foreground-process name and cwd at most once per 2 s.
     /// The pid comes from the PTY's process-group leader; one `ps` and one
     /// `lsof` (or one procfs read) per pane per tick.
@@ -1517,6 +1760,57 @@ impl Pane {
             process.cwd = None;
         }
         process.checked_at = now;
+    }
+}
+
+/// Directory a restored pane should start in: its saved cwd if it still exists,
+/// else the workspace root, else the pane spawn's own default (home / `$SHELL`).
+fn restore_cwd(saved: Option<PathBuf>, root: Option<PathBuf>) -> Option<PathBuf> {
+    saved
+        .filter(|path| path.is_dir())
+        .or_else(|| root.filter(|path| path.is_dir()))
+}
+
+/// The command a restored pane should run. Only when `resume_agents` is on and
+/// the saved command's program matches a manifest that defines a `resume` string
+/// do we relaunch it — with the manifest's resume command, not the raw one.
+/// Everything else restores as a plain shell (no command re-run).
+fn resume_command(
+    pane: &persist::PaneFile,
+    resume_agents: bool,
+    manifests: &[manifest::Manifest],
+) -> Option<Vec<String>> {
+    if !resume_agents {
+        return None;
+    }
+    let command = pane.command.as_ref()?;
+    let process = command.first().and_then(|arg| proc::process_basename(arg));
+    let manifest = manifests.iter().find(|manifest| {
+        manifest.resume.is_some() && manifest.identifies(process.as_deref(), "")
+    })?;
+    let resume = manifest.resume.as_ref()?;
+    // Resume strings are simple shell words (e.g. `codex resume --last`).
+    Some(resume.split_whitespace().map(str::to_owned).collect())
+}
+
+/// Rebuild a layout tree with re-allocated pane ids. The caller validated that
+/// every leaf has a mapping, so a missing id would be a bug, not bad input.
+fn remap_tree(tree: &LayoutTree, ids: &HashMap<PaneId, PaneId>) -> LayoutTree {
+    match tree {
+        LayoutTree::Leaf { pane } => LayoutTree::Leaf {
+            pane: *ids.get(pane).expect("validated leaf has a remapped id"),
+        },
+        LayoutTree::Split {
+            axis,
+            ratio,
+            first,
+            second,
+        } => LayoutTree::Split {
+            axis: *axis,
+            ratio: *ratio,
+            first: Box::new(remap_tree(first, ids)),
+            second: Box::new(remap_tree(second, ids)),
+        },
     }
 }
 
@@ -1732,7 +2026,10 @@ async fn serve_client(stream: UnixStream, session: Arc<Session>, name: String) -
                     Ok(()) if hello => {
                         initialized = true;
                         write_server(&mut writer, &ServerMessage::Welcome { session: name.clone() }).await?;
+                        // The first client attach sees `restored: true`; clear it
+                        // afterward so later snapshots (and `ls`) report normally.
                         write_server(&mut writer, &ServerMessage::Layout(session.snapshot()?)).await?;
+                        session.clear_restored();
                     }
                     Ok(()) if kill => {
                         write_server(&mut writer, &ServerMessage::Shutdown).await?;
@@ -2047,6 +2344,181 @@ mod tests {
         assert!(!move_tab(workspace, 1));
         assert!(move_tab(workspace, -1));
         assert_eq!(workspace.tabs[0].id, TabId(2));
+    }
+
+    /// A persisted 2-workspace / 3-tab / 4-pane layout with `/tmp` and `/` cwds.
+    fn restore_fixture() -> persist::SessionFile {
+        persist::SessionFile {
+            version: 1,
+            name: "restored".into(),
+            active_workspace: 11,
+            workspaces: vec![
+                persist::WorkspaceFile {
+                    id: 10,
+                    name: "one".into(),
+                    root: Some(PathBuf::from("/tmp")),
+                    active_tab: 20,
+                    tabs: vec![
+                        persist::TabFile {
+                            id: 20,
+                            name: "agents".into(),
+                            zoomed: false,
+                            focused: 31,
+                            tree: LayoutTree::Split {
+                                axis: SplitAxis::Horizontal,
+                                ratio: 0.5,
+                                first: Box::new(LayoutTree::Leaf { pane: PaneId(30) }),
+                                second: Box::new(LayoutTree::Leaf { pane: PaneId(31) }),
+                            },
+                            panes: vec![
+                                persist::PaneFile {
+                                    id: 30,
+                                    title: "codex".into(),
+                                    cwd: Some(PathBuf::from("/tmp")),
+                                    command: Some(vec!["codex".into()]),
+                                },
+                                persist::PaneFile {
+                                    id: 31,
+                                    title: "root".into(),
+                                    cwd: Some(PathBuf::from("/")),
+                                    command: None,
+                                },
+                            ],
+                        },
+                        persist::TabFile {
+                            id: 21,
+                            name: "logs".into(),
+                            zoomed: true,
+                            focused: 32,
+                            tree: LayoutTree::Leaf { pane: PaneId(32) },
+                            panes: vec![persist::PaneFile {
+                                id: 32,
+                                title: "tail".into(),
+                                cwd: None,
+                                command: None,
+                            }],
+                        },
+                    ],
+                },
+                persist::WorkspaceFile {
+                    id: 11,
+                    name: "two".into(),
+                    root: None,
+                    active_tab: 22,
+                    tabs: vec![persist::TabFile {
+                        id: 22,
+                        name: "shell".into(),
+                        zoomed: false,
+                        focused: 33,
+                        tree: LayoutTree::Leaf { pane: PaneId(33) },
+                        panes: vec![persist::PaneFile {
+                            id: 33,
+                            title: "shell".into(),
+                            cwd: Some(PathBuf::from("/tmp")),
+                            command: None,
+                        }],
+                    }],
+                },
+            ],
+        }
+    }
+
+    #[tokio::test]
+    async fn restore_rebuilds_names_trees_and_cwds() {
+        let session = Session::restore(restore_fixture(), false).expect("restore");
+        let state = session.state.lock().expect("state lock");
+        // Workspaces and tabs come back by name, in order.
+        assert_eq!(state.workspaces.len(), 2);
+        assert_eq!(state.workspaces[0].name, "one");
+        assert_eq!(state.workspaces[1].name, "two");
+        assert_eq!(state.workspaces[0].root, Some(PathBuf::from("/tmp")));
+        assert_eq!(state.workspaces[0].tabs.len(), 2);
+        assert_eq!(state.workspaces[0].tabs[0].name, "agents");
+        // Zoom survives the round-trip.
+        assert!(state.workspaces[0].tabs[1].zoomed);
+        // Tree shapes are preserved: a split of two leaves, then single leaves.
+        assert!(matches!(
+            state.workspaces[0].tabs[0].tree,
+            LayoutTree::Split { .. }
+        ));
+        assert!(matches!(
+            state.workspaces[0].tabs[1].tree,
+            LayoutTree::Leaf { .. }
+        ));
+        // The active workspace resolves to the saved id (11 -> "two").
+        assert_eq!(state.active_workspace, state.workspaces[1].id);
+        // Ids are re-allocated (never the stale 30/31/32/33) and next_id covers them.
+        let mut leaves = Vec::new();
+        for workspace in &state.workspaces {
+            for tab in &workspace.tabs {
+                layout::leaves(&tab.tree, &mut leaves);
+            }
+        }
+        assert_eq!(leaves.len(), 4);
+        assert!(leaves.iter().all(|id| id.0 <= state.next_id && id.0 > 0));
+        drop(state);
+        assert_eq!(session.panes.lock().expect("pane lock").len(), 4);
+        assert!(session.restored.load(Ordering::Relaxed));
+        // cwds round-trip: panes were spawned in /tmp and /, captured via spawn_cwd.
+        let rebuilt = session.build_file();
+        let cwds: Vec<_> = rebuilt
+            .workspaces
+            .iter()
+            .flat_map(|workspace| workspace.tabs.iter())
+            .flat_map(|tab| tab.panes.iter())
+            .map(|pane| pane.cwd.clone())
+            .collect();
+        assert!(cwds.contains(&Some(PathBuf::from("/tmp"))));
+        assert!(cwds.contains(&Some(PathBuf::from("/"))));
+    }
+
+    #[test]
+    fn resume_command_uses_manifest_resume_only_when_enabled() {
+        let manifests = vec![manifest::Manifest {
+            name: "codex".into(),
+            display: "Codex".into(),
+            process: vec!["codex".into()],
+            title: Vec::new(),
+            resume: Some("codex resume --last".into()),
+            rules: Vec::new(),
+        }];
+        let agent = persist::PaneFile {
+            id: 1,
+            title: "codex".into(),
+            cwd: None,
+            command: Some(vec!["codex".into()]),
+        };
+        // resume_agents off: never re-run.
+        assert_eq!(resume_command(&agent, false, &manifests), None);
+        // On, and a manifest with a resume matches: use the resume command.
+        assert_eq!(
+            resume_command(&agent, true, &manifests),
+            Some(vec!["codex".into(), "resume".into(), "--last".into()])
+        );
+        // A plain shell pane has no command to resume.
+        let shell = persist::PaneFile {
+            id: 2,
+            title: "shell".into(),
+            cwd: None,
+            command: None,
+        };
+        assert_eq!(resume_command(&shell, true, &manifests), None);
+        // A command with no matching manifest is left as a plain shell.
+        let unknown = persist::PaneFile {
+            id: 3,
+            title: "make".into(),
+            cwd: None,
+            command: Some(vec!["make".into()]),
+        };
+        assert_eq!(resume_command(&unknown, true, &manifests), None);
+    }
+
+    #[tokio::test]
+    async fn restore_without_resume_agents_starts_plain_shells() {
+        // resume_agents=false: the saved `codex` command is not re-run.
+        let session = Session::restore(restore_fixture(), false).expect("restore");
+        let panes = session.panes.lock().expect("pane lock");
+        assert!(panes.values().all(|pane| pane.spawn_command.is_none()));
     }
 
     #[tokio::test]

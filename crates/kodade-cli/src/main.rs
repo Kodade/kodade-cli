@@ -42,6 +42,10 @@ async fn main() -> Result<()> {
                 println!("{}", serde_json::to_string_pretty(&layout)?);
             } else {
                 println!("{}", commands::format_ls(&layout));
+                // Mark a session that was rebuilt from a state file and not yet attached (#9).
+                if layout.restored {
+                    println!("(restored)");
+                }
             }
             Ok(())
         }

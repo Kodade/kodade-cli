@@ -255,6 +255,10 @@ pub struct LayoutSnapshot {
     pub tree: LayoutTree,
     pub panes: Vec<PaneSnapshot>,
     pub zoomed: bool,
+    /// True when this session was rebuilt from a persisted state file and no
+    /// client has attached (`Hello`) since. Older daemons omit it (#9).
+    #[serde(default)]
+    pub restored: bool,
 }
 
 /// Attribute bits carried by a `Run`. Kept as bit flags so a styled row stays
@@ -368,6 +372,7 @@ mod tests {
                 cwd: Some(PathBuf::from("/tmp/repo")),
             }],
             zoomed: false,
+            restored: false,
         });
 
         let encoded = encode(&message).expect("message encodes");

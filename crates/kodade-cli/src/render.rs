@@ -645,6 +645,7 @@ mod tests {
             tree: LayoutTree::Leaf { pane: PaneId(3) },
             panes: vec![],
             zoomed: false,
+            restored: false,
         }
     }
 
