@@ -17,6 +17,10 @@ pub struct Config {
     /// `notify.enabled` — consumed by the notification work (#10).
     pub notify: bool,
     pub prefix: KeyEvent,
+    /// Right-side status bar widgets, in order (#11).
+    pub status_right: Vec<StatusWidget>,
+    /// Host terminal title template (#11). `{session}`/`{workspace}`/`{tab}`.
+    pub window_title: String,
     /// Chords that fire after the prefix key.
     bindings: HashMap<KeyEvent, Action>,
     /// Chords that fire on their own (ctrl/alt chords without `prefix+`).
@@ -24,6 +28,27 @@ pub struct Config {
     named_theme: Option<String>,
     /// Problems found while loading; printed by `load` and `config validate`.
     pub warnings: Vec<String>,
+}
+
+/// A right-side status bar widget (#11).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatusWidget {
+    Zoom,
+    Blocked,
+    Hostname,
+    Time,
+}
+
+impl StatusWidget {
+    fn parse(name: &str) -> Option<Self> {
+        Some(match name {
+            "zoom" => Self::Zoom,
+            "blocked" => Self::Blocked,
+            "hostname" => Self::Hostname,
+            "time" => Self::Time,
+            _ => return None,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -80,6 +105,8 @@ pub enum Action {
     // Config (#20).
     ReloadConfig,
     Settings,
+    /// Flash big pane ids for a second, tmux `display-panes` style (#11).
+    DisplayPanes,
 }
 
 /// Every remappable action and its config name. Single source of truth for
@@ -135,6 +162,7 @@ const ACTIONS: &[(&str, Action)] = &[
     ("layout_even", Action::LayoutEven),
     ("reload_config", Action::ReloadConfig),
     ("settings", Action::Settings),
+    ("display_panes", Action::DisplayPanes),
 ];
 
 impl Action {
@@ -227,7 +255,8 @@ impl Action {
             | Self::RenameTab
             | Self::RenameWorkspace
             | Self::LastPane
-            | Self::ResizeMode => return None,
+            | Self::ResizeMode
+            | Self::DisplayPanes => return None,
             // Client-side only: they never reach the daemon.
             Self::ReloadConfig | Self::Settings => return None,
         })
@@ -241,10 +270,22 @@ struct FileConfig {
     sidebar: Option<bool>,
     notify: Option<Section<NotifyTable>>,
     keys: Option<HashMap<String, Chords>>,
+    status: Option<StatusFile>,
+    ui: Option<UiFile>,
     /// Anything this version does not know: reported as a warning so typos
     /// like `sidbar = true` do not silently do nothing.
     #[serde(flatten)]
     extra: HashMap<String, toml::Value>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct StatusFile {
+    right: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct UiFile {
+    window_title: Option<String>,
 }
 
 /// A setting that accepts either a bare `key = true` boolean (the pre-0.2
@@ -344,6 +385,7 @@ impl Default for Config {
             ("alt+r", Action::ResizeMode),
             ("!", Action::BreakPane),
             ("=", Action::LayoutEven),
+            ("q", Action::DisplayPanes),
         ] {
             bindings.insert(
                 parse_key_chord(binding).expect("built-in key is valid"),
@@ -364,6 +406,8 @@ impl Default for Config {
             copy_on_select: true,
             notify: true,
             prefix: parse_key_chord("ctrl+b").expect("built-in prefix is valid"),
+            status_right: vec![StatusWidget::Zoom, StatusWidget::Blocked],
+            window_title: "Ködade · {workspace} · {tab}".into(),
             bindings,
             // Defaults are all prefixed; global chords are opt-in per config.
             globals: HashMap::new(),
@@ -426,6 +470,22 @@ impl Config {
             None => {}
         }
         config.sidebar = file.sidebar.unwrap_or(config.sidebar);
+        if let Some(right) = file.status.and_then(|status| status.right) {
+            // Unknown widget names warn and are skipped, keeping the rest.
+            let mut widgets = Vec::new();
+            for name in &right {
+                match StatusWidget::parse(name) {
+                    Some(widget) => widgets.push(widget),
+                    None => config
+                        .warnings
+                        .push(format!("unknown status widget {name}")),
+                }
+            }
+            config.status_right = widgets;
+        }
+        if let Some(title) = file.ui.and_then(|ui| ui.window_title) {
+            config.window_title = title;
+        }
         if let Some(keys) = file.keys {
             // Sorted so warnings and overrides are deterministic.
             let mut entries = keys.iter().collect::<Vec<_>>();
@@ -1397,6 +1457,44 @@ red = \"#abcdef\"
         // Prompt- and snapshot-driven actions are resolved by `App`.
         assert!(Action::CloseTab.message().is_none());
         assert!(Action::ResizeMode.message().is_none());
+    }
+
+    #[test]
+    fn status_and_window_title_parse_with_defaults() {
+        let defaults = Config::default();
+        assert_eq!(
+            defaults.status_right,
+            vec![StatusWidget::Zoom, StatusWidget::Blocked]
+        );
+        assert_eq!(defaults.window_title, "Ködade · {workspace} · {tab}");
+        assert_eq!(
+            defaults.action(parse_key_chord("q").unwrap()),
+            Some(Action::DisplayPanes)
+        );
+        let file = Config::from_file(FileConfig {
+            status: Some(StatusFile {
+                right: Some(vec![
+                    "time".into(),
+                    "hostname".into(),
+                    "nope".into(),
+                    "zoom".into(),
+                ]),
+            }),
+            ui: Some(UiFile {
+                window_title: Some("{session}:{tab}".into()),
+            }),
+            ..FileConfig::default()
+        });
+        // Unknown widget names drop out; the rest keep their order.
+        assert_eq!(
+            file.status_right,
+            vec![
+                StatusWidget::Time,
+                StatusWidget::Hostname,
+                StatusWidget::Zoom
+            ]
+        );
+        assert_eq!(file.window_title, "{session}:{tab}");
     }
 
     #[test]

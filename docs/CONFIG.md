@@ -15,6 +15,8 @@ TOML, or omitted setting uses the defaults below.
 | `notify` | `true` | Agent-state notifications. Accepts a boolean or a `[notify]` table. |
 | `notify.enabled` | `true` | Table form of `notify`. |
 | `keys.prefix` | `"ctrl+b"` | Prefix key pressed before a remappable action. |
+| `status.right` | `["zoom", "blocked"]` | Right-side status bar widgets, in order. See [Status bar](#status-bar). |
+| `ui.window_title` | `"Ködade · {workspace} · {tab}"` | Host terminal title template (OSC 0). See [Window title](#window-title). |
 
 `mouse = true` and `[mouse]` are both valid, so a pre-0.2 config keeps working:
 
@@ -32,6 +34,34 @@ binding; the action's other default aliases are removed, and an empty array
 chords, and a chord that takes a key away from another action are all reported
 as warnings (see [`config validate`](#config-subcommands)); the rest of the
 file still loads.
+
+## Status bar
+
+The status bar's left segment shows `session · workspace · tab` (the real
+session name passed with `-s`). Mode prompts (rename, copy, navigate, resize,
+prefix, and `y/n` confirms) temporarily replace the left segment.
+
+`status.right` lists the widgets drawn at the right edge, in order. Unknown
+names warn and are skipped.
+
+| Widget | Shows |
+|---|---|
+| `zoom` | `[zoom]` while a pane is zoomed. |
+| `blocked` | `● N blocked` (in the blocked color) when N panes across all workspaces are blocked. |
+| `hostname` | The local host name. |
+| `time` | Local `HH:MM`. |
+
+`prefix q` briefly flashes each pane's `#id` (like tmux `display-panes`), so you
+can `kodade-cli send <id>` without an `ls` first. Pane borders also carry
+`#id name — state` on the left and the cwd basename on the right when the pane
+is wide enough.
+
+## Window title
+
+On attach — and whenever the active workspace or tab changes — the host
+terminal title is set via OSC 0 from `ui.window_title`. Placeholders
+`{session}`, `{workspace}`, and `{tab}` are substituted. Nothing is restored on
+exit; terminals reset their own title.
 
 ## Remappable actions
 
@@ -83,6 +113,7 @@ single-letter and arrow-key aliases.
 | `layout_even` | `=` |
 | `reload_config` | `ctrl+r` |
 | `settings` | `s` |
+| `display_panes` | `q` |
 
 `close_tab` asks for confirmation in the status bar when a pane in the tab is
 working, and `close_workspace` when any agent in it is working or blocked;

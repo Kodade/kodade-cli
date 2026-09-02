@@ -60,8 +60,15 @@ The default prefix is `ctrl+b`. After the prefix, the default actions are:
 | `alt+h` `alt+j` `alt+k` `alt+l` | Swap the pane with its neighbour |
 | `o` / `O` / `;` | Next / previous / last pane |
 | `!` / `=` | Break pane to a new tab / equalize the layout |
+| `q` | Flash big pane ids (tmux `display-panes`) |
 | `alt+r` | Resize mode (`hjkl` 1 cell, `HJKL` 5, `esc` exits) |
 | `s` / `ctrl+r` | Settings menu / reload config and theme |
+
+The status bar shows `session · workspace · tab` on the left and configurable
+widgets on the right (`[zoom]`, a `● N blocked` counter, hostname, time — set
+`status.right`). Pane borders carry `#id name — state` plus the cwd basename,
+and the host terminal title tracks the active workspace/tab. See
+[docs/CONFIG.md](docs/CONFIG.md#status-bar).
 
 Mouse is enabled by default: click panes, tabs, and sidebar rows to focus;
 drag pane borders to resize; scroll over a pane to scroll; right-click a pane,

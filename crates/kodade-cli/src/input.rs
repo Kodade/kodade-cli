@@ -1,5 +1,7 @@
-use kodade_cli_proto::{AgentStateKind, Direction, PaneId, TabId, TabInfo};
+use kodade_cli_proto::{Direction, PaneId, TabId, TabInfo};
 use ratatui::layout::Rect;
+
+use crate::render::tab_label;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TabSpan {
@@ -19,14 +21,8 @@ pub fn tab_spans(start: u16, tabs: &[TabInfo]) -> Vec<TabSpan> {
     let mut column = start;
     tabs.iter()
         .map(|tab| {
-            let prefix = matches!(tab.state, AgentStateKind::Blocked | AgentStateKind::Working)
-                .then_some("● ")
-                .unwrap_or("");
-            let label = if tab.active {
-                format!("{prefix}[{}]", tab.name)
-            } else {
-                format!(" {prefix}{} ", tab.name)
-            };
+            // Share the exact rendered label (incl. ellipsis) so hit-testing lines up.
+            let label = tab_label(&tab.name, tab.active, tab.state);
             let span = TabSpan {
                 id: tab.id,
                 start: column,
@@ -117,6 +113,7 @@ fn distance(a: u16, b: u16) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kodade_cli_proto::AgentStateKind;
 
     #[test]
     fn tab_hit_testing_uses_rendered_spans() {
