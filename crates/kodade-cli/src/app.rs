@@ -118,6 +118,9 @@ pub struct App {
     notifier: notify::Notifier,
     /// Session reported by the daemon's `Welcome`; shown in the status bar (#11).
     session_name: String,
+    /// Socket the client is attached to (local or an SSH-forwarded one for
+    /// `--remote`); used for one-shot requests like copy-mode reads (#23).
+    socket: PathBuf,
     /// `prefix q` pane-id flash expiry (#11).
     flash_until: Option<Instant>,
     /// When the sidebar was last hidden, for the timed gutter hint (#24).
@@ -142,7 +145,7 @@ const FLASH: Duration = Duration::from_secs(1);
 const SIDEBAR_HINT: Duration = Duration::from_secs(3);
 
 impl App {
-    pub fn new(config: &config::Config, session: &str) -> Self {
+    pub fn new(config: &config::Config, session: &str, socket: PathBuf) -> Self {
         // The toast tells the user which chord jumps to the pane, so read the
         // live binding (defaults to `N` per #14's o/O collision).
         let jump_hint = config
@@ -174,6 +177,7 @@ impl App {
             paste_buffer: String::new(),
             notifier: notify::Notifier::new(config, jump_hint),
             session_name: session.to_string(),
+            socket,
             flash_until: None,
             sidebar_hidden_at: None,
             last_title: String::new(),
@@ -298,7 +302,7 @@ impl App {
     /// daemon connection (the copy-mode buffer). Returns `None` on any error.
     async fn fetch_pane_lines(&self, pane: PaneId) -> Option<Vec<String>> {
         let reply = crate::commands::request(
-            &self.session_name,
+            &self.socket,
             ClientMessage::ReadPane {
                 id: pane,
                 scrollback: true,

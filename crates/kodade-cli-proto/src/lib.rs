@@ -8,12 +8,22 @@ use std::path::PathBuf;
 use anyhow::Result;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
+/// Wire protocol version. Bumped whenever a client and daemon can no longer
+/// understand each other. Both ends compare it at attach time (see `Hello` /
+/// `Welcome`) so a stale binary fails fast instead of misbehaving (#23).
+pub const PROTOCOL_VERSION: u32 = 1;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ClientMessage {
     Query(QueryKind),
     Hello {
         cols: u16,
         rows: u16,
+        /// Protocol version the client speaks. `#[serde(default)]` decodes an
+        /// old client that never sent the field as version 0, so the daemon can
+        /// still report a clear mismatch instead of failing to parse (#23).
+        #[serde(default)]
+        version: u32,
     },
     Input {
         bytes: Vec<u8>,
@@ -139,12 +149,23 @@ pub enum ClientMessage {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum QueryKind {
     Layout,
+    /// Cheap version probe: the daemon replies with `ServerMessage::Version` and
+    /// nothing else, so `--remote` can check compatibility before attaching (#23).
+    Version,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ServerMessage {
     Welcome {
         session: String,
+        /// Protocol version the daemon speaks; an unexpected value makes the
+        /// client abort before touching the terminal (#23).
+        #[serde(default)]
+        version: u32,
+    },
+    /// Reply to `Query(Version)`.
+    Version {
+        version: u32,
     },
     Layout(LayoutSnapshot),
     /// Pushed to every attached client when a known agent transitions into
@@ -416,6 +437,38 @@ mod tests {
         assert_eq!(
             decode::<ServerMessage>(&encoded).expect("message decodes"),
             message
+        );
+    }
+
+    #[test]
+    fn old_hello_without_version_decodes_as_zero() {
+        // A pre-#23 client sends `Hello` without the `version` field; it must
+        // decode as version 0 so the daemon can report a clean mismatch.
+        let hello: ClientMessage =
+            decode(br#"{"Hello":{"cols":80,"rows":24}}"#).expect("legacy hello decodes");
+        assert_eq!(
+            hello,
+            ClientMessage::Hello {
+                cols: 80,
+                rows: 24,
+                version: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn version_query_and_reply_round_trip() {
+        let query = ClientMessage::Query(QueryKind::Version);
+        assert_eq!(
+            decode::<ClientMessage>(&encode(&query).unwrap()).unwrap(),
+            query
+        );
+        let reply = ServerMessage::Version {
+            version: PROTOCOL_VERSION,
+        };
+        assert_eq!(
+            decode::<ServerMessage>(&encode(&reply).unwrap()).unwrap(),
+            reply
         );
     }
 }

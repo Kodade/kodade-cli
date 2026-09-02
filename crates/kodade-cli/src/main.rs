@@ -9,20 +9,21 @@ mod notify;
 mod overlay;
 mod paste;
 mod picker;
+mod remote;
 mod render;
 mod selection;
 mod settings;
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use clap::Parser;
 use crossterm::{
     event::{DisableBracketedPaste, EnableBracketedPaste},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use kodade_cli_proto::{decode, encode, ClientMessage, ServerMessage, SplitAxis};
+use kodade_cli_proto::{decode, encode, ClientMessage, ServerMessage, SplitAxis, PROTOCOL_VERSION};
 use ratatui::{backend::CrosstermBackend, Terminal};
-use std::{env, process::Stdio, time::Duration};
+use std::{env, path::Path, process::Stdio, time::Duration};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::UnixStream,
@@ -32,18 +33,48 @@ use tokio::{
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = cli::Cli::parse();
-    let session = args.session;
+    let session = args.session.clone();
+    let remote = args.remote.clone();
+
+    // Commands that never open a session socket run locally; `session` verbs
+    // pass through to the host when `--remote` is set.
+    let needs_socket = matches!(
+        args.command,
+        None | Some(
+            cli::Command::Ls { .. }
+                | cli::Command::Agent { .. }
+                | cli::Command::Pane { .. }
+                | cli::Command::Send { .. }
+                | cli::Command::New { .. }
+                | cli::Command::Run { .. }
+                | cli::Command::Split { .. }
+                | cli::Command::NewTab { .. }
+                | cli::Command::KillSession
+        )
+    );
+    // `--remote` sets up the SSH forward once; `_tunnel` must outlive every
+    // request below so the forward stays open (dropping it removes the socket).
+    let (socket, _tunnel) = if needs_socket {
+        remote::resolve_socket(&args).await?
+    } else {
+        (kodade_cli_daemon::socket_path(&session), None)
+    };
+    let command = args.command;
+
     // The config is only loaded where it is used, so `config validate` does not
     // print its warnings twice.
-    match args.command {
+    match command {
         // No subcommand attaches the TUI to the session.
-        None => attach(&session, &config::Config::load()).await,
+        None => attach(&socket, &session, &config::Config::load()).await,
         Some(cli::Command::Daemon { session: name }) => {
             kodade_cli_daemon::run(name.unwrap_or(session)).await
         }
+        Some(cli::Command::Session { command }) => {
+            session_command(remote.as_deref(), &session, command).await
+        }
         Some(cli::Command::Ls { json }) => {
             let layout =
-                commands::layout(commands::request(&session, commands::layout_query()).await?)?;
+                commands::layout(commands::request(&socket, commands::layout_query()).await?)?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&layout)?);
             } else {
@@ -56,9 +87,9 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Some(cli::Command::Agent { command }) => {
-            agent(&session, &config::Config::load(), command).await
+            agent(&socket, &session, &config::Config::load(), command).await
         }
-        Some(cli::Command::Pane { command }) => pane(&session, command).await,
+        Some(cli::Command::Pane { command }) => pane(&socket, command).await,
         Some(cli::Command::Send {
             pane,
             text,
@@ -70,21 +101,21 @@ async fn main() -> Result<()> {
                 format!("{text}\r").into_bytes()
             };
             commands::layout(
-                commands::request(&session, ClientMessage::SendToPane { id: pane, bytes }).await?,
+                commands::request(&socket, ClientMessage::SendToPane { id: pane, bytes }).await?,
             )?;
             Ok(())
         }
         Some(cli::Command::New { workspace, path }) => {
             let layout =
-                commands::layout(commands::request(&session, commands::layout_query()).await?)?;
+                commands::layout(commands::request(&socket, commands::layout_query()).await?)?;
             // Selecting an existing name is idempotent; otherwise create it.
             if let Ok(id) = commands::resolve_workspace(&layout, &workspace) {
-                commands::request(&session, ClientMessage::SelectWorkspace { id }).await?;
+                commands::request(&socket, ClientMessage::SelectWorkspace { id }).await?;
                 println!("{}", id.0);
             } else {
                 let reply = commands::layout(
                     commands::request(
-                        &session,
+                        &socket,
                         ClientMessage::NewWorkspace {
                             name: workspace,
                             root: path,
@@ -102,10 +133,10 @@ async fn main() -> Result<()> {
             name,
             command,
         }) => {
-            let (ws, tab) = resolve_target(&session, workspace, tab).await?;
+            let (ws, tab) = resolve_target(&socket, workspace, tab).await?;
             let reply = commands::layout(
                 commands::request(
-                    &session,
+                    &socket,
                     ClientMessage::NewPane {
                         workspace: ws,
                         tab,
@@ -125,7 +156,7 @@ async fn main() -> Result<()> {
             command,
         }) => {
             if let Some(pane) = pane {
-                commands::request(&session, ClientMessage::FocusPaneId { id: pane }).await?;
+                commands::request(&socket, ClientMessage::FocusPaneId { id: pane }).await?;
             }
             let axis = if down {
                 SplitAxis::Vertical
@@ -134,7 +165,7 @@ async fn main() -> Result<()> {
             };
             let reply = commands::layout(
                 commands::request(
-                    &session,
+                    &socket,
                     ClientMessage::NewPane {
                         workspace: None,
                         tab: None,
@@ -149,10 +180,10 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Some(cli::Command::NewTab { workspace, name }) => {
-            let (ws, _) = resolve_target(&session, workspace, None).await?;
+            let (ws, _) = resolve_target(&socket, workspace, None).await?;
             let reply = commands::layout(
                 commands::request(
-                    &session,
+                    &socket,
                     ClientMessage::NewPane {
                         workspace: ws,
                         tab: None,
@@ -167,7 +198,7 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Some(cli::Command::KillSession) => {
-            match commands::request(&session, ClientMessage::KillSession).await? {
+            match commands::request(&socket, ClientMessage::KillSession).await? {
                 ServerMessage::Shutdown => Ok(()),
                 message => commands::layout(message).map(|_| ()),
             }
@@ -199,7 +230,7 @@ async fn main() -> Result<()> {
 /// Resolve optional `-w`/`-t` names to ids, fetching one layout snapshot only
 /// when a name is actually given.
 async fn resolve_target(
-    session: &str,
+    socket: &Path,
     workspace: Option<String>,
     tab: Option<String>,
 ) -> Result<(
@@ -209,7 +240,7 @@ async fn resolve_target(
     if workspace.is_none() && tab.is_none() {
         return Ok((None, None));
     }
-    let layout = commands::layout(commands::request(session, commands::layout_query()).await?)?;
+    let layout = commands::layout(commands::request(socket, commands::layout_query()).await?)?;
     let ws = workspace
         .as_deref()
         .map(|name| commands::resolve_workspace(&layout, name))
@@ -256,12 +287,35 @@ fn config_command(command: cli::ConfigCommand) {
     }
 }
 
+/// `session` subcommands. Locally these inspect this host's daemon; with
+/// `--remote` they run on the host over SSH (#23).
+async fn session_command(
+    remote: Option<&str>,
+    session: &str,
+    command: cli::SessionCommand,
+) -> Result<()> {
+    if let Some(host) = remote {
+        return remote::run_session(host, session, &command).await;
+    }
+    match command {
+        cli::SessionCommand::Path => {
+            println!("{}", kodade_cli_daemon::socket_path(session).display());
+            Ok(())
+        }
+    }
+}
+
 /// `agent` subcommands: read pane state or report it back to the daemon.
-async fn agent(session: &str, config: &config::Config, command: cli::AgentCommand) -> Result<()> {
+async fn agent(
+    socket: &Path,
+    session: &str,
+    config: &config::Config,
+    command: cli::AgentCommand,
+) -> Result<()> {
     match command {
         cli::AgentCommand::Ls { json } => {
             let layout =
-                commands::layout(commands::request(session, commands::layout_query()).await?)?;
+                commands::layout(commands::request(socket, commands::layout_query()).await?)?;
             if json {
                 println!(
                     "{}",
@@ -274,19 +328,19 @@ async fn agent(session: &str, config: &config::Config, command: cli::AgentComman
         }
         cli::AgentCommand::Attach { pane } => {
             commands::layout(
-                commands::request(session, ClientMessage::FocusPaneId { id: pane }).await?,
+                commands::request(socket, ClientMessage::FocusPaneId { id: pane }).await?,
             )?;
-            attach(session, config).await
+            attach(socket, session, config).await
         }
         cli::AgentCommand::Rename { pane, name } => {
             commands::layout(
-                commands::request(session, ClientMessage::RenamePaneId { id: pane, name }).await?,
+                commands::request(socket, ClientMessage::RenamePaneId { id: pane, name }).await?,
             )?;
             Ok(())
         }
         cli::AgentCommand::Explain { pane, json } => {
             let layout =
-                commands::layout(commands::request(session, commands::layout_query()).await?)?;
+                commands::layout(commands::request(socket, commands::layout_query()).await?)?;
             let pane = commands::find_pane(&layout, pane)?;
             if json {
                 println!("{}", serde_json::to_string_pretty(pane)?);
@@ -303,7 +357,7 @@ async fn agent(session: &str, config: &config::Config, command: cli::AgentComman
         } => {
             commands::layout(
                 commands::request(
-                    session,
+                    socket,
                     ClientMessage::AgentState {
                         pane,
                         state,
@@ -318,7 +372,7 @@ async fn agent(session: &str, config: &config::Config, command: cli::AgentComman
 }
 
 /// `pane` subcommands: read a pane's text for scripting.
-async fn pane(session: &str, command: cli::PaneCommand) -> Result<()> {
+async fn pane(socket: &Path, command: cli::PaneCommand) -> Result<()> {
     match command {
         cli::PaneCommand::Read {
             pane,
@@ -326,7 +380,7 @@ async fn pane(session: &str, command: cli::PaneCommand) -> Result<()> {
             scrollback,
         } => {
             let reply = commands::request(
-                session,
+                socket,
                 ClientMessage::ReadPane {
                     id: pane,
                     scrollback,
@@ -345,16 +399,22 @@ async fn pane(session: &str, command: cli::PaneCommand) -> Result<()> {
     }
 }
 
-/// Connects to the session daemon, starting it in the background when missing.
-async fn attach(session: &str, config: &config::Config) -> Result<()> {
-    let path = kodade_cli_daemon::socket_path(session);
-    let stream = match UnixStream::connect(&path).await {
+/// Connects to the session daemon at `socket`, starting a local one in the
+/// background when the socket is the local path and nothing answers. A remote
+/// (forwarded) socket is never auto-started here — `remote::resolve_socket`
+/// already ensured the remote daemon is up.
+async fn attach(socket: &Path, session: &str, config: &config::Config) -> Result<()> {
+    // Only spawn a daemon for this host's own socket; a `--remote` tunnel socket
+    // differs from the local path and must not trigger a local daemon.
+    let can_spawn = socket == kodade_cli_daemon::socket_path(session).as_path();
+    let stream = match UnixStream::connect(socket).await {
         Ok(s) => s,
         Err(e)
-            if matches!(
-                e.kind(),
-                std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
-            ) =>
+            if can_spawn
+                && matches!(
+                    e.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+                ) =>
         {
             std::process::Command::new(env::current_exe().context("locate binary")?)
                 .arg("daemon")
@@ -364,7 +424,7 @@ async fn attach(session: &str, config: &config::Config) -> Result<()> {
                 .stderr(Stdio::null())
                 .spawn()?;
             loop {
-                if let Ok(s) = UnixStream::connect(&path).await {
+                if let Ok(s) = UnixStream::connect(socket).await {
                     break s;
                 }
                 tokio::time::sleep(Duration::from_millis(20)).await;
@@ -372,19 +432,36 @@ async fn attach(session: &str, config: &config::Config) -> Result<()> {
         }
         Err(e) => return Err(e.into()),
     };
-    tui(stream, config, session).await
+    tui(stream, config, session, socket).await
 }
 
 /// Sets up the terminal, hands the socket to `App`, and always restores it.
-async fn tui(stream: UnixStream, config: &config::Config, session: &str) -> Result<()> {
+async fn tui(
+    stream: UnixStream,
+    config: &config::Config,
+    session: &str,
+    socket: &Path,
+) -> Result<()> {
     let (reader, mut writer) = stream.into_split();
+    let mut lines = BufReader::new(reader).lines();
+    let mut state = app::App::new(config, session, socket.to_path_buf());
+    let (cols, rows) = crossterm::terminal::size()?;
+    // Send a versioned Hello, then verify the daemon speaks our protocol before
+    // touching the terminal so a mismatch prints cleanly and exits 1 (#23).
+    writer
+        .write_all(&encode(&ClientMessage::Hello {
+            cols: state.pane_cols(cols),
+            rows,
+            version: PROTOCOL_VERSION,
+        })?)
+        .await?;
+    handshake(&mut lines, &mut state).await?;
     let (tx, mut rx) = mpsc::channel(16);
     tokio::spawn(async move {
-        let mut lines = BufReader::new(reader).lines();
         while let Ok(Some(line)) = lines.next_line().await {
             let update = match decode(line.as_bytes()) {
                 Ok(ServerMessage::Layout(layout)) => app::Update::Layout(layout),
-                Ok(ServerMessage::Welcome { session }) => app::Update::Session(session),
+                Ok(ServerMessage::Welcome { session, .. }) => app::Update::Session(session),
                 Ok(ServerMessage::Notification(notification)) => {
                     app::Update::Notification(notification)
                 }
@@ -395,14 +472,6 @@ async fn tui(stream: UnixStream, config: &config::Config, session: &str) -> Resu
             }
         }
     });
-    let mut state = app::App::new(config, session);
-    let (cols, rows) = crossterm::terminal::size()?;
-    writer
-        .write_all(&encode(&ClientMessage::Hello {
-            cols: state.pane_cols(cols),
-            rows,
-        })?)
-        .await?;
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
@@ -421,4 +490,38 @@ async fn tui(stream: UnixStream, config: &config::Config, session: &str) -> Resu
     }
     term.show_cursor()?;
     result
+}
+
+/// Read the daemon's opening `Welcome` and verify its protocol version before
+/// the terminal is put into raw mode. A mismatch (or an `Error`, which is what
+/// the daemon sends when it rejects our `Hello`) prints a message and exits 1
+/// so the user never sees a half-drawn screen (#23).
+async fn handshake(
+    lines: &mut tokio::io::Lines<BufReader<tokio::net::unix::OwnedReadHalf>>,
+    state: &mut app::App,
+) -> Result<()> {
+    loop {
+        let line = lines
+            .next_line()
+            .await?
+            .ok_or_else(|| anyhow!("daemon closed the connection during handshake"))?;
+        match decode::<ServerMessage>(line.as_bytes()) {
+            Ok(ServerMessage::Welcome { session, version }) => {
+                if version != PROTOCOL_VERSION {
+                    eprintln!(
+                        "protocol version mismatch: client {PROTOCOL_VERSION}, daemon {version} — upgrade kodade-cli on both ends"
+                    );
+                    std::process::exit(1);
+                }
+                state.handle_session(session);
+                return Ok(());
+            }
+            Ok(ServerMessage::Error { message }) => {
+                eprintln!("{message}");
+                std::process::exit(1);
+            }
+            // Ignore anything before the Welcome (there should be nothing).
+            _ => continue,
+        }
+    }
 }

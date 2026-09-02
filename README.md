@@ -170,6 +170,9 @@ for the installed version. The scripting commands are:
   (visible screen by default; `--scrollback` includes the full history, `--lines N`
   keeps only the last N lines).
 - `kodade-cli kill-session` — stop the current session.
+- `kodade-cli session path` — print the daemon socket path for the session
+  (`--remote` prints the host's path). The `session` group grows `ls`, `kill`,
+  and `rename` verbs.
 - `kodade-cli config path|show|validate` — print the config path, the effective
   config as TOML, or check the file (exits non-zero on problems).
 
@@ -184,6 +187,34 @@ workspace root, so agents keep landing in the right repo.
 
 `ls`, `agent ls`, and `agent explain` also accept `--json`, which prints the
 matching protocol snapshots for scripts.
+
+## Remote
+
+`kodade-cli --remote USER@HOST` attaches to a daemon on another host over an
+SSH-forwarded socket, so you can drive agent panes on a build box or server from
+your laptop. The same flag works with the scripting subcommands
+(`kodade-cli --remote HOST -s work agent ls`) and with `-s NAME` to pick a
+session. `--remote HOST session ls` lists the host's sessions (prefixed with
+`host:`).
+
+Requirements and behavior:
+
+- `kodade-cli` must be installed on the remote host and on your PATH there. If it
+  is missing, the command prints the install one-liner and exits. (Auto-install
+  is a later phase.)
+- Auth is your existing SSH setup — config, agent, and keys. Ködade never sees
+  or proxies credentials.
+- The daemon is started on the host automatically if it is not already running,
+  and it keeps your session alive between connections. Dropping the link and
+  re-running `--remote` reattaches to the same session; a control-master
+  connection lingers ~60 s (`ControlPersist`) so reconnecting is fast.
+- Set `ServerAliveInterval` in your `~/.ssh/config` for the host if you attach
+  over flaky links, so a dead connection is noticed promptly.
+- Copy mode and the clipboard run on your local machine, so yanking from a
+  remote pane copies to your local clipboard as usual.
+
+Requires OpenSSH with Unix-domain forwarding (`-L localsock:remotesock`), which
+is standard on current macOS and Linux.
 
 `kodade-cli integrate list` shows the available integrations.
 `kodade-cli integrate <agent>` prints the hook/notify settings and

@@ -93,6 +93,76 @@ Session names must be non-empty path components. They cannot contain `/` or be
 `.` or `..`. The daemon removes a socket file only when it cannot connect to a
 live daemon at that path.
 
+## Protocol versioning (#23)
+
+`kodade-cli-proto` exports `PROTOCOL_VERSION: u32` (currently `1`). Both ends
+check it at attach time so a stale binary fails fast with a clear message
+instead of misbehaving. Bump it whenever a client and daemon can no longer
+understand each other.
+
+The handshake:
+
+- The client's first message is `Hello { cols, rows, version }`. The `version`
+  field carries `#[serde(default)]`, so a pre-versioning client that omits it
+  decodes as version `0` rather than failing to parse.
+- The daemon compares `Hello.version` to its own `PROTOCOL_VERSION`. A match is
+  answered with `Welcome { session, version }` followed by the first `Layout`.
+  A mismatch is answered with `Error { message: "protocol version mismatch:
+  client N, daemon M — upgrade kodade-cli on both ends" }` and the connection
+  closes.
+- The client verifies `Welcome.version` before it puts the terminal into raw
+  mode. An unexpected value (or the daemon's `Error`) prints the same message
+  and exits `1`, so the user never sees a half-drawn screen.
+- `Query(Version)` is a cheap probe: the daemon replies with `Version {
+  version }` and keeps the connection open. `--remote` uses it to check
+  compatibility before attaching.
+
+This section is the versioning reference; when the #16 `docs/SOCKET-API.md`
+lands it should link back here (this branch predates that file).
+
+## Remote mode (#23)
+
+`kodade-cli --remote USER@HOST [-s NAME] [subcommand]` attaches to (or scripts)
+a daemon on another host over an SSH-forwarded Unix socket. It is implemented in
+`remote.rs` with no new dependencies and no credential handling — everything
+runs through the user's own `ssh` (their config, agent, and keys).
+
+Every code path that needs a session socket goes through
+`remote::resolve_socket(&cli)`: a local session returns
+`kodade_cli_daemon::socket_path(session)` unchanged, while `--remote` sets up
+the forward and returns the local end of it, so the TUI and every scripting
+subcommand treat it exactly like a local daemon.
+
+The forward is built with a multiplexed control master so the extra round-trips
+are cheap:
+
+1. `ssh -o ControlMaster=auto -o ControlPath=<runtime>/kodade-cli/cm-%C
+   -o ControlPersist=60 USER@HOST kodade-cli --version` checks the remote
+   binary; if it is missing, the install one-liner is printed and the command
+   exits `1`.
+2. `ssh … kodade-cli daemon NAME` (with `-f`) starts the remote daemon detached
+   when one is not already running (a harmless error if it is).
+3. `ssh … kodade-cli session path -s NAME` returns the remote socket path.
+4. `ssh -N -L <local>:<remote-socket> …` forwards it (OpenSSH Unix-to-Unix
+   forwarding) to `<runtime>/kodade-cli/remote-<host>-<NAME>.sock`. The command
+   waits up to 10 s for that local socket to accept a connection.
+
+On exit the forwarding process is stopped and the local socket file removed; the
+control master lingers (`ControlPersist=60`) so re-running `--remote`
+reconnects without a fresh handshake. Because the daemon keeps session state,
+dropping the tunnel and re-running `--remote` reattaches — the client's `Hello`
+re-sends the terminal size, so a differently-sized terminal simply re-fits.
+
+`--remote HOST session ls` runs the remote `session ls` over the control
+connection and prefixes each line with `host:` (the `session` group lands with
+#16; this branch ships `session path`). The command builders (`version_args`,
+`socket_path_args`, `start_daemon_args`, `tunnel_args`, `run_args`) and the
+local socket resolver are unit-tested in `remote.rs`; the live tunnel path is
+only exercised against a real host.
+
+Out of scope (phase 2): multiple remotes in one sidebar, and auto-installing
+`kodade-cli` on the remote host.
+
 ## Checks
 
 Run the local gate from the repository root:
