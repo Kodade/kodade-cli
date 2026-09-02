@@ -8,6 +8,7 @@ mod mode;
 mod notify;
 mod overlay;
 mod paste;
+mod picker;
 mod render;
 mod selection;
 mod settings;

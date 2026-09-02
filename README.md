@@ -50,7 +50,9 @@ The default prefix is `ctrl+b`. After the prefix, the default actions are:
 | `n` | Navigate mode |
 | `tab` / `p` | Next / previous tab |
 | `z` / `d` | Zoom pane / detach |
-| `r` / `w` / `W` | Rename / next workspace / new workspace (`W` prompts for `NAME [PATH]`) |
+| `r` / `W` | Rename / new workspace (`W` prompts for `NAME [PATH]`) |
+| `w` / `g` | Workspace picker / goto palette (fuzzy; type to filter, `enter` jumps) |
+| `alt+w` | Next workspace (cycle without the picker) |
 | `b` / `[` | Toggle sidebar / copy mode |
 | `h` `j` `k` `l` or arrows | Focus left, down, up, right |
 | `H` `J` `K` `L` | Resize left, down, up, right |

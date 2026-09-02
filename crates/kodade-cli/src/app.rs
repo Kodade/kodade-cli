@@ -27,7 +27,9 @@ use tokio::{io::AsyncWriteExt, net::unix::OwnedWriteHalf, sync::mpsc};
 use crate::{
     config, help, input, mode, notify,
     overlay::{self, Overlay, OverlayEvent, OverlayTarget},
-    paste, render,
+    paste,
+    picker::{self, PickTarget},
+    render,
     selection::{self, Selection, SelectionMode},
     settings,
 };
@@ -98,6 +100,9 @@ pub struct App {
     last_pane: Option<PaneId>,
     /// Settings menu (`prefix s`), drawn over everything else.
     settings: Option<Overlay>,
+    /// Workspace switcher (`prefix w`) or goto palette (`prefix g`); holds its
+    /// item list so the filter rebuilds without re-reading the snapshot (#17).
+    picker: Option<picker::Picker>,
     /// Help overlay (`prefix ?`); holds the full row set so its filter can
     /// rebuild without re-reading the config (#6).
     help: Option<help::HelpOverlay>,
@@ -162,6 +167,7 @@ impl App {
             focused_pane: None,
             last_pane: None,
             settings: None,
+            picker: None,
             help: None,
             help_seen: help::state_seen(),
             note: None,
@@ -353,6 +359,7 @@ impl App {
                 prefix_hint: &prefix_hint,
                 first_attach_hint,
                 help: self.help.as_ref().map(|state| &state.overlay),
+                picker: self.picker.as_ref(),
             },
             &self.theme,
         )
@@ -485,6 +492,8 @@ impl App {
             self.handle_help_key(key);
         } else if self.settings.is_some() {
             self.handle_settings_key(key, writer, term).await?;
+        } else if self.picker.is_some() {
+            self.handle_picker_key(key, writer).await?;
         } else if let Some(current) = self.navigate {
             self.handle_navigate_key(key, current, writer).await?;
         } else if self.resize {
@@ -919,6 +928,22 @@ impl App {
                 self.settings = Some(settings::overlay(&self.config, 0));
             }
             config::Action::Help => self.open_help(),
+            config::Action::WorkspacePicker => {
+                if let Some(layout) = &self.layout {
+                    self.picker = Some(picker::Picker::new(
+                        "workspaces · type to filter · esc closes",
+                        picker::workspace_items(layout),
+                    ));
+                }
+            }
+            config::Action::Goto => {
+                if let Some(layout) = &self.layout {
+                    self.picker = Some(picker::Picker::new(
+                        "go to · type to filter · esc closes",
+                        picker::goto_items(layout),
+                    ));
+                }
+            }
             config::Action::Navigate => {
                 self.sidebar = true;
                 self.navigate = Some(0);
@@ -1074,6 +1099,77 @@ impl App {
         Ok(())
     }
 
+    // Picker overlay (`prefix w` / `prefix g`): esc closes, enter activates the
+    // highlighted row, anything else filters the list.
+    async fn handle_picker_key(
+        &mut self,
+        key: KeyEvent,
+        writer: &mut OwnedWriteHalf,
+    ) -> Result<()> {
+        let Some(mut picker) = self.picker.take() else {
+            return Ok(());
+        };
+        match overlay::overlay_key(&mut picker.overlay, key) {
+            OverlayEvent::Cancel => return Ok(()),
+            OverlayEvent::Select => {
+                if let Some(target) = picker.current_target() {
+                    self.activate_pick(target, writer).await?;
+                    // Selecting closes the picker.
+                    return Ok(());
+                }
+                self.picker = Some(picker);
+            }
+            OverlayEvent::Filtered => {
+                picker.apply_filter();
+                self.picker = Some(picker);
+            }
+            _ => self.picker = Some(picker),
+        }
+        Ok(())
+    }
+
+    // Focuses the workspace, tab, or pane behind a picker row. A tab first
+    // activates its owning workspace, since it may live in an inactive one.
+    async fn activate_pick(
+        &mut self,
+        target: PickTarget,
+        writer: &mut OwnedWriteHalf,
+    ) -> Result<()> {
+        match target {
+            PickTarget::Workspace(id) => {
+                write(writer, &ClientMessage::SelectWorkspace { id }).await?;
+            }
+            PickTarget::Tab(id) => {
+                if let Some(workspace) = self.workspace_of_tab(id) {
+                    write(writer, &ClientMessage::SelectWorkspace { id: workspace }).await?;
+                }
+                write(writer, &ClientMessage::SelectTab { id }).await?;
+            }
+            PickTarget::Pane(id) => {
+                write(writer, &ClientMessage::FocusPaneId { id }).await?;
+            }
+        }
+        Ok(())
+    }
+
+    // The workspace that owns `tab` in the newest snapshot, if any.
+    fn workspace_of_tab(
+        &self,
+        tab: kodade_cli_proto::TabId,
+    ) -> Option<kodade_cli_proto::WorkspaceId> {
+        self.layout
+            .as_ref()?
+            .workspaces
+            .iter()
+            .find_map(|workspace| {
+                workspace
+                    .tabs
+                    .iter()
+                    .any(|candidate| candidate.id == tab)
+                    .then_some(workspace.id)
+            })
+    }
+
     // Applies a just-toggled setting to the running client.
     async fn apply_setting(
         &mut self,
@@ -1190,6 +1286,11 @@ impl App {
         // The settings overlay owns the mouse while it is up.
         if self.settings.is_some() {
             return self.settings_mouse(mouse, writer, term).await;
+        }
+        // The picker owns the mouse the same way: a click selects a row, a
+        // click outside closes it.
+        if self.picker.is_some() {
+            return self.picker_mouse(mouse, writer, term).await;
         }
         // The help overlay swallows mouse input: a click outside it closes it,
         // and clicks inside do nothing (its rows are not actionable).
@@ -1523,6 +1624,39 @@ impl App {
                     .await?;
             }
             None => self.settings = None,
+        }
+        Ok(())
+    }
+
+    // Picker clicks: a left click on a row selects it, anything else closes.
+    async fn picker_mouse(
+        &mut self,
+        mouse: MouseEvent,
+        writer: &mut OwnedWriteHalf,
+        term: &mut Term,
+    ) -> Result<()> {
+        if !matches!(
+            mouse.kind,
+            MouseEventKind::Down(MouseButton::Left) | MouseEventKind::Down(MouseButton::Right)
+        ) {
+            return Ok(());
+        }
+        let size = term.size()?;
+        let area = Rect::new(0, 0, size.width, size.height);
+        let overlay = &self.picker.as_ref().expect("picker open").overlay;
+        let row = matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+            .then(|| overlay::row_at(area, overlay, mouse.column, mouse.row))
+            .flatten();
+        match row {
+            Some(index) => {
+                if let Some(picker) = &mut self.picker {
+                    picker.overlay.selected = index;
+                }
+                // Reuse the enter path so a click and a keypress behave alike.
+                self.handle_picker_key(KeyEvent::from(KeyCode::Enter), writer)
+                    .await?;
+            }
+            None => self.picker = None,
         }
         Ok(())
     }
