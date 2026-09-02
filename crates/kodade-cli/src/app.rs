@@ -18,13 +18,19 @@ use ratatui::{backend::CrosstermBackend, layout::Rect, Frame, Terminal};
 use std::{
     io::Write,
     path::{Path, PathBuf},
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tokio::{io::AsyncWriteExt, net::unix::OwnedWriteHalf, sync::mpsc};
 
-use crate::{config, input, mode, render};
+use crate::{
+    config, input, mode,
+    overlay::{self, Overlay, OverlayEvent, OverlayTarget},
+    render, settings,
+};
 
 const SCROLL_STEP: i16 = 3;
+/// How long a status-bar note stays up.
+const NOTE_TTL: Duration = Duration::from_secs(5);
 
 type Term = Terminal<CrosstermBackend<std::io::Stdout>>;
 
@@ -73,7 +79,10 @@ pub struct App {
     /// Focused pane in the newest snapshot and the one before it (`last_pane`).
     focused_pane: Option<PaneId>,
     last_pane: Option<PaneId>,
-    note: Option<String>,
+    /// Settings menu (`prefix s`), drawn over everything else.
+    settings: Option<Overlay>,
+    /// Status-bar note and the instant it stops being shown.
+    note: Option<(String, Instant)>,
     /// Session reported by the daemon's `Welcome`; the status bar uses it in #11.
     #[allow(dead_code)]
     session_name: String,
@@ -99,11 +108,25 @@ impl App {
             resize: false,
             focused_pane: None,
             last_pane: None,
+            settings: None,
             note: None,
             session_name: session.to_string(),
             theme: config.resolve_theme(),
             config: config.clone(),
         }
+    }
+
+    /// Sets the status-bar note; it clears itself after `NOTE_TTL`.
+    fn set_note(&mut self, text: impl Into<String>) {
+        self.note = Some((text.into(), Instant::now() + NOTE_TTL));
+    }
+
+    // The note, unless it has expired.
+    fn note(&self) -> Option<&str> {
+        self.note
+            .as_ref()
+            .filter(|(_, expiry)| *expiry > Instant::now())
+            .map(|(text, _)| text.as_str())
     }
 
     /// Pane width for the current sidebar state, used by `Hello` and `Resize`.
@@ -149,7 +172,8 @@ impl App {
                 menu: self.menu.as_ref(),
                 resize: self.resize,
                 confirm: self.confirm.as_ref().map(|c| c.message.as_str()),
-                note: self.note.as_deref(),
+                settings: self.settings.as_ref(),
+                note: self.note(),
             },
             &self.theme,
         )
@@ -208,14 +232,19 @@ impl App {
             self.handle_copy_key(key, writer, term).await?;
         } else if self.menu.is_some() {
             self.handle_menu_key(key, writer).await?;
+        } else if self.settings.is_some() {
+            self.handle_settings_key(key, writer, term).await?;
         } else if let Some(current) = self.navigate {
             self.handle_navigate_key(key, current, writer).await?;
         } else if self.resize {
             self.handle_resize_key(key, writer).await?;
         } else if self.prefix {
             return self.handle_prefix_key(key, writer, term).await;
-        } else if key == self.config.prefix {
+        } else if config::normalize_key(key) == self.config.prefix {
             self.prefix = true;
+        } else if let Some(action) = self.config.global_action(key) {
+            // Global chords (ctrl/alt, no `prefix+`) fire before the pane sees the key.
+            return self.run_action(action, writer, term).await;
         } else if let Some(bytes) = bytes(key) {
             write(writer, &ClientMessage::Input { bytes }).await?;
         }
@@ -348,10 +377,10 @@ impl App {
                     let (payload, truncated) = mode::osc52(&text);
                     execute!(term.backend_mut(), crossterm::style::Print(payload))?;
                     term.backend_mut().flush()?;
-                    self.note = Some(if truncated {
-                        " copied (truncated to 100KB)".into()
+                    self.set_note(if truncated {
+                        " copied (truncated to 100KB)"
                     } else {
-                        " copied".into()
+                        " copied"
                     });
                     keep = false;
                 }
@@ -457,7 +486,7 @@ impl App {
         term: &mut Term,
     ) -> Result<Flow> {
         self.prefix = false;
-        if key == self.config.prefix {
+        if config::normalize_key(key) == self.config.prefix {
             write(
                 writer,
                 &ClientMessage::Input {
@@ -470,18 +499,24 @@ impl App {
         let Some(action) = self.config.action(key) else {
             return Ok(Flow::Continue);
         };
+        self.run_action(action, writer, term).await
+    }
+
+    // Runs a bound action, whether it came from the prefix table or a global chord.
+    async fn run_action(
+        &mut self,
+        action: config::Action,
+        writer: &mut OwnedWriteHalf,
+        term: &mut Term,
+    ) -> Result<Flow> {
         match action {
             config::Action::SidebarToggle => {
                 self.sidebar = !self.sidebar;
-                let size = term.size()?;
-                write(
-                    writer,
-                    &ClientMessage::Resize {
-                        cols: self.pane_cols(size.width),
-                        rows: size.height,
-                    },
-                )
-                .await?;
+                self.send_resize(writer, term).await?;
+            }
+            config::Action::ReloadConfig => self.reload_config(term)?,
+            config::Action::Settings => {
+                self.settings = Some(settings::overlay(&self.config, 0));
             }
             config::Action::Navigate => {
                 self.sidebar = true;
@@ -562,6 +597,107 @@ impl App {
         Ok(Flow::Continue)
     }
 
+    // Settings menu: move the selection, toggle a setting, or close.
+    async fn handle_settings_key(
+        &mut self,
+        key: KeyEvent,
+        writer: &mut OwnedWriteHalf,
+        term: &mut Term,
+    ) -> Result<()> {
+        let Some(mut menu) = self.settings.take() else {
+            return Ok(());
+        };
+        match overlay::overlay_key(&mut menu, key) {
+            // Dropping the overlay closes it.
+            OverlayEvent::Cancel => return Ok(()),
+            OverlayEvent::Select => {
+                let Some(OverlayTarget::Index(index)) =
+                    menu.current().map(|row| row.target.clone())
+                else {
+                    self.settings = Some(menu);
+                    return Ok(());
+                };
+                let setting = settings::SETTINGS[index];
+                settings::toggle(&mut self.config, setting);
+                self.apply_setting(setting, writer, term).await?;
+                if let Err(error) = settings::write(&config::config_path(), &self.config) {
+                    self.set_note(format!(" config write failed: {error}"));
+                }
+                // Rebuild so the row shows the new value.
+                self.settings = Some(settings::overlay(&self.config, menu.selected));
+            }
+            _ => self.settings = Some(menu),
+        }
+        Ok(())
+    }
+
+    // Applies a just-toggled setting to the running client.
+    async fn apply_setting(
+        &mut self,
+        setting: settings::Setting,
+        writer: &mut OwnedWriteHalf,
+        term: &mut Term,
+    ) -> Result<()> {
+        match setting {
+            settings::Setting::Theme => {
+                let config = self.config.clone();
+                self.apply_theme(&config);
+                if config.theme == config::ThemeChoice::Auto {
+                    self.set_note(" auto resolves on next start");
+                }
+            }
+            settings::Setting::Mouse => set_mouse_capture(term, self.config.mouse)?,
+            settings::Setting::Sidebar => {
+                self.sidebar = self.config.sidebar;
+                self.send_resize(writer, term).await?;
+            }
+            settings::Setting::CopyOnSelect | settings::Setting::Notify => {}
+        }
+        Ok(())
+    }
+
+    // `prefix R`: re-read config.toml and the theme without detaching. A broken
+    // file keeps the previous config and reports it in the status bar.
+    fn reload_config(&mut self, term: &mut Term) -> Result<()> {
+        match config::Config::load_checked() {
+            Ok(config) => {
+                self.apply_theme(&config);
+                if config.mouse != self.config.mouse {
+                    set_mouse_capture(term, config.mouse)?;
+                }
+                let note = match config.warnings.first() {
+                    Some(warning) => format!(" config reloaded · {warning}"),
+                    None => " config reloaded".into(),
+                };
+                self.config = config;
+                self.set_note(note);
+            }
+            Err(error) => self.set_note(format!(" config error: {error} · previous config kept")),
+        }
+        Ok(())
+    }
+
+    // Re-resolves the theme. `auto` keeps the current theme because its OSC 11
+    // query cannot run while the TUI owns the terminal.
+    fn apply_theme(&mut self, config: &config::Config) {
+        if config.theme != config::ThemeChoice::Auto {
+            self.theme = config.resolve_theme();
+        }
+    }
+
+    // Tells the daemon the pane area after the sidebar changed.
+    async fn send_resize(&self, writer: &mut OwnedWriteHalf, term: &mut Term) -> Result<()> {
+        let size = term.size()?;
+        write(
+            writer,
+            &ClientMessage::Resize {
+                cols: self.pane_cols(size.width),
+                rows: size.height,
+            },
+        )
+        .await
+    }
+
     /// Routes a mouse event; ignored entirely when mouse support is off.
     pub async fn handle_mouse(
         &mut self,
@@ -571,6 +707,10 @@ impl App {
     ) -> Result<()> {
         if !self.config.mouse || self.layout.is_none() {
             return Ok(());
+        }
+        // The settings overlay owns the mouse while it is up.
+        if self.settings.is_some() {
+            return self.settings_mouse(mouse, writer, term).await;
         }
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
@@ -673,6 +813,40 @@ impl App {
             }
         } else if let Some(id) = input::pane_at(&rects, mouse.column, mouse.row) {
             write(writer, &ClientMessage::FocusPaneId { id }).await?;
+        }
+        Ok(())
+    }
+
+    // Clicks while the settings overlay is open: a row activates, anything
+    // else closes it. Nothing falls through to panes, tabs, or the sidebar.
+    async fn settings_mouse(
+        &mut self,
+        mouse: MouseEvent,
+        writer: &mut OwnedWriteHalf,
+        term: &mut Term,
+    ) -> Result<()> {
+        if !matches!(
+            mouse.kind,
+            MouseEventKind::Down(MouseButton::Left) | MouseEventKind::Down(MouseButton::Right)
+        ) {
+            return Ok(());
+        }
+        let size = term.size()?;
+        let area = Rect::new(0, 0, size.width, size.height);
+        let menu = self.settings.as_ref().expect("settings overlay open");
+        let row = matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+            .then(|| overlay::row_at(area, menu, mouse.column, mouse.row))
+            .flatten();
+        match row {
+            Some(index) => {
+                if let Some(menu) = &mut self.settings {
+                    menu.selected = index;
+                }
+                // Reuse the enter path so a click and a keypress behave alike.
+                self.handle_settings_key(KeyEvent::from(KeyCode::Enter), writer, term)
+                    .await?;
+            }
+            None => self.settings = None,
         }
         Ok(())
     }
@@ -781,6 +955,16 @@ impl App {
             self.sidebar,
         ))
     }
+}
+
+/// Turns terminal mouse reporting on or off after a settings change.
+fn set_mouse_capture(term: &mut Term, enabled: bool) -> Result<()> {
+    if enabled {
+        execute!(term.backend_mut(), event::EnableMouseCapture)?;
+    } else {
+        execute!(term.backend_mut(), event::DisableMouseCapture)?;
+    }
+    Ok(())
 }
 
 /// Pane width for a terminal width and sidebar state.

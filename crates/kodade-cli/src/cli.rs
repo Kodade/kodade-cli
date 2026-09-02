@@ -108,6 +108,11 @@ pub enum Command {
     },
     /// Stop the session and its daemon.
     KillSession,
+    /// Inspect the configuration file.
+    Config {
+        #[command(subcommand)]
+        command: ConfigCommand,
+    },
     /// Print or install agent CLI integrations.
     Integrate {
         #[command(subcommand)]
@@ -156,6 +161,16 @@ pub enum AgentCommand {
         #[arg(long, value_name = "NAME", default_value = "cli")]
         source: String,
     },
+}
+
+#[derive(Debug, Subcommand, PartialEq, Eq)]
+pub enum ConfigCommand {
+    /// Print the path of the config file.
+    Path,
+    /// Print the effective configuration as TOML.
+    Show,
+    /// Check the config file, exiting non-zero when it has problems.
+    Validate,
 }
 
 #[derive(Debug, Subcommand, PartialEq, Eq)]
@@ -328,6 +343,23 @@ mod tests {
                 no_newline: false,
             })
         );
+    }
+
+    #[test]
+    fn parses_config_subcommands() {
+        assert_eq!(
+            parse(&["kodade-cli", "config", "path"]).command,
+            Some(Command::Config {
+                command: ConfigCommand::Path
+            })
+        );
+        assert_eq!(
+            parse(&["kodade-cli", "config", "validate"]).command,
+            Some(Command::Config {
+                command: ConfigCommand::Validate
+            })
+        );
+        assert!(Cli::try_parse_from(["kodade-cli", "config", "nope"]).is_err());
     }
 
     #[test]

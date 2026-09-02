@@ -4,7 +4,9 @@ mod commands;
 mod config;
 mod input;
 mod mode;
+mod overlay;
 mod render;
+mod settings;
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -25,10 +27,11 @@ use tokio::{
 async fn main() -> Result<()> {
     let args = cli::Cli::parse();
     let session = args.session;
-    let config = config::Config::load();
+    // The config is only loaded where it is used, so `config validate` does not
+    // print its warnings twice.
     match args.command {
         // No subcommand attaches the TUI to the session.
-        None => attach(&session, &config).await,
+        None => attach(&session, &config::Config::load()).await,
         Some(cli::Command::Daemon { session: name }) => {
             kodade_cli_daemon::run(name.unwrap_or(session)).await
         }
@@ -42,7 +45,9 @@ async fn main() -> Result<()> {
             }
             Ok(())
         }
-        Some(cli::Command::Agent { command }) => agent(&session, &config, command).await,
+        Some(cli::Command::Agent { command }) => {
+            agent(&session, &config::Config::load(), command).await
+        }
         Some(cli::Command::Send {
             pane,
             text,
@@ -156,6 +161,10 @@ async fn main() -> Result<()> {
                 message => commands::layout(message).map(|_| ()),
             }
         }
+        Some(cli::Command::Config { command }) => {
+            config_command(command);
+            Ok(())
+        }
         Some(cli::Command::Integrate { target }) => match target {
             cli::IntegrateCommand::List => commands::integrate_list(),
             cli::IntegrateCommand::ClaudeCode { write } => commands::integrate_claude_code(write),
@@ -190,6 +199,41 @@ async fn resolve_target(
         .map(|name| commands::resolve_tab(&layout, ws, name))
         .transpose()?;
     Ok((ws, tab))
+}
+
+/// `config` subcommands: locate, print, or check the config file.
+fn config_command(command: cli::ConfigCommand) {
+    match command {
+        cli::ConfigCommand::Path => println!("{}", config::config_path().display()),
+        cli::ConfigCommand::Show => match config::Config::load_checked() {
+            Ok(config) => print!("{}", config.to_toml()),
+            Err(error) => {
+                eprintln!("kodade-cli: {error}");
+                std::process::exit(1);
+            }
+        },
+        cli::ConfigCommand::Validate => {
+            let path = config::config_path();
+            // No file at all is a normal state: the defaults apply.
+            if !path.exists() {
+                println!("{}: not found (defaults in use)", path.display());
+                return;
+            }
+            match config::Config::load_checked() {
+                Ok(config) if config.warnings.is_empty() => println!("{}: ok", path.display()),
+                Ok(config) => {
+                    for warning in &config.warnings {
+                        println!("{}: {warning}", path.display());
+                    }
+                    std::process::exit(1);
+                }
+                Err(error) => {
+                    println!("{error}");
+                    std::process::exit(1);
+                }
+            }
+        }
+    }
 }
 
 /// `agent` subcommands: read pane state or report it back to the daemon.

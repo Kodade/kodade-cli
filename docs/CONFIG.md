@@ -8,13 +8,30 @@ TOML, or omitted setting uses the defaults below.
 | Setting | Default | Description |
 |---|---|---|
 | `theme` | `"auto"` | `"auto"`, `"kodade-dark"`, `"kodade-light"`, `"tokyo-night"`, `"dark"`/`"light"` (aliases), or a user theme name. See [Themes](#themes). |
-| `mouse` | `true` | Enable mouse capture and mouse interaction. |
+| `mouse` | `true` | Enable mouse capture and mouse interaction. Accepts a boolean or a `[mouse]` table. |
+| `mouse.enabled` | `true` | Table form of `mouse`. |
+| `mouse.copy_on_select` | `true` | Copy a mouse selection as soon as the drag ends. |
 | `sidebar` | `true` | Show the sidebar when the TUI starts. |
+| `notify` | `true` | Agent-state notifications. Accepts a boolean or a `[notify]` table. |
+| `notify.enabled` | `true` | Table form of `notify`. |
 | `keys.prefix` | `"ctrl+b"` | Prefix key pressed before a remappable action. |
 
+`mouse = true` and `[mouse]` are both valid, so a pre-0.2 config keeps working:
+
+```toml
+mouse = true            # still supported
+
+[mouse]                 # equivalent, plus the new key
+enabled = true
+copy_on_select = false
+```
+
 Key overrides live under `[keys]`. Setting an action replaces its default
-binding; the action's other default aliases are removed. Unknown action names
-and invalid chords are ignored with a warning.
+binding; the action's other default aliases are removed, and an empty array
+(`zoom = []`) unbinds it. Unknown settings, unknown action names, invalid
+chords, and a chord that takes a key away from another action are all reported
+as warnings (see [`config validate`](#config-subcommands)); the rest of the
+file still loads.
 
 ## Remappable actions
 
@@ -64,6 +81,8 @@ single-letter and arrow-key aliases.
 | `resize_mode` | `alt+r` |
 | `break_pane` | `!` |
 | `layout_even` | `=` |
+| `reload_config` | `ctrl+r` |
+| `settings` | `s` |
 
 `close_tab` asks for confirmation in the status bar when a pane in the tab is
 working, and `close_workspace` when any agent in it is working or blocked;
@@ -71,26 +90,106 @@ working, and `close_workspace` when any agent in it is working or blocked;
 `hjkl` resize by one cell, `HJKL` by five, and `esc` or `enter` exits.
 `break_pane` moves the focused pane into a new tab without restarting it.
 
+`reload_config` re-reads this file and the theme in place, and `settings`
+opens the [settings menu](#settings-menu).
+
 Example:
 
 ```toml
 theme = "dark"
-mouse = true
 sidebar = true
+
+[mouse]
+enabled = true
+copy_on_select = true
 
 [keys]
 prefix = "ctrl+space"
-split_right = "s"
-focus_left = "alt+h"
+split_right = ["%", "ctrl+alt+v"]   # prefixed and global
+focus_left = "prefix+alt+h"         # keep it behind the prefix
 copy_mode = "F5"
 ```
 
 ## Key-chord syntax
 
-Chords are one optional `ctrl+` or `alt+` modifier followed by one character,
-`up`, `down`, `left`, `right`, or a function key from `F0` through `F9`.
-`shift+` and multi-key sequences are not supported. Uppercase characters are
-distinct keys, so `L` and `l` can be separate bindings.
+A chord is `[prefix+][ctrl+][alt+][shift+]key`; modifiers may appear in any
+order. Key names:
+
+- a single character (`%`, `x`, `[`, `=`)
+- `enter`, `esc`, `space`, `backspace`, `tab`, `home`, `end`, `pageup`,
+  `pagedown`, `delete`
+- `up`, `down`, `left`, `right`
+- `F1` through `F12`
+
+`shift+` on a letter is the same binding as the uppercase letter — `shift+x`
+and `X` are identical — so `l` and `L` stay separate bindings. On other keys
+`shift+` is kept as a modifier (`shift+tab`). Multi-key sequences (`"g t"`) are
+still not supported.
+
+## Binding arrays and global chords
+
+A binding value is one chord or an array of chords:
+
+```toml
+[keys]
+split_right = ["%", "ctrl+alt+v"]
+```
+
+A chord that carries `ctrl` or `alt` and is *not* written as `prefix+…` is a
+**global** chord: it fires on its own, without the prefix, and the pane never
+sees the key. Everything else is prefix-relative. So in the example above,
+`prefix %` and a bare `ctrl+alt+v` both split right.
+
+Built-in defaults are always prefix-relative, including the ones printed as
+`alt+k` in the table above. To rebind one and keep it behind the prefix, write
+`prefix+alt+k`; writing `alt+k` makes it global.
+
+Global chords are inert while a mode or overlay is active — rename, copy mode,
+navigate, resize mode, a context menu, a confirmation, or the settings menu all
+see the key first.
+
+## Live reload
+
+`prefix ctrl+r` (`reload_config`) re-reads `config.toml` and the theme file
+without detaching: new bindings, mouse setting, and colors apply immediately.
+A broken config keeps the previous one and shows
+`config error: … · previous config kept` in the status bar for five seconds.
+
+`theme = "auto"` is resolved once at startup, because its terminal query cannot
+run while the TUI owns the terminal; reload keeps the current theme in that
+case. Name the theme explicitly to have reload recolor.
+
+## Settings menu
+
+`prefix s` opens the settings overlay: theme (cycles `auto`, the built-ins, and
+every theme in `~/.config/kodade-cli/themes/`), mouse, sidebar, copy on select,
+and notifications. Enter toggles or cycles the highlighted row, applies it
+immediately, and writes it back to `config.toml`. Comments, formatting, and
+keys the menu does not know about are preserved; the file is created if it does
+not exist yet. `j`/`k`, arrows, or ctrl+n/ctrl+p move, `esc` or `q` closes.
+
+## Config subcommands
+
+| Command | Behavior |
+|---|---|
+| `kodade-cli config path` | Prints the config file path. |
+| `kodade-cli config show` | Prints the effective config (defaults merged) as TOML. |
+| `kodade-cli config validate` | Prints every warning and exits `1` when the file has problems, `0` when it is clean. A missing file prints `not found (defaults in use)` and exits `0`. |
+
+## Upgrading from 0.1
+
+The chord grammar changed, so three things behave differently:
+
+- **Bare modifier chords are now global.** `focus_left = "alt+h"` used to mean
+  `prefix alt+h`; it now fires without the prefix, and `prefix alt+h` falls
+  through to its default, `swap_left`. Write `focus_left = "prefix+alt+h"` to
+  keep the 0.1 behavior.
+- **`prefix = "ctrl+space"` now works.** Multi-character key names are
+  supported, so this no longer falls back to `ctrl+b`.
+- **`F0` is gone.** Function keys are `F1` through `F12`.
+
+Everything else is compatible: `mouse = true`, single-chord strings, and
+uppercase letters (`L`) all keep their meaning.
 
 ## Themes
 
