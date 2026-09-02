@@ -73,6 +73,12 @@ pub struct Ui<'a> {
     pub sidebar_hint: bool,
     /// Live mouse selection, highlighted in its own pane (#12).
     pub selection: Option<&'a Selection>,
+    /// Prefix-mode chord hint, generated from the live bindings (#6).
+    pub prefix_hint: &'a str,
+    /// First-attach `ctrl+b ? for help` hint, shown until help is opened (#6).
+    pub first_attach_hint: Option<&'a str>,
+    /// Help overlay (`prefix ?`), drawn over everything else (#6).
+    pub help: Option<&'a Overlay>,
 }
 
 pub fn render(frame: &mut Frame, layout: &LayoutSnapshot, ui: &Ui, theme: &Theme) {
@@ -94,6 +100,9 @@ pub fn render(frame: &mut Frame, layout: &LayoutSnapshot, ui: &Ui, theme: &Theme
         flash,
         sidebar_hint,
         selection,
+        prefix_hint,
+        first_attach_hint,
+        help,
     } = *ui;
     let areas = Layout::default()
         .direction(LayoutDirection::Horizontal)
@@ -172,14 +181,19 @@ pub fn render(frame: &mut Frame, layout: &LayoutSnapshot, ui: &Ui, theme: &Theme
     } else if navigate.is_some() {
         " navigate · j/k move · enter activate · esc exit".into()
     } else if prefix {
-        " prefix: % \" b hjkl c m n p s w W x z d r q · 1-9 X T R D o O ; ! = alt+hjkl alt+r ctrl+r"
-            .into()
+        // Generated from the live bindings so remaps show through (#6).
+        format!(" prefix: {prefix_hint} · ? help")
     } else {
         let tab = active_tab_name(layout);
-        if sidebar_hint {
-            format!(" ▸ prefix b · sidebar · {session} · {workspace} · {tab}")
+        let core = if sidebar_hint {
+            format!("▸ prefix b · sidebar · {session} · {workspace} · {tab}")
         } else {
-            format!(" {session} · {workspace} · {tab}")
+            format!("{session} · {workspace} · {tab}")
+        };
+        // First-attach nudge toward the help overlay, cleared once it is opened.
+        match first_attach_hint {
+            Some(hint) => format!(" {hint} · {core}"),
+            None => format!(" {core}"),
         }
     };
     frame.render_widget(
@@ -206,6 +220,10 @@ pub fn render(frame: &mut Frame, layout: &LayoutSnapshot, ui: &Ui, theme: &Theme
     }
     if let Some(settings) = settings {
         render_overlay(frame, frame.area(), settings, theme);
+    }
+    // The help overlay draws last so it sits above every other surface.
+    if let Some(help) = help {
+        render_overlay(frame, frame.area(), help, theme);
     }
 }
 
@@ -731,6 +749,7 @@ fn render_menu(frame: &mut Frame, menu: &Menu, area: Rect, theme: &Theme) {
             MenuAction::Equalize => "Equalize",
             MenuAction::MoveLeft => "Move left",
             MenuAction::MoveRight => "Move right",
+            MenuAction::Help => "Help…",
         })
         .collect::<Vec<_>>();
     // Flip the menu left of the click when it would clip the right edge (#24).
@@ -1158,6 +1177,9 @@ mod tests {
             flash: false,
             sidebar_hint: false,
             selection: None,
+            prefix_hint: "",
+            first_attach_hint: None,
+            help: None,
         };
         let mut terminal = Terminal::new(TestBackend::new(40, 10)).expect("test terminal");
         terminal
@@ -1283,6 +1305,9 @@ mod tests {
             flash: false,
             sidebar_hint: false,
             selection: None,
+            prefix_hint: "",
+            first_attach_hint: None,
+            help: None,
         };
         let mut terminal = Terminal::new(TestBackend::new(80, 12)).expect("test terminal");
         terminal

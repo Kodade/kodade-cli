@@ -25,7 +25,7 @@ use std::{
 use tokio::{io::AsyncWriteExt, net::unix::OwnedWriteHalf, sync::mpsc};
 
 use crate::{
-    config, input, mode,
+    config, help, input, mode,
     overlay::{self, Overlay, OverlayEvent, OverlayTarget},
     paste, render,
     selection::{self, Selection, SelectionMode},
@@ -88,6 +88,12 @@ pub struct App {
     last_pane: Option<PaneId>,
     /// Settings menu (`prefix s`), drawn over everything else.
     settings: Option<Overlay>,
+    /// Help overlay (`prefix ?`); holds the full row set so its filter can
+    /// rebuild without re-reading the config (#6).
+    help: Option<help::HelpOverlay>,
+    /// Whether the help overlay has ever been opened; drives the first-attach
+    /// hint and is persisted to the state file (#6).
+    help_seen: bool,
     /// Status-bar note and the instant it stops being shown.
     note: Option<(String, Instant)>,
     /// Last sanitized paste, copy-mode yank, or mouse selection; re-sent by
@@ -137,6 +143,8 @@ impl App {
             focused_pane: None,
             last_pane: None,
             settings: None,
+            help: None,
+            help_seen: help::state_seen(),
             note: None,
             paste_buffer: String::new(),
             session_name: session.to_string(),
@@ -207,6 +215,10 @@ impl App {
 
     pub fn draw(&self, frame: &mut Frame) {
         let Some(layout) = &self.layout else { return };
+        // Both hints are generated from the live bindings so remaps show through.
+        let prefix_hint = help::prefix_hint(&self.config);
+        let attach = help::attach_hint(&self.config);
+        let first_attach_hint = (!self.help_seen).then_some(attach.as_str());
         render::render(
             frame,
             layout,
@@ -228,9 +240,21 @@ impl App {
                 flash: self.flash_active(),
                 sidebar_hint: self.sidebar_hint_active(),
                 selection: self.selection.as_ref(),
+                prefix_hint: &prefix_hint,
+                first_attach_hint,
+                help: self.help.as_ref().map(|state| &state.overlay),
             },
             &self.theme,
         )
+    }
+
+    // Opens the help overlay and records that help has been seen.
+    fn open_help(&mut self) {
+        self.help = Some(help::overlay(&self.config));
+        if !self.help_seen {
+            self.help_seen = true;
+            help::mark_seen();
+        }
     }
 
     /// Whether the `prefix q` pane-id flash is still showing.
@@ -335,6 +359,8 @@ impl App {
             self.handle_copy_key(key, writer, term).await?;
         } else if self.menu.is_some() {
             self.handle_menu_key(key, writer).await?;
+        } else if self.help.is_some() {
+            self.handle_help_key(key);
         } else if self.settings.is_some() {
             self.handle_settings_key(key, writer, term).await?;
         } else if let Some(current) = self.navigate {
@@ -578,6 +604,11 @@ impl App {
                     .await?;
                 self.navigate = None;
             }
+            // `?` opens the help overlay from navigate mode (#6).
+            KeyCode::Char('?') => {
+                self.navigate = None;
+                self.open_help();
+            }
             _ => {}
         }
         Ok(())
@@ -602,6 +633,9 @@ impl App {
             return Ok(Flow::Continue);
         }
         let Some(action) = self.config.action(key) else {
+            // An unbound key after the prefix: nudge toward the help overlay.
+            let chord = config::render_chord(config::normalize_key(key));
+            self.set_note(format!(" unbound: {chord} · prefix ? for help"));
             return Ok(Flow::Continue);
         };
         self.run_action(action, writer, term).await
@@ -639,6 +673,7 @@ impl App {
             config::Action::Settings => {
                 self.settings = Some(settings::overlay(&self.config, 0));
             }
+            config::Action::Help => self.open_help(),
             config::Action::Navigate => {
                 self.sidebar = true;
                 self.navigate = Some(0);
@@ -724,6 +759,33 @@ impl App {
             }
         }
         Ok(Flow::Continue)
+    }
+
+    // Help overlay: esc / q / ? close; anything else filters the row list.
+    fn handle_help_key(&mut self, key: KeyEvent) {
+        let Some(mut state) = self.help.take() else {
+            return;
+        };
+        let plain = key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT;
+        // `?` always closes, and `q` closes when the filter box is empty so the
+        // muscle-memory close key still works before any typing.
+        let close = matches!(key.code, KeyCode::Esc)
+            || (plain && key.code == KeyCode::Char('?'))
+            || (plain
+                && key.code == KeyCode::Char('q')
+                && state
+                    .overlay
+                    .filter
+                    .as_deref()
+                    .unwrap_or_default()
+                    .is_empty());
+        if close {
+            return;
+        }
+        if overlay::overlay_key(&mut state.overlay, key) == OverlayEvent::Filtered {
+            state.apply_filter();
+        }
+        self.help = Some(state);
     }
 
     // Settings menu: move the selection, toggle a setting, or close.
@@ -876,6 +938,20 @@ impl App {
         // The settings overlay owns the mouse while it is up.
         if self.settings.is_some() {
             return self.settings_mouse(mouse, writer, term).await;
+        }
+        // The help overlay swallows mouse input: a click outside it closes it,
+        // and clicks inside do nothing (its rows are not actionable).
+        if self.help.is_some() {
+            if let MouseEventKind::Down(_) = mouse.kind {
+                let area = term.size().map(|s| Rect::new(0, 0, s.width, s.height))?;
+                let inside = self.help.as_ref().is_some_and(|state| {
+                    overlay::contains(area, &state.overlay, mouse.column, mouse.row)
+                });
+                if !inside {
+                    self.help = None;
+                }
+            }
+            return Ok(());
         }
         // A pane app that turned mouse reporting on gets the event verbatim.
         if self.passthrough(mouse, writer, term).await? {
@@ -1273,6 +1349,7 @@ impl App {
                 };
                 write(writer, &message).await?;
             }
+            mode::MenuAction::Help => self.open_help(),
         }
         Ok(())
     }

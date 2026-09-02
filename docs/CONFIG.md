@@ -105,53 +105,68 @@ The following names are accepted in `[keys]`. Defaults are shown as the key or
 keys pressed after the prefix. `focus_*` and `resize_*` intentionally have
 single-letter and arrow-key aliases.
 
+This table is generated from the default bindings; run `kodade-cli keys` for
+your live config. `prefix+…` chords are prefix-relative; a chord with a bare
+modifier (`ctrl+…`/`alt+…`) fires globally.
+
+<!-- keys:start -->
 | Action name | Default |
 |---|---|
 | `split_right` | `%` |
 | `split_down` | `"` |
 | `close_pane` | `x` |
-| `new_tab` | `c` |
-| `next_tab` | `tab` |
-| `prev_tab` | `p` |
 | `zoom` | `z` |
-| `detach` | `d` |
 | `rename` | `r` |
-| `workspace_next` | `w` |
-| `new_workspace` | `W` |
-| `sidebar_toggle` | `b` |
-| `focus_up` | `up`, `k` |
+| `focus_up` | `k`, `up` |
 | `focus_down` | `down`, `j` |
-| `focus_left` | `left`, `h` |
-| `focus_right` | `right`, `l` |
+| `focus_left` | `h`, `left` |
+| `focus_right` | `l`, `right` |
 | `resize_up` | `K` |
 | `resize_down` | `J` |
 | `resize_left` | `H` |
 | `resize_right` | `L` |
-| `navigate` | `n` |
-| `copy_mode` | `[` |
-| `select_tab_1` … `select_tab_9` | `1` … `9` |
-| `close_tab` | `X` |
-| `rename_tab` | `T` |
-| `rename_workspace` | `R` |
-| `close_workspace` | `D` |
-| `swap_up` | `alt+k` |
-| `swap_down` | `alt+j` |
-| `swap_left` | `alt+h` |
-| `swap_right` | `alt+l` |
-| `move_tab_left` | unbound |
-| `move_tab_right` | unbound |
+| `swap_up` | `prefix+alt+k` |
+| `swap_down` | `prefix+alt+j` |
+| `swap_left` | `prefix+alt+h` |
+| `swap_right` | `prefix+alt+l` |
 | `next_pane` | `o` |
 | `prev_pane` | `O` |
 | `last_pane` | `;` |
-| `workspace_prev` | unbound |
-| `resize_mode` | `alt+r` |
 | `break_pane` | `!` |
 | `layout_even` | `=` |
-| `reload_config` | `ctrl+r` |
-| `settings` | `s` |
 | `display_panes` | `q` |
+| `new_tab` | `c` |
+| `next_tab` | `tab` |
+| `prev_tab` | `p` |
+| `select_tab_1` | `1` |
+| `select_tab_2` | `2` |
+| `select_tab_3` | `3` |
+| `select_tab_4` | `4` |
+| `select_tab_5` | `5` |
+| `select_tab_6` | `6` |
+| `select_tab_7` | `7` |
+| `select_tab_8` | `8` |
+| `select_tab_9` | `9` |
+| `close_tab` | `X` |
+| `rename_tab` | `T` |
+| `move_tab_left` | unbound |
+| `move_tab_right` | unbound |
+| `workspace_next` | `w` |
+| `new_workspace` | `W` |
+| `rename_workspace` | `R` |
+| `close_workspace` | `D` |
+| `workspace_prev` | unbound |
+| `navigate` | `n` |
+| `copy_mode` | `[` |
+| `resize_mode` | `prefix+alt+r` |
+| `settings` | `s` |
+| `help` | `?` |
+| `detach` | `d` |
+| `sidebar_toggle` | `b` |
+| `reload_config` | `prefix+ctrl+r` |
 | `paste_buffer` | `]` |
 | `mouse_toggle` | `m` |
+<!-- keys:end -->
 
 `close_tab` asks for confirmation in the status bar when a pane in the tab is
 working, and `close_workspace` when any agent in it is working or blocked;

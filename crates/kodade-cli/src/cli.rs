@@ -113,6 +113,12 @@ pub enum Command {
         #[command(subcommand)]
         command: ConfigCommand,
     },
+    /// Print the key bindings, generated from the current config.
+    Keys {
+        /// Print the bindings as JSON instead of aligned text.
+        #[arg(long)]
+        json: bool,
+    },
     /// Print or install agent CLI integrations.
     Integrate {
         #[command(subcommand)]

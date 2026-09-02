@@ -148,6 +148,8 @@ pub enum MenuAction {
     /// Reorder a tab (#14).
     MoveLeft,
     MoveRight,
+    /// Open the help overlay (#6); present on every target.
+    Help,
 }
 #[derive(Debug, Clone)]
 pub struct Menu {
@@ -167,14 +169,16 @@ impl Menu {
                 MenuAction::BreakToTab,
                 MenuAction::Equalize,
                 MenuAction::Close,
+                MenuAction::Help,
             ],
             MenuTarget::Tab(_) => &[
                 MenuAction::Rename,
                 MenuAction::MoveLeft,
                 MenuAction::MoveRight,
                 MenuAction::Close,
+                MenuAction::Help,
             ],
-            MenuTarget::Workspace(_) => &[MenuAction::Rename, MenuAction::Close],
+            MenuTarget::Workspace(_) => &[MenuAction::Rename, MenuAction::Close, MenuAction::Help],
         }
     }
     pub fn move_by(&mut self, delta: isize) {
