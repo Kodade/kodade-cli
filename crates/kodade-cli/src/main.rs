@@ -2,6 +2,7 @@ mod app;
 mod cli;
 mod commands;
 mod config;
+mod help;
 mod input;
 mod mode;
 mod overlay;
@@ -170,6 +171,15 @@ async fn main() -> Result<()> {
         }
         Some(cli::Command::Config { command }) => {
             config_command(command);
+            Ok(())
+        }
+        Some(cli::Command::Keys { json }) => {
+            let config = config::Config::load();
+            if json {
+                println!("{}", help::keys_json(&config));
+            } else {
+                print!("{}", help::keys_text(&config));
+            }
             Ok(())
         }
         Some(cli::Command::Integrate { target }) => match target {

@@ -122,6 +122,8 @@ pub enum Action {
     PasteBuffer,
     /// Toggle mouse capture at runtime so the host terminal can select (#12).
     MouseToggle,
+    // Help overlay (#6).
+    Help,
 }
 
 /// Every remappable action and its config name. Single source of truth for
@@ -180,6 +182,7 @@ const ACTIONS: &[(&str, Action)] = &[
     ("display_panes", Action::DisplayPanes),
     ("paste_buffer", Action::PasteBuffer),
     ("mouse_toggle", Action::MouseToggle),
+    ("help", Action::Help),
 ];
 
 impl Action {
@@ -275,9 +278,11 @@ impl Action {
             | Self::ResizeMode
             | Self::DisplayPanes => return None,
             // Client-side only: they never reach the daemon.
-            Self::ReloadConfig | Self::Settings | Self::PasteBuffer | Self::MouseToggle => {
-                return None
-            }
+            Self::ReloadConfig
+            | Self::Settings
+            | Self::PasteBuffer
+            | Self::MouseToggle
+            | Self::Help => return None,
         })
     }
 }
@@ -421,6 +426,7 @@ impl Default for Config {
             ("q", Action::DisplayPanes),
             ("]", Action::PasteBuffer),
             ("m", Action::MouseToggle),
+            ("?", Action::Help),
         ] {
             bindings.insert(
                 parse_key_chord(binding).expect("built-in key is valid"),
@@ -641,6 +647,12 @@ impl Config {
     /// Every remappable action and its config name.
     pub fn actions() -> &'static [(&'static str, Action)] {
         ACTIONS
+    }
+
+    /// Builds a config straight from TOML text, for tests in sibling modules.
+    #[cfg(test)]
+    pub(crate) fn from_toml_str(source: &str) -> Self {
+        Self::from_file(toml::from_str(source).expect("valid test toml"))
     }
 
     /// Chords bound to an action, rendered back to config text. Prefixed
@@ -1105,6 +1117,12 @@ fn config_dir() -> PathBuf {
 /// The config file the CLI reads and the settings overlay writes back to.
 pub fn config_path() -> PathBuf {
     config_dir().join("config.toml")
+}
+
+/// The client's own state file (first-attach hint, etc.); separate from the
+/// user-owned config so we never rewrite their config.toml (#6).
+pub fn state_path() -> PathBuf {
+    config_dir().join("state")
 }
 
 /// Theme names offered by the settings overlay: `auto`, the built-ins, then
