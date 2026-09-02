@@ -1,9 +1,12 @@
 use std::collections::HashMap;
 
-use kodade_cli_proto::{AgentStateKind, LayoutSnapshot, LayoutTree, PaneId, TabId, WorkspaceId};
+use kodade_cli_proto::{
+    AgentStateKind, CellColor, LayoutSnapshot, LayoutTree, PaneId, Run, Screen, TabId, WorkspaceId,
+    ATTR_BOLD, ATTR_DIM, ATTR_INVERSE, ATTR_ITALIC, ATTR_UNDERLINE,
+};
 use ratatui::{
     layout::{Constraint, Direction as LayoutDirection, Layout, Rect},
-    style::{Color, Style},
+    style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph},
     Frame,
@@ -102,13 +105,15 @@ pub fn render(frame: &mut Frame, layout: &LayoutSnapshot, ui: &Ui, theme: &Theme
             } else {
                 pane_title(pane)
             };
-            let contents = copy
+            // Copy mode holds its own frozen Screen; both paths use the same
+            // run renderer so styling is identical.
+            let screen = copy
                 .filter(|copy| copy.pane == pane.id)
-                .map(|copy| copy.screen.contents.as_str())
-                .unwrap_or(&pane.screen.contents);
+                .map(|copy| &copy.screen)
+                .unwrap_or(&pane.screen);
             frame.render_widget(
-                Paragraph::new(contents)
-                    .style(Style::default().bg(theme.bg))
+                Paragraph::new(pane_lines(screen, theme))
+                    .style(Style::default().fg(theme.text).bg(theme.bg))
                     .block(
                         Block::default()
                             .borders(Borders::ALL)
@@ -121,6 +126,10 @@ pub fn render(frame: &mut Frame, layout: &LayoutSnapshot, ui: &Ui, theme: &Theme
                     ),
                 *rect,
             );
+            // The block cursor only makes sense on the live focused pane.
+            if pane.focused && copy.is_none() && pane.scroll_offset == 0 {
+                render_cursor(frame, &pane.screen, *rect, theme);
+            }
         }
     }
     let status = if rename {
@@ -147,6 +156,106 @@ pub fn render(frame: &mut Frame, layout: &LayoutSnapshot, ui: &Ui, theme: &Theme
     if let Some(menu) = menu {
         render_menu(frame, menu, frame.area(), theme);
     }
+}
+
+/// Convert a pane `Screen` into styled ratatui lines. Shared by the live pane
+/// draw and copy mode so both look the same.
+pub fn pane_lines<'a>(screen: &'a Screen, theme: &Theme) -> Vec<Line<'a>> {
+    screen
+        .rows
+        .iter()
+        .map(|runs| {
+            Line::from(
+                runs.iter()
+                    .map(|run| run_span(run, theme))
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .collect()
+}
+
+fn run_span<'a>(run: &'a Run, theme: &Theme) -> Span<'a> {
+    let mut style = Style::default()
+        .fg(fg_color(run.fg, theme))
+        .bg(bg_color(run.bg, theme));
+    let mut modifiers = Modifier::empty();
+    if run.attrs & ATTR_BOLD != 0 {
+        modifiers |= Modifier::BOLD;
+    }
+    if run.attrs & ATTR_ITALIC != 0 {
+        modifiers |= Modifier::ITALIC;
+    }
+    if run.attrs & ATTR_UNDERLINE != 0 {
+        modifiers |= Modifier::UNDERLINED;
+    }
+    if run.attrs & ATTR_DIM != 0 {
+        modifiers |= Modifier::DIM;
+    }
+    if run.attrs & ATTR_INVERSE != 0 {
+        modifiers |= Modifier::REVERSED;
+    }
+    if !modifiers.is_empty() {
+        style = style.add_modifier(modifiers);
+    }
+    Span::styled(run.text.as_str(), style)
+}
+
+/// Indexed colors 0–15 come from the theme `[ansi]` palette (#8); 16–255 use
+/// the terminal's own 256-color cube.
+fn cell_color(color: CellColor, theme: &Theme) -> Option<Color> {
+    match color {
+        CellColor::Default => None,
+        CellColor::Indexed(index) if (index as usize) < theme.ansi.len() => {
+            Some(theme.ansi[index as usize])
+        }
+        CellColor::Indexed(index) => Some(Color::Indexed(index)),
+        CellColor::Rgb(r, g, b) => Some(Color::Rgb(r, g, b)),
+    }
+}
+
+fn fg_color(color: CellColor, theme: &Theme) -> Color {
+    cell_color(color, theme).unwrap_or(theme.text)
+}
+
+fn bg_color(color: CellColor, theme: &Theme) -> Color {
+    cell_color(color, theme).unwrap_or(theme.bg)
+}
+
+/// Draw a block cursor inside the pane border, keeping whatever character sits
+/// under it visible in the pane background color.
+fn render_cursor(frame: &mut Frame, screen: &Screen, rect: Rect, theme: &Theme) {
+    if !screen.cursor_visible {
+        return;
+    }
+    let x = rect.x.saturating_add(1).saturating_add(screen.cursor_col);
+    let y = rect.y.saturating_add(1).saturating_add(screen.cursor_row);
+    // Inner area only: the border occupies the outer ring.
+    if x + 1 >= rect.x + rect.width || y + 1 >= rect.y + rect.height {
+        return;
+    }
+    let under = cursor_char(screen).unwrap_or_else(|| " ".to_string());
+    let width = Span::raw(&under).width().max(1) as u16;
+    frame.render_widget(
+        Paragraph::new(under).style(Style::default().fg(theme.bg).bg(theme.cursor)),
+        Rect::new(x, y, width.min(rect.x + rect.width - 1 - x), 1),
+    );
+}
+
+/// The character currently under the cursor, walking runs by display width so
+/// wide characters count for two columns.
+fn cursor_char(screen: &Screen) -> Option<String> {
+    let runs = screen.rows.get(screen.cursor_row as usize)?;
+    let mut column = 0u16;
+    for run in runs {
+        for grapheme in run.text.chars() {
+            let width = Span::raw(grapheme.to_string()).width().max(1) as u16;
+            if screen.cursor_col < column + width {
+                return Some(grapheme.to_string());
+            }
+            column += width;
+        }
+    }
+    None
 }
 
 /// Label for one tab, matching `input::tab_spans` geometry exactly so mouse
@@ -536,6 +645,120 @@ mod tests {
             assert_eq!(span.end - span.start, label.chars().count() as u16);
             column = span.end + 1; // single-space separator between tabs
         }
+    }
+
+    fn run(text: &str, fg: CellColor, bg: CellColor, attrs: u8) -> Run {
+        Run {
+            text: text.into(),
+            fg,
+            bg,
+            attrs,
+        }
+    }
+
+    #[test]
+    fn runs_map_colors_through_the_theme_and_attributes_to_modifiers() {
+        let theme = Theme::kodade_dark();
+        let screen = Screen {
+            rows: vec![vec![
+                run("a", CellColor::Indexed(2), CellColor::Default, ATTR_BOLD),
+                run(
+                    "b",
+                    CellColor::Indexed(200),
+                    CellColor::Rgb(1, 2, 3),
+                    ATTR_ITALIC | ATTR_UNDERLINE | ATTR_DIM | ATTR_INVERSE,
+                ),
+                run("c", CellColor::Default, CellColor::Default, 0),
+            ]],
+            ..Screen::default()
+        };
+        let lines = pane_lines(&screen, &theme);
+        let spans = &lines[0].spans;
+        // 0–15 come from the theme palette; 16+ stay terminal-indexed.
+        assert_eq!(spans[0].style.fg, Some(theme.ansi[2]));
+        assert_eq!(spans[0].style.bg, Some(theme.bg));
+        assert!(spans[0].style.add_modifier.contains(Modifier::BOLD));
+        assert_eq!(spans[1].style.fg, Some(Color::Indexed(200)));
+        assert_eq!(spans[1].style.bg, Some(Color::Rgb(1, 2, 3)));
+        assert_eq!(
+            spans[1].style.add_modifier,
+            Modifier::ITALIC | Modifier::UNDERLINED | Modifier::DIM | Modifier::REVERSED
+        );
+        // Default fg/bg fall back to the theme's text and pane background.
+        assert_eq!(spans[2].style.fg, Some(theme.text));
+        assert_eq!(spans[2].style.bg, Some(theme.bg));
+        assert_eq!(spans[2].style.add_modifier, Modifier::empty());
+    }
+
+    #[test]
+    fn cursor_char_counts_wide_cells_as_two_columns() {
+        let screen = Screen {
+            cursor_row: 0,
+            cursor_col: 2,
+            rows: vec![vec![run("宽x", CellColor::Default, CellColor::Default, 0)]],
+            ..Screen::default()
+        };
+        assert_eq!(cursor_char(&screen).as_deref(), Some("x"));
+        let past_end = Screen {
+            cursor_col: 9,
+            ..screen
+        };
+        assert_eq!(cursor_char(&past_end), None);
+    }
+
+    #[test]
+    fn focused_pane_draws_styled_cells_and_a_block_cursor() {
+        use kodade_cli_proto::PaneSnapshot;
+        use ratatui::{backend::TestBackend, Terminal};
+
+        let theme = Theme::kodade_dark();
+        let mut layout = snapshot();
+        layout.panes = vec![PaneSnapshot {
+            id: PaneId(3),
+            title: "zsh".into(),
+            focused: true,
+            scroll_offset: 0,
+            screen: Screen {
+                contents: "ok".into(),
+                cursor_row: 0,
+                cursor_col: 1,
+                cursor_visible: true,
+                rows: vec![vec![run(
+                    "ok",
+                    CellColor::Indexed(1),
+                    CellColor::Default,
+                    0,
+                )]],
+                bracketed_paste: false,
+                mouse_reporting: false,
+            },
+            agent: None,
+            state: AgentStateKind::Idle,
+            state_reason: String::new(),
+        }];
+        let ui = Ui {
+            sidebar: false,
+            prefix: false,
+            rename: false,
+            name: "",
+            navigate: None,
+            copy: None,
+            menu: None,
+            note: None,
+        };
+        let mut terminal = Terminal::new(TestBackend::new(40, 10)).expect("test terminal");
+        terminal
+            .draw(|frame| render(frame, &layout, &ui, &theme))
+            .expect("frame renders");
+        let buffer = terminal.backend().buffer();
+        // Pane content starts one row below the tab bar and one cell inside the
+        // border; `o` is themed red and `k` sits under the block cursor.
+        let first = &buffer[(2, 2)];
+        assert_eq!(first.symbol(), "o");
+        assert_eq!(first.fg, theme.ansi[1]);
+        let cursor = &buffer[(3, 2)];
+        assert_eq!(cursor.symbol(), "k");
+        assert_eq!(cursor.bg, theme.cursor);
     }
 
     #[test]

@@ -16,9 +16,10 @@ use std::{
 
 use anyhow::{anyhow, bail, Context, Result};
 use kodade_cli_proto::{
-    decode, encode, AgentInfo, AgentStateKind, ClientMessage, Direction, LayoutSnapshot,
-    LayoutTree, PaneId, PaneSnapshot, QueryKind, Screen, ServerMessage, SidebarTabInfo, SplitAxis,
-    TabId, TabInfo, WorkspaceId, WorkspaceInfo,
+    decode, encode, AgentInfo, AgentStateKind, CellColor, ClientMessage, Direction, LayoutSnapshot,
+    LayoutTree, PaneId, PaneSnapshot, QueryKind, Run, Screen, ServerMessage, SidebarTabInfo,
+    SplitAxis, TabId, TabInfo, WorkspaceId, WorkspaceInfo, ATTR_BOLD, ATTR_DIM, ATTR_INVERSE,
+    ATTR_ITALIC, ATTR_UNDERLINE,
 };
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use tokio::{
@@ -1159,13 +1160,99 @@ fn read_pty(
         }
     });
 }
+/// Build a wire `Screen` from the pane's terminal state: plain `contents` for
+/// copy mode plus one styled run list per visible row (#7).
 fn snapshot(parser: &PtyParser) -> Screen {
-    let (cursor_row, cursor_col) = parser.screen().cursor_position();
+    let screen = parser.screen();
+    let (cursor_row, cursor_col) = screen.cursor_position();
+    let (rows, cols) = screen.size();
     Screen {
-        contents: parser.screen().contents(),
+        contents: screen.contents(),
         cursor_row,
         cursor_col,
+        cursor_visible: !screen.hide_cursor(),
+        rows: (0..rows).map(|row| screen_row(screen, row, cols)).collect(),
+        bracketed_paste: screen.bracketed_paste(),
+        mouse_reporting: screen.mouse_protocol_mode() != vt100::MouseProtocolMode::None,
     }
+}
+
+/// Coalesce one screen row into runs of identically styled cells. Empty cells
+/// become spaces so column positions survive the trip; a wide char is emitted
+/// once and its continuation cell skipped.
+fn screen_row(screen: &vt100::Screen, row: u16, cols: u16) -> Vec<Run> {
+    // Most rows are one or two styles wide; reserve small and grow rarely.
+    let mut runs: Vec<Run> = Vec::with_capacity(4);
+    let mut style: Option<(CellColor, CellColor, u8)> = None;
+    let mut col = 0;
+    while col < cols {
+        let Some(cell) = screen.cell(row, col) else {
+            break;
+        };
+        if cell.is_wide_continuation() {
+            col += 1;
+            continue;
+        }
+        let next = (
+            cell_color(cell.fgcolor()),
+            cell_color(cell.bgcolor()),
+            cell_attrs(cell),
+        );
+        if style != Some(next) {
+            runs.push(Run {
+                text: String::new(),
+                fg: next.0,
+                bg: next.1,
+                attrs: next.2,
+            });
+            style = Some(next);
+        }
+        let text = &mut runs.last_mut().expect("run pushed above").text;
+        if cell.has_contents() {
+            text.push_str(cell.contents());
+        } else {
+            text.push(' ');
+        }
+        col += if cell.is_wide() { 2 } else { 1 };
+    }
+    // Trailing unstyled blanks cost bytes and draw nothing; trim them.
+    if let Some(last) = runs.last_mut() {
+        if last.fg == CellColor::Default && last.bg == CellColor::Default && last.attrs == 0 {
+            last.text.truncate(last.text.trim_end_matches(' ').len());
+            if last.text.is_empty() {
+                runs.pop();
+            }
+        }
+    }
+    runs
+}
+
+fn cell_color(color: vt100::Color) -> CellColor {
+    match color {
+        vt100::Color::Default => CellColor::Default,
+        vt100::Color::Idx(index) => CellColor::Indexed(index),
+        vt100::Color::Rgb(r, g, b) => CellColor::Rgb(r, g, b),
+    }
+}
+
+fn cell_attrs(cell: &vt100::Cell) -> u8 {
+    let mut attrs = 0;
+    if cell.bold() {
+        attrs |= ATTR_BOLD;
+    }
+    if cell.italic() {
+        attrs |= ATTR_ITALIC;
+    }
+    if cell.underline() {
+        attrs |= ATTR_UNDERLINE;
+    }
+    if cell.dim() {
+        attrs |= ATTR_DIM;
+    }
+    if cell.inverse() {
+        attrs |= ATTR_INVERSE;
+    }
+    attrs
 }
 fn pane_sizes(tree: &LayoutTree, width: u16, height: u16, output: &mut Vec<(PaneId, u16, u16)>) {
     match tree {
@@ -1292,6 +1379,97 @@ mod tests {
         parser.process(b"hello\r\nworld");
         assert!(snapshot(&parser).contents.contains("hello"));
     }
+    /// Paint an 80x24-style sample with the escape sequences a colored `ls`,
+    /// a prompt, and a 256/RGB-color TUI would emit.
+    fn mixed_sample(rows: u16, cols: u16) -> PtyParser {
+        let mut parser = PtyParser::new_with_callbacks(rows, cols, 100, PtyCallbacks::default());
+        for row in 0..rows {
+            let line = match row % 4 {
+                0 => format!("\x1b[0;34mdir-{row:03}\x1b[0m  \x1b[0;32mrun.sh\x1b[0m  plain.txt"),
+                1 => format!("\x1b[1mbold header {row}\x1b[0m normal tail"),
+                2 => {
+                    format!("\x1b[38;5;208m256-color {row}\x1b[0m \x1b[3;4mitalic underline\x1b[0m")
+                }
+                _ => format!("\x1b[38;2;120;200;80mrgb {row}\x1b[0m \x1b[7minverse\x1b[0m done"),
+            };
+            // Repeat each pattern so the row is styled edge to edge (worst case
+            // for run counts), then let vt100 clip at the right margin.
+            for _ in 0..cols.div_ceil(40) {
+                parser.process(line.as_bytes());
+            }
+            parser.process(b"\r\n");
+        }
+        parser
+    }
+
+    #[test]
+    fn snapshot_coalesces_colors_and_attributes_into_runs() {
+        let mut parser = PtyParser::new_with_callbacks(2, 20, 100, PtyCallbacks::default());
+        parser.process(b"\x1b[31mred\x1b[1mbold\x1b[0mplain");
+        let screen = snapshot(&parser);
+        let runs = &screen.rows[0];
+        assert_eq!(runs.len(), 3);
+        assert_eq!(runs[0].text, "red");
+        assert_eq!(runs[0].fg, CellColor::Indexed(1));
+        assert_eq!(runs[0].attrs, 0);
+        assert_eq!(runs[1].text, "bold");
+        assert_eq!(runs[1].attrs, ATTR_BOLD);
+        assert_eq!(runs[2].text, "plain");
+        assert_eq!(runs[2].fg, CellColor::Default);
+        // Trailing unstyled blanks are trimmed, and the cursor rides along.
+        assert!(screen.cursor_visible);
+        assert_eq!(screen.rows[1], Vec::<Run>::new());
+    }
+
+    #[test]
+    fn snapshot_keeps_wide_chars_in_two_columns() {
+        let mut parser = PtyParser::new_with_callbacks(1, 10, 100, PtyCallbacks::default());
+        parser.process("宽x".as_bytes());
+        let screen = snapshot(&parser);
+        let text: String = screen.rows[0].iter().map(|run| run.text.as_str()).collect();
+        assert_eq!(text, "宽x");
+        // Column 1 is the wide continuation cell, so `x` sits at column 2.
+        assert_eq!(screen.cursor_col, 3);
+    }
+
+    #[test]
+    fn snapshot_reports_terminal_modes() {
+        let mut parser = PtyParser::new_with_callbacks(2, 10, 100, PtyCallbacks::default());
+        parser.process(b"\x1b[?2004h\x1b[?1000h\x1b[?25l");
+        let screen = snapshot(&parser);
+        assert!(screen.bracketed_paste);
+        assert!(screen.mouse_reporting);
+        assert!(!screen.cursor_visible);
+    }
+
+    #[test]
+    fn styled_snapshots_stay_within_size_budgets() {
+        // proto::encode is the same serde_json path the socket uses.
+        let small = encode(&snapshot(&mixed_sample(24, 80)))
+            .expect("snapshot serializes")
+            .len();
+        let large = encode(&snapshot(&mixed_sample(60, 200)))
+            .expect("snapshot serializes")
+            .len();
+        assert!(small < 20_000, "80x24 snapshot was {small} bytes");
+        assert!(large < 100_000, "200x60 snapshot was {large} bytes");
+    }
+
+    #[test]
+    fn building_snapshots_stays_linear() {
+        let parser = mixed_sample(60, 200);
+        let started = Instant::now();
+        for _ in 0..100 {
+            let screen = snapshot(&parser);
+            assert_eq!(screen.rows.len(), 60);
+        }
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "100 snapshots took {elapsed:?}"
+        );
+    }
+
     #[test]
     fn osc_window_title_reaches_the_detection_callback() {
         let mut parser = PtyParser::new_with_callbacks(3, 20, 100, PtyCallbacks::default());
