@@ -141,23 +141,27 @@ pub fn render(frame: &mut Frame, layout: &LayoutSnapshot, ui: &Ui, theme: &Theme
     rects_for(&layout.tree, areas[1], &mut rects);
     for pane in &layout.panes {
         if let Some(rect) = rects.get(&pane.id) {
-            // Copy mode holds its own frozen Screen; both paths use the same
-            // run renderer so styling is identical.
-            let screen = copy
-                .filter(|copy| copy.pane == pane.id)
-                .map(|copy| &copy.screen)
-                .unwrap_or(&pane.screen);
-            // A mouse selection highlights only in the pane it started in.
-            let selection = selection.filter(|selection| selection.pane == pane.id);
-            frame.render_widget(
-                Paragraph::new(pane_lines(screen, theme, selection))
-                    .style(Style::default().fg(theme.text).bg(theme.bg))
-                    .block(pane_block(pane, *rect, theme)),
-                *rect,
-            );
-            // The block cursor only makes sense on the live focused pane.
-            if pane.focused && copy.is_none() && pane.scroll_offset == 0 {
-                render_cursor(frame, &pane.screen, *rect, theme);
+            let block = pane_block(pane, *rect, theme);
+            // The copy-mode pane draws its own plain-text scrollback viewport
+            // (selection + search highlighted); every other pane draws the
+            // styled live screen (#7) with any live mouse selection (#12).
+            if let Some(cm) = copy.filter(|copy| copy.pane == pane.id) {
+                let inner = block.inner(*rect);
+                frame.render_widget(block, *rect);
+                render_copy(frame, cm, inner, theme);
+            } else {
+                // A mouse selection highlights only in the pane it started in.
+                let selection = selection.filter(|selection| selection.pane == pane.id);
+                frame.render_widget(
+                    Paragraph::new(pane_lines(&pane.screen, theme, selection))
+                        .style(Style::default().fg(theme.text).bg(theme.bg))
+                        .block(block),
+                    *rect,
+                );
+                // The block cursor only makes sense on the live focused pane.
+                if pane.focused && copy.is_none() && pane.scroll_offset == 0 {
+                    render_cursor(frame, &pane.screen, *rect, theme);
+                }
             }
         }
     }
@@ -178,8 +182,18 @@ pub fn render(frame: &mut Frame, layout: &LayoutSnapshot, ui: &Ui, theme: &Theme
         " resize · hjkl 1 · HJKL 5 · esc".into()
     } else if new_workspace {
         format!(" new workspace: {name}")
-    } else if copy.is_some() {
-        " copy mode · v select · y copy · esc exit".into()
+    } else if let Some(cm) = copy {
+        if let Some(prompt) = &cm.prompt {
+            // Live search entry: echo the sigil and the query being typed.
+            let sigil = if prompt.forward { '/' } else { '?' };
+            format!(" {sigil}{}", prompt.input)
+        } else {
+            format!(
+                " copy · {}/{} · / search · v V select · y copy · e editor · esc",
+                cm.cursor.row + 1,
+                cm.line_count()
+            )
+        }
     } else if navigate.is_some() {
         " navigate · j/k move · enter activate · esc exit".into()
     } else if prefix {
@@ -377,6 +391,71 @@ fn local_hh_mm() -> String {
         libc::localtime_r(&now, &mut tm);
         format!("{:02}:{:02}", tm.tm_hour, tm.tm_min)
     }
+}
+
+/// Draw the copy-mode viewport: plain history lines from `top`, with the
+/// selection in `theme.selection`, search matches in `theme.accent`, and the
+/// cursor cell reversed. Copy mode is intentionally unstyled otherwise — the
+/// frozen cell colors of the live screen are not reproduced here.
+fn render_copy(frame: &mut Frame, cm: &CopyMode, area: Rect, theme: &Theme) {
+    let height = area.height as usize;
+    let rows: Vec<Line> = (0..height)
+        .map(|i| {
+            let row = cm.top + i;
+            if row < cm.line_count() {
+                copy_line(cm, row, theme)
+            } else {
+                Line::default()
+            }
+        })
+        .collect();
+    frame.render_widget(
+        Paragraph::new(rows).style(Style::default().fg(theme.text).bg(theme.bg)),
+        area,
+    );
+}
+
+/// One copy-mode line as styled spans, grouping runs of equal style. Priority
+/// is cursor > selection > search match > base text.
+fn copy_line<'a>(cm: &'a CopyMode, row: usize, theme: &Theme) -> Line<'a> {
+    let line = cm.line(row);
+    let selection = cm.selection_span(row);
+    let matches = cm.search_spans(row);
+    let cursor_col = (cm.cursor.row == row).then_some(cm.cursor.col);
+
+    let base = Style::default().fg(theme.text).bg(theme.bg);
+    let sel_style = Style::default().fg(theme.text).bg(theme.selection);
+    let match_style = Style::default().fg(theme.bg).bg(theme.accent);
+    let cursor_style = Style::default().fg(theme.bg).bg(theme.cursor);
+
+    let mut spans: Vec<Span> = Vec::new();
+    let mut text = String::new();
+    let mut style = base;
+    for (col, ch) in line.chars().enumerate() {
+        let mut cell = base;
+        if matches.iter().any(|(s, e)| col >= *s && col < *e) {
+            cell = match_style;
+        }
+        if selection.is_some_and(|(s, e)| col >= s && col < e) {
+            cell = sel_style;
+        }
+        if cursor_col == Some(col) {
+            cell = cursor_style;
+        }
+        if cell != style && !text.is_empty() {
+            spans.push(Span::styled(std::mem::take(&mut text), style));
+        }
+        style = cell;
+        text.push(ch);
+    }
+    if !text.is_empty() {
+        spans.push(Span::styled(text, style));
+    }
+    // A cursor resting at or past end-of-line gets a trailing highlighted cell.
+    if cursor_col == Some(line.chars().count()) {
+        spans.push(Span::styled(" ", cursor_style));
+    }
+    Line::from(spans)
 }
 
 /// Convert a pane `Screen` into styled ratatui lines. Shared by the live pane

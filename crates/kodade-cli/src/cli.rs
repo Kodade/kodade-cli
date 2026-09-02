@@ -51,6 +51,11 @@ pub enum Command {
         #[command(subcommand)]
         command: AgentCommand,
     },
+    /// Work with a pane's contents. #16 extends this group with more verbs.
+    Pane {
+        #[command(subcommand)]
+        command: PaneCommand,
+    },
     /// Send text to a pane, followed by a newline.
     Send {
         #[arg(value_name = "PANE", value_parser = pane_id)]
@@ -166,6 +171,22 @@ pub enum AgentCommand {
         /// Name recorded as the source of the report.
         #[arg(long, value_name = "NAME", default_value = "cli")]
         source: String,
+    },
+}
+
+#[derive(Debug, Subcommand, PartialEq, Eq)]
+pub enum PaneCommand {
+    /// Print a pane's text. Defaults to the visible screen; `--scrollback`
+    /// includes the full history and `--lines N` keeps only the last N lines.
+    Read {
+        #[arg(value_name = "PANE", value_parser = pane_id)]
+        pane: PaneId,
+        /// Keep only the last N lines.
+        #[arg(long, value_name = "N")]
+        lines: Option<usize>,
+        /// Include the full scrollback, not just the visible screen.
+        #[arg(long)]
+        scrollback: bool,
     },
 }
 
@@ -347,6 +368,39 @@ mod tests {
                 pane: PaneId(1),
                 text: "--no-newline".into(),
                 no_newline: false,
+            })
+        );
+    }
+
+    #[test]
+    fn parses_pane_read() {
+        assert_eq!(
+            parse(&[
+                "kodade-cli",
+                "pane",
+                "read",
+                "7",
+                "--lines",
+                "5",
+                "--scrollback"
+            ])
+            .command,
+            Some(Command::Pane {
+                command: PaneCommand::Read {
+                    pane: PaneId(7),
+                    lines: Some(5),
+                    scrollback: true,
+                }
+            })
+        );
+        assert_eq!(
+            parse(&["kodade-cli", "pane", "read", "2"]).command,
+            Some(Command::Pane {
+                command: PaneCommand::Read {
+                    pane: PaneId(2),
+                    lines: None,
+                    scrollback: false,
+                }
             })
         );
     }

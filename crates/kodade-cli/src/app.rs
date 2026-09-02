@@ -13,7 +13,7 @@ use crossterm::{
 };
 use kodade_cli_proto::{
     AgentStateKind, ClientMessage, Direction, LayoutSnapshot, Notification, PaneId, Screen,
-    SidebarTabInfo, WorkspaceInfo,
+    ServerMessage, SidebarTabInfo, SplitAxis, WorkspaceInfo,
 };
 use ratatui::{backend::CrosstermBackend, layout::Rect, style::Color, Frame, Terminal};
 use std::{
@@ -208,13 +208,9 @@ impl App {
         pane_cols(cols, self.sidebar)
     }
 
-    /// Stores a new snapshot and keeps copy mode pointed at fresh screen text.
+    /// Stores a new snapshot. Copy mode refreshes its full-history buffer
+    /// separately (throttled) in the event loop, not from the visible screen.
     pub fn handle_layout(&mut self, layout: LayoutSnapshot) {
-        if let Some(copy_mode) = &mut self.copy {
-            if let Some(pane) = layout.panes.iter().find(|pane| pane.id == copy_mode.pane) {
-                copy_mode.refresh(pane.screen.clone());
-            }
-        }
         // A selection belongs to one pane's current output: drop it when focus
         // moves, when its pane goes away, or (opt-in) when the pane redraws.
         if let Some(selection) = &self.selection {
@@ -290,6 +286,41 @@ impl App {
             None => self.set_note(" no notifications"),
         }
         Ok(())
+    }
+
+    /// Fetch a pane's full scrollback + screen as plain lines over a one-shot
+    /// daemon connection (the copy-mode buffer). Returns `None` on any error.
+    async fn fetch_pane_lines(&self, pane: PaneId) -> Option<Vec<String>> {
+        let reply = crate::commands::request(
+            &self.session_name,
+            ClientMessage::ReadPane {
+                id: pane,
+                scrollback: true,
+                lines: None,
+            },
+        )
+        .await
+        .ok()?;
+        match reply {
+            ServerMessage::PaneText { text, .. } => {
+                Some(text.split('\n').map(str::to_string).collect())
+            }
+            _ => None,
+        }
+    }
+
+    /// Refresh the copy buffer if enough time has passed since the last fetch.
+    async fn refresh_copy(&mut self) {
+        let Some(cm) = &self.copy else { return };
+        if cm.refreshed_at.elapsed() < Duration::from_millis(500) {
+            return;
+        }
+        let (pane, height) = (cm.pane, cm.height);
+        if let Some(lines) = self.fetch_pane_lines(pane).await {
+            if let Some(cm) = &mut self.copy {
+                cm.refresh(lines, height);
+            }
+        }
     }
 
     pub fn draw(&self, frame: &mut Frame) {
@@ -389,14 +420,23 @@ impl App {
         rx: &mut mpsc::Receiver<Update>,
     ) -> Result<()> {
         loop {
+            let mut layout_changed = false;
             while let Ok(update) = rx.try_recv() {
                 match update {
-                    Update::Layout(layout) => self.handle_layout(layout),
+                    Update::Layout(layout) => {
+                        self.handle_layout(layout);
+                        layout_changed = true;
+                    }
                     Update::Session(session) => self.handle_session(session),
                     Update::Notification(notification) => {
                         self.handle_notification(notification, term)?
                     }
                 }
+            }
+            // Refetch the copy-mode buffer when the pane produced new output,
+            // throttled so a busy pane does not flood the socket.
+            if layout_changed {
+                self.refresh_copy().await;
             }
             self.sync_title(term)?;
             term.draw(|frame| self.draw(frame))?;
@@ -567,73 +607,196 @@ impl App {
         write(writer, &ClientMessage::ResizePane { direction, cells }).await
     }
 
-    // Copy mode: vi-style movement, `v` anchors, `y` copies through OSC 52.
+    // Copy mode: vi motions over full scrollback, `/`?` search, `v`/`V`/`ctrl+v`
+    // selection, `y` copies via OSC 52, `e` opens the buffer in an editor pane.
     async fn handle_copy_key(
         &mut self,
         key: KeyEvent,
         writer: &mut OwnedWriteHalf,
         term: &mut Term,
     ) -> Result<()> {
-        let Some(mut copy_mode) = self.copy.take() else {
+        let Some(mut cm) = self.copy.take() else {
             return Ok(());
         };
+
+        // A live `/`?` prompt swallows input until Enter/Esc.
+        if let Some(mut prompt) = cm.prompt.take() {
+            match key.code {
+                KeyCode::Esc => {}
+                KeyCode::Enter => {
+                    cm.set_search(&prompt.input, prompt.forward);
+                    cm.search_jump(prompt.forward);
+                }
+                KeyCode::Backspace => {
+                    prompt.input.pop();
+                    cm.prompt = Some(prompt);
+                }
+                KeyCode::Char(c) => {
+                    prompt.input.push(c);
+                    cm.prompt = Some(prompt);
+                }
+                _ => cm.prompt = Some(prompt),
+            }
+            self.copy = Some(cm);
+            return Ok(());
+        }
+
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        // Any key but a second `g` cancels a pending `gg`.
+        let pending_g = cm.pending_g;
+        cm.pending_g = false;
         let mut keep = true;
+
         match key.code {
-            KeyCode::Esc | KeyCode::Char('q') => keep = false,
-            KeyCode::Char('v') => copy_mode.anchor = Some(copy_mode.cursor),
-            KeyCode::Char('y') => {
-                if let Some(anchor) = copy_mode.anchor {
-                    let text =
-                        mode::selected_text(&copy_mode.screen.contents, anchor, copy_mode.cursor);
-                    // Fill the internal paste buffer so `paste_buffer` can re-send it.
-                    self.paste_buffer = text.clone();
-                    let (payload, truncated) = mode::osc52(&text);
-                    execute!(term.backend_mut(), crossterm::style::Print(payload))?;
-                    term.backend_mut().flush()?;
-                    self.set_note(if truncated {
-                        " copied (truncated to 100KB)"
-                    } else {
-                        " copied"
-                    });
+            // Esc peels off search highlights, then a selection, then exits.
+            KeyCode::Esc => {
+                if cm.search.is_some() {
+                    cm.clear_search();
+                } else if cm.anchor.is_some() {
+                    cm.anchor = None;
+                } else {
                     keep = false;
                 }
             }
-            KeyCode::Up | KeyCode::Char('k') => copy_mode.move_by(-1, 0),
-            KeyCode::Down | KeyCode::Char('j') => copy_mode.move_by(1, 0),
-            KeyCode::Left | KeyCode::Char('h') => copy_mode.move_by(0, -1),
-            KeyCode::Right | KeyCode::Char('l') => copy_mode.move_by(0, 1),
-            KeyCode::PageUp | KeyCode::Char('u')
-                if key.modifiers.contains(KeyModifiers::CONTROL)
-                    || matches!(key.code, KeyCode::PageUp) =>
-            {
-                write(
-                    writer,
-                    &ClientMessage::ScrollPane {
-                        id: copy_mode.pane,
-                        delta: 20,
-                    },
-                )
-                .await?
+            KeyCode::Char('q') => keep = false,
+
+            // Ctrl chords first, so plain letters below stay reachable.
+            KeyCode::Char('v') if ctrl => {
+                cm.select = mode::SelectKind::Block;
+                cm.anchor = Some(cm.cursor);
             }
-            KeyCode::PageDown | KeyCode::Char('d')
-                if key.modifiers.contains(KeyModifiers::CONTROL)
-                    || matches!(key.code, KeyCode::PageDown) =>
-            {
-                write(
-                    writer,
-                    &ClientMessage::ScrollPane {
-                        id: copy_mode.pane,
-                        delta: -20,
-                    },
-                )
-                .await?
+            KeyCode::Char('b') if ctrl => cm.page(false),
+            KeyCode::Char('f') if ctrl => cm.page(true),
+            KeyCode::Char('u') if ctrl => cm.half_page(false),
+            KeyCode::Char('d') if ctrl => cm.half_page(true),
+
+            // Selection anchors.
+            KeyCode::Char('v') => {
+                cm.select = mode::SelectKind::Char;
+                cm.anchor = Some(cm.cursor);
             }
+            KeyCode::Char('V') => {
+                cm.select = mode::SelectKind::Line;
+                cm.anchor = Some(cm.cursor);
+            }
+
+            // Yank the selection (or current line) through OSC 52.
+            KeyCode::Char('y') => {
+                let text = cm.yank_text();
+                self.paste_buffer = text.clone();
+                let (payload, truncated) = mode::osc52(&text);
+                execute!(term.backend_mut(), crossterm::style::Print(payload))?;
+                term.backend_mut().flush()?;
+                self.set_note(if truncated {
+                    " copied (truncated to 100KB)"
+                } else {
+                    " copied"
+                });
+                keep = false;
+            }
+
+            // Open the buffer in an editor, in a NEW pane — never the agent's.
+            KeyCode::Char('e') => {
+                if self.open_in_editor(&cm, writer).await? {
+                    keep = false;
+                }
+            }
+
+            // Search.
+            KeyCode::Char('/') => {
+                cm.prompt = Some(mode::Prompt {
+                    forward: true,
+                    input: String::new(),
+                })
+            }
+            KeyCode::Char('?') => {
+                cm.prompt = Some(mode::Prompt {
+                    forward: false,
+                    input: String::new(),
+                })
+            }
+            KeyCode::Char('n') => {
+                if let Some(forward) = cm.search.as_ref().map(|s| s.forward) {
+                    cm.search_jump(forward);
+                }
+            }
+            KeyCode::Char('N') => {
+                if let Some(forward) = cm.search.as_ref().map(|s| s.forward) {
+                    cm.search_jump(!forward);
+                }
+            }
+
+            // Character / line motions.
+            KeyCode::Up | KeyCode::Char('k') => cm.move_rows(-1),
+            KeyCode::Down | KeyCode::Char('j') => cm.move_rows(1),
+            KeyCode::Left | KeyCode::Char('h') => cm.move_cols(-1),
+            KeyCode::Right | KeyCode::Char('l') => cm.move_cols(1),
+            KeyCode::Char('0') => cm.goto_line_start(),
+            KeyCode::Char('$') => cm.goto_line_end(),
+            KeyCode::Char('^') => cm.goto_first_nonblank(),
+
+            // Word motions (`e` is the editor, so word-end is `E`, WORD-wise).
+            KeyCode::Char('w') => cm.next_word(false),
+            KeyCode::Char('W') => cm.next_word(true),
+            KeyCode::Char('b') => cm.prev_word(false),
+            KeyCode::Char('B') => cm.prev_word(true),
+            KeyCode::Char('E') => cm.end_word(true),
+
+            // Paragraph and buffer jumps.
+            KeyCode::Char('{') => cm.paragraph(false),
+            KeyCode::Char('}') => cm.paragraph(true),
+            KeyCode::Char('g') => {
+                if pending_g {
+                    cm.goto_top();
+                } else {
+                    cm.pending_g = true;
+                }
+            }
+            KeyCode::Char('G') => cm.goto_bottom(),
+
+            // Viewport-relative and paged movement.
+            KeyCode::Char('H') => cm.viewport_top(),
+            KeyCode::Char('M') => cm.viewport_middle(),
+            KeyCode::Char('L') => cm.viewport_bottom(),
+            KeyCode::PageUp => cm.page(false),
+            KeyCode::PageDown => cm.page(true),
             _ => {}
         }
         if keep {
-            self.copy = Some(copy_mode);
+            self.copy = Some(cm);
         }
         Ok(())
+    }
+
+    /// Write the copy buffer to a temp file and open `$EDITOR` (fallback `vi`)
+    /// in a new vertical split. Returns whether the editor pane was requested.
+    async fn open_in_editor(
+        &mut self,
+        cm: &mode::CopyMode,
+        writer: &mut OwnedWriteHalf,
+    ) -> Result<bool> {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let path = std::env::temp_dir().join(format!("kodade-cli-{}-{}.txt", cm.pane.0, ts));
+        if std::fs::write(&path, cm.lines.join("\n")).is_err() {
+            self.set_note(" could not write copy-mode temp file");
+            return Ok(false);
+        }
+        let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".into());
+        write(
+            writer,
+            &ClientMessage::NewPane {
+                workspace: None,
+                tab: None,
+                split: Some(SplitAxis::Vertical),
+                command: Some(vec![editor, path.to_string_lossy().into_owned()]),
+                name: Some("editor".into()),
+            },
+        )
+        .await?;
+        Ok(true)
     }
 
     // Context menu: move the selection or run the highlighted action.
@@ -761,10 +924,16 @@ impl App {
                 self.navigate = Some(0);
             }
             config::Action::CopyMode => {
-                if let Some(current) = &self.layout {
-                    if let Some(pane) = current.panes.iter().find(|pane| pane.focused) {
-                        self.copy = Some(mode::CopyMode::new(pane.id, pane.screen.clone()));
-                    }
+                // Freeze the focused pane's full history; viewport height comes
+                // from its visible row count.
+                let target = self
+                    .layout
+                    .as_ref()
+                    .and_then(|layout| layout.panes.iter().find(|pane| pane.focused))
+                    .map(|pane| (pane.id, pane.screen.rows.len().max(1)));
+                if let Some((id, height)) = target {
+                    let lines = self.fetch_pane_lines(id).await.unwrap_or_default();
+                    self.copy = Some(mode::CopyMode::new(id, lines, height));
                 }
             }
             config::Action::Rename => self.rename = true,

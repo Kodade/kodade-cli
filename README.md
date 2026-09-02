@@ -87,9 +87,30 @@ htop) get the events themselves unless `mouse.passthrough = false`, and
 `prefix m` turns capture off when you want the terminal's own selection. See
 [docs/CONFIG.md](docs/CONFIG.md#mouse).
 
-Copy mode uses `v` to set a selection anchor, movement keys to select, and `y`
-to copy. Copying sends the selection through OSC 52, including over SSH; copy
-payloads are limited to 100 KB.
+Copy mode (`prefix [`) freezes the pane's full scrollback and navigates it with
+vi motions over the whole history, not just the visible screen. The status bar
+shows `copy · LINE/TOTAL · / search · v V select · y copy · e editor · esc`.
+
+| Key | Action |
+|---|---|
+| `h` `j` `k` `l` / arrows | Move by cell / line |
+| `w` `b` / `W` `B` / `E` | Word / WORD motions (`e` is the editor, so word-end is `E`) |
+| `0` `^` `$` | Line start / first non-blank / line end |
+| `gg` / `G` | Top / bottom of the buffer |
+| `{` / `}` | Previous / next blank line |
+| `ctrl+u` `ctrl+d` | Half page up / down |
+| `ctrl+b` `ctrl+f` / `PageUp` `PageDown` | Page up / down |
+| `H` `M` `L` | Cursor to viewport top / middle / bottom |
+| `v` / `V` / `ctrl+v` | Char / line / block selection anchor |
+| `/` `?` then `n` `N` | Search forward / back (case-insensitive), step matches |
+| `y` | Copy the selection (or current line) via OSC 52 and the paste buffer |
+| `e` | Open the buffer in `$EDITOR` (fallback `vi`) in a new split |
+| `esc` | Clear search, then the selection, then exit; `q` exits |
+
+Copying sends the selection through OSC 52, including over SSH; copy payloads
+are limited to 100 KB. The buffer is refetched (throttled) while the pane keeps
+producing output. Copy mode draws plain text — the frozen cell colors of the
+live screen are not reproduced there.
 
 Paste is bracketed so a program can tell it from typing. Pasted text is
 sanitized by default (`paste.sanitize`): CRLF is normalized, embedded escape
@@ -143,6 +164,9 @@ for the installed version. The scripting commands are:
 - `kodade-cli agent report PANE STATE` — report an agent state to the daemon.
 - `kodade-cli agent update-manifests` — opt-in refresh of agent-detection manifests from GitHub.
 - `kodade-cli send PANE TEXT` — send text followed by a newline (`--no-newline` is also supported).
+- `kodade-cli pane read PANE [--lines N] [--scrollback]` — print a pane's text
+  (visible screen by default; `--scrollback` includes the full history, `--lines N`
+  keeps only the last N lines).
 - `kodade-cli kill-session` — stop the current session.
 - `kodade-cli config path|show|validate` — print the config path, the effective
   config as TOML, or check the file (exits non-zero on problems).

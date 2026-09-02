@@ -57,6 +57,7 @@ async fn main() -> Result<()> {
         Some(cli::Command::Agent { command }) => {
             agent(&session, &config::Config::load(), command).await
         }
+        Some(cli::Command::Pane { command }) => pane(&session, command).await,
         Some(cli::Command::Send {
             pane,
             text,
@@ -311,6 +312,34 @@ async fn agent(session: &str, config: &config::Config, command: cli::AgentComman
                 .await?,
             )?;
             Ok(())
+        }
+    }
+}
+
+/// `pane` subcommands: read a pane's text for scripting.
+async fn pane(session: &str, command: cli::PaneCommand) -> Result<()> {
+    match command {
+        cli::PaneCommand::Read {
+            pane,
+            lines,
+            scrollback,
+        } => {
+            let reply = commands::request(
+                session,
+                ClientMessage::ReadPane {
+                    id: pane,
+                    scrollback,
+                    lines,
+                },
+            )
+            .await?;
+            match reply {
+                ServerMessage::PaneText { text, .. } => {
+                    println!("{text}");
+                    Ok(())
+                }
+                other => anyhow::bail!("unexpected reply: {other:?}"),
+            }
         }
     }
 }
