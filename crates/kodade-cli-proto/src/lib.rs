@@ -50,6 +50,38 @@ pub enum ClientMessage {
     SelectTab {
         id: TabId,
     },
+    /// One-based position of a tab in the active workspace (`select_tab_1..9`).
+    SelectTabIndex {
+        index: u8,
+    },
+    /// Reorder the active tab by `delta` positions, clamped to the ends.
+    MoveTab {
+        delta: i8,
+    },
+    /// Swap the focused pane with its neighbour in `direction`.
+    SwapPane {
+        direction: Direction,
+    },
+    /// Move the focused pane out of its tab and into a new one.
+    BreakPane,
+    /// Reset every split ratio in the active tab to 0.5.
+    EqualizeLayout,
+    /// Focus the next / previous leaf of the active tab.
+    FocusPaneCycle {
+        forward: bool,
+    },
+    /// Activate the workspace `delta` positions away, wrapping.
+    SelectWorkspaceDelta {
+        delta: i8,
+    },
+    RenameTabId {
+        id: TabId,
+        name: String,
+    },
+    RenameWorkspaceId {
+        id: WorkspaceId,
+        name: String,
+    },
     NewWorkspace {
         name: String,
     },

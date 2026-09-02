@@ -46,6 +46,30 @@ single-letter and arrow-key aliases.
 | `resize_right` | `L` |
 | `navigate` | `n` |
 | `copy_mode` | `[` |
+| `select_tab_1` … `select_tab_9` | `1` … `9` |
+| `close_tab` | `X` |
+| `rename_tab` | `T` |
+| `rename_workspace` | `R` |
+| `close_workspace` | `D` |
+| `swap_up` | `alt+k` |
+| `swap_down` | `alt+j` |
+| `swap_left` | `alt+h` |
+| `swap_right` | `alt+l` |
+| `move_tab_left` | unbound |
+| `move_tab_right` | unbound |
+| `next_pane` | `o` |
+| `prev_pane` | `O` |
+| `last_pane` | `;` |
+| `workspace_prev` | unbound |
+| `resize_mode` | `alt+r` |
+| `break_pane` | `!` |
+| `layout_even` | `=` |
+
+`close_tab` asks for confirmation in the status bar when a pane in the tab is
+working, and `close_workspace` when any agent in it is working or blocked;
+`y` confirms, anything else cancels. `resize_mode` is a persistent mode:
+`hjkl` resize by one cell, `HJKL` by five, and `esc` or `enter` exits.
+`break_pane` moves the focused pane into a new tab without restarting it.
 
 Example:
 
