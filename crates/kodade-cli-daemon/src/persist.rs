@@ -108,18 +108,57 @@ pub fn remove_session_file(name: &str) {
 }
 
 /// Daemon-side view of `~/.config/kodade-cli/config.toml`. Only `[session]
-/// resume_agents` is read here; the client owns the full config (#20). Unknown
-/// keys and tables are ignored, so the shared file loads for either side.
+/// resume_agents` and `[worktrees] directory` are read here; the client owns the
+/// full config (#20). Unknown keys and tables are ignored, so the shared file
+/// loads for either side.
 #[derive(Debug, Default, Deserialize)]
 struct DaemonConfig {
     #[serde(default)]
     session: SessionConfig,
+    #[serde(default)]
+    worktrees: WorktreesConfig,
 }
 
 #[derive(Debug, Default, Deserialize)]
 struct SessionConfig {
     #[serde(default)]
     resume_agents: bool,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct WorktreesConfig {
+    /// Root directory git-worktree workspaces are created under (#22).
+    #[serde(default)]
+    directory: Option<String>,
+}
+
+/// Root directory for git-worktree workspaces (#22): `[worktrees] directory`
+/// from the shared config, with a leading `~` expanded, defaulting to
+/// `~/.kodade/worktrees`.
+pub fn worktrees_directory() -> PathBuf {
+    let home = dirs::home_dir();
+    let configured = home
+        .as_ref()
+        .and_then(|home| fs::read_to_string(home.join(".config/kodade-cli/config.toml")).ok())
+        .and_then(|text| toml::from_str::<DaemonConfig>(&text).ok())
+        .and_then(|config| config.worktrees.directory);
+    match configured {
+        Some(dir) => expand_tilde(&dir, home.as_deref()),
+        None => home
+            .map(|home| home.join(".kodade/worktrees"))
+            .unwrap_or_else(|| PathBuf::from(".kodade/worktrees")),
+    }
+}
+
+/// Expand a leading `~` to the home directory; other paths pass through.
+fn expand_tilde(token: &str, home: Option<&std::path::Path>) -> PathBuf {
+    match (token.strip_prefix("~/"), home) {
+        (Some(rest), Some(home)) => home.join(rest),
+        _ if token == "~" => home
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from(token)),
+        _ => PathBuf::from(token),
+    }
 }
 
 /// Whether restored agent panes should re-run their resume command. Any read or

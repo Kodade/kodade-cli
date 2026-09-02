@@ -168,6 +168,20 @@ pub enum ClientMessage {
         id: WorkspaceId,
         color: Option<String>,
     },
+    /// Create a git-worktree workspace: `git worktree add` for `branch` (created
+    /// from `from`, or checked out if it already exists) under `[worktrees]
+    /// directory`, then a workspace `repo:branch` rooted there with a shell tab (#22).
+    NewWorktreeWorkspace {
+        repo_root: PathBuf,
+        branch: String,
+        from: Option<String>,
+    },
+    /// Close a worktree workspace; unless `keep`, also `git worktree remove` its
+    /// directory (#22).
+    RemoveWorktreeWorkspace {
+        id: WorkspaceId,
+        keep: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -348,6 +362,16 @@ pub struct WorkspaceInfo {
     /// fallback in the client (#19). Older daemons omit it.
     #[serde(default)]
     pub color: Option<String>,
+    /// Git branch of this workspace's root, when it is a repo; refreshed on the
+    /// daemon's 2s process tick and shown dimmed in the sidebar (#22). Older
+    /// daemons omit it.
+    #[serde(default)]
+    pub branch: Option<String>,
+    /// For a git-worktree workspace, the workspace whose root is the main repo,
+    /// so the sidebar can nest it under its parent (#22). `None` for a normal
+    /// workspace or a worktree whose main repo has no open workspace.
+    #[serde(default)]
+    pub parent: Option<WorkspaceId>,
     /// Metadata for every tab, including panes outside the active screen.
     pub tabs: Vec<SidebarTabInfo>,
 }
@@ -645,6 +669,8 @@ pub const CLIENT_MESSAGE_NAMES: &[&str] = &[
     "ZoomPane",
     "AgentState",
     "SetWorkspaceColor",
+    "NewWorktreeWorkspace",
+    "RemoveWorktreeWorkspace",
 ];
 
 /// Every `ServerMessage` variant name (see [`CLIENT_MESSAGE_NAMES`]).
@@ -709,6 +735,8 @@ pub fn client_message_name(message: &ClientMessage) -> &'static str {
         ClientMessage::ZoomPane => "ZoomPane",
         ClientMessage::AgentState { .. } => "AgentState",
         ClientMessage::SetWorkspaceColor { .. } => "SetWorkspaceColor",
+        ClientMessage::NewWorktreeWorkspace { .. } => "NewWorktreeWorkspace",
+        ClientMessage::RemoveWorktreeWorkspace { .. } => "RemoveWorktreeWorkspace",
     }
 }
 
@@ -764,6 +792,8 @@ mod tests {
                 state: AgentStateKind::Idle,
                 root: Some(PathBuf::from("/tmp/repo")),
                 color: None,
+                branch: Some("main".into()),
+                parent: None,
                 tabs: vec![SidebarTabInfo {
                     id: TabId(2),
                     name: "shell".into(),
@@ -950,6 +980,15 @@ mod tests {
             ClientMessage::SetWorkspaceColor {
                 id: workspace,
                 color: Some("#e7a33b".into()),
+            },
+            ClientMessage::NewWorktreeWorkspace {
+                repo_root: PathBuf::from("/tmp/repo"),
+                branch: "feat-a".into(),
+                from: Some("main".into()),
+            },
+            ClientMessage::RemoveWorktreeWorkspace {
+                id: workspace,
+                keep: false,
             },
         ]
     }

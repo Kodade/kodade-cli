@@ -58,6 +58,7 @@ async fn main() -> Result<()> {
                 | cli::Command::Run { .. }
                 | cli::Command::Split { .. }
                 | cli::Command::NewTab { .. }
+                | cli::Command::Worktree { .. }
                 | cli::Command::KillSession
         )
     );
@@ -81,6 +82,7 @@ async fn main() -> Result<()> {
         Some(cli::Command::Session { command }) => {
             session_command(remote.as_deref(), &session, command).await
         }
+        Some(cli::Command::Worktree { command }) => worktree(&socket, command).await,
         Some(cli::Command::Ls { json }) => {
             let layout =
                 commands::layout(commands::request(&socket, commands::layout_query()).await?)?;
@@ -688,6 +690,65 @@ async fn agent(
                 )
                 .await?,
             )?;
+            Ok(())
+        }
+    }
+}
+
+/// `worktree` subcommands: add, remove, and list git-worktree workspaces (#22).
+async fn worktree(socket: &Path, command: cli::WorktreeCommand) -> Result<()> {
+    match command {
+        cli::WorktreeCommand::Add {
+            branch,
+            from,
+            workspace,
+        } => {
+            let layout =
+                commands::layout(commands::request(socket, commands::layout_query()).await?)?;
+            // The repo to branch is the target workspace's root (default: active).
+            let ws = match workspace.as_deref() {
+                Some(name) => commands::resolve_workspace(&layout, name)?,
+                None => layout.active_workspace,
+            };
+            let repo_root = layout
+                .workspaces
+                .iter()
+                .find(|item| item.id == ws)
+                .and_then(|item| item.root.clone())
+                .ok_or_else(|| anyhow!("workspace has no root directory to branch from"))?;
+            let reply = commands::layout(
+                commands::request(
+                    socket,
+                    ClientMessage::NewWorktreeWorkspace {
+                        repo_root,
+                        branch,
+                        from,
+                    },
+                )
+                .await?,
+            )?;
+            println!("{}", reply.active_workspace.0);
+            Ok(())
+        }
+        cli::WorktreeCommand::Remove { target, keep } => {
+            let layout =
+                commands::layout(commands::request(socket, commands::layout_query()).await?)?;
+            let id = commands::resolve_worktree(&layout, &target)?;
+            commands::request(socket, ClientMessage::RemoveWorktreeWorkspace { id, keep }).await?;
+            println!("{}", id.0);
+            Ok(())
+        }
+        cli::WorktreeCommand::List { json } => {
+            let layout =
+                commands::layout(commands::request(socket, commands::layout_query()).await?)?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&commands::worktree_workspaces(&layout))?
+                );
+            } else {
+                println!("{}", commands::format_worktrees(&layout));
+            }
             Ok(())
         }
     }

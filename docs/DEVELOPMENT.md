@@ -6,7 +6,7 @@ Ködade CLI is a Rust workspace with three crates:
   encoding/decoding.
 - `kodade-cli-daemon` owns sessions, PTYs, terminal parsing, screen state,
   agent detection, and the Unix socket server. Its current modules include
-  `agent.rs`, `manifest.rs`, `layout.rs`, `proc.rs`, and `persist.rs`.
+  `agent.rs`, `manifest.rs`, `layout.rs`, `proc.rs`, `git.rs`, and `persist.rs`.
 - `kodade-cli` owns the `kodade-cli` binary and its thin ratatui/crossterm TUI.
   Its current modules are `cli.rs`, `app.rs`, `config.rs`, `mode.rs`,
   `render.rs`, `input.rs`, and `commands.rs`. `cli.rs` holds the clap
@@ -32,6 +32,24 @@ single-quoted) so agent CLIs keep their environment and never proxy
 credentials. `NewPane` opens a new tab when `split` is `None`, otherwise it
 splits the focused pane; the new pane becomes focused so the reply snapshot
 identifies it.
+
+## Git worktree workspaces (#22)
+
+`git.rs` isolates all git access. Branch labels are pure filesystem reads:
+`repo_root` walks up to a `.git` entry, `current_branch` reads `.git/HEAD` (or,
+for a linked worktree, follows the `gitdir:` file to the real HEAD), and
+`main_worktree_root` follows `commondir` to find a worktree's main repo. These
+run on the daemon's 2-second process tick — each `Workspace` caches its `branch`
+so no subprocess runs per frame — and the cached branch plus the derived
+`parent` (the open workspace whose root is the worktree's main repo) travel on
+`WorkspaceInfo` so the sidebar can nest worktrees and dim their branch.
+
+Mutations shell out: `NewWorktreeWorkspace` runs `git worktree add` under
+`[worktrees] directory` (default `~/.kodade/worktrees`, read with the same tiny
+loader as `[session]`) and opens a `repo:branch` workspace rooted there;
+`RemoveWorktreeWorkspace` closes the workspace and, unless `keep`, runs
+`git worktree remove`. Removal is only attempted when `main_worktree_root`
+resolves, so nothing outside a registered worktree is ever deleted.
 
 ## Session persistence and restore
 

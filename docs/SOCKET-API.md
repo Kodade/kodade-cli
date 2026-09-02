@@ -67,6 +67,8 @@ printf '%s\n' '{"Query":"Layout"}' | nc -U /tmp/kodade-cli-$UID/default.sock
 | `MoveTab` | `{"MoveTab":{"delta":1}}` | `Layout` |
 | `MovePaneToTab` | `{"MovePaneToTab":{"pane":3,"tab":2}}` | `Layout` |
 | `SetWorkspaceColor` | `{"SetWorkspaceColor":{"id":1,"color":"#e7a33b"}}` | `Layout` |
+| `NewWorktreeWorkspace` | `{"NewWorktreeWorkspace":{"repo_root":"/src/repo","branch":"feat-a","from":"main"}}` | `Layout` |
+| `RemoveWorktreeWorkspace` | `{"RemoveWorktreeWorkspace":{"id":9,"keep":false}}` | `Layout` |
 | `SwapPane` | `{"SwapPane":{"direction":"Right"}}` | `Layout` |
 | `BreakPane` | `"BreakPane"` | `Layout` |
 | `EqualizeLayout` | `"EqualizeLayout"` | `Layout` |
@@ -84,6 +86,16 @@ printf '%s\n' '{"Query":"Layout"}' | nc -U /tmp/kodade-cli-$UID/default.sock
 cross-workspace move follows the pane: the target workspace and tab become
 active, as `FocusPaneId` would. A workspace whose last tab is emptied by the
 move receives a fresh shell tab, because a workspace always has at least one.
+
+`NewWorktreeWorkspace` runs `git worktree add` for `branch` (created from `from`,
+or checked out when it already exists) under the `[worktrees] directory` config
+(default `~/.kodade/worktrees`), then opens a `repo:branch` workspace rooted in
+the new worktree. `RemoveWorktreeWorkspace` closes the workspace and, unless
+`keep`, runs `git worktree remove`; the directory is only ever removed when git
+reports it as a registered worktree. Each `WorkspaceInfo` in a `Layout` carries a
+`branch` (the workspace root's current git branch, refreshed on the daemon's 2 s
+tick, `null` outside a repo) and a `parent` (the workspace id whose root is a
+worktree workspace's main repo, when that workspace is open, else `null`).
 
 `ApplyLayout` **executes code**: every pane the file names that is not already
 alive is spawned with the saved `command`, through the login shell, in the saved

@@ -99,6 +99,10 @@ pub struct App {
     rename: bool,
     /// The `prefix W` workspace prompt reuses the rename text buffer (`name`).
     new_workspace: bool,
+    /// The `prefix G` worktree prompt (branch name), also reusing `name` (#22).
+    worktree_new: bool,
+    /// Pending `remove worktree <branch>? y/n/k(eep)` prompt: (workspace, branch).
+    worktree_confirm: Option<(WorkspaceId, String)>,
     name: String,
     rename_target: Option<mode::MenuTarget>,
     drag: Option<DragState>,
@@ -182,6 +186,8 @@ impl App {
             prefix: false,
             rename: false,
             new_workspace: false,
+            worktree_new: false,
+            worktree_confirm: None,
             name: String::new(),
             rename_target: None,
             drag: None,
@@ -425,6 +431,14 @@ impl App {
         let prefix_hint = help::prefix_hint(&self.config);
         let attach = help::attach_hint(&self.config);
         let first_attach_hint = (!self.help_seen).then_some(attach.as_str());
+        // The worktree removal prompt reuses the confirm status line (#22).
+        let worktree_prompt = self
+            .worktree_confirm
+            .as_ref()
+            .map(|(_, branch)| format!("remove worktree {branch}? y/n/k(eep)"));
+        let confirm = worktree_prompt
+            .as_deref()
+            .or_else(|| self.confirm.as_ref().map(|c| c.message.as_str()));
         render::render(
             frame,
             layout,
@@ -436,12 +450,13 @@ impl App {
                 prefix: self.prefix,
                 rename: self.rename,
                 new_workspace: self.new_workspace,
+                worktree_new: self.worktree_new,
                 name: &self.name,
                 navigate: self.navigate,
                 copy: self.copy.as_ref(),
                 menu: self.menu.as_ref(),
                 resize: self.resize,
-                confirm: self.confirm.as_ref().map(|c| c.message.as_str()),
+                confirm,
                 settings: self.settings.as_ref(),
                 note: self.note(),
                 session: &self.session_name,
@@ -576,12 +591,16 @@ impl App {
     ) -> Result<Flow> {
         // Any keystroke ends a mouse selection (#12).
         self.clear_selection();
-        if self.confirm.is_some() {
+        if self.worktree_confirm.is_some() {
+            self.handle_worktree_confirm_key(key, writer).await?;
+        } else if self.confirm.is_some() {
             self.handle_confirm_key(key, writer).await?;
         } else if self.rename {
             self.handle_rename_key(key, writer).await?;
         } else if self.new_workspace {
             self.handle_new_workspace_key(key, writer).await?;
+        } else if self.worktree_new {
+            self.handle_worktree_new_key(key, writer).await?;
         } else if self.copy.is_some() {
             self.handle_copy_key(key, writer, term).await?;
         } else if self.menu.is_some() {
@@ -685,6 +704,85 @@ impl App {
                 self.name.pop();
             }
             KeyCode::Char(c) => self.name.push(c),
+            _ => {}
+        }
+        Ok(())
+    }
+
+    // Worktree prompt: type `BRANCH [FROM]`, enter opens a worktree workspace on
+    // the active workspace's repo (#22).
+    async fn handle_worktree_new_key(
+        &mut self,
+        key: KeyEvent,
+        writer: &mut OwnedWriteHalf,
+    ) -> Result<()> {
+        match key.code {
+            KeyCode::Enter => {
+                let input = std::mem::take(&mut self.name);
+                self.worktree_new = false;
+                let mut parts = input.split_whitespace();
+                let Some(branch) = parts.next().map(str::to_owned) else {
+                    return Ok(());
+                };
+                let from = parts.next().map(str::to_owned);
+                // The repo comes from the active workspace's root directory.
+                let repo_root = self
+                    .active_workspace()
+                    .and_then(|workspace| workspace.root.clone());
+                match repo_root {
+                    Some(repo_root) => {
+                        write(
+                            writer,
+                            &ClientMessage::NewWorktreeWorkspace {
+                                repo_root,
+                                branch,
+                                from,
+                            },
+                        )
+                        .await?;
+                    }
+                    None => self.set_note(" active workspace has no repo to branch"),
+                }
+            }
+            KeyCode::Esc => {
+                self.name.clear();
+                self.worktree_new = false;
+            }
+            KeyCode::Backspace => {
+                self.name.pop();
+            }
+            KeyCode::Char(c) => self.name.push(c),
+            _ => {}
+        }
+        Ok(())
+    }
+
+    // `remove worktree <branch>? y/n/k(eep)`: `y` removes the directory, `k`
+    // keeps it, anything else cancels (#22).
+    async fn handle_worktree_confirm_key(
+        &mut self,
+        key: KeyEvent,
+        writer: &mut OwnedWriteHalf,
+    ) -> Result<()> {
+        let (id, _) = self
+            .worktree_confirm
+            .take()
+            .expect("worktree confirm exists");
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                write(
+                    writer,
+                    &ClientMessage::RemoveWorktreeWorkspace { id, keep: false },
+                )
+                .await?;
+            }
+            KeyCode::Char('k') | KeyCode::Char('K') => {
+                write(
+                    writer,
+                    &ClientMessage::RemoveWorktreeWorkspace { id, keep: true },
+                )
+                .await?;
+            }
             _ => {}
         }
         Ok(())
@@ -1143,6 +1241,7 @@ impl App {
             }
             config::Action::Rename => self.rename = true,
             config::Action::NewWorkspace => self.new_workspace = true,
+            config::Action::WorktreeNew => self.worktree_new = true,
             config::Action::Detach => return Ok(Flow::Detach),
             config::Action::ResizeMode => self.resize = true,
             config::Action::RenameTab => {
@@ -1177,7 +1276,23 @@ impl App {
                 }
             }
             config::Action::CloseWorkspace => {
-                if let Some(prompt) = self.active_workspace().map(|workspace| {
+                // A worktree workspace gets the y/n/k(eep) removal prompt instead
+                // of the plain close confirmation (#22).
+                let worktree = self
+                    .active_workspace()
+                    .filter(|workspace| workspace.parent.is_some())
+                    .map(|workspace| {
+                        (
+                            workspace.id,
+                            workspace
+                                .branch
+                                .clone()
+                                .unwrap_or_else(|| workspace.name.clone()),
+                        )
+                    });
+                if let Some(worktree) = worktree {
+                    self.worktree_confirm = Some(worktree);
+                } else if let Some(prompt) = self.active_workspace().map(|workspace| {
                     (
                         ClientMessage::CloseWorkspace { id: workspace.id },
                         close_workspace_prompt(workspace),
@@ -2248,6 +2363,8 @@ mod tests {
                 state: AgentStateKind::Idle,
                 root: None,
                 color: None,
+                branch: None,
+                parent: None,
                 tabs: Vec::new(),
             })
             .collect();
@@ -2329,6 +2446,8 @@ mod tests {
             state: AgentStateKind::Blocked,
             root: None,
             color: None,
+            branch: None,
+            parent: None,
             tabs: vec![tab(&[AgentStateKind::Blocked, AgentStateKind::Idle])],
         };
         assert_eq!(close_tab_prompt(&workspace.tabs[0]), None);

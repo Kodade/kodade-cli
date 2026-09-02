@@ -251,6 +251,8 @@ mod tests {
                 state: AgentStateKind::Idle,
                 root: Some("/home/keith/repos/alpha-src".into()),
                 color: None,
+                branch: None,
+                parent: None,
                 tabs: vec![SidebarTabInfo {
                     id: TabId(1),
                     name: "edit".into(),
@@ -268,6 +270,8 @@ mod tests {
                 state: AgentStateKind::Blocked,
                 root: None,
                 color: None,
+                branch: None,
+                parent: None,
                 tabs: vec![
                     SidebarTabInfo {
                         id: TabId(2),
