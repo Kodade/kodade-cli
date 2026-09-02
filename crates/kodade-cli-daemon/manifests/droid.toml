@@ -1,0 +1,6 @@
+# unverified: sourced from https://docs.factory.ai/cli/getting-started/overview (CLI not installed locally)
+# Identification only: no screen rules until a real session confirms its prompt strings.
+name = "droid"
+display = "Droid"
+process = ["droid"]
+title = ["Droid", "Factory"]

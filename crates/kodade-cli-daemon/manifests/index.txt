@@ -1,0 +1,15 @@
+aider.toml
+amp.toml
+claude-code.toml
+cline.toml
+codex.toml
+copilot.toml
+cursor-agent.toml
+droid.toml
+gemini-cli.toml
+grok.toml
+hermes.toml
+kimi.toml
+opencode.toml
+pi.toml
+qwen-code.toml

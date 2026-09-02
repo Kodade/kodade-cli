@@ -77,6 +77,9 @@ struct Pane {
     hook: Mutex<Option<ReportedHook>>,
     spawn_process: String,
     process: Mutex<ProcessEvidence>,
+    // Tracks how long the current detected state has held, for sidebar age labels.
+    last_state: Mutex<Option<AgentStateKind>>,
+    state_since: Mutex<Instant>,
 }
 
 #[derive(Clone)]
@@ -300,6 +303,11 @@ impl Session {
             .iter()
             .map(|(id, pane)| (*id, pane.detect(&self.manifests, now)))
             .collect();
+        // Age is tracked once per snapshot, after detection settles on a state.
+        let ages: HashMap<_, _> = panes
+            .iter()
+            .map(|(id, pane)| (*id, pane.track_state(detections[id].state, now)))
+            .collect();
         let snapshots = ids
             .into_iter()
             .filter_map(|id| {
@@ -312,6 +320,7 @@ impl Session {
                     agent: detections[&id].agent.clone(),
                     state: detections[&id].state,
                     state_reason: detections[&id].reason.clone(),
+                    state_age_secs: ages[&id],
                 })
             })
             .collect();
@@ -325,7 +334,7 @@ impl Session {
                     let tabs = item
                         .tabs
                         .iter()
-                        .map(|tab| sidebar_tab_info(tab, &panes, &detections))
+                        .map(|tab| sidebar_tab_info(tab, &panes, &detections, &ages))
                         .collect::<Vec<_>>();
                     WorkspaceInfo {
                         id: item.id,
@@ -889,6 +898,7 @@ fn sidebar_tab_info(
     tab: &Tab,
     panes: &HashMap<PaneId, Arc<Pane>>,
     detections: &HashMap<PaneId, agent::Detection>,
+    ages: &HashMap<PaneId, u64>,
 ) -> SidebarTabInfo {
     let mut pane_ids = Vec::new();
     layout::leaves(&tab.tree, &mut pane_ids);
@@ -907,6 +917,7 @@ fn sidebar_tab_info(
                         pane_ref.title.lock().expect("title lock poisoned").clone()
                     }),
                     state: detection.state,
+                    state_age_secs: ages.get(&pane).copied().unwrap_or(0),
                 })
             })
             .collect(),
@@ -996,6 +1007,8 @@ impl Pane {
                 name: None,
                 checked_at: Instant::now() - Duration::from_secs(2),
             }),
+            last_state: Mutex::new(None),
+            state_since: Mutex::new(Instant::now()),
         })
     }
     fn snapshot(&self) -> Screen {
@@ -1072,6 +1085,7 @@ impl Pane {
         // `ps` turns that portable pid into a basename without sysctl; unavailable leaders fall
         // back to the login-shell process captured at spawn, with OSC terminal title as evidence.
         let process = self.process_name(now);
+        let last_output = *self.last_output.lock().expect("output lock poisoned");
         let hook = self
             .hook
             .lock()
@@ -1081,9 +1095,10 @@ impl Pane {
                 state: hook.state,
                 source: hook.source,
                 age: now.saturating_duration_since(hook.reported_at),
+                // A `done` report is released once the pane prints anything new.
+                output_since_report: last_output > hook.reported_at,
             });
-        let output_age =
-            now.saturating_duration_since(*self.last_output.lock().expect("output lock poisoned"));
+        let output_age = now.saturating_duration_since(last_output);
         agent::detect(
             manifests,
             process.as_deref().or(Some(&self.spawn_process)),
@@ -1092,6 +1107,16 @@ impl Pane {
             output_age,
             hook,
         )
+    }
+
+    /// Records a state transition and returns how many seconds the current state
+    /// has held. `state_since` only resets when the detected state actually changes.
+    fn track_state(&self, state: AgentStateKind, now: Instant) -> u64 {
+        let mut last = self.last_state.lock().expect("state lock poisoned");
+        let mut since = self.state_since.lock().expect("state_since lock poisoned");
+        *since = state_since_after(*last, state, *since, now);
+        *last = Some(state);
+        now.saturating_duration_since(*since).as_secs()
     }
 
     fn process_name(&self, now: Instant) -> Option<String> {
@@ -1127,6 +1152,21 @@ fn tab_state(tab: &Tab, detections: &HashMap<PaneId, agent::Detection>) -> Agent
             .into_iter()
             .filter_map(|id| detections.get(&id).map(|item| item.state)),
     )
+}
+
+/// `state_since` moves to `now` only when the detected state changes; an
+/// unchanged state keeps its original start so the age keeps growing.
+fn state_since_after(
+    last: Option<AgentStateKind>,
+    next: AgentStateKind,
+    since: Instant,
+    now: Instant,
+) -> Instant {
+    if last == Some(next) {
+        since
+    } else {
+        now
+    }
 }
 
 fn scroll_offset_after_delta(offset: usize, delta: i16, available: usize) -> usize {
@@ -1484,6 +1524,37 @@ mod tests {
         pane_sizes(&LayoutTree::Leaf { pane: PaneId(1) }, 80, 24, &mut sizes);
         assert_eq!(sizes, vec![(PaneId(1), 78, 22)]);
     }
+    #[test]
+    fn state_since_resets_only_on_change() {
+        let start = Instant::now();
+        let later = start + Duration::from_secs(5);
+        // Same state: the original start time is retained (age keeps growing).
+        assert_eq!(
+            state_since_after(
+                Some(AgentStateKind::Working),
+                AgentStateKind::Working,
+                start,
+                later
+            ),
+            start
+        );
+        // Changed state: the clock restarts at `now`.
+        assert_eq!(
+            state_since_after(
+                Some(AgentStateKind::Working),
+                AgentStateKind::Blocked,
+                start,
+                later
+            ),
+            later
+        );
+        // First observation restarts as well.
+        assert_eq!(
+            state_since_after(None, AgentStateKind::Idle, start, later),
+            later
+        );
+    }
+
     #[test]
     fn scroll_offset_clamps_to_available_history() {
         assert_eq!(scroll_offset_after_delta(1, 99, 2), 2);

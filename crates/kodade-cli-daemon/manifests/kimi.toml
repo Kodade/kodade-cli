@@ -1,0 +1,6 @@
+# unverified: sourced from https://github.com/MoonshotAI/kimi-cli (CLI not installed locally)
+# Identification only: no screen rules until a real session confirms its prompt strings.
+name = "kimi"
+display = "Kimi CLI"
+process = ["kimi"]
+title = ["Kimi"]

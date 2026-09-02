@@ -1,0 +1,6 @@
+# unverified: sourced from https://docs.github.com/en/copilot/concepts/agents/about-copilot-cli (CLI not installed locally)
+# Identification only: no screen rules until a real session confirms its prompt strings.
+name = "copilot"
+display = "GitHub Copilot CLI"
+process = ["copilot"]
+title = ["Copilot"]

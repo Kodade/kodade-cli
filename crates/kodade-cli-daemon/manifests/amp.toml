@@ -1,0 +1,6 @@
+# unverified: sourced from https://ampcode.com/manual (CLI not installed locally)
+# Identification only: no screen rules until a real session confirms its prompt strings.
+name = "amp"
+display = "Amp"
+process = ["amp"]
+title = ["Amp"]

@@ -1,0 +1,6 @@
+# unverified: sourced from https://withpi.ai (CLI not installed locally)
+# Identification only: no screen rules until a real session confirms its prompt strings.
+name = "pi"
+display = "Pi"
+process = ["pi"]
+title = ["Pi"]

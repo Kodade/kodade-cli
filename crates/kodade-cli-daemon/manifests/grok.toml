@@ -2,6 +2,7 @@ name = "grok"
 display = "Grok Build"
 process = ["grok"]
 title = ["Grok"]
+resume = "grok --continue"
 
 [[rule]]
 state = "blocked"

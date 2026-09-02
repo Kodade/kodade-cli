@@ -338,7 +338,15 @@ pub fn sidebar_rows(layout: &LayoutSnapshot) -> Vec<SidebarRow> {
                 });
                 rows.extend(tab.agents.iter().map(|agent| SidebarRow {
                     target: SidebarTarget::Pane(agent.pane),
-                    label: format!("    {}", agent.name),
+                    // Active states carry a short age (e.g. `Codex 4m`); #19 restructures later.
+                    label: match agent.state {
+                        AgentStateKind::Blocked
+                        | AgentStateKind::Working
+                        | AgentStateKind::Done => {
+                            format!("    {} {}", agent.name, format_age(agent.state_age_secs))
+                        }
+                        _ => format!("    {}", agent.name),
+                    },
                     state: agent.state,
                 }));
             }
@@ -352,6 +360,17 @@ pub fn sidebar_rows(layout: &LayoutSnapshot) -> Vec<SidebarRow> {
 pub fn sidebar_row_at(rows: &[SidebarRow], row: u16) -> Option<&SidebarRow> {
     let index = row.checked_sub(SIDEBAR_HEADER_ROWS)?;
     rows.get(index as usize)
+}
+
+/// Compact state age: seconds under a minute, minutes under an hour, else hours.
+pub fn format_age(secs: u64) -> String {
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m", secs / 60)
+    } else {
+        format!("{}h", secs / 3600)
+    }
 }
 
 fn render_sidebar(
@@ -568,6 +587,7 @@ mod tests {
                             pane: PaneId(3),
                             name: "Codex".into(),
                             state: AgentStateKind::Blocked,
+                            state_age_secs: 245,
                         }],
                     }],
                 },
@@ -598,6 +618,8 @@ mod tests {
         assert_eq!(rows[0].label, "▾ active");
         assert_eq!(rows[1].target, SidebarTarget::Tab(TabId(2)));
         assert_eq!(rows[2].target, SidebarTarget::Pane(PaneId(3)));
+        // Blocked agent rows carry a compact age label.
+        assert_eq!(rows[2].label, "    Codex 4m");
         assert_eq!(rows[3].label, "▸ other");
         // Screen row 0 is the `workspaces` heading; the list starts at row 1.
         assert_eq!(sidebar_row_at(&rows, 0), None);
@@ -759,6 +781,15 @@ mod tests {
         let cursor = &buffer[(3, 2)];
         assert_eq!(cursor.symbol(), "k");
         assert_eq!(cursor.bg, theme.cursor);
+    }
+
+    #[test]
+    fn format_age_uses_compact_units() {
+        assert_eq!(format_age(4), "4s");
+        assert_eq!(format_age(59), "59s");
+        assert_eq!(format_age(245), "4m");
+        assert_eq!(format_age(3600), "1h");
+        assert_eq!(format_age(7300), "2h");
     }
 
     #[test]

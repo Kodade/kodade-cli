@@ -2,6 +2,7 @@ name = "gemini-cli"
 display = "Gemini CLI"
 process = ["gemini"]
 title = ["Gemini"]
+resume = "gemini --resume latest"
 
 [[rule]]
 state = "blocked"

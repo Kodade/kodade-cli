@@ -2,6 +2,7 @@ name = "codex"
 display = "Codex"
 process = ["codex"]
 title = ["Codex"]
+resume = "codex resume --last"
 
 [[rule]]
 state = "blocked"

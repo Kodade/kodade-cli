@@ -223,6 +223,7 @@ mod tests {
                 agent: Some("Codex".into()),
                 state: AgentStateKind::Blocked,
                 state_reason: "manifest rule 'Allow?' matched".into(),
+                state_age_secs: 0,
             }],
             zoomed: false,
         }

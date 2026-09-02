@@ -1,0 +1,6 @@
+# unverified: sourced from https://github.com/NousResearch (CLI not installed locally)
+# Identification only: no screen rules until a real session confirms its prompt strings.
+name = "hermes"
+display = "Hermes"
+process = ["hermes"]
+title = ["Hermes"]
