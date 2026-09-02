@@ -83,12 +83,22 @@ pub struct App {
     settings: Option<Overlay>,
     /// Status-bar note and the instant it stops being shown.
     note: Option<(String, Instant)>,
-    /// Session reported by the daemon's `Welcome`; the status bar uses it in #11.
-    #[allow(dead_code)]
+    /// Session reported by the daemon's `Welcome`; shown in the status bar (#11).
     session_name: String,
+    /// `prefix q` pane-id flash expiry (#11).
+    flash_until: Option<Instant>,
+    /// When the sidebar was last hidden, for the timed gutter hint (#24).
+    sidebar_hidden_at: Option<Instant>,
+    /// Last OSC-0 title written, so we only re-emit on change (#11).
+    last_title: String,
     config: config::Config,
     theme: config::Theme,
 }
+
+/// How long the `prefix q` pane-id flash stays up.
+const FLASH: Duration = Duration::from_secs(1);
+/// How long the `prefix b · sidebar` hint lingers after hiding the sidebar.
+const SIDEBAR_HINT: Duration = Duration::from_secs(3);
 
 impl App {
     pub fn new(config: &config::Config, session: &str) -> Self {
@@ -111,6 +121,9 @@ impl App {
             settings: None,
             note: None,
             session_name: session.to_string(),
+            flash_until: None,
+            sidebar_hidden_at: None,
+            last_title: String::new(),
             theme: config.resolve_theme(),
             config: config.clone(),
         }
@@ -174,8 +187,57 @@ impl App {
                 confirm: self.confirm.as_ref().map(|c| c.message.as_str()),
                 settings: self.settings.as_ref(),
                 note: self.note(),
+                session: &self.session_name,
+                status_right: &self.config.status_right,
+                flash: self.flash_active(),
+                sidebar_hint: self.sidebar_hint_active(),
             },
             &self.theme,
+        )
+    }
+
+    /// Whether the `prefix q` pane-id flash is still showing.
+    fn flash_active(&self) -> bool {
+        self.flash_until.is_some_and(|until| Instant::now() < until)
+    }
+
+    /// Whether the timed `prefix b · sidebar` hint should show (sidebar hidden).
+    fn sidebar_hint_active(&self) -> bool {
+        !self.sidebar
+            && self
+                .sidebar_hidden_at
+                .is_some_and(|at| at.elapsed() < SIDEBAR_HINT)
+    }
+
+    /// Sets the host terminal title (OSC 0) when the workspace/tab changed.
+    fn sync_title(&mut self, term: &mut Term) -> Result<()> {
+        let Some(title) = self.window_title() else {
+            return Ok(());
+        };
+        if title != self.last_title {
+            write!(term.backend_mut(), "\x1b]0;{title}\x07")?;
+            term.backend_mut().flush()?;
+            self.last_title = title;
+        }
+        Ok(())
+    }
+
+    /// Renders the `ui.window_title` template from the active workspace/tab.
+    fn window_title(&self) -> Option<String> {
+        let layout = self.layout.as_ref()?;
+        let workspace = layout
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.active)
+            .map(|workspace| workspace.name.as_str())
+            .unwrap_or("");
+        let tab = self.active_tab().map(|tab| tab.name.as_str()).unwrap_or("");
+        Some(
+            self.config
+                .window_title
+                .replace("{session}", &self.session_name)
+                .replace("{workspace}", workspace)
+                .replace("{tab}", tab),
         )
     }
 
@@ -193,6 +255,7 @@ impl App {
                     Update::Session(session) => self.handle_session(session),
                 }
             }
+            self.sync_title(term)?;
             term.draw(|frame| self.draw(frame))?;
             if !event::poll(Duration::from_millis(16))? {
                 continue;
@@ -510,8 +573,15 @@ impl App {
         term: &mut Term,
     ) -> Result<Flow> {
         match action {
+            config::Action::DisplayPanes => {
+                self.flash_until = Some(Instant::now() + FLASH);
+            }
             config::Action::SidebarToggle => {
                 self.sidebar = !self.sidebar;
+                // Start the timed gutter hint when the sidebar just went away.
+                if !self.sidebar {
+                    self.sidebar_hidden_at = Some(Instant::now());
+                }
                 self.send_resize(writer, term).await?;
             }
             config::Action::ReloadConfig => self.reload_config(term)?,
@@ -758,8 +828,9 @@ impl App {
         writer: &mut OwnedWriteHalf,
         term: &mut Term,
     ) -> Result<()> {
+        let area_width = term.size()?.width;
         if let Some(menu) = &mut self.menu {
-            if let Some(selected) = mode::menu_hit(menu, mouse.column, mouse.row) {
+            if let Some(selected) = mode::menu_hit(menu, mouse.column, mouse.row, area_width) {
                 menu.selected = selected;
                 self.execute_menu(writer).await?;
             } else {
@@ -805,10 +876,9 @@ impl App {
                 },
             });
         } else if mouse.row == 0 {
-            if let Some(id) = input::tab_at(
-                &render::tab_spans_for(current, content_area.x),
-                mouse.column,
-            ) {
+            if let Some(id) =
+                input::tab_at(&render::tab_spans_for(current, content_area), mouse.column)
+            {
                 write(writer, &ClientMessage::SelectTab { id }).await?;
             }
         } else if let Some(id) = input::pane_at(&rects, mouse.column, mouse.row) {

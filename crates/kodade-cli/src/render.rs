@@ -1,8 +1,9 @@
 use std::collections::HashMap;
+use std::sync::OnceLock;
 
 use kodade_cli_proto::{
-    AgentStateKind, CellColor, LayoutSnapshot, LayoutTree, PaneId, Run, Screen, TabId, WorkspaceId,
-    ATTR_BOLD, ATTR_DIM, ATTR_INVERSE, ATTR_ITALIC, ATTR_UNDERLINE,
+    AgentStateKind, CellColor, LayoutSnapshot, LayoutTree, PaneId, Run, Screen, TabId, TabInfo,
+    WorkspaceId, ATTR_BOLD, ATTR_DIM, ATTR_INVERSE, ATTR_ITALIC, ATTR_UNDERLINE,
 };
 use ratatui::{
     layout::{Constraint, Direction as LayoutDirection, Layout, Rect},
@@ -13,11 +14,15 @@ use ratatui::{
 };
 
 use crate::{
-    config::Theme,
+    config::{StatusWidget, Theme},
     input::{tab_spans, TabSpan},
-    mode::{CopyMode, Menu, MenuAction},
+    mode::{menu_origin_x, CopyMode, Menu, MenuAction, MENU_WIDTH},
     overlay::{render_overlay, Overlay},
 };
+
+/// Longest a single tab name is shown before ellipsis; the whole bar then
+/// scrolls horizontally to keep the active tab visible.
+const MAX_TAB_NAME: usize = 24;
 
 pub const TAB_PREFIX: &str = " Ködade · ";
 pub const SIDEBAR_WIDTH: u16 = 24;
@@ -57,6 +62,14 @@ pub struct Ui<'a> {
     /// Settings menu (#20); the help overlay and pickers reuse the same widget.
     pub settings: Option<&'a Overlay>,
     pub note: Option<&'a str>,
+    /// Real session name for the status bar left segment (#11).
+    pub session: &'a str,
+    /// Right-side status widgets to draw, in order (#11).
+    pub status_right: &'a [StatusWidget],
+    /// `prefix q` flash: draw big pane ids over each pane (#11).
+    pub flash: bool,
+    /// Show the `prefix b · sidebar` hint in the status bar (#24 gutter hint).
+    pub sidebar_hint: bool,
 }
 
 pub fn render(frame: &mut Frame, layout: &LayoutSnapshot, ui: &Ui, theme: &Theme) {
@@ -73,6 +86,10 @@ pub fn render(frame: &mut Frame, layout: &LayoutSnapshot, ui: &Ui, theme: &Theme
         confirm,
         settings,
         note,
+        session,
+        status_right,
+        flash,
+        sidebar_hint,
     } = *ui;
     let areas = Layout::default()
         .direction(LayoutDirection::Horizontal)
@@ -103,21 +120,12 @@ pub fn render(frame: &mut Frame, layout: &LayoutSnapshot, ui: &Ui, theme: &Theme
         .find(|item| item.active)
         .map(|item| item.name.as_str())
         .unwrap_or("workspace");
-    frame.render_widget(
-        Paragraph::new(Line::from(tab_bar_spans(workspace, &layout.tabs, theme)))
-            .style(Style::default().fg(theme.text).bg(theme.tabbar_bg)),
-        areas[0],
-    );
+    render_tab_bar(frame, workspace, &layout.tabs, areas[0], theme);
 
     let mut rects = HashMap::new();
     rects_for(&layout.tree, areas[1], &mut rects);
     for pane in &layout.panes {
         if let Some(rect) = rects.get(&pane.id) {
-            let title = if pane.scroll_offset > 0 {
-                format!("{} [scroll]", pane_title(pane))
-            } else {
-                pane_title(pane)
-            };
             // Copy mode holds its own frozen Screen; both paths use the same
             // run renderer so styling is identical.
             let screen = copy
@@ -127,16 +135,7 @@ pub fn render(frame: &mut Frame, layout: &LayoutSnapshot, ui: &Ui, theme: &Theme
             frame.render_widget(
                 Paragraph::new(pane_lines(screen, theme))
                     .style(Style::default().fg(theme.text).bg(theme.bg))
-                    .block(
-                        Block::default()
-                            .borders(Borders::ALL)
-                            .title(title)
-                            .border_style(Style::default().fg(border_color(
-                                theme,
-                                pane.state,
-                                pane.focused,
-                            ))),
-                    ),
+                    .block(pane_block(pane, *rect, theme)),
                 *rect,
             );
             // The block cursor only makes sense on the live focused pane.
@@ -145,7 +144,16 @@ pub fn render(frame: &mut Frame, layout: &LayoutSnapshot, ui: &Ui, theme: &Theme
             }
         }
     }
-    let status = if let Some(confirm) = confirm {
+    // `prefix q` overlay: big pane ids centered in each pane for a beat.
+    if flash {
+        for pane in &layout.panes {
+            if let Some(rect) = rects.get(&pane.id) {
+                render_pane_flash(frame, pane.id, *rect, theme);
+            }
+        }
+    }
+    // Left status: a mode hint overrides, else session · workspace · tab.
+    let left = if let Some(confirm) = confirm {
         format!(" {confirm}")
     } else if rename {
         format!(" rename pane: {name}")
@@ -158,15 +166,29 @@ pub fn render(frame: &mut Frame, layout: &LayoutSnapshot, ui: &Ui, theme: &Theme
     } else if navigate.is_some() {
         " navigate · j/k move · enter activate · esc exit".into()
     } else if prefix {
-        " prefix: % \" b hjkl c n p s w W x z d r · 1-9 X T R D o O ; ! = alt+hjkl alt+r ctrl+r"
+        " prefix: % \" b hjkl c n p s w W x z d r q · 1-9 X T R D o O ; ! = alt+hjkl alt+r ctrl+r"
             .into()
     } else {
-        format!(" session · {workspace}")
+        let tab = active_tab_name(layout);
+        if sidebar_hint {
+            format!(" ▸ prefix b · sidebar · {session} · {workspace} · {tab}")
+        } else {
+            format!(" {session} · {workspace} · {tab}")
+        }
     };
     frame.render_widget(
-        Paragraph::new(status).style(Style::default().fg(theme.dim).bg(theme.status_bg)),
+        Paragraph::new(left).style(Style::default().fg(theme.dim).bg(theme.status_bg)),
         areas[2],
     );
+    // Right status widgets, drawn over the same row at the right edge.
+    let widgets = status_right_spans(status_right, layout, theme);
+    if !widgets.is_empty() {
+        frame.render_widget(
+            Paragraph::new(Line::from(widgets).right_aligned())
+                .style(Style::default().bg(theme.status_bg)),
+            areas[2],
+        );
+    }
     if let Some(note) = note {
         frame.render_widget(
             Paragraph::new(note).style(Style::default().fg(theme.done).bg(theme.status_bg)),
@@ -178,6 +200,156 @@ pub fn render(frame: &mut Frame, layout: &LayoutSnapshot, ui: &Ui, theme: &Theme
     }
     if let Some(settings) = settings {
         render_overlay(frame, frame.area(), settings, theme);
+    }
+}
+
+/// The active tab's name in the active workspace, for the status bar / title.
+fn active_tab_name(layout: &LayoutSnapshot) -> &str {
+    layout
+        .workspaces
+        .iter()
+        .find(|workspace| workspace.active)
+        .and_then(|workspace| {
+            workspace
+                .tabs
+                .iter()
+                .find(|tab| tab.id == layout.active_tab)
+        })
+        .map(|tab| tab.name.as_str())
+        .unwrap_or("")
+}
+
+/// Build the border block for a pane: `#id name — state` on the left (id dim)
+/// with a `[scroll]` marker, and the cwd basename right-aligned when wide enough.
+fn pane_block<'a>(
+    pane: &'a kodade_cli_proto::PaneSnapshot,
+    rect: Rect,
+    theme: &Theme,
+) -> Block<'a> {
+    let dim = Style::default().fg(theme.dim);
+    let name = pane.agent.as_deref().unwrap_or(pane.title.as_str());
+    let mut spans = vec![
+        Span::styled(format!("#{} ", pane.id.0), dim),
+        Span::styled(name.to_string(), Style::default().fg(theme.text)),
+        Span::styled(format!(" — {}", state_name(pane.state)), dim),
+    ];
+    if pane.scroll_offset > 0 {
+        spans.push(Span::styled(" [scroll]", Style::default().fg(theme.accent)));
+    }
+    let mut block = Block::default()
+        .borders(Borders::ALL)
+        .title_top(Line::from(spans))
+        .border_style(Style::default().fg(border_color(theme, pane.state, pane.focused)));
+    // Show the cwd basename on the right of the top border on wide panes.
+    if rect.width >= 30 {
+        if let Some(base) = pane
+            .cwd
+            .as_deref()
+            .and_then(std::path::Path::file_name)
+            .and_then(|base| base.to_str())
+        {
+            block =
+                block.title_top(Line::from(Span::styled(base.to_string(), dim)).right_aligned());
+        }
+    }
+    block
+}
+
+/// Draw one big pane id centered in the pane, accent-on-bg, for the flash.
+fn render_pane_flash(frame: &mut Frame, id: PaneId, rect: Rect, theme: &Theme) {
+    if rect.width <= 2 || rect.height <= 2 {
+        return;
+    }
+    let label = format!(" {} ", id.0);
+    let width = (label.chars().count() as u16).min(rect.width);
+    let x = rect.x + (rect.width.saturating_sub(width)) / 2;
+    let y = rect.y + rect.height / 2;
+    frame.render_widget(
+        Paragraph::new(label).style(
+            Style::default()
+                .fg(theme.bg)
+                .bg(theme.accent)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Rect::new(x, y, width, 1),
+    );
+}
+
+/// Right-side status widgets in config order, joined by two spaces plus a
+/// trailing pad so nothing sits flush against the terminal edge.
+fn status_right_spans(
+    widgets: &[StatusWidget],
+    layout: &LayoutSnapshot,
+    theme: &Theme,
+) -> Vec<Span<'static>> {
+    let dim = Style::default().fg(theme.dim).bg(theme.status_bg);
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut push = |span: Span<'static>| {
+        if !spans.is_empty() {
+            spans.push(Span::styled("  ", dim));
+        }
+        spans.push(span);
+    };
+    for widget in widgets {
+        match widget {
+            StatusWidget::Zoom if layout.zoomed => push(Span::styled(
+                "[zoom]",
+                Style::default().fg(theme.accent).bg(theme.status_bg),
+            )),
+            StatusWidget::Zoom => {}
+            StatusWidget::Blocked => {
+                let count = blocked_count(layout);
+                if count > 0 {
+                    push(Span::styled(
+                        format!("● {count} blocked"),
+                        Style::default().fg(theme.blocked).bg(theme.status_bg),
+                    ));
+                }
+            }
+            StatusWidget::Hostname => push(Span::styled(hostname().to_string(), dim)),
+            StatusWidget::Time => push(Span::styled(local_hh_mm(), dim)),
+        }
+    }
+    if !spans.is_empty() {
+        spans.push(Span::styled(" ", dim));
+    }
+    spans
+}
+
+/// Panes reporting `blocked` across every workspace.
+fn blocked_count(layout: &LayoutSnapshot) -> usize {
+    layout
+        .workspaces
+        .iter()
+        .flat_map(|workspace| &workspace.tabs)
+        .flat_map(|tab| &tab.agents)
+        .filter(|agent| agent.state == AgentStateKind::Blocked)
+        .count()
+}
+
+/// Local host name, read once via `gethostname` and cached.
+fn hostname() -> &'static str {
+    static HOST: OnceLock<String> = OnceLock::new();
+    HOST.get_or_init(|| {
+        let mut buf = [0_u8; 256];
+        // SAFETY: buf is valid for buf.len() bytes; gethostname NUL-terminates.
+        let rc = unsafe { libc::gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len()) };
+        if rc != 0 {
+            return String::new();
+        }
+        let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+        String::from_utf8_lossy(&buf[..end]).into_owned()
+    })
+}
+
+/// Local `HH:MM` without pulling in a date crate.
+fn local_hh_mm() -> String {
+    // SAFETY: localtime_r writes into a zeroed tm we own; time() takes null.
+    unsafe {
+        let now = libc::time(std::ptr::null_mut());
+        let mut tm: libc::tm = std::mem::zeroed();
+        libc::localtime_r(&now, &mut tm);
+        format!("{:02}:{:02}", tm.tm_hour, tm.tm_min)
     }
 }
 
@@ -285,6 +457,7 @@ fn cursor_char(screen: &Screen) -> Option<String> {
 /// hit-testing lines up with what is rendered.
 pub fn tab_label(name: &str, active: bool, state: AgentStateKind) -> String {
     let dot = state_dot(state);
+    let name = truncate_ellipsis(name, MAX_TAB_NAME);
     if active {
         format!("{dot}[{name}]")
     } else {
@@ -292,34 +465,85 @@ pub fn tab_label(name: &str, active: bool, state: AgentStateKind) -> String {
     }
 }
 
-/// Build the tab-bar line: accent wordmark, workspace name, then the tabs with
-/// the active one in `tab_active_fg/bg`. Column layout mirrors `tab_spans_for`.
-fn tab_bar_spans<'a>(
-    workspace: &'a str,
-    tabs: &'a [kodade_cli_proto::TabInfo],
-    theme: &Theme,
-) -> Vec<Span<'a>> {
+/// Draw the tab bar: a fixed wordmark + workspace name on the left, then the
+/// tabs in a scrolling sub-area so the active tab stays visible on overflow.
+fn render_tab_bar(frame: &mut Frame, workspace: &str, tabs: &[TabInfo], area: Rect, theme: &Theme) {
     let base = Style::default().bg(theme.tabbar_bg);
-    let mut spans = vec![
-        Span::styled(TAB_PREFIX, base.fg(theme.accent)),
-        Span::styled(workspace, base.fg(theme.text)),
-        Span::styled("  ", base),
-    ];
+    // Fixed prefix fills the whole row (background) and draws the wordmark.
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(TAB_PREFIX, base.fg(theme.accent)),
+            Span::styled(workspace.to_string(), base.fg(theme.text)),
+            Span::styled("  ", base),
+        ]))
+        .style(Style::default().fg(theme.text).bg(theme.tabbar_bg)),
+        area,
+    );
+    let start = tab_bar_start(workspace);
+    if start >= area.width {
+        return;
+    }
+    let tabs_rect = Rect::new(area.x + start, area.y, area.width - start, 1);
+    let offset = tab_scroll_offset(tabs, tabs_rect.width);
+    frame.render_widget(
+        Paragraph::new(Line::from(tab_bar_spans_only(tabs, theme)))
+            .style(base)
+            .scroll((0, offset)),
+        tabs_rect,
+    );
+}
+
+/// Column where the first tab starts, relative to the tab-bar area origin.
+fn tab_bar_start(workspace: &str) -> u16 {
+    (TAB_PREFIX.chars().count() + workspace.chars().count() + 2) as u16
+}
+
+/// Tab labels only (no wordmark), positioned from column 0. `tab_spans(0, ..)`
+/// mirrors this geometry so hit-testing lines up after the same scroll offset.
+fn tab_bar_spans_only<'a>(tabs: &'a [TabInfo], theme: &Theme) -> Vec<Span<'a>> {
+    let base = Style::default().bg(theme.tabbar_bg);
+    let mut spans = Vec::new();
     for (index, tab) in tabs.iter().enumerate() {
         if index > 0 {
             spans.push(Span::styled(" ", base));
         }
         let label = tab_label(&tab.name, tab.active, tab.state);
-        let style = if tab.active {
+        let mut style = if tab.active {
             Style::default()
                 .fg(theme.tab_active_fg)
                 .bg(theme.tab_active_bg)
         } else {
             base.fg(theme.text)
         };
+        // Blocked tabs tint bold in the blocked color, matching the border/row.
+        if tab.state == AgentStateKind::Blocked {
+            style = style.fg(theme.blocked).add_modifier(Modifier::BOLD);
+        }
         spans.push(Span::styled(label, style));
     }
     spans
+}
+
+/// Horizontal scroll (in columns) so the active tab is fully visible when the
+/// tabs overflow the available width. Shared by render and hit-testing.
+fn tab_scroll_offset(tabs: &[TabInfo], available: u16) -> u16 {
+    let rel = tab_spans(0, tabs);
+    let total = rel.last().map(|span| span.end).unwrap_or(0);
+    if total <= available {
+        return 0;
+    }
+    let Some(index) = tabs.iter().position(|tab| tab.active) else {
+        return 0;
+    };
+    let (start, end) = (rel[index].start, rel[index].end);
+    let mut offset = 0;
+    if end > available {
+        offset = end - available;
+    }
+    if start < offset {
+        offset = start;
+    }
+    offset
 }
 
 pub fn sidebar_width(visible: bool) -> u16 {
@@ -428,9 +652,9 @@ fn render_sidebar(
         if y >= area.y.saturating_add(area.height) {
             break;
         }
-        let text = truncate(
+        let text = truncate_ellipsis(
             &format!("{} {}", row.label, sidebar_dot(row.state)),
-            area.width,
+            area.width as usize,
         );
         let style = if navigate == Some(index) {
             Style::default().fg(theme.sidebar_bg).bg(theme.accent)
@@ -462,7 +686,9 @@ fn render_menu(frame: &mut Frame, menu: &Menu, area: Rect, theme: &Theme) {
             MenuAction::MoveRight => "Move right",
         })
         .collect::<Vec<_>>();
-    let width = 14.min(area.width.saturating_sub(menu.x));
+    // Flip the menu left of the click when it would clip the right edge (#24).
+    let x = menu_origin_x(menu.x, area.width);
+    let width = MENU_WIDTH.min(area.width.saturating_sub(x));
     for (index, label) in labels.iter().enumerate() {
         let y = menu.y.saturating_add(index as u16);
         if y >= area.height {
@@ -475,13 +701,23 @@ fn render_menu(frame: &mut Frame, menu: &Menu, area: Rect, theme: &Theme) {
         };
         frame.render_widget(
             Paragraph::new(*label).style(style),
-            Rect::new(menu.x, y, width, 1),
+            Rect::new(x, y, width, 1),
         );
     }
 }
 
-fn truncate(text: &str, width: u16) -> String {
-    text.chars().take(width as usize).collect()
+/// Truncate `text` to `width` columns, appending `…` when it overflows. Counts
+/// `char`s (not display width), which suits the labels this draws (#11).
+pub fn truncate_ellipsis(text: &str, width: usize) -> String {
+    if text.chars().count() <= width {
+        return text.to_string();
+    }
+    if width == 0 {
+        return String::new();
+    }
+    let mut out: String = text.chars().take(width - 1).collect();
+    out.push('…');
+    out
 }
 
 fn sidebar_dot(state: AgentStateKind) -> &'static str {
@@ -499,13 +735,6 @@ fn state_color(theme: &Theme, state: AgentStateKind) -> Color {
         AgentStateKind::Done => theme.done,
         AgentStateKind::Idle | AgentStateKind::Unknown => theme.idle,
     }
-}
-
-fn pane_title(pane: &kodade_cli_proto::PaneSnapshot) -> String {
-    pane.agent
-        .as_ref()
-        .map(|agent| format!("{agent} — {}", state_name(pane.state)))
-        .unwrap_or_else(|| pane.title.clone())
 }
 
 fn border_color(theme: &Theme, state: AgentStateKind, focused: bool) -> Color {
@@ -535,17 +764,42 @@ fn state_name(state: AgentStateKind) -> &'static str {
     }
 }
 
-pub fn tab_spans_for(layout: &LayoutSnapshot, origin_x: u16) -> Vec<TabSpan> {
-    let workspace_len = layout
+/// Hit-test spans for the tab bar, in absolute screen columns. `area` is the
+/// content region (right of the sidebar). Applies the same scroll offset and
+/// clipping as `render_tab_bar`, so clicks land on the rendered tabs.
+pub fn tab_spans_for(layout: &LayoutSnapshot, area: Rect) -> Vec<TabSpan> {
+    let workspace = layout
         .workspaces
         .iter()
         .find(|item| item.active)
-        .map(|item| item.name.chars().count())
-        .unwrap_or("workspace".len());
-    tab_spans(
-        origin_x.saturating_add((TAB_PREFIX.chars().count() + workspace_len + 2) as u16),
-        &layout.tabs,
-    )
+        .map(|item| item.name.as_str())
+        .unwrap_or("workspace");
+    let start = tab_bar_start(workspace);
+    if start >= area.width {
+        return Vec::new();
+    }
+    let available = area.width - start;
+    let origin = area.x + start;
+    let offset = tab_scroll_offset(&layout.tabs, available);
+    tab_spans(0, &layout.tabs)
+        .into_iter()
+        .zip(&layout.tabs)
+        .filter_map(|(span, tab)| {
+            let s = span.start as i32 - offset as i32;
+            let e = span.end as i32 - offset as i32;
+            // Fully scrolled off the left, or starts past the right edge.
+            if e <= 0 || s >= available as i32 {
+                return None;
+            }
+            let s = s.max(0) as u16;
+            let e = (e as u16).min(available);
+            Some(TabSpan {
+                id: tab.id,
+                start: origin + s,
+                end: origin + e,
+            })
+        })
+        .collect()
 }
 
 pub fn pane_rects_for(layout: &LayoutSnapshot, area: Rect) -> Vec<(PaneId, Rect)> {
@@ -704,10 +958,11 @@ mod tests {
         let workspace = "active";
         let mut layout = snapshot();
         layout.tabs = tabs.clone();
-        // Rendered wordmark + workspace + 2 spaces before the first tab.
-        let origin = 0;
-        let start = origin + (TAB_PREFIX.chars().count() + workspace.chars().count() + 2) as u16;
-        let spans = tab_spans_for(&layout, origin);
+        // Rendered wordmark + workspace + 2 spaces before the first tab. A wide
+        // area means no overflow, so the scroll offset is zero.
+        let area = Rect::new(0, 0, 200, 24);
+        let start = area.x + (TAB_PREFIX.chars().count() + workspace.chars().count() + 2) as u16;
+        let spans = tab_spans_for(&layout, area);
         // Each hit-test span must be exactly as wide as the rendered label, and
         // the labels must be the ones tab_bar_spans draws.
         let mut column = start;
@@ -823,6 +1078,10 @@ mod tests {
             confirm: None,
             settings: None,
             note: None,
+            session: "work",
+            status_right: &[],
+            flash: false,
+            sidebar_hint: false,
         };
         let mut terminal = Terminal::new(TestBackend::new(40, 10)).expect("test terminal");
         terminal
@@ -856,5 +1115,111 @@ mod tests {
             Rect::new(SIDEBAR_WIDTH, 0, 56, 24)
         );
         assert_eq!(content_area(area, false), Rect::new(1, 0, 79, 24));
+        // #24: content width + sidebar/gutter width must cover the whole row so
+        // `pane_cols` never drifts by the collapsed 1-col gutter.
+        for sidebar in [true, false] {
+            assert_eq!(
+                content_area(area, sidebar).width + sidebar_width(sidebar),
+                area.width
+            );
+        }
+    }
+
+    #[test]
+    fn truncate_ellipsis_appends_a_marker_only_on_overflow() {
+        assert_eq!(truncate_ellipsis("short", 10), "short");
+        assert_eq!(truncate_ellipsis("exact", 5), "exact");
+        assert_eq!(truncate_ellipsis("overlong", 5), "over…");
+        assert_eq!(truncate_ellipsis("x", 0), "");
+    }
+
+    fn tab(id: u64, name: &str, active: bool) -> kodade_cli_proto::TabInfo {
+        kodade_cli_proto::TabInfo {
+            id: TabId(id),
+            name: name.into(),
+            active,
+            state: AgentStateKind::Idle,
+        }
+    }
+
+    #[test]
+    fn tab_bar_scrolls_to_keep_the_active_tab_visible() {
+        let mut layout = snapshot();
+        layout.tabs = (1..=8)
+            .map(|i| tab(i, &format!("tab{i}"), i == 6))
+            .collect();
+        // Narrow content area forces overflow (8 tabs, ~6 cols each).
+        let area = Rect::new(0, 0, 40, 24);
+        let start = tab_bar_start("active");
+        let available = area.width - start;
+        let spans = tab_spans_for(&layout, area);
+        let active = spans
+            .iter()
+            .find(|span| span.id == TabId(6))
+            .expect("active tab is drawn");
+        // The active tab lands fully inside the visible tab strip.
+        assert!(active.start >= area.x + start);
+        assert!(active.end <= area.x + start + available);
+        let label = tab_label("tab6", true, AgentStateKind::Idle);
+        assert_eq!(active.end - active.start, label.chars().count() as u16);
+        // The first tab scrolled off the left edge (absent or left-clipped).
+        let first = spans.iter().find(|span| span.id == TabId(1));
+        assert!(first.is_none_or(|span| span.start == area.x + start));
+    }
+
+    #[test]
+    fn blocked_state_tints_border_tab_and_workspace_row() {
+        use kodade_cli_proto::PaneSnapshot;
+        use ratatui::{backend::TestBackend, Terminal};
+
+        let theme = Theme::kodade_dark();
+        let mut layout = snapshot();
+        // The active workspace, its tab, and the pane are all blocked.
+        layout.tabs = vec![tab(2, "agents", true)];
+        layout.tabs[0].state = AgentStateKind::Blocked;
+        layout.panes = vec![PaneSnapshot {
+            id: PaneId(3),
+            title: "zsh".into(),
+            focused: true,
+            scroll_offset: 0,
+            screen: Screen::default(),
+            agent: Some("Codex".into()),
+            state: AgentStateKind::Blocked,
+            state_reason: String::new(),
+            state_age_secs: 0,
+            cwd: None,
+        }];
+        let ui = Ui {
+            sidebar: true,
+            prefix: false,
+            rename: false,
+            new_workspace: false,
+            name: "",
+            navigate: None,
+            copy: None,
+            menu: None,
+            resize: false,
+            confirm: None,
+            settings: None,
+            note: None,
+            session: "work",
+            status_right: &[],
+            flash: false,
+            sidebar_hint: false,
+        };
+        let mut terminal = Terminal::new(TestBackend::new(80, 12)).expect("test terminal");
+        terminal
+            .draw(|frame| render(frame, &layout, &ui, &theme))
+            .expect("frame renders");
+        let buffer = terminal.backend().buffer();
+        let has_blocked_fg = |y: u16, xs: std::ops::Range<u16>| {
+            xs.clone().any(|x| buffer[(x, y)].fg == theme.blocked)
+        };
+        // Pane border: top-left corner of the content area is drawn blocked.
+        assert_eq!(buffer[(SIDEBAR_WIDTH, 1)].fg, theme.blocked);
+        // Tab bar row (y=0) carries the blocked tab label.
+        assert!(has_blocked_fg(0, SIDEBAR_WIDTH..80));
+        // Sidebar workspace row (y=1, below the heading) is tinted blocked.
+        assert!(has_blocked_fg(1, 0..SIDEBAR_WIDTH));
     }
 }

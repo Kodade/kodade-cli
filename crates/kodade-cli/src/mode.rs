@@ -188,9 +188,23 @@ impl Menu {
     }
 }
 
-pub fn menu_hit(menu: &Menu, column: u16, row: u16) -> Option<usize> {
-    (column >= menu.x
-        && column < menu.x.saturating_add(14)
+/// Fixed context-menu width; labels like `Split right` fit within it.
+pub const MENU_WIDTH: u16 = 14;
+
+/// Left edge of the menu, flipped left of the click when it would clip the
+/// right screen edge (#24). Render and hit-test share this so they agree.
+pub fn menu_origin_x(x: u16, area_width: u16) -> u16 {
+    if x.saturating_add(MENU_WIDTH) > area_width {
+        x.saturating_sub(MENU_WIDTH)
+    } else {
+        x
+    }
+}
+
+pub fn menu_hit(menu: &Menu, column: u16, row: u16, area_width: u16) -> Option<usize> {
+    let x = menu_origin_x(menu.x, area_width);
+    (column >= x
+        && column < x.saturating_add(MENU_WIDTH)
         && row >= menu.y
         && row < menu.y.saturating_add(menu.actions().len() as u16))
     .then(|| (row - menu.y) as usize)
@@ -232,7 +246,24 @@ mod tests {
             y: 4,
             selected: 0,
         };
-        assert_eq!(menu_hit(&menu, 4, 6), Some(2));
-        assert_eq!(menu_hit(&menu, 20, 4), None);
+        assert_eq!(menu_hit(&menu, 4, 6, 80), Some(2));
+        assert_eq!(menu_hit(&menu, 20, 4, 80), None);
+    }
+
+    #[test]
+    fn menu_flips_left_near_the_right_edge() {
+        // With room to the right the menu opens at the click column.
+        assert_eq!(menu_origin_x(3, 80), 3);
+        // x + 14 past the edge flips the menu left of the click.
+        assert_eq!(menu_origin_x(70, 80), 56);
+        let menu = Menu {
+            target: MenuTarget::Pane(PaneId(1)),
+            x: 70,
+            y: 4,
+            selected: 0,
+        };
+        // Hit-testing agrees with the flipped origin (56..70), not 70..84.
+        assert_eq!(menu_hit(&menu, 57, 4, 80), Some(0));
+        assert_eq!(menu_hit(&menu, 71, 4, 80), None);
     }
 }
