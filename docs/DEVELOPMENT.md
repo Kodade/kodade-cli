@@ -6,7 +6,7 @@ Ködade CLI is a Rust workspace with three crates:
   encoding/decoding.
 - `kodade-cli-daemon` owns sessions, PTYs, terminal parsing, screen state,
   agent detection, and the Unix socket server. Its current modules include
-  `agent.rs`, `manifest.rs`, and `layout.rs`.
+  `agent.rs`, `manifest.rs`, `layout.rs`, and `proc.rs`.
 - `kodade-cli` owns the `kodade-cli` binary and its thin ratatui/crossterm TUI.
   Its current modules are `cli.rs`, `app.rs`, `config.rs`, `mode.rs`,
   `render.rs`, `input.rs`, and `commands.rs`. `cli.rs` holds the clap
@@ -17,6 +17,21 @@ The daemon runs the user's shell as a login shell and keeps the PTY alive when
 a client disconnects. The client connects to the daemon, forwards input and
 resize events, renders screen updates, and also provides the scripting
 subcommands.
+
+## Daemon model: workspace roots and cwd inheritance
+
+A workspace can carry a `root` directory. When the daemon spawns a pane it
+resolves the working directory in this order: an explicit cwd, then the focused
+pane's live cwd in the same workspace, then the workspace root, then the
+daemon's own cwd. `proc.rs` reads a pane's foreground leader (via the PTY's
+process-group leader) to get its live cwd and command line — Linux reads
+`/proc/<pid>/cwd`, macOS shells out to `lsof`, and both are cached on the pane
+with the same 2-second cadence as the process name. Commands from `run`/`split`
+always execute through the login shell (`$SHELL -lc 'exec …'`, arguments
+single-quoted) so agent CLIs keep their environment and never proxy
+credentials. `NewPane` opens a new tab when `split` is `None`, otherwise it
+splits the focused pane; the new pane becomes focused so the reply snapshot
+identifies it.
 
 ## Client and daemon protocol
 

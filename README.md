@@ -50,7 +50,7 @@ The default prefix is `ctrl+b`. After the prefix, the default actions are:
 | `n` | Navigate mode |
 | `tab` / `p` | Next / previous tab |
 | `z` / `d` | Zoom pane / detach |
-| `r` / `w` / `W` | Rename / next workspace / new workspace |
+| `r` / `w` / `W` | Rename / next workspace / new workspace (`W` prompts for `NAME [PATH]`) |
 | `b` / `[` | Toggle sidebar / copy mode |
 | `h` `j` `k` `l` or arrows | Focus left, down, up, right |
 | `H` `J` `K` `L` | Resize left, down, up, right |
@@ -83,6 +83,14 @@ Run `kodade-cli --help` for the full command list and `kodade-cli --version`
 for the installed version. The scripting commands are:
 
 - `kodade-cli ls` — list sessions, workspaces, tabs, panes, and states.
+- `kodade-cli new -w NAME [PATH]` — create a workspace with an optional root
+  directory and print its id (selects the workspace if the name already exists).
+- `kodade-cli run [-w NAME] [-t TAB] [--name NAME] -- CMD ARGS…` — run a command
+  in a new pane through the login shell and print the new pane id.
+- `kodade-cli split [--down] [-p PANE] [-- CMD…]` — split the focused (or given)
+  pane and print the new pane id.
+- `kodade-cli new-tab [-w NAME] [--name NAME]` — open a new tab and print its
+  pane id.
 - `kodade-cli agent ls` — list recognized agents and states.
 - `kodade-cli agent attach PANE` — focus a pane and attach the TUI.
 - `kodade-cli agent rename PANE NAME` — rename a pane.
@@ -95,6 +103,11 @@ for the installed version. The scripting commands are:
 Text and names may start with `-` (`kodade-cli send 1 -y`), and `--` forces
 the next value through verbatim when it collides with a flag
 (`kodade-cli send 1 -- --no-newline`).
+
+`-w` and `-t` accept either a name or a numeric id. A workspace can have a root
+directory (`new -w NAME PATH` or the `prefix W` prompt); new panes, splits, and
+tabs start in the focused pane's live working directory, falling back to the
+workspace root, so agents keep landing in the right repo.
 
 `ls`, `agent ls`, and `agent explain` also accept `--json`, which prints the
 matching protocol snapshots for scripts.

@@ -15,7 +15,11 @@ use kodade_cli_proto::{
     AgentStateKind, ClientMessage, Direction, LayoutSnapshot, PaneId, SidebarTabInfo, WorkspaceInfo,
 };
 use ratatui::{backend::CrosstermBackend, layout::Rect, Frame, Terminal};
-use std::{io::Write, time::Duration};
+use std::{
+    io::Write,
+    path::{Path, PathBuf},
+    time::Duration,
+};
 use tokio::{io::AsyncWriteExt, net::unix::OwnedWriteHalf, sync::mpsc};
 
 use crate::{config, input, mode, render};
@@ -54,6 +58,8 @@ pub struct App {
     layout: Option<LayoutSnapshot>,
     prefix: bool,
     rename: bool,
+    /// The `prefix W` workspace prompt reuses the rename text buffer (`name`).
+    new_workspace: bool,
     name: String,
     rename_target: Option<mode::MenuTarget>,
     drag: Option<DragState>,
@@ -81,6 +87,7 @@ impl App {
             layout: None,
             prefix: false,
             rename: false,
+            new_workspace: false,
             name: String::new(),
             rename_target: None,
             drag: None,
@@ -135,6 +142,7 @@ impl App {
                 sidebar: self.sidebar,
                 prefix: self.prefix,
                 rename: self.rename,
+                new_workspace: self.new_workspace,
                 name: &self.name,
                 navigate: self.navigate,
                 copy: self.copy.as_ref(),
@@ -194,6 +202,8 @@ impl App {
             self.handle_confirm_key(key, writer).await?;
         } else if self.rename {
             self.handle_rename_key(key, writer).await?;
+        } else if self.new_workspace {
+            self.handle_new_workspace_key(key, writer).await?;
         } else if self.copy.is_some() {
             self.handle_copy_key(key, writer, term).await?;
         } else if self.menu.is_some() {
@@ -254,6 +264,41 @@ impl App {
         let confirm = self.confirm.take().expect("confirm exists");
         if matches!(key.code, KeyCode::Char('y') | KeyCode::Char('Y')) {
             write(writer, &confirm.on_yes).await?;
+        }
+        Ok(())
+    }
+
+    // Workspace prompt: type `NAME [PATH]`, enter creates it (reuses `name`).
+    async fn handle_new_workspace_key(
+        &mut self,
+        key: KeyEvent,
+        writer: &mut OwnedWriteHalf,
+    ) -> Result<()> {
+        match key.code {
+            KeyCode::Enter => {
+                let input = std::mem::take(&mut self.name);
+                let focused_cwd = self
+                    .layout
+                    .as_ref()
+                    .and_then(|layout| layout.panes.iter().find(|pane| pane.focused))
+                    .and_then(|pane| pane.cwd.clone());
+                let (name, root) = parse_workspace_prompt(
+                    &input,
+                    focused_cwd.as_deref(),
+                    dirs::home_dir().as_deref(),
+                );
+                write(writer, &ClientMessage::NewWorkspace { name, root }).await?;
+                self.new_workspace = false;
+            }
+            KeyCode::Esc => {
+                self.name.clear();
+                self.new_workspace = false;
+            }
+            KeyCode::Backspace => {
+                self.name.pop();
+            }
+            KeyCode::Char(c) => self.name.push(c),
+            _ => {}
         }
         Ok(())
     }
@@ -450,6 +495,7 @@ impl App {
                 }
             }
             config::Action::Rename => self.rename = true,
+            config::Action::NewWorkspace => self.new_workspace = true,
             config::Action::Detach => return Ok(Flow::Detach),
             config::Action::ResizeMode => self.resize = true,
             config::Action::RenameTab => {
@@ -788,6 +834,50 @@ fn plural(count: usize) -> &'static str {
     }
 }
 
+/// Parse a `prefix W` prompt of `NAME [PATH]` into a workspace name and root.
+/// A lone path-like token is taken as the path; `~` expands to `home`; the path
+/// defaults to the focused pane's cwd and the name to the path basename.
+fn parse_workspace_prompt(
+    input: &str,
+    focused_cwd: Option<&Path>,
+    home: Option<&Path>,
+) -> (String, Option<PathBuf>) {
+    let mut parts = input.split_whitespace();
+    let first = parts.next();
+    let second = parts.next();
+    let is_pathish = |token: &str| token.starts_with('~') || token.contains('/');
+    let (name_token, path_token) = match (first, second) {
+        (Some(name), Some(path)) => (Some(name), Some(path)),
+        (Some(one), None) if is_pathish(one) => (None, Some(one)),
+        (Some(one), None) => (Some(one), None),
+        (None, _) => (None, None),
+    };
+    let root = path_token
+        .map(|token| expand_tilde(token, home))
+        .or_else(|| focused_cwd.map(PathBuf::from));
+    let name = name_token
+        .map(str::to_owned)
+        .or_else(|| {
+            root.as_deref()
+                .and_then(Path::file_name)
+                .and_then(|base| base.to_str())
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| "workspace".to_owned());
+    (name, root)
+}
+
+/// Expand a leading `~` to the home directory; other paths pass through.
+fn expand_tilde(token: &str, home: Option<&Path>) -> PathBuf {
+    match (token.strip_prefix("~/"), home) {
+        (Some(rest), Some(home)) => home.join(rest),
+        _ if token == "~" => home
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from(token)),
+        _ => PathBuf::from(token),
+    }
+}
+
 // Selecting a sidebar row means focusing its workspace, tab, or pane.
 fn sidebar_message(target: render::SidebarTarget) -> ClientMessage {
     match target {
@@ -883,12 +973,48 @@ mod tests {
             name: "main".into(),
             active: true,
             state: AgentStateKind::Blocked,
+            root: None,
             tabs: vec![tab(&[AgentStateKind::Blocked, AgentStateKind::Idle])],
         };
         assert_eq!(close_tab_prompt(&workspace.tabs[0]), None);
         assert_eq!(
             close_workspace_prompt(&workspace),
             Some("close workspace \"main\" with 1 active agent? y/n".into())
+        );
+    }
+
+    #[test]
+    fn workspace_prompt_parses_name_and_path() {
+        let home = Path::new("/Users/keith");
+        let cwd = Path::new("/Users/keith/src/repo");
+        // NAME PATH, with ~ expansion.
+        assert_eq!(
+            parse_workspace_prompt("api ~/src/api", Some(cwd), Some(home)),
+            (
+                "api".to_owned(),
+                Some(PathBuf::from("/Users/keith/src/api"))
+            )
+        );
+        // Lone name → path defaults to the focused cwd.
+        assert_eq!(
+            parse_workspace_prompt("api", Some(cwd), Some(home)),
+            (
+                "api".to_owned(),
+                Some(PathBuf::from("/Users/keith/src/repo"))
+            )
+        );
+        // Lone path → name defaults to its basename.
+        assert_eq!(
+            parse_workspace_prompt("/tmp/thing", Some(cwd), Some(home)),
+            ("thing".to_owned(), Some(PathBuf::from("/tmp/thing")))
+        );
+        // Empty → cwd basename as the name.
+        assert_eq!(
+            parse_workspace_prompt("", Some(cwd), Some(home)),
+            (
+                "repo".to_owned(),
+                Some(PathBuf::from("/Users/keith/src/repo"))
+            )
         );
     }
 
