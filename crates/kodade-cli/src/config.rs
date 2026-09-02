@@ -146,6 +146,10 @@ pub enum Action {
     Rename,
     WorkspaceNext,
     NewWorkspace,
+    /// Fuzzy workspace switcher overlay (#17).
+    WorkspacePicker,
+    /// Fuzzy goto palette over every workspace, tab, and agent pane (#17).
+    Goto,
     SidebarToggle,
     FocusUp,
     FocusDown,
@@ -204,6 +208,8 @@ const ACTIONS: &[(&str, Action)] = &[
     ("detach", Action::Detach),
     ("rename", Action::Rename),
     ("workspace_next", Action::WorkspaceNext),
+    ("workspace_picker", Action::WorkspacePicker),
+    ("goto", Action::Goto),
     ("new_workspace", Action::NewWorkspace),
     ("sidebar_toggle", Action::SidebarToggle),
     ("focus_up", Action::FocusUp),
@@ -348,6 +354,8 @@ impl Action {
             | Self::Settings
             | Self::PasteBuffer
             | Self::MouseToggle
+            | Self::WorkspacePicker
+            | Self::Goto
             | Self::Help
             | Self::NotificationJump => return None,
         })
@@ -461,7 +469,11 @@ impl Default for Config {
             ("z", Action::Zoom),
             ("d", Action::Detach),
             ("r", Action::Rename),
-            ("w", Action::WorkspaceNext),
+            // #17 took `w` for the workspace picker; next/prev cycling is on
+            // the global `alt+w` (prev stays unbound, remap `workspace_prev`).
+            ("w", Action::WorkspacePicker),
+            ("alt+w", Action::WorkspaceNext),
+            ("g", Action::Goto),
             ("W", Action::NewWorkspace),
             ("b", Action::SidebarToggle),
             ("[", Action::CopyMode),

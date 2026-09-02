@@ -17,7 +17,7 @@ use crate::{
     config::{StatusWidget, Theme},
     input::{tab_spans, TabSpan},
     mode::{menu_origin_x, CopyMode, Menu, MenuAction, MENU_WIDTH},
-    overlay::{render_overlay, Overlay},
+    overlay::{self, render_overlay, Overlay},
     selection::Selection,
 };
 
@@ -81,6 +81,8 @@ pub struct Ui<'a> {
     pub first_attach_hint: Option<&'a str>,
     /// Help overlay (`prefix ?`), drawn over everything else (#6).
     pub help: Option<&'a Overlay>,
+    /// Workspace / goto picker (`prefix w` / `prefix g`), drawn like help (#17).
+    pub picker: Option<&'a crate::picker::Picker>,
 }
 
 pub fn render(frame: &mut Frame, layout: &LayoutSnapshot, ui: &Ui, theme: &Theme) {
@@ -105,6 +107,7 @@ pub fn render(frame: &mut Frame, layout: &LayoutSnapshot, ui: &Ui, theme: &Theme
         prefix_hint,
         first_attach_hint,
         help,
+        picker,
     } = *ui;
     let areas = Layout::default()
         .direction(LayoutDirection::Horizontal)
@@ -240,6 +243,22 @@ pub fn render(frame: &mut Frame, layout: &LayoutSnapshot, ui: &Ui, theme: &Theme
     // The help overlay draws last so it sits above every other surface.
     if let Some(help) = help {
         render_overlay(frame, frame.area(), help, theme);
+    }
+    // The picker draws over everything, with a state-colored dot per row.
+    if let Some(picker) = picker {
+        overlay::render_picker(frame, frame.area(), &picker.overlay, theme, |index| {
+            let state = picker.state_at(index);
+            (picker_dot(state), state_color(theme, state))
+        });
+    }
+}
+
+// The leading dot glyph for a picker row, matching the sidebar's state marks.
+fn picker_dot(state: AgentStateKind) -> &'static str {
+    match state {
+        AgentStateKind::Working => "◐ ",
+        AgentStateKind::Blocked | AgentStateKind::Done => "● ",
+        AgentStateKind::Idle | AgentStateKind::Unknown => "· ",
     }
 }
 
@@ -1261,6 +1280,7 @@ mod tests {
             prefix_hint: "",
             first_attach_hint: None,
             help: None,
+            picker: None,
         };
         let mut terminal = Terminal::new(TestBackend::new(40, 10)).expect("test terminal");
         terminal
@@ -1389,6 +1409,7 @@ mod tests {
             prefix_hint: "",
             first_attach_hint: None,
             help: None,
+            picker: None,
         };
         let mut terminal = Terminal::new(TestBackend::new(80, 12)).expect("test terminal");
         terminal

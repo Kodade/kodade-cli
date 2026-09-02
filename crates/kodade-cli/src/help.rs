@@ -191,7 +191,7 @@ const HINT_ACTIONS: &[Action] = &[
     Action::Zoom,
     Action::Navigate,
     Action::NextPane,
-    Action::WorkspaceNext,
+    Action::WorkspacePicker,
     Action::NewWorkspace,
     Action::Rename,
     Action::Detach,
@@ -352,10 +352,9 @@ fn group_of(action: Action) -> Group {
         | DisplayPanes => Group::Panes,
         NewTab | NextTab | PrevTab | SelectTabIndex(_) | CloseTab | RenameTab | MoveTabLeft
         | MoveTabRight => Group::Tabs,
-        WorkspaceNext | WorkspacePrev | NewWorkspace | RenameWorkspace | CloseWorkspace => {
-            Group::Workspaces
-        }
-        Navigate | CopyMode | ResizeMode | Settings | Help => Group::Modes,
+        WorkspaceNext | WorkspacePrev | WorkspacePicker | NewWorkspace | RenameWorkspace
+        | CloseWorkspace => Group::Workspaces,
+        Navigate | Goto | CopyMode | ResizeMode | Settings | Help => Group::Modes,
         Detach | SidebarToggle | ReloadConfig | PasteBuffer | MouseToggle | NotificationJump => {
             Group::Other
         }
@@ -376,6 +375,8 @@ fn label_of(action: Action) -> String {
         Detach => "detach".into(),
         Rename => "rename pane".into(),
         WorkspaceNext => "next workspace".into(),
+        WorkspacePicker => "workspace picker".into(),
+        Goto => "go to".into(),
         NewWorkspace => "new workspace".into(),
         SidebarToggle => "toggle sidebar".into(),
         FocusUp => "focus up".into(),

@@ -172,11 +172,13 @@ modifier (`ctrl+…`/`alt+…`) fires globally.
 | `rename_tab` | `T` |
 | `move_tab_left` | unbound |
 | `move_tab_right` | unbound |
-| `workspace_next` | `w` |
+| `workspace_next` | `prefix+alt+w` |
+| `workspace_picker` | `w` |
 | `new_workspace` | `W` |
 | `rename_workspace` | `R` |
 | `close_workspace` | `D` |
 | `workspace_prev` | unbound |
+| `goto` | `g` |
 | `navigate` | `n` |
 | `copy_mode` | `[` |
 | `resize_mode` | `prefix+alt+r` |
@@ -195,6 +197,14 @@ working, and `close_workspace` when any agent in it is working or blocked;
 `y` confirms, anything else cancels. `resize_mode` is a persistent mode:
 `hjkl` resize by one cell, `HJKL` by five, and `esc` or `enter` exits.
 `break_pane` moves the focused pane into a new tab without restarting it.
+
+`workspace_picker` (`prefix w`) opens a fuzzy switcher over every workspace,
+and `goto` (`prefix g`) opens a fuzzy palette over every workspace, tab, and
+agent pane. Type to filter (a subsequence match that favours word starts and
+runs), `ctrl+n`/`ctrl+p` or the arrows move, `enter` jumps, `esc` closes;
+blocked entries always sort to the top. Cycling straight to the next workspace
+without the picker is `workspace_next` (`prefix alt+w`); `workspace_prev`
+ships unbound — bind it to a bare `alt+…` chord to cycle backwards globally.
 
 `reload_config` re-reads this file and the theme in place, and `settings`
 opens the [settings menu](#settings-menu).

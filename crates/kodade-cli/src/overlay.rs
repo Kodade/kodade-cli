@@ -9,7 +9,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use kodade_cli_proto::{PaneId, TabId, WorkspaceId};
 use ratatui::{
     layout::Rect,
-    style::Style,
+    style::{Color, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph},
     Frame,
@@ -259,6 +259,75 @@ pub fn render_overlay(frame: &mut Frame, area: Rect, overlay: &Overlay, theme: &
                 Span::raw(hint),
             ]))
             .style(style),
+            Rect::new(list.x, list.y + offset as u16, list.width, 1),
+        );
+    }
+}
+
+/// Additive picker renderer (#17): like `render_overlay`, but each row leads
+/// with a state-colored dot and draws its hint dimmed. `dot(index)` returns the
+/// glyph and color for the row at `index` in `overlay.rows`; a selected row is
+/// inverted whole so it stays legible. This does not change `render_overlay`.
+pub fn render_picker(
+    frame: &mut Frame,
+    area: Rect,
+    overlay: &Overlay,
+    theme: &Theme,
+    dot: impl Fn(usize) -> (&'static str, Color),
+) {
+    let rect = overlay_rect(area, overlay);
+    frame.render_widget(Clear, rect);
+    frame.render_widget(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(format!(" {} ", overlay.title))
+            .border_style(Style::default().fg(theme.accent))
+            .style(Style::default().fg(theme.menu_fg).bg(theme.menu_bg)),
+        rect,
+    );
+    let inner_width = rect.width.saturating_sub(2);
+    if inner_width == 0 || rect.height <= 2 {
+        return;
+    }
+    if let Some(filter) = &overlay.filter {
+        frame.render_widget(
+            Paragraph::new(format!("> {filter}")).style(Style::default().fg(theme.accent)),
+            Rect::new(rect.x + 1, rect.y + 1, inner_width, 1),
+        );
+    }
+    let list = list_area(rect, overlay);
+    let height = list.height as usize;
+    if height == 0 {
+        return;
+    }
+    let start = window_start(overlay.selected, height);
+    for (offset, row) in overlay.rows.iter().skip(start).take(height).enumerate() {
+        let index = start + offset;
+        let selected = index == overlay.selected;
+        let (glyph, dot_color) = dot(index);
+        let dot_width = Span::raw(glyph).width();
+        // Reserve the dot's cells first, then split the rest between label and hint.
+        let avail = (list.width as usize).saturating_sub(dot_width);
+        let (hint, hint_width) = clip(&row.hint, avail);
+        let (label, label_width) = clip(&row.label, avail - hint_width);
+        let pad = avail - hint_width - label_width;
+        let (label_style, hint_style, dot_style) = if selected {
+            let inverted = Style::default().fg(theme.menu_bg).bg(theme.accent);
+            (inverted, inverted, inverted)
+        } else {
+            (
+                Style::default().fg(theme.menu_fg).bg(theme.menu_bg),
+                Style::default().fg(theme.dim).bg(theme.menu_bg),
+                Style::default().fg(dot_color).bg(theme.menu_bg),
+            )
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(glyph, dot_style),
+                Span::styled(label, label_style),
+                Span::styled(" ".repeat(pad), label_style),
+                Span::styled(hint, hint_style),
+            ])),
             Rect::new(list.x, list.y + offset as u16, list.width, 1),
         );
     }
