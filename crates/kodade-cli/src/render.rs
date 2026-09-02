@@ -4,6 +4,7 @@ use kodade_cli_proto::{AgentStateKind, LayoutSnapshot, LayoutTree, PaneId, TabId
 use ratatui::{
     layout::{Constraint, Direction as LayoutDirection, Layout, Rect},
     style::{Color, Style},
+    text::{Line, Span},
     widgets::{Block, Borders, Paragraph},
     Frame,
 };
@@ -16,6 +17,9 @@ use crate::{
 
 pub const TAB_PREFIX: &str = " Ködade · ";
 pub const SIDEBAR_WIDTH: u16 = 24;
+/// Non-selectable heading rows drawn above the sidebar list (currently the
+/// lowercase `workspaces` label). Both render and hit-test offset by this.
+pub const SIDEBAR_HEADER_ROWS: u16 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SidebarTarget {
@@ -83,21 +87,8 @@ pub fn render(frame: &mut Frame, layout: &LayoutSnapshot, ui: &Ui, theme: &Theme
         .find(|item| item.active)
         .map(|item| item.name.as_str())
         .unwrap_or("workspace");
-    let tabs = layout
-        .tabs
-        .iter()
-        .map(|tab| {
-            let prefix = state_dot(tab.state);
-            if tab.active {
-                format!("{prefix}[{}]", tab.name)
-            } else {
-                format!(" {prefix}{} ", tab.name)
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" ");
     frame.render_widget(
-        Paragraph::new(format!("{TAB_PREFIX}{workspace}  {tabs}"))
+        Paragraph::new(Line::from(tab_bar_spans(workspace, &layout.tabs, theme)))
             .style(Style::default().fg(theme.text).bg(theme.tabbar_bg)),
         areas[0],
     );
@@ -116,16 +107,18 @@ pub fn render(frame: &mut Frame, layout: &LayoutSnapshot, ui: &Ui, theme: &Theme
                 .map(|copy| copy.screen.contents.as_str())
                 .unwrap_or(&pane.screen.contents);
             frame.render_widget(
-                Paragraph::new(contents).block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .title(title)
-                        .border_style(Style::default().fg(border_color(
-                            theme,
-                            pane.state,
-                            pane.focused,
-                        ))),
-                ),
+                Paragraph::new(contents)
+                    .style(Style::default().bg(theme.bg))
+                    .block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .title(title)
+                            .border_style(Style::default().fg(border_color(
+                                theme,
+                                pane.state,
+                                pane.focused,
+                            ))),
+                    ),
                 *rect,
             );
         }
@@ -154,6 +147,47 @@ pub fn render(frame: &mut Frame, layout: &LayoutSnapshot, ui: &Ui, theme: &Theme
     if let Some(menu) = menu {
         render_menu(frame, menu, frame.area(), theme);
     }
+}
+
+/// Label for one tab, matching `input::tab_spans` geometry exactly so mouse
+/// hit-testing lines up with what is rendered.
+pub fn tab_label(name: &str, active: bool, state: AgentStateKind) -> String {
+    let dot = state_dot(state);
+    if active {
+        format!("{dot}[{name}]")
+    } else {
+        format!(" {dot}{name} ")
+    }
+}
+
+/// Build the tab-bar line: accent wordmark, workspace name, then the tabs with
+/// the active one in `tab_active_fg/bg`. Column layout mirrors `tab_spans_for`.
+fn tab_bar_spans<'a>(
+    workspace: &'a str,
+    tabs: &'a [kodade_cli_proto::TabInfo],
+    theme: &Theme,
+) -> Vec<Span<'a>> {
+    let base = Style::default().bg(theme.tabbar_bg);
+    let mut spans = vec![
+        Span::styled(TAB_PREFIX, base.fg(theme.accent)),
+        Span::styled(workspace, base.fg(theme.text)),
+        Span::styled("  ", base),
+    ];
+    for (index, tab) in tabs.iter().enumerate() {
+        if index > 0 {
+            spans.push(Span::styled(" ", base));
+        }
+        let label = tab_label(&tab.name, tab.active, tab.state);
+        let style = if tab.active {
+            Style::default()
+                .fg(theme.tab_active_fg)
+                .bg(theme.tab_active_bg)
+        } else {
+            base.fg(theme.text)
+        };
+        spans.push(Span::styled(label, style));
+    }
+    spans
 }
 
 pub fn sidebar_width(visible: bool) -> u16 {
@@ -204,8 +238,11 @@ pub fn sidebar_rows(layout: &LayoutSnapshot) -> Vec<SidebarRow> {
     rows
 }
 
+/// Map a screen row (sidebar starts at y=0) to a list entry, skipping the
+/// `workspaces` heading row(s). Clicks on a heading return `None`.
 pub fn sidebar_row_at(rows: &[SidebarRow], row: u16) -> Option<&SidebarRow> {
-    rows.get(row as usize)
+    let index = row.checked_sub(SIDEBAR_HEADER_ROWS)?;
+    rows.get(index as usize)
 }
 
 fn render_sidebar(
@@ -215,8 +252,20 @@ fn render_sidebar(
     navigate: Option<usize>,
     theme: &Theme,
 ) {
+    // Fill the sidebar background, then draw the lowercase dim heading (#8).
+    frame.render_widget(
+        Block::default().style(Style::default().bg(theme.sidebar_bg)),
+        area,
+    );
+    frame.render_widget(
+        Paragraph::new("workspaces").style(Style::default().fg(theme.dim).bg(theme.sidebar_bg)),
+        Rect::new(area.x, area.y, area.width, 1),
+    );
     for (index, row) in sidebar_rows(layout).iter().enumerate() {
-        let y = area.y.saturating_add(index as u16);
+        let y = area
+            .y
+            .saturating_add(SIDEBAR_HEADER_ROWS)
+            .saturating_add(index as u16);
         if y >= area.y.saturating_add(area.height) {
             break;
         }
@@ -225,9 +274,11 @@ fn render_sidebar(
             area.width,
         );
         let style = if navigate == Some(index) {
-            Style::default().fg(theme.tabbar_bg).bg(theme.accent)
+            Style::default().fg(theme.sidebar_bg).bg(theme.accent)
         } else {
-            Style::default().fg(state_color(theme, row.state))
+            Style::default()
+                .fg(state_color(theme, row.state))
+                .bg(theme.sidebar_bg)
         };
         frame.render_widget(
             Paragraph::new(text).style(style),
@@ -255,9 +306,9 @@ fn render_menu(frame: &mut Frame, menu: &Menu, area: Rect, theme: &Theme) {
             break;
         }
         let style = if index == menu.selected {
-            Style::default().fg(theme.tabbar_bg).bg(theme.accent)
+            Style::default().fg(theme.menu_bg).bg(theme.accent)
         } else {
-            Style::default().fg(theme.text).bg(theme.status_bg)
+            Style::default().fg(theme.menu_fg).bg(theme.menu_bg)
         };
         frame.render_widget(
             Paragraph::new(*label).style(style),
@@ -439,11 +490,52 @@ mod tests {
         assert_eq!(rows[1].target, SidebarTarget::Tab(TabId(2)));
         assert_eq!(rows[2].target, SidebarTarget::Pane(PaneId(3)));
         assert_eq!(rows[3].label, "▸ other");
+        // Screen row 0 is the `workspaces` heading; the list starts at row 1.
+        assert_eq!(sidebar_row_at(&rows, 0), None);
         assert_eq!(
-            sidebar_row_at(&rows, 2).map(|row| &row.target),
+            sidebar_row_at(&rows, 1).map(|row| &row.target),
+            Some(&SidebarTarget::Workspace(WorkspaceId(1)))
+        );
+        assert_eq!(
+            sidebar_row_at(&rows, 3).map(|row| &row.target),
             Some(&SidebarTarget::Pane(PaneId(3)))
         );
-        assert_eq!(sidebar_row_at(&rows, 4), None);
+        assert_eq!(sidebar_row_at(&rows, 5), None);
+    }
+
+    #[test]
+    fn tab_bar_spans_match_hit_test_span_widths() {
+        use kodade_cli_proto::TabInfo;
+        let tabs = vec![
+            TabInfo {
+                id: TabId(1),
+                name: "shell".into(),
+                active: true,
+                state: AgentStateKind::Idle,
+            },
+            TabInfo {
+                id: TabId(2),
+                name: "logs".into(),
+                active: false,
+                state: AgentStateKind::Working,
+            },
+        ];
+        let workspace = "active";
+        let mut layout = snapshot();
+        layout.tabs = tabs.clone();
+        // Rendered wordmark + workspace + 2 spaces before the first tab.
+        let origin = 0;
+        let start = origin + (TAB_PREFIX.chars().count() + workspace.chars().count() + 2) as u16;
+        let spans = tab_spans_for(&layout, origin);
+        // Each hit-test span must be exactly as wide as the rendered label, and
+        // the labels must be the ones tab_bar_spans draws.
+        let mut column = start;
+        for (span, tab) in spans.iter().zip(&tabs) {
+            let label = tab_label(&tab.name, tab.active, tab.state);
+            assert_eq!(span.start, column);
+            assert_eq!(span.end - span.start, label.chars().count() as u16);
+            column = span.end + 1; // single-space separator between tabs
+        }
     }
 
     #[test]

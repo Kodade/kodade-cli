@@ -242,21 +242,35 @@ impl Config {
 
     pub fn resolve_theme(&self) -> Theme {
         match self.theme {
-            ThemeChoice::Dark => Theme::dark(),
-            ThemeChoice::Light => Theme::light(),
+            // `dark` / `light` alias to the Ködade built-ins.
+            ThemeChoice::Dark => Theme::kodade_dark(),
+            ThemeChoice::Light => Theme::kodade_light(),
+            // OSC 11 (terminal_background) runs only on `auto` — see #24. Every
+            // other arm resolves a fixed theme and never queries the terminal.
             ThemeChoice::Auto => terminal_background()
                 .as_deref()
                 .map(Theme::from_background)
-                .unwrap_or_else(Theme::dark),
+                .unwrap_or_else(Theme::kodade_dark),
             ThemeChoice::Named => self
                 .named_theme
                 .as_deref()
-                .and_then(load_user_theme)
+                // Built-in names resolve before the user themes directory.
+                .and_then(|name| builtin_theme(name).or_else(|| load_user_theme(name)))
                 .unwrap_or_else(|| {
-                    eprintln!("kodade-cli: warning: theme not found or invalid, using dark");
-                    Theme::dark()
+                    eprintln!("kodade-cli: warning: theme not found or invalid, using kodade-dark");
+                    Theme::kodade_dark()
                 }),
         }
+    }
+}
+
+/// Resolve one of the built-in theme names, ahead of the user themes dir.
+fn builtin_theme(name: &str) -> Option<Theme> {
+    match name {
+        "kodade-dark" => Some(Theme::kodade_dark()),
+        "kodade-light" => Some(Theme::kodade_light()),
+        "tokyo-night" => Some(Theme::tokyo_night()),
+        _ => None,
     }
 }
 
@@ -298,6 +312,40 @@ struct ThemeFile {
     idle: String,
     tabbar_bg: String,
     status_bg: String,
+    // Expanded schema (#8). All optional so 10-field user themes keep loading;
+    // each falls back to an existing field (see `parse`).
+    bg: Option<String>,
+    surface: Option<String>,
+    selection: Option<String>,
+    cursor: Option<String>,
+    menu_bg: Option<String>,
+    menu_fg: Option<String>,
+    tab_active_fg: Option<String>,
+    tab_active_bg: Option<String>,
+    sidebar_bg: Option<String>,
+    ansi: Option<AnsiFile>,
+}
+
+/// The 16-entry `[ansi]` palette table (#8). Missing table or keys fall back to
+/// the standard xterm colors.
+#[derive(Debug, Clone, Deserialize, Default)]
+struct AnsiFile {
+    black: Option<String>,
+    red: Option<String>,
+    green: Option<String>,
+    yellow: Option<String>,
+    blue: Option<String>,
+    magenta: Option<String>,
+    cyan: Option<String>,
+    white: Option<String>,
+    bright_black: Option<String>,
+    bright_red: Option<String>,
+    bright_green: Option<String>,
+    bright_yellow: Option<String>,
+    bright_blue: Option<String>,
+    bright_magenta: Option<String>,
+    bright_cyan: Option<String>,
+    bright_white: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -315,44 +363,141 @@ pub struct Theme {
     pub idle: Color,
     pub tabbar_bg: Color,
     pub status_bg: Color,
+    // Expanded schema (#8).
+    pub bg: Color,
+    /// Consumed by the colored-pane renderer (#7) / selection (#12); parsed now.
+    #[allow(dead_code)]
+    pub surface: Color,
+    #[allow(dead_code)]
+    pub selection: Color,
+    #[allow(dead_code)]
+    pub cursor: Color,
+    pub menu_bg: Color,
+    pub menu_fg: Color,
+    pub tab_active_fg: Color,
+    pub tab_active_bg: Color,
+    pub sidebar_bg: Color,
+    /// Indexed ANSI palette, order: black..white then bright_black..bright_white.
+    /// Consumed by the colored-pane renderer (#7); parsed now so themes carry it.
+    #[allow(dead_code)]
+    pub ansi: [Color; 16],
 }
 
 impl Theme {
-    fn dark() -> Self {
-        Self::parse(include_str!("../themes/dark.toml")).expect("built-in dark theme is valid")
+    fn kodade_dark() -> Self {
+        Self::parse(include_str!("../themes/kodade-dark.toml"))
+            .expect("built-in kodade-dark theme is valid")
     }
 
-    fn light() -> Self {
-        Self::parse(include_str!("../themes/light.toml")).expect("built-in light theme is valid")
+    fn kodade_light() -> Self {
+        Self::parse(include_str!("../themes/kodade-light.toml"))
+            .expect("built-in kodade-light theme is valid")
+    }
+
+    fn tokyo_night() -> Self {
+        Self::parse(include_str!("../themes/tokyo-night.toml"))
+            .expect("built-in tokyo-night theme is valid")
     }
 
     fn parse(source: &str) -> Result<Self, String> {
         let raw = toml::from_str::<ThemeFile>(source).map_err(|error| error.to_string())?;
+        let accent = parse_hex_color(&raw.accent)?;
+        let border = parse_hex_color(&raw.border)?;
+        let text = parse_hex_color(&raw.text)?;
+        let tabbar_bg = parse_hex_color(&raw.tabbar_bg)?;
+        let status_bg = parse_hex_color(&raw.status_bg)?;
+        // Optional field → parse if present, else the given fallback.
+        let opt = |value: &Option<String>, fallback: Color| -> Result<Color, String> {
+            match value {
+                Some(hex) => parse_hex_color(hex),
+                None => Ok(fallback),
+            }
+        };
         Ok(Self {
             name: raw.name,
-            accent: parse_hex_color(&raw.accent)?,
-            border: parse_hex_color(&raw.border)?,
-            text: parse_hex_color(&raw.text)?,
+            accent,
+            border,
+            text,
             dim: parse_hex_color(&raw.dim)?,
             blocked: parse_hex_color(&raw.blocked)?,
             working: parse_hex_color(&raw.working)?,
             done: parse_hex_color(&raw.done)?,
             idle: parse_hex_color(&raw.idle)?,
-            tabbar_bg: parse_hex_color(&raw.tabbar_bg)?,
-            status_bg: parse_hex_color(&raw.status_bg)?,
+            tabbar_bg,
+            status_bg,
+            bg: opt(&raw.bg, tabbar_bg)?,
+            surface: opt(&raw.surface, status_bg)?,
+            selection: opt(&raw.selection, border)?,
+            cursor: opt(&raw.cursor, accent)?,
+            menu_bg: opt(&raw.menu_bg, status_bg)?,
+            menu_fg: opt(&raw.menu_fg, text)?,
+            tab_active_fg: opt(&raw.tab_active_fg, accent)?,
+            tab_active_bg: opt(&raw.tab_active_bg, tabbar_bg)?,
+            sidebar_bg: opt(&raw.sidebar_bg, tabbar_bg)?,
+            ansi: parse_ansi(raw.ansi.as_ref())?,
         })
     }
 
     fn from_background(background: &str) -> Self {
         let Ok(Color::Rgb(red, green, blue)) = parse_rgb_color(background) else {
-            return Self::dark();
+            return Self::kodade_dark();
         };
         if u16::from(red) + u16::from(green) + u16::from(blue) > 382 {
-            Self::light()
+            Self::kodade_light()
         } else {
-            Self::dark()
+            Self::kodade_dark()
         }
     }
+}
+
+/// Standard xterm 16-color palette, used when a theme omits `[ansi]` keys.
+const XTERM_16: [(u8, u8, u8); 16] = [
+    (0x00, 0x00, 0x00),
+    (0x80, 0x00, 0x00),
+    (0x00, 0x80, 0x00),
+    (0x80, 0x80, 0x00),
+    (0x00, 0x00, 0x80),
+    (0x80, 0x00, 0x80),
+    (0x00, 0x80, 0x80),
+    (0xc0, 0xc0, 0xc0),
+    (0x80, 0x80, 0x80),
+    (0xff, 0x00, 0x00),
+    (0x00, 0xff, 0x00),
+    (0xff, 0xff, 0x00),
+    (0x00, 0x00, 0xff),
+    (0xff, 0x00, 0xff),
+    (0x00, 0xff, 0xff),
+    (0xff, 0xff, 0xff),
+];
+
+fn parse_ansi(file: Option<&AnsiFile>) -> Result<[Color; 16], String> {
+    let mut palette = XTERM_16.map(|(r, g, b)| Color::Rgb(r, g, b));
+    if let Some(ansi) = file {
+        let keys = [
+            &ansi.black,
+            &ansi.red,
+            &ansi.green,
+            &ansi.yellow,
+            &ansi.blue,
+            &ansi.magenta,
+            &ansi.cyan,
+            &ansi.white,
+            &ansi.bright_black,
+            &ansi.bright_red,
+            &ansi.bright_green,
+            &ansi.bright_yellow,
+            &ansi.bright_blue,
+            &ansi.bright_magenta,
+            &ansi.bright_cyan,
+            &ansi.bright_white,
+        ];
+        for (slot, value) in palette.iter_mut().zip(keys) {
+            if let Some(hex) = value {
+                *slot = parse_hex_color(hex)?;
+            }
+        }
+    }
+    Ok(palette)
 }
 
 fn config_dir() -> PathBuf {
@@ -435,7 +580,116 @@ mod tests {
     fn parses_hex_colors_and_theme_toml() {
         assert_eq!(parse_hex_color("#7aa2f7"), Ok(Color::Rgb(122, 162, 247)));
         assert!(parse_hex_color("#xyz").is_err());
-        assert_eq!(Theme::dark().name, "dark");
+        assert_eq!(Theme::kodade_dark().name, "kodade-dark");
+    }
+
+    #[test]
+    fn kodade_dark_populates_expanded_schema() {
+        let theme = Theme::kodade_dark();
+        assert_eq!(theme.accent, Color::Rgb(0xE7, 0xA3, 0x3B));
+        assert_eq!(theme.bg, Color::Rgb(0x2a, 0x28, 0x25));
+        assert_eq!(theme.cursor, Color::Rgb(0xe2, 0xb8, 0x6e));
+        assert_eq!(theme.tab_active_bg, Color::Rgb(0x38, 0x35, 0x2f));
+        // ANSI table parsed, purple-free magenta slot.
+        assert_eq!(theme.ansi[2], Color::Rgb(0xa8, 0xc8, 0x7f)); // green
+        assert_eq!(theme.ansi[5], Color::Rgb(0xd9, 0x8a, 0x5b)); // "magenta"
+    }
+
+    #[test]
+    fn ten_field_theme_falls_back_for_optional_fields() {
+        // A legacy user theme with only the original 10 fields must still load.
+        let source = "\
+name = \"legacy\"
+accent = \"#112233\"
+border = \"#445566\"
+text = \"#778899\"
+dim = \"#010203\"
+blocked = \"#111111\"
+working = \"#222222\"
+done = \"#333333\"
+idle = \"#444444\"
+tabbar_bg = \"#0a0b0c\"
+status_bg = \"#0d0e0f\"
+";
+        let theme = Theme::parse(source).expect("legacy theme loads");
+        // Fallbacks: bg→tabbar_bg, surface→status_bg, selection→border,
+        // cursor→accent, menu_bg→status_bg, menu_fg→text, tab_active_fg→accent,
+        // tab_active_bg→tabbar_bg, sidebar_bg→tabbar_bg.
+        assert_eq!(theme.bg, theme.tabbar_bg);
+        assert_eq!(theme.surface, theme.status_bg);
+        assert_eq!(theme.selection, theme.border);
+        assert_eq!(theme.cursor, theme.accent);
+        assert_eq!(theme.menu_bg, theme.status_bg);
+        assert_eq!(theme.menu_fg, theme.text);
+        assert_eq!(theme.tab_active_fg, theme.accent);
+        assert_eq!(theme.tab_active_bg, theme.tabbar_bg);
+        assert_eq!(theme.sidebar_bg, theme.tabbar_bg);
+        // Missing [ansi] → standard xterm palette.
+        assert_eq!(theme.ansi[1], Color::Rgb(0x80, 0x00, 0x00));
+        assert_eq!(theme.ansi[9], Color::Rgb(0xff, 0x00, 0x00));
+    }
+
+    #[test]
+    fn partial_ansi_table_overrides_only_listed_keys() {
+        let source = "\
+name = \"partial\"
+accent = \"#112233\"
+border = \"#445566\"
+text = \"#778899\"
+dim = \"#010203\"
+blocked = \"#111111\"
+working = \"#222222\"
+done = \"#333333\"
+idle = \"#444444\"
+tabbar_bg = \"#0a0b0c\"
+status_bg = \"#0d0e0f\"
+
+[ansi]
+red = \"#abcdef\"
+";
+        let theme = Theme::parse(source).expect("partial ansi loads");
+        assert_eq!(theme.ansi[1], Color::Rgb(0xab, 0xcd, 0xef)); // overridden
+        assert_eq!(theme.ansi[2], Color::Rgb(0x00, 0x80, 0x00)); // xterm default
+    }
+
+    #[test]
+    fn theme_names_alias_and_resolve_built_ins_first() {
+        // `dark`/`light` alias to the Ködade built-ins.
+        let dark = Config::from_file(FileConfig {
+            theme: Some("dark".into()),
+            ..FileConfig::default()
+        });
+        assert_eq!(dark.theme, ThemeChoice::Dark);
+        assert_eq!(dark.resolve_theme().name, "kodade-dark");
+        let light = Config::from_file(FileConfig {
+            theme: Some("light".into()),
+            ..FileConfig::default()
+        });
+        assert_eq!(light.resolve_theme().name, "kodade-light");
+        // Explicit built-in names resolve without touching the user dir.
+        assert_eq!(builtin_theme("kodade-light").unwrap().name, "kodade-light");
+        assert_eq!(builtin_theme("tokyo-night").unwrap().name, "tokyo-night");
+        assert!(builtin_theme("no-such-theme").is_none());
+        let tokyo = Config::from_file(FileConfig {
+            theme: Some("tokyo-night".into()),
+            ..FileConfig::default()
+        });
+        assert_eq!(tokyo.theme, ThemeChoice::Named);
+        assert_eq!(tokyo.resolve_theme().name, "tokyo-night");
+    }
+
+    #[test]
+    fn osc11_query_guarded_to_auto_only() {
+        // #24: terminal_background() (OSC 11) must only run for `auto`. Named,
+        // dark, and light arms resolve fixed built-ins and never query.
+        assert_eq!(Config::default().theme, ThemeChoice::Auto);
+        for name in ["dark", "light", "kodade-dark", "tokyo-night"] {
+            let config = Config::from_file(FileConfig {
+                theme: Some(name.into()),
+                ..FileConfig::default()
+            });
+            assert_ne!(config.theme, ThemeChoice::Auto);
+        }
     }
 
     #[test]
