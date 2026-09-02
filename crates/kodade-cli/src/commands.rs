@@ -10,6 +10,39 @@ use tokio::{
     net::UnixStream,
 };
 
+/// Integrations that install a lifecycle hook / notify entry for a known agent.
+pub const INTEGRATIONS: &[&str] = &["claude-code", "codex", "gemini-cli"];
+
+/// Command each hook/notify entry runs; `state` is the state it reports.
+fn report_command(state: &str) -> String {
+    format!("kodade-cli agent report $KODADE_PANE {state} -s \"$KODADE_SESSION\"")
+}
+
+/// List every known integration and whether its config directory is present.
+pub fn integrate_list() -> Result<()> {
+    let home = dirs::home_dir();
+    for agent in INTEGRATIONS {
+        let (target, mechanism) = match *agent {
+            "claude-code" => (".claude/settings.json", "hooks"),
+            "codex" => (".codex/config.toml", "notify"),
+            "gemini-cli" => (".gemini/settings.json", "hooks"),
+            _ => continue,
+        };
+        let path = home.as_ref().map(|home| home.join(target));
+        let available = match &path {
+            // "available" = the agent's config directory exists on this machine.
+            Some(path) => path.parent().map(|parent| parent.exists()).unwrap_or(false),
+            None => false,
+        };
+        let status = if available { "available" } else { "not found" };
+        let shown = path
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| target.into());
+        println!("{agent:<12} {status:<10} {shown} ({mechanism})");
+    }
+    Ok(())
+}
+
 pub fn integrate_claude_code(write: bool) -> Result<()> {
     let snippet = claude_hooks();
     if !write {
@@ -21,9 +54,126 @@ pub fn integrate_claude_code(write: bool) -> Result<()> {
     }
     let home = dirs::home_dir().ok_or_else(|| anyhow!("home directory unavailable"))?;
     let path = home.join(".claude/settings.json");
-    merge_claude_settings_path(&path)?;
+    merge_hook_settings(&path, &claude_hooks())?;
     println!("installed Claude Code hooks in {}", path.display());
     Ok(())
+}
+
+/// Codex runs a single `notify` program with a JSON payload appended as the last
+/// argument. `sh -c '<script>'` receives that payload as `$0`, which the report
+/// script ignores.
+fn codex_notify() -> toml_edit::Array {
+    let mut array = toml_edit::Array::new();
+    array.push("sh");
+    array.push("-c");
+    array.push(report_command("idle"));
+    array
+}
+
+pub fn integrate_codex(write: bool, force: bool) -> Result<()> {
+    let home = dirs::home_dir().ok_or_else(|| anyhow!("home directory unavailable"))?;
+    let path = home.join(".codex/config.toml");
+    let source = match fs::read_to_string(&path) {
+        Ok(source) => source,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(error.into()),
+    };
+    let merged = match merge_codex_notify(&source, force)? {
+        Some(merged) => merged,
+        None => {
+            println!(
+                "Codex already has a `notify` entry in {}.\n\
+                 Ködade will not overwrite it. Re-run with --force to replace it, or add manually:\n{}",
+                path.display(),
+                notify_preview()
+            );
+            return Ok(());
+        }
+    };
+    if !write {
+        println!("{}", notify_preview());
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&path, merged)?;
+    println!("installed Codex notify hook in {}", path.display());
+    Ok(())
+}
+
+/// Insert the Ködade `notify` entry into a Codex config, preserving comments and
+/// other keys. Returns `None` when a `notify` already exists and `force` is off.
+fn merge_codex_notify(source: &str, force: bool) -> Result<Option<String>> {
+    let mut doc = source
+        .parse::<toml_edit::DocumentMut>()
+        .context("parse Codex config.toml")?;
+    if doc.contains_key("notify") && !force {
+        return Ok(None);
+    }
+    doc["notify"] = toml_edit::value(codex_notify());
+    Ok(Some(doc.to_string()))
+}
+
+fn notify_preview() -> String {
+    let mut preview = toml_edit::DocumentMut::new();
+    preview["notify"] = toml_edit::value(codex_notify());
+    preview.to_string().trim_end().to_string()
+}
+
+/// Gemini CLI uses Claude-compatible hook events (it even ships `gemini hooks
+/// migrate`), so we install the same Stop/UserPromptSubmit/Notification mapping.
+fn gemini_hooks() -> Value {
+    json!({
+        "Stop": [{ "matcher": "*", "hooks": [{ "type": "command", "command": report_command("idle") }] }],
+        "UserPromptSubmit": [{ "matcher": "*", "hooks": [{ "type": "command", "command": report_command("working") }] }],
+        "Notification": [{ "matcher": "*", "hooks": [{ "type": "command", "command": report_command("blocked") }] }]
+    })
+}
+
+pub fn integrate_gemini(write: bool, _force: bool) -> Result<()> {
+    if !write {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({ "hooks": gemini_hooks() }))?
+        );
+        return Ok(());
+    }
+    let home = dirs::home_dir().ok_or_else(|| anyhow!("home directory unavailable"))?;
+    let path = home.join(".gemini/settings.json");
+    merge_hook_settings(&path, &gemini_hooks())?;
+    println!("installed Gemini CLI hooks in {}", path.display());
+    Ok(())
+}
+
+/// Opt-in manifest refresh: download the manifest index and each listed file
+/// from the repo's `main` into the user override directory. This is the only
+/// command that ever touches the network.
+pub fn update_manifests() -> Result<()> {
+    const BASE: &str = "https://raw.githubusercontent.com/ContractorKeith/kodade-cli/main/crates/kodade-cli-daemon/manifests/";
+    let home = dirs::home_dir().ok_or_else(|| anyhow!("home directory unavailable"))?;
+    let dir = home.join(".config/kodade-cli/agent-detection");
+    fs::create_dir_all(&dir).context("create agent-detection directory")?;
+    let index = curl(&format!("{BASE}index.txt"))?;
+    for name in index.lines().map(str::trim).filter(|line| !line.is_empty()) {
+        let contents = curl(&format!("{BASE}{name}"))?;
+        let path = dir.join(name);
+        fs::write(&path, contents)?;
+        println!("wrote {}", path.display());
+    }
+    Ok(())
+}
+
+/// Fetch a URL with the system `curl` so no HTTP crate enters the dependency set.
+fn curl(url: &str) -> Result<String> {
+    let output = std::process::Command::new("curl")
+        .args(["-fsSL", url])
+        .output()
+        .context("run curl")?;
+    if !output.status.success() {
+        bail!("curl failed for {url}");
+    }
+    String::from_utf8(output.stdout).context("curl returned non-UTF-8 data")
 }
 
 fn claude_hooks() -> Value {
@@ -34,20 +184,22 @@ fn claude_hooks() -> Value {
     })
 }
 
-fn merge_claude_settings_path(path: &Path) -> Result<()> {
+/// Merge a JSON hooks map into a Claude-style `settings.json` without dropping
+/// existing keys or re-adding a hook whose command is already present.
+fn merge_hook_settings(path: &Path, new_hooks: &Value) -> Result<()> {
     let mut settings: Value = match fs::read_to_string(path) {
-        Ok(source) => serde_json::from_str(&source).context("parse Claude settings.json")?,
+        Ok(source) => serde_json::from_str(&source).context("parse settings.json")?,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => json!({}),
         Err(error) => return Err(error.into()),
     };
     let hooks = settings
         .as_object_mut()
-        .ok_or_else(|| anyhow!("Claude settings.json must be an object"))?
+        .ok_or_else(|| anyhow!("settings.json must be an object"))?
         .entry("hooks")
         .or_insert_with(|| json!({}))
         .as_object_mut()
-        .ok_or_else(|| anyhow!("Claude hooks must be an object"))?;
-    for (event, entries) in claude_hooks().as_object().expect("hooks object") {
+        .ok_or_else(|| anyhow!("hooks must be an object"))?;
+    for (event, entries) in new_hooks.as_object().expect("hooks object") {
         let destination = hooks
             .entry(event)
             .or_insert_with(|| json!([]))
@@ -169,6 +321,31 @@ pub fn format_agents(layout: &LayoutSnapshot) -> String {
         .join("\n")
 }
 
+/// Detection lines examined for a manifest rule (mirrors the daemon's window).
+const EXPLAIN_LINES: usize = 8;
+
+/// `agent explain` output: the chosen state and reason (the reason already names
+/// the matched needle) followed by the bottom-8-line window it matched against.
+pub fn format_explain(pane: &kodade_cli_proto::PaneSnapshot) -> String {
+    let window = bottom_lines(&pane.screen.contents, EXPLAIN_LINES);
+    format!(
+        "{}  {}\n{}\nmatched window (bottom {EXPLAIN_LINES} lines):\n{}",
+        state_name(pane.state),
+        pane.state_reason,
+        pane.agent
+            .as_ref()
+            .map(|agent| format!("agent: {agent}"))
+            .unwrap_or_else(|| "agent: none".into()),
+        window
+    )
+}
+
+fn bottom_lines(contents: &str, lines: usize) -> String {
+    let all: Vec<&str> = contents.lines().collect();
+    let start = all.len().saturating_sub(lines);
+    all[start..].join("\n")
+}
+
 pub fn find_pane(layout: &LayoutSnapshot, id: PaneId) -> Result<&kodade_cli_proto::PaneSnapshot> {
     layout
         .panes
@@ -249,13 +426,47 @@ mod tests {
     }
 
     #[test]
+    fn codex_notify_merge_preserves_and_guards() {
+        // Fresh config: notify is added and the report command is present.
+        let merged = merge_codex_notify("model = \"gpt-5\"\n", false)
+            .unwrap()
+            .expect("notify inserted");
+        assert!(merged.contains("model = \"gpt-5\""));
+        assert!(merged.contains("kodade-cli agent report"));
+        // Existing notify without --force is left untouched.
+        assert!(merge_codex_notify("notify = [\"x\"]\n", false)
+            .unwrap()
+            .is_none());
+        // --force replaces it.
+        let forced = merge_codex_notify("notify = [\"x\"]\n", true)
+            .unwrap()
+            .expect("notify replaced");
+        assert!(forced.contains("kodade-cli agent report"));
+        assert!(!forced.contains("\"x\""));
+    }
+
+    #[test]
+    fn explain_shows_bottom_window_and_reason() {
+        let mut layout = fixture();
+        layout.panes[0].screen.contents = (1..=10)
+            .map(|line| format!("line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let text = format_explain(&layout.panes[0]);
+        assert!(text.contains("manifest rule 'Allow?' matched"));
+        assert!(text.contains("matched window (bottom 8 lines):"));
+        assert!(text.contains("line 3")); // first of the last 8 lines
+        assert!(!text.contains("line 2"));
+    }
+
+    #[test]
     fn merges_claude_settings_without_duplicate_hooks() {
         let temp = std::env::temp_dir().join(format!("kodade-cli-hooks-{}", std::process::id()));
         let path = temp.join("settings.json");
         fs::create_dir_all(&temp).unwrap();
         fs::write(&path, r#"{"theme":"dark","hooks":{"Stop":[]}}"#).unwrap();
-        merge_claude_settings_path(&path).unwrap();
-        merge_claude_settings_path(&path).unwrap();
+        merge_hook_settings(&path, &claude_hooks()).unwrap();
+        merge_hook_settings(&path, &claude_hooks()).unwrap();
         let settings: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(settings["theme"], "dark");
         assert_eq!(settings["hooks"]["Stop"].as_array().unwrap().len(), 1);

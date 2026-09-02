@@ -181,10 +181,40 @@ confident indication that the agent is waiting for user action. Avoid generic
 words such as `error`, `continue`, or `ready` unless they are part of a
 distinctive prompt.
 
-## Planned interfaces
+## CLI commands
 
-The PRD describes `kodade-cli agent explain <pane>` to show why a state was
-chosen and `kodade-cli integrate <agent>` to install lifecycle-hook
-integration. Those commands are planned; the current CLI does not implement
-them. The daemon's protocol can accept an `AgentState` report, but the hook
-installer and agent-facing integration are not yet present.
+### `agent explain <pane>`
+
+Prints the chosen state, the reason (which names the matched needle), the
+detected agent, and the bottom eight screen lines the detector examined — the
+same window the daemon matches against. Use it to see exactly why a pane read
+as `blocked` or `idle`.
+
+### `integrate`
+
+Installs the lifecycle hook / notify entry that lets an agent self-report its
+state, so detection does not depend on screen strings alone.
+
+- `integrate list` — shows each known integration, its config file, and
+  whether that config directory exists on this machine.
+- `integrate claude-code [--write]` — merges hook entries into
+  `~/.claude/settings.json` (`Stop` → idle, `UserPromptSubmit` → working,
+  `Notification` → blocked). Without `--write` it prints the snippet.
+- `integrate gemini-cli [--write]` — Gemini CLI exposes Claude-compatible
+  hooks (it even ships `gemini hooks migrate`), so the same three events are
+  merged into `~/.gemini/settings.json`.
+- `integrate codex [--write] [--force]` — Codex uses a single top-level
+  `notify` program. This merges `notify = ["sh", "-c", "<report idle>"]` into
+  `~/.codex/config.toml` with `toml_edit`, preserving comments. Codex appends a
+  JSON payload as the program's last argument (`$0` for `sh -c`), which the
+  report command ignores. If a `notify` entry already exists, Ködade refuses to
+  overwrite it and prints instructions instead — pass `--force` to replace it.
+
+Merges are idempotent and never remove existing keys or hooks.
+
+### `agent update-manifests`
+
+Opt-in manifest refresh. Downloads `index.txt` and each listed manifest from
+`main` on GitHub into `~/.config/kodade-cli/agent-detection/` using the system
+`curl` (no HTTP crate, no telemetry), printing every file it writes. This is
+the only command that ever reaches the network; nothing runs automatically.
