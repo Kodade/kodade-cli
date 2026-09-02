@@ -63,6 +63,7 @@ The default prefix is `ctrl+b`. After the prefix, the default actions are:
 | `q` | Flash big pane ids (tmux `display-panes`) |
 | `alt+r` | Resize mode (`hjkl` 1 cell, `HJKL` 5, `esc` exits) |
 | `s` / `ctrl+r` | Settings menu / reload config and theme |
+| `]` | Paste the internal buffer (last paste or copy-mode yank) |
 
 The status bar shows `session · workspace · tab` on the left and configurable
 widgets on the right (`[zoom]`, a `● N blocked` counter, hostname, time — set
@@ -79,6 +80,12 @@ sidebar and `enter` activates a row; `esc` exits.
 Copy mode uses `v` to set a selection anchor, movement keys to select, and `y`
 to copy. Copying sends the selection through OSC 52, including over SSH; copy
 payloads are limited to 100 KB.
+
+Paste is bracketed so a program can tell it from typing. Pasted text is
+sanitized by default (`paste.sanitize`): CRLF is normalized, embedded escape
+sequences — including a smuggled OSC 52 or CSI — are dropped, and control bytes
+other than tab and newline are stripped. Large pastes are chunked and paced.
+The last paste (or yank) is kept in a buffer that `]` re-sends.
 
 Bindings accept a chord or an array of chords, in any modifier order
 (`split_right = ["%", "ctrl+alt+v"]`). A `ctrl`/`alt` chord that is not written

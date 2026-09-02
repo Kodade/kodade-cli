@@ -5,12 +5,14 @@ mod config;
 mod input;
 mod mode;
 mod overlay;
+mod paste;
 mod render;
 mod settings;
 
 use anyhow::{Context, Result};
 use clap::Parser;
 use crossterm::{
+    event::{DisableBracketedPaste, EnableBracketedPaste},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -359,12 +361,15 @@ async fn tui(stream: UnixStream, config: &config::Config, session: &str) -> Resu
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
+    // Bracketed paste lets the client tell a paste from typing (#21).
+    execute!(stdout, EnableBracketedPaste)?;
     if config.mouse {
         execute!(stdout, crossterm::event::EnableMouseCapture)?;
     }
     let mut term = Terminal::new(CrosstermBackend::new(stdout))?;
     let result = state.run(&mut term, &mut writer, &mut rx).await;
     disable_raw_mode()?;
+    execute!(term.backend_mut(), DisableBracketedPaste)?;
     execute!(term.backend_mut(), LeaveAlternateScreen)?;
     if config.mouse {
         execute!(term.backend_mut(), crossterm::event::DisableMouseCapture)?;

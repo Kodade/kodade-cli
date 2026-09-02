@@ -25,12 +25,14 @@ use tokio::{io::AsyncWriteExt, net::unix::OwnedWriteHalf, sync::mpsc};
 use crate::{
     config, input, mode,
     overlay::{self, Overlay, OverlayEvent, OverlayTarget},
-    render, settings,
+    paste, render, settings,
 };
 
 const SCROLL_STEP: i16 = 3;
 /// How long a status-bar note stays up.
 const NOTE_TTL: Duration = Duration::from_secs(5);
+/// Pace a multi-chunk paste so the socket writer does not flood the daemon.
+const PASTE_CHUNK_GAP: Duration = Duration::from_millis(5);
 
 type Term = Terminal<CrosstermBackend<std::io::Stdout>>;
 
@@ -83,6 +85,8 @@ pub struct App {
     settings: Option<Overlay>,
     /// Status-bar note and the instant it stops being shown.
     note: Option<(String, Instant)>,
+    /// Last sanitized paste / copy-mode yank, re-sent by `paste_buffer` (#21).
+    paste_buffer: String,
     /// Session reported by the daemon's `Welcome`; shown in the status bar (#11).
     session_name: String,
     /// `prefix q` pane-id flash expiry (#11).
@@ -120,6 +124,7 @@ impl App {
             last_pane: None,
             settings: None,
             note: None,
+            paste_buffer: String::new(),
             session_name: session.to_string(),
             flash_until: None,
             sidebar_hidden_at: None,
@@ -273,6 +278,7 @@ impl App {
                 Event::Mouse(mouse) => {
                     self.handle_mouse(mouse, writer, term).await?;
                 }
+                Event::Paste(text) => self.handle_paste(text, writer).await?,
                 _ => {}
             }
         }
@@ -437,6 +443,8 @@ impl App {
                 if let Some(anchor) = copy_mode.anchor {
                     let text =
                         mode::selected_text(&copy_mode.screen.contents, anchor, copy_mode.cursor);
+                    // Fill the internal paste buffer so `paste_buffer` can re-send it.
+                    self.paste_buffer = text.clone();
                     let (payload, truncated) = mode::osc52(&text);
                     execute!(term.backend_mut(), crossterm::style::Print(payload))?;
                     term.backend_mut().flush()?;
@@ -658,6 +666,14 @@ impl App {
                     write(writer, &ClientMessage::FocusPaneId { id }).await?
                 }
             }
+            config::Action::PasteBuffer => {
+                if self.paste_buffer.is_empty() {
+                    self.set_note(" paste buffer empty");
+                } else {
+                    let text = self.paste_buffer.clone();
+                    self.send_paste(&text, writer).await?;
+                }
+            }
             other => {
                 if let Some(message) = other.message() {
                     write(writer, &message).await?
@@ -766,6 +782,38 @@ impl App {
             },
         )
         .await
+    }
+
+    // A bracketed-paste event: sanitize (when enabled), remember it, and send it.
+    async fn handle_paste(&mut self, text: String, writer: &mut OwnedWriteHalf) -> Result<()> {
+        let text = if self.config.paste_sanitize {
+            paste::sanitize(&text)
+        } else {
+            text
+        };
+        self.paste_buffer = text.clone();
+        self.send_paste(&text, writer).await
+    }
+
+    // Frames text for the focused pane and sends it, pacing multi-chunk pastes.
+    // Bracketed panes get the paste markers; the daemon writes the bytes as-is.
+    async fn send_paste(&self, text: &str, writer: &mut OwnedWriteHalf) -> Result<()> {
+        let bracketed = self
+            .layout
+            .as_ref()
+            .and_then(|layout| layout.panes.iter().find(|pane| pane.focused))
+            .map(|pane| pane.screen.bracketed_paste)
+            .unwrap_or(false);
+        let bytes = paste::wrap(text, bracketed);
+        let chunks = paste::chunks(&bytes, paste::CHUNK_SIZE);
+        let many = chunks.len() > 1;
+        for (index, chunk) in chunks.into_iter().enumerate() {
+            if many && index > 0 {
+                tokio::time::sleep(PASTE_CHUNK_GAP).await;
+            }
+            write(writer, &ClientMessage::Input { bytes: chunk }).await?;
+        }
+        Ok(())
     }
 
     /// Routes a mouse event; ignored entirely when mouse support is off.
