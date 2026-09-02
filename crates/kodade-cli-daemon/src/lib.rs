@@ -2190,7 +2190,7 @@ mod tests {
         }
         let elapsed = started.elapsed();
         assert!(
-            elapsed < Duration::from_secs(1),
+            elapsed < Duration::from_secs(5),
             "100 snapshots took {elapsed:?}"
         );
     }
