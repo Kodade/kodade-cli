@@ -16,6 +16,8 @@ pub struct Config {
     pub copy_on_select: bool,
     /// `notify.enabled` — consumed by the notification work (#10).
     pub notify: bool,
+    /// `paste.sanitize` — strip escape sequences and control bytes from pastes (#21).
+    pub paste_sanitize: bool,
     pub prefix: KeyEvent,
     /// Right-side status bar widgets, in order (#11).
     pub status_right: Vec<StatusWidget>,
@@ -107,6 +109,8 @@ pub enum Action {
     Settings,
     /// Flash big pane ids for a second, tmux `display-panes` style (#11).
     DisplayPanes,
+    // Paste (#21): re-paste the internal buffer.
+    PasteBuffer,
 }
 
 /// Every remappable action and its config name. Single source of truth for
@@ -163,6 +167,7 @@ const ACTIONS: &[(&str, Action)] = &[
     ("reload_config", Action::ReloadConfig),
     ("settings", Action::Settings),
     ("display_panes", Action::DisplayPanes),
+    ("paste_buffer", Action::PasteBuffer),
 ];
 
 impl Action {
@@ -258,7 +263,7 @@ impl Action {
             | Self::ResizeMode
             | Self::DisplayPanes => return None,
             // Client-side only: they never reach the daemon.
-            Self::ReloadConfig | Self::Settings => return None,
+            Self::ReloadConfig | Self::Settings | Self::PasteBuffer => return None,
         })
     }
 }
@@ -269,6 +274,7 @@ struct FileConfig {
     mouse: Option<Section<MouseTable>>,
     sidebar: Option<bool>,
     notify: Option<Section<NotifyTable>>,
+    paste: Option<Section<PasteTable>>,
     keys: Option<HashMap<String, Chords>>,
     status: Option<StatusFile>,
     ui: Option<UiFile>,
@@ -308,6 +314,13 @@ struct MouseTable {
 #[derive(Debug, Deserialize, Default)]
 struct NotifyTable {
     enabled: Option<bool>,
+    #[serde(flatten)]
+    extra: HashMap<String, toml::Value>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct PasteTable {
+    sanitize: Option<bool>,
     #[serde(flatten)]
     extra: HashMap<String, toml::Value>,
 }
@@ -386,6 +399,7 @@ impl Default for Config {
             ("!", Action::BreakPane),
             ("=", Action::LayoutEven),
             ("q", Action::DisplayPanes),
+            ("]", Action::PasteBuffer),
         ] {
             bindings.insert(
                 parse_key_chord(binding).expect("built-in key is valid"),
@@ -405,6 +419,7 @@ impl Default for Config {
             sidebar: true,
             copy_on_select: true,
             notify: true,
+            paste_sanitize: true,
             prefix: parse_key_chord("ctrl+b").expect("built-in prefix is valid"),
             status_right: vec![StatusWidget::Zoom, StatusWidget::Blocked],
             window_title: "Ködade · {workspace} · {tab}".into(),
@@ -466,6 +481,14 @@ impl Config {
             Some(Section::Table(table)) => {
                 config.notify = table.enabled.unwrap_or(config.notify);
                 config.warn_unknown("notify.", &table.extra);
+            }
+            None => {}
+        }
+        match file.paste {
+            Some(Section::Enabled(enabled)) => config.paste_sanitize = enabled,
+            Some(Section::Table(table)) => {
+                config.paste_sanitize = table.sanitize.unwrap_or(config.paste_sanitize);
+                config.warn_unknown("paste.", &table.extra);
             }
             None => {}
         }
@@ -621,6 +644,8 @@ impl Config {
         let _ = writeln!(out, "copy_on_select = {}", self.copy_on_select);
         let _ = writeln!(out, "\n[notify]");
         let _ = writeln!(out, "enabled = {}", self.notify);
+        let _ = writeln!(out, "\n[paste]");
+        let _ = writeln!(out, "sanitize = {}", self.paste_sanitize);
         let _ = writeln!(out, "\n[keys]");
         let _ = writeln!(out, "prefix = {}", toml_string(&render_chord(self.prefix)));
         for (name, action) in Self::actions() {

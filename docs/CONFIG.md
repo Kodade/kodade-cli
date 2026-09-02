@@ -14,6 +14,7 @@ TOML, or omitted setting uses the defaults below.
 | `sidebar` | `true` | Show the sidebar when the TUI starts. |
 | `notify` | `true` | Agent-state notifications. Accepts a boolean or a `[notify]` table. |
 | `notify.enabled` | `true` | Table form of `notify`. |
+| `paste.sanitize` | `true` | Strip escape sequences and control bytes from pasted text before it reaches a pane. Off leaves only bracketed-paste wrapping (no stripping). Accepts a `[paste]` table or a boolean. |
 | `keys.prefix` | `"ctrl+b"` | Prefix key pressed before a remappable action. |
 | `status.right` | `["zoom", "blocked"]` | Right-side status bar widgets, in order. See [Status bar](#status-bar). |
 | `ui.window_title` | `"Ködade · {workspace} · {tab}"` | Host terminal title template (OSC 0). See [Window title](#window-title). |
@@ -114,6 +115,7 @@ single-letter and arrow-key aliases.
 | `reload_config` | `ctrl+r` |
 | `settings` | `s` |
 | `display_panes` | `q` |
+| `paste_buffer` | `]` |
 
 `close_tab` asks for confirmation in the status bar when a pane in the tab is
 working, and `close_workspace` when any agent in it is working or blocked;
@@ -123,6 +125,10 @@ working, and `close_workspace` when any agent in it is working or blocked;
 
 `reload_config` re-reads this file and the theme in place, and `settings`
 opens the [settings menu](#settings-menu).
+
+`paste_buffer` re-sends the last paste (or copy-mode yank) into the focused
+pane; it reports `paste buffer empty` when nothing has been copied yet. See
+[Paste](#paste).
 
 Example:
 
@@ -140,6 +146,25 @@ split_right = ["%", "ctrl+alt+v"]   # prefixed and global
 focus_left = "prefix+alt+h"         # keep it behind the prefix
 copy_mode = "F5"
 ```
+
+## Paste
+
+Ködade CLI turns on [bracketed paste](https://cirw.in/blog/bracketed-paste) so
+a program in the focused pane can tell a paste from typing. Before the bytes
+reach the pane the client sanitizes them (when `paste.sanitize` is on, the
+default): it normalizes `\r\n` to `\n`, drops any embedded escape sequences —
+including a smuggled OSC 52 clipboard write or cursor-moving CSI — and strips
+C0 control bytes other than tab and newline. Large pastes are split into 64 KB
+chunks and paced so the daemon is not flooded. Turning `paste.sanitize` off
+keeps the bracketed-paste framing but sends the text unchanged.
+
+```toml
+[paste]
+sanitize = true         # default; false wraps only, no stripping
+```
+
+The last paste (or copy-mode yank) is kept in an internal buffer that
+`paste_buffer` (`]` by default) re-sends into the focused pane.
 
 ## Session persistence
 
