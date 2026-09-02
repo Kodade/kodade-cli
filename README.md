@@ -80,7 +80,7 @@ Mouse is enabled by default: click panes, tabs, and sidebar rows to focus;
 drag pane borders to resize; scroll over a pane to scroll; right-click a pane,
 tab, or workspace for its menu; the pane menu can break a pane out to its own
 tab or equalize the layout, and the tab menu can reorder tabs. In navigate mode, `j`/`k` move through the
-sidebar and `enter` activates a row; `esc` exits.
+sidebar and `enter` selects a row (folding/unfolding a workspace, or activating a tab/pane); `q` or `esc` exits.
 
 The sidebar has three shapes cycled by `prefix b`: the full list, a compact
 3-column rail of workspace state dots, and a hidden 1-column gutter. It is

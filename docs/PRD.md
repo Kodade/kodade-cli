@@ -4,6 +4,12 @@
 **Owner:** @ContractorKeith
 **Repo:** github.com/Kodade/kodade-cli · Apache License 2.0
 
+> **Implementation status (2026-09-02):** v0.2.0 implements the §5.x product
+> design — object model, screen layout, agent detection, input model, CLI
+> surface, persistence, and theming — across issues #6–#24. See
+> [docs/features/v0-2-parity/PLAN.md](features/v0-2-parity/PLAN.md) for the
+> per-issue plan and outcomes. This PRD remains the design reference.
+
 ## 1. Summary
 
 Ködade CLI is a lightweight terminal workspace for running and supervising

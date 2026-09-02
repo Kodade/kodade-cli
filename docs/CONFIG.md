@@ -109,7 +109,8 @@ agents_panel = true
 `prefix b` cycles the sidebar full → compact → hidden → full. Compact is a
 3-column rail of one state dot per workspace; clicking a dot selects it. In the
 full sidebar, `prefix n` (navigate) moves with `j`/`k`, `enter` folds/unfolds a
-workspace (and selects it), `*` expands all, and the agents panel below the
+workspace (and selects it) or activates a tab/pane, `q`/`esc` exits navigate,
+`*` expands all, and the agents panel below the
 workspaces lists every agent pane by urgency. Right-click a workspace for a
 `Color…` menu that cycles its swatch through 8 presets; collapsed workspaces are
 remembered per session in `~/.config/kodade-cli/state`.

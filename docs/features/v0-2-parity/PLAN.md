@@ -148,3 +148,40 @@ rows, and selection. Help (#6), pickers (#17), and settings (#20) all use it.
 - Small-team code: readable over clever, brief comments marking functions and
   non-obvious constraints, a new dependency needs a one-line reason in
   `Cargo.toml`.
+
+## Outcome (2026-09-02)
+
+All v0.2.0 issues landed on `main`. Landing commit per issue:
+
+| Issue | Landing commit | Summary |
+| --- | --- | --- |
+| #6 | `38413fd` | Help overlay, `keys` command, status hints from the binding table |
+| #7 | `be6167a` | Cell-level pane rendering with colors, attributes, cursor |
+| #8 | `c08a8a6` | Ködade themes, expanded theme schema, ANSI palette |
+| #9 | `a585254` | Persist session layout, restore on daemon restart |
+| #10 | `2b1f5ad` | Agent notifications: status toast, bell, OSC 777, sound, `prefix N` |
+| #11 | `91d890b` | Status bar widgets, pane ids/cwd in chrome, window title, display-panes |
+| #12 | `9015ef6` | Mouse text selection, copy-on-select, link clicks, passthrough |
+| #13 | `f3644f2` | Workspace roots, cwd inheritance, new/run/split/new-tab |
+| #14 | `1754231` | Tab, pane, and workspace management actions |
+| #15 | `467e2c7` | Copy mode: search, vi motions, scrollback, editor, pane read |
+| #16 | `6320cc0` | Scripting parity: pane/tab/workspace/session verbs, wait, events, completions |
+| #17 | `4991074` | Fuzzy workspace picker and goto picker overlays |
+| #18 | `23eca6e` | Broader agent detection, state age, sticky done, codex/gemini |
+| #19 | `f737b85` | Configurable sidebar: compact rail, per-workspace collapse, agents panel, swatches |
+| #20 | `0fb8a24` | Binding arrays, global chords, config reload, settings overlay, config subcommands |
+| #21 | `550e64e` | Bracketed paste, paste sanitizing, internal paste buffer |
+| #22 | `f679157` | Git worktree workspaces, `prefix G`, worktree CLI, branch labels |
+| #23 | `262036a` | Remote mode over an SSH-forwarded socket, protocol version handshake |
+| #24 | this sweep | Review-nit verification, doc sync, outcomes (the clap `--version` and dependency bumps landed earlier in `4fd3be9`) |
+
+### Human follow-ups
+
+- **#8 / #11:** capture README screenshots of the Ködade theme and the status-bar
+  widgets (colored panes, pane ids/cwd, window title) — the docs describe them
+  but ship no images yet.
+- **#18:** replace the placeholder prompt strings in the unverified agent
+  manifests with real captured prompts (the shipped manifests for less-common
+  agents were written from docs, not observed output).
+- **#23:** run a live remote test over a real SSH-forwarded socket; only the
+  local socket resolver and handshake are unit-tested, the tunnel path is not.
