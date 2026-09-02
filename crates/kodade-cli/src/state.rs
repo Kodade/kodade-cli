@@ -2,8 +2,9 @@
 //!
 //! This is small, non-critical UI memory (collapsed sidebar workspaces, and the
 //! `help_seen` flag #6 owns) — not session layout, which the daemon persists.
-//! Every field is `#[serde(default)]` so the file merges cleanly across
-//! features and a missing or malformed file just starts empty.
+//! Every known field is `#[serde(default)]` and any unknown keys are captured in
+//! a flattened `extra` map, so writing one feature's state preserves every other
+//! key in the file and a missing or malformed file just starts empty.
 
 use std::{collections::HashMap, fs};
 
@@ -23,6 +24,10 @@ pub struct State {
     /// Collapsed sidebar workspaces, keyed by session, then workspace name (#19).
     #[serde(default)]
     pub collapsed: HashMap<String, Vec<String>>,
+    /// Any other keys in the file (from features this build does not know about)
+    /// are carried through so `save()` never drops them.
+    #[serde(flatten)]
+    extra: HashMap<String, toml::Value>,
 }
 
 impl State {
@@ -34,13 +39,22 @@ impl State {
             .unwrap_or_default()
     }
 
+    /// Serialize to a TOML document. Going through a `Value` first lets the
+    /// serializer order scalar keys before tables (serializing the struct
+    /// directly would error when a flattened scalar follows the `collapsed`
+    /// table).
+    fn to_toml(&self) -> Result<String, toml::ser::Error> {
+        let value = toml::Value::try_from(self)?;
+        toml::to_string(&value)
+    }
+
     /// Write the state file, best-effort (a failure is not fatal to the UI).
     pub fn save(&self) {
         let path = state_path();
         if let Some(parent) = path.parent() {
             let _ = fs::create_dir_all(parent);
         }
-        if let Ok(text) = toml::to_string(self) {
+        if let Ok(text) = self.to_toml() {
             let _ = fs::write(path, text);
         }
     }
@@ -85,6 +99,25 @@ mod tests {
         state.collapsed.insert("work".into(), Vec::new());
         state.collapsed.retain(|_, names| !names.is_empty());
         assert!(state.collapsed_for("work").is_empty());
+    }
+
+    #[test]
+    fn unknown_keys_survive_a_collapse_toggle() {
+        // A key written by some other feature this build does not know about.
+        let source = "help_seen = true\nfuture_flag = 7\n";
+        let mut state: State = toml::from_str(source).expect("parse");
+        // Mutating collapse and re-serializing must keep the unknown key intact.
+        state.collapsed.insert("work".into(), vec!["api".into()]);
+        let text = state.to_toml().expect("serialize");
+        let back: State = toml::from_str(&text).expect("re-parse");
+        assert!(back.help_seen);
+        assert_eq!(back.collapsed_for("work"), vec!["api"]);
+        assert_eq!(
+            back.extra
+                .get("future_flag")
+                .and_then(toml::Value::as_integer),
+            Some(7)
+        );
     }
 
     #[test]

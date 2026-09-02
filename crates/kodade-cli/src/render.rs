@@ -968,6 +968,9 @@ pub struct SidebarLayout {
     /// First row (relative to the sidebar top) of the agents panel.
     pub agents_y: u16,
     pub agents_height: u16,
+    /// First agents-section row drawn, so a selected agent past the panel
+    /// height scrolls into view (#19).
+    pub agents_offset: usize,
 }
 
 pub fn sidebar_layout(height: u16, model: &SidebarModel, selected: Option<usize>) -> SidebarLayout {
@@ -980,11 +983,21 @@ pub fn sidebar_layout(height: u16, model: &SidebarModel, selected: Option<usize>
     };
     let ws_height = height.saturating_sub(agents_height);
     let ws_len = model.workspaces.len();
-    // Scroll the workspaces list when the selected row would fall off the end.
+    // Scroll each section so its selected row stays visible. When the selection
+    // sits in the agents panel, hold the workspaces list at the bottom of its
+    // range (its "last" offset) rather than snapping back to the top.
     let ws_offset = match selected {
         Some(index) if index < ws_len && ws_height > 0 => {
-            let visible = ws_height as usize;
-            index.saturating_sub(visible - 1)
+            index.saturating_sub(ws_height as usize - 1)
+        }
+        Some(index) if index >= ws_len && ws_height > 0 => {
+            ws_len.saturating_sub(ws_height as usize)
+        }
+        _ => 0,
+    };
+    let agents_offset = match selected {
+        Some(index) if index >= ws_len && agents_height > 0 => {
+            (index - ws_len).saturating_sub(agents_height as usize - 1)
         }
         _ => 0,
     };
@@ -993,6 +1006,7 @@ pub fn sidebar_layout(height: u16, model: &SidebarModel, selected: Option<usize>
         ws_height,
         agents_y: ws_height,
         agents_height,
+        agents_offset,
     }
 }
 
@@ -1013,9 +1027,10 @@ pub fn sidebar_row_at<'a>(
         if within >= layout.agents_height as usize {
             return None;
         }
-        let row = model.agents.get(within)?;
+        let index = layout.agents_offset + within;
+        let row = model.agents.get(index)?;
         row.target.as_ref()?;
-        Some((model.workspaces.len() + within, row))
+        Some((model.workspaces.len() + index, row))
     }
 }
 
@@ -1076,12 +1091,13 @@ fn render_sidebar(
         let selected = navigate == Some(index);
         draw_sidebar_row(frame, area, area.y + screen, row, selected, theme);
     }
-    // Agents panel, pinned below the workspaces list.
+    // Agents panel, pinned below the workspaces list (scrolled to its selection).
     for screen in 0..place.agents_height {
-        let Some(row) = model.agents.get(screen as usize) else {
+        let index = place.agents_offset + screen as usize;
+        let Some(row) = model.agents.get(index) else {
             break;
         };
-        let flat = model.workspaces.len() + screen as usize;
+        let flat = model.workspaces.len() + index;
         let selected = navigate == Some(flat);
         draw_sidebar_row(
             frame,
@@ -1121,28 +1137,43 @@ fn draw_sidebar_row(
             style
         }
     };
-    // A workspace row gets a 1-cell swatch before its label.
-    if let (Some(color), false) = (row.color, selected) {
+    // A workspace row reserves a 1-cell swatch before its label. The cell is
+    // always reserved (even when selected) so the label never shifts; on a
+    // selected row the swatch sits under the accent background.
+    if let Some(color) = row.color {
+        let swatch = if selected {
+            base
+        } else {
+            Style::default().fg(color).bg(theme.sidebar_bg)
+        };
         frame.render_widget(
-            Paragraph::new("█").style(Style::default().fg(color).bg(theme.sidebar_bg)),
+            Paragraph::new("█").style(swatch),
             Rect::new(area.x, y, 1, 1),
         );
         let inner = Rect::new(area.x + 1, y, area.width.saturating_sub(1), 1);
-        let text = truncate_ellipsis(
-            &format!("{} {}", row.label, sidebar_dot(row.state)),
-            inner.width as usize,
+        frame.render_widget(
+            Paragraph::new(sidebar_row_text(row, inner.width as usize)).style(base),
+            inner,
         );
-        frame.render_widget(Paragraph::new(text).style(base), inner);
         return;
     }
-    let text = truncate_ellipsis(
-        &format!("{} {}", row.label, sidebar_dot(row.state)),
-        area.width as usize,
-    );
     frame.render_widget(
-        Paragraph::new(text).style(base),
+        Paragraph::new(sidebar_row_text(row, area.width as usize)).style(base),
         Rect::new(area.x, y, area.width, 1),
     );
+}
+
+/// Render a row's label plus its trailing state dot into `width` columns,
+/// reserving the dot's cell so truncation drops label text, never the dot (#19).
+fn sidebar_row_text(row: &SidebarRow, width: usize) -> String {
+    let dot = sidebar_dot(row.state);
+    // Leading space + the (single-column) dot.
+    let reserved = dot.chars().count() + 1;
+    if width <= reserved {
+        return truncate_ellipsis(&format!("{} {}", row.label, dot), width);
+    }
+    let label = truncate_ellipsis(&row.label, width - reserved);
+    format!("{label} {dot}")
 }
 
 /// One state dot per workspace, colored by rollup state; the active workspace's
@@ -1516,6 +1547,57 @@ mod tests {
         let last_ws = model.workspaces.len() - 1;
         let deep = sidebar_layout(6, &model, Some(last_ws));
         assert_eq!(deep.ws_offset, last_ws + 1 - deep.ws_height as usize);
+    }
+
+    #[test]
+    fn agents_panel_scrolls_and_hit_tests_its_selection() {
+        let mut layout = snapshot();
+        // Ten agents in the second workspace so the panel overflows.
+        layout.workspaces[1].tabs[0].agents = (0..10)
+            .map(|i| AgentInfo {
+                pane: PaneId(100 + i),
+                name: format!("a{i}"),
+                state: AgentStateKind::Working,
+                state_age_secs: i,
+            })
+            .collect();
+        let model = sidebar_rows(&layout, &no_collapse(), true);
+        let ws_len = model.workspaces.len();
+        // Select the last agent row (flat index past the panel height).
+        let last_agent = ws_len + model.agents.len() - 1;
+        let place = sidebar_layout(20, &model, Some(last_agent));
+        assert_eq!(place.agents_height, 8);
+        // The agents section scrolled so the selected row is the last drawn one.
+        assert_eq!(
+            place.agents_offset,
+            model.agents.len() - place.agents_height as usize
+        );
+        // The workspaces list holds at the bottom of its range, not snapped to 0.
+        assert_eq!(place.ws_offset, ws_len - place.ws_height as usize);
+        // The selected agent row is drawn on the panel's last screen line and is
+        // hit-testable there (it was previously off-panel and unreachable).
+        let last_screen = place.agents_y + place.agents_height - 1;
+        let (flat, row) = sidebar_row_at(&model, &place, last_screen).expect("row drawn");
+        assert_eq!(flat, last_agent);
+        assert_eq!(row.target, model.agents.last().unwrap().target);
+    }
+
+    #[test]
+    fn sidebar_row_text_reserves_the_state_dot() {
+        let row = SidebarRow {
+            kind: SidebarKind::Pane,
+            target: Some(SidebarTarget::Pane(PaneId(1))),
+            label: "a-very-long-agent-name-here".into(),
+            state: AgentStateKind::Blocked,
+            dim: false,
+            color: None,
+        };
+        let dot = sidebar_dot(AgentStateKind::Blocked);
+        let text = sidebar_row_text(&row, 12);
+        // Fits the width and always ends with the state dot (never truncated off).
+        assert_eq!(text.chars().count(), 12);
+        assert!(text.ends_with(dot), "{text:?} should keep the dot");
+        assert!(text.contains('…'), "long label should be ellipsized");
     }
 
     #[test]

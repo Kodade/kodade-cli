@@ -102,8 +102,9 @@ pub struct App {
     collapsed: HashSet<WorkspaceId>,
     /// Persisted UI state (collapsed workspaces, help_seen); loaded once (#19).
     ui_state: state::State,
-    /// Whether persisted collapse has been reconciled against a snapshot yet.
-    collapsed_seeded: bool,
+    /// Workspace ids already reconciled against the persisted collapse set, so a
+    /// newly appearing workspace is seeded but existing ones are left alone (#19).
+    seeded_ids: HashSet<WorkspaceId>,
     /// True when auto-hide collapsed the sidebar, so widening restores it (#19).
     auto_hidden: bool,
     navigate: Option<usize>,
@@ -185,7 +186,7 @@ impl App {
             },
             collapsed: HashSet::new(),
             ui_state: state::State::load(),
-            collapsed_seeded: false,
+            seeded_ids: HashSet::new(),
             auto_hidden: false,
             navigate: None,
             copy: None,
@@ -245,7 +246,7 @@ impl App {
 
     /// Collapse a full sidebar under the auto-hide column threshold, and restore
     /// it once the terminal is wide enough again (#19).
-    fn apply_auto_hide(&mut self, cols: u16) {
+    pub fn apply_auto_hide(&mut self, cols: u16) {
         let below = cols < self.config.sidebar_auto_hide_below;
         if below && self.sidebar_mode == SidebarMode::Full {
             self.sidebar_mode = config_collapsed_mode(&self.config);
@@ -292,20 +293,22 @@ impl App {
         self.seed_collapsed();
     }
 
-    /// On the first snapshot, map persisted collapsed workspace names to ids so
-    /// the sidebar reopens with the same workspaces folded (#19).
+    /// Map persisted collapsed workspace names to ids so the sidebar reopens
+    /// with the same workspaces folded. Runs every snapshot but only seeds ids
+    /// it has not seen yet, so a workspace that first appears later is still
+    /// reconciled while ones the user has since toggled are left alone (#19).
     fn seed_collapsed(&mut self) {
-        if self.collapsed_seeded {
-            return;
-        }
         let Some(layout) = &self.layout else { return };
+        let ids: HashSet<WorkspaceId> = layout.workspaces.iter().map(|w| w.id).collect();
         let names = self.ui_state.collapsed_for(&self.session_name);
         for workspace in &layout.workspaces {
-            if names.contains(&workspace.name) {
+            if self.seeded_ids.insert(workspace.id) && names.contains(&workspace.name) {
                 self.collapsed.insert(workspace.id);
             }
         }
-        self.collapsed_seeded = true;
+        // Drop bookkeeping for workspaces that have gone away.
+        self.seeded_ids.retain(|id| ids.contains(id));
+        self.collapsed.retain(|id| ids.contains(id));
     }
 
     /// Persist the current collapsed set as workspace names for this session.
@@ -580,7 +583,7 @@ impl App {
         } else if self.picker.is_some() {
             self.handle_picker_key(key, writer).await?;
         } else if let Some(current) = self.navigate {
-            self.handle_navigate_key(key, current, writer).await?;
+            self.handle_navigate_key(key, current, writer, term).await?;
         } else if self.resize {
             self.handle_resize_key(key, writer).await?;
         } else if self.prefix {
@@ -920,13 +923,17 @@ impl App {
         key: KeyEvent,
         current: usize,
         writer: &mut OwnedWriteHalf,
+        term: &mut Term,
     ) -> Result<()> {
         let rows = self.sidebar_flat();
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => {
                 self.navigate = None;
                 if !self.config.sidebar {
+                    // Restoring the collapsed shape shrinks the sidebar, so tell
+                    // the daemon the new pane width.
                     self.sidebar_mode = config_collapsed_mode(&self.config);
+                    self.send_resize(writer, term).await?;
                 }
             }
             KeyCode::Up | KeyCode::Char('k') => {
@@ -1069,8 +1076,11 @@ impl App {
                 });
             }
             config::Action::SidebarToggle => {
-                // Cycle full → compact → hidden → full (#19).
+                // Cycle full → compact → hidden → full (#19). A deliberate choice
+                // clears the auto-hide flag so a later widening resize does not
+                // override it.
                 self.sidebar_mode = self.sidebar_mode.next();
+                self.auto_hidden = false;
                 if self.sidebar_mode == SidebarMode::Hidden {
                     self.sidebar_hidden_at = Some(Instant::now());
                 }
@@ -1098,8 +1108,15 @@ impl App {
                 }
             }
             config::Action::Navigate => {
+                // Opening navigate forces the full sidebar; tell the daemon the
+                // new pane width when that actually widened the sidebar.
+                let widened = self.sidebar_mode != SidebarMode::Full;
                 self.sidebar_mode = SidebarMode::Full;
+                self.auto_hidden = false;
                 self.navigate = self.first_selectable_row();
+                if widened {
+                    self.send_resize(writer, term).await?;
+                }
             }
             config::Action::CopyMode => {
                 // Freeze the focused pane's full history; viewport height comes
@@ -1343,11 +1360,13 @@ impl App {
                 set_mouse_capture(term, self.mouse_capture)?;
             }
             settings::Setting::Sidebar => {
+                // A deliberate toggle clears auto-hide so a later resize keeps it.
                 self.sidebar_mode = if self.config.sidebar {
                     SidebarMode::Full
                 } else {
                     config_collapsed_mode(&self.config)
                 };
+                self.auto_hidden = false;
                 self.send_resize(writer, term).await?;
             }
             settings::Setting::CopyOnSelect | settings::Setting::Notify => {}
@@ -2203,7 +2222,7 @@ mod tests {
     #[test]
     fn auto_hide_collapses_at_80_columns_and_restores_when_widened() {
         let config = config::Config::default();
-        let mut app = App::new(&config, "work");
+        let mut app = App::new(&config, "work", PathBuf::from("/tmp/kodade-test.sock"));
         // Default auto_hide_below is 100 columns; 80 is under it.
         app.apply_auto_hide(80);
         assert_eq!(app.sidebar_mode, SidebarMode::Compact);
@@ -2217,7 +2236,7 @@ mod tests {
     #[test]
     fn sidebar_toggle_cycles_full_compact_hidden() {
         let config = config::Config::default();
-        let mut app = App::new(&config, "work");
+        let mut app = App::new(&config, "work", PathBuf::from("/tmp/kodade-test.sock"));
         assert_eq!(app.sidebar_mode, SidebarMode::Full);
         app.sidebar_mode = app.sidebar_mode.next();
         assert_eq!(app.sidebar_mode, SidebarMode::Compact);
@@ -2225,6 +2244,62 @@ mod tests {
         assert_eq!(app.sidebar_mode, SidebarMode::Hidden);
         app.sidebar_mode = app.sidebar_mode.next();
         assert_eq!(app.sidebar_mode, SidebarMode::Full);
+    }
+
+    // A layout with the named workspaces; workspace i gets `WorkspaceId(i+1)`.
+    fn layout_named(names: &[&str]) -> LayoutSnapshot {
+        let workspaces = names
+            .iter()
+            .enumerate()
+            .map(|(i, name)| WorkspaceInfo {
+                id: kodade_cli_proto::WorkspaceId(i as u64 + 1),
+                name: (*name).into(),
+                active: i == 0,
+                state: AgentStateKind::Idle,
+                root: None,
+                color: None,
+                tabs: Vec::new(),
+            })
+            .collect();
+        LayoutSnapshot {
+            active_workspace: kodade_cli_proto::WorkspaceId(1),
+            active_tab: kodade_cli_proto::TabId(1),
+            workspaces,
+            tabs: Vec::new(),
+            tree: kodade_cli_proto::LayoutTree::Leaf { pane: PaneId(1) },
+            panes: Vec::new(),
+            zoomed: false,
+            restored: false,
+        }
+    }
+
+    #[test]
+    fn seed_collapsed_reconciles_newly_appearing_workspaces() {
+        use kodade_cli_proto::WorkspaceId;
+        let config = config::Config::default();
+        let mut app = App::new(
+            &config,
+            "seed-test-session",
+            PathBuf::from("/tmp/kodade-test.sock"),
+        );
+        // Persisted collapse names a workspace that has not appeared yet.
+        app.ui_state
+            .collapsed
+            .insert("seed-test-session".into(), vec!["beta".into()]);
+        // First snapshot has only alpha; beta absent, so nothing collapses.
+        app.handle_layout(layout_named(&["alpha"]));
+        assert!(app.collapsed.is_empty());
+        // beta appears in a later snapshot and is seeded from the persisted set.
+        app.handle_layout(layout_named(&["alpha", "beta"]));
+        assert!(app.collapsed.contains(&WorkspaceId(2)));
+        // A workspace the user expands stays expanded across later snapshots.
+        app.collapsed.remove(&WorkspaceId(2));
+        app.handle_layout(layout_named(&["alpha", "beta"]));
+        assert!(!app.collapsed.contains(&WorkspaceId(2)));
+        // A workspace that goes away is dropped from the collapsed set.
+        app.collapsed.insert(WorkspaceId(2));
+        app.handle_layout(layout_named(&["alpha"]));
+        assert!(!app.collapsed.contains(&WorkspaceId(2)));
     }
 
     #[test]

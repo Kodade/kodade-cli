@@ -166,6 +166,8 @@ impl CollapsedMode {
 pub const SIDEBAR_WIDTH_MIN: u16 = 16;
 pub const SIDEBAR_WIDTH_MAX: u16 = 40;
 pub const SIDEBAR_WIDTH_DEFAULT: u16 = 24;
+/// Upper bound for `sidebar.auto_hide_below` (columns); 0 disables auto-hide.
+pub const SIDEBAR_AUTO_HIDE_MAX: u16 = 400;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Action {
@@ -715,9 +717,16 @@ impl Config {
                             .push(format!("unknown sidebar.collapsed {name}")),
                     }
                 }
-                config.sidebar_auto_hide_below = table
-                    .auto_hide_below
-                    .unwrap_or(config.sidebar_auto_hide_below);
+                if let Some(below) = table.auto_hide_below {
+                    // Out-of-range values are clamped to 0..=400 with a warning.
+                    let clamped = below.clamp(0, SIDEBAR_AUTO_HIDE_MAX);
+                    if clamped != below {
+                        config.warnings.push(format!(
+                            "sidebar.auto_hide_below {below} out of range 0..={SIDEBAR_AUTO_HIDE_MAX}, using {clamped}"
+                        ));
+                    }
+                    config.sidebar_auto_hide_below = clamped;
+                }
                 config.sidebar_agents_panel =
                     table.agents_panel.unwrap_or(config.sidebar_agents_panel);
                 config.warn_unknown("sidebar.", &table.extra);
@@ -1915,6 +1924,14 @@ red = \"#abcdef\"
             toml::from_str::<FileConfig>("[sidebar]\nwidth = 4\n").expect("narrow parses"),
         );
         assert_eq!(narrow.sidebar_width, SIDEBAR_WIDTH_MIN);
+        // An out-of-range auto_hide_below clamps to 0..=400 with a warning.
+        let wide = Config::from_file(
+            toml::from_str::<FileConfig>("[sidebar]\nauto_hide_below = 9000\n")
+                .expect("wide parses"),
+        );
+        assert_eq!(wide.sidebar_auto_hide_below, SIDEBAR_AUTO_HIDE_MAX);
+        assert_eq!(wide.warnings.len(), 1);
+        assert!(wide.warnings[0].contains("auto_hide_below"));
     }
 
     #[test]

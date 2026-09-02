@@ -447,6 +447,9 @@ async fn tui(
     let mut lines = BufReader::new(reader).lines();
     let mut state = app::App::new(config, session, socket.to_path_buf());
     let (cols, rows) = crossterm::terminal::size()?;
+    // Collapse the sidebar before the first Hello so a narrow launch starts with
+    // the right pane width (#19).
+    state.apply_auto_hide(cols);
     // Send a versioned Hello, then verify the daemon speaks our protocol before
     // touching the terminal so a mismatch prints cleanly and exits 1 (#23).
     writer

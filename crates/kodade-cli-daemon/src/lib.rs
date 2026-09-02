@@ -1150,6 +1150,12 @@ impl Session {
                 self.notify();
             }
             ClientMessage::SetWorkspaceColor { id, color } => {
+                // Reject anything that is not `#` + 6 hex digits; `None` clears it.
+                if let Some(hex) = &color {
+                    if !is_hex_color(hex) {
+                        bail!("workspace color must be #rrggbb, got {hex:?}");
+                    }
+                }
                 let mut state = self
                     .state
                     .lock()
@@ -2035,6 +2041,13 @@ fn scroll_offset_after_delta(offset: usize, delta: i16, available: usize) -> usi
     next.min(available)
 }
 
+/// A `#rrggbb` color literal: a leading `#` and exactly six hex digits (#19).
+fn is_hex_color(value: &str) -> bool {
+    value
+        .strip_prefix('#')
+        .is_some_and(|rest| rest.len() == 6 && rest.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
 /// PTY reading blocks, so parser ownership stays in Tokio's blocking pool.
 fn read_pty(
     mut reader: Box<dyn Read + Send>,
@@ -2850,6 +2863,51 @@ mod tests {
             .expect("read line")
             .expect("stream open");
         decode::<ServerMessage>(line.as_bytes()).expect("decode server message")
+    }
+
+    #[test]
+    fn is_hex_color_requires_hash_and_six_hex_digits() {
+        assert!(is_hex_color("#001122"));
+        assert!(is_hex_color("#AbCdEf"));
+        assert!(!is_hex_color("#0011"));
+        assert!(!is_hex_color("#00112g"));
+        assert!(!is_hex_color("001122"));
+        assert!(!is_hex_color("red"));
+    }
+
+    #[tokio::test]
+    async fn set_workspace_color_validates_and_clears() {
+        let session = Session::spawn(80, 24, "color".into()).expect("spawn session");
+        let id = session.snapshot().expect("snapshot").workspaces[0].id;
+        // Bad values are rejected without mutating the workspace.
+        assert!(session
+            .handle(ClientMessage::SetWorkspaceColor {
+                id,
+                color: Some("red".into()),
+            })
+            .is_err());
+        assert!(session
+            .handle(ClientMessage::SetWorkspaceColor {
+                id,
+                color: Some("#12345".into()),
+            })
+            .is_err());
+        assert_eq!(session.snapshot().unwrap().workspaces[0].color, None);
+        // A valid `#rrggbb` sticks and `None` clears it again.
+        session
+            .handle(ClientMessage::SetWorkspaceColor {
+                id,
+                color: Some("#AbCdEf".into()),
+            })
+            .expect("valid color accepted");
+        assert_eq!(
+            session.snapshot().unwrap().workspaces[0].color.as_deref(),
+            Some("#AbCdEf")
+        );
+        session
+            .handle(ClientMessage::SetWorkspaceColor { id, color: None })
+            .expect("clear accepted");
+        assert_eq!(session.snapshot().unwrap().workspaces[0].color, None);
     }
 
     #[tokio::test]
