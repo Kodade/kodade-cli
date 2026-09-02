@@ -67,6 +67,8 @@ struct Workspace {
     active_tab: TabId,
     /// Directory new panes in this workspace fall back to (PRD §5.1).
     root: Option<PathBuf>,
+    /// Sidebar swatch color as `#rrggbb`, when the user set one (#19).
+    color: Option<String>,
 }
 struct Tab {
     id: TabId,
@@ -298,6 +300,7 @@ impl Session {
                 active_tab: tab.id,
                 tabs: vec![tab],
                 root: None,
+                color: None,
             });
         Ok(session)
     }
@@ -370,6 +373,7 @@ impl Session {
                 tabs,
                 active_tab,
                 root: saved.root.clone(),
+                color: saved.color.clone(),
             });
         }
         let active_workspace = workspace_ids
@@ -396,6 +400,7 @@ impl Session {
                 id: workspace.id.0,
                 name: workspace.name.clone(),
                 root: workspace.root.clone(),
+                color: workspace.color.clone(),
                 active_tab: workspace.active_tab.0,
                 tabs: workspace
                     .tabs
@@ -716,6 +721,7 @@ impl Session {
                         active: item.id == workspace.id,
                         state: agent::rollup(tabs.iter().map(|tab| tab.state)),
                         root: item.root.clone(),
+                        color: item.color.clone(),
                         tabs,
                     }
                 })
@@ -1143,6 +1149,17 @@ impl Session {
                 drop(state);
                 self.notify();
             }
+            ClientMessage::SetWorkspaceColor { id, color } => {
+                let mut state = self
+                    .state
+                    .lock()
+                    .map_err(|_| anyhow!("state lock poisoned"))?;
+                if let Some(workspace) = state.workspaces.iter_mut().find(|item| item.id == id) {
+                    workspace.color = color;
+                }
+                drop(state);
+                self.notify();
+            }
             ClientMessage::NewWorkspace { name, root } => {
                 // A workspace root seeds its first pane's cwd; later panes inherit.
                 let pane = self.new_pane("shell", root.clone(), None)?;
@@ -1164,6 +1181,7 @@ impl Session {
                         zoomed: false,
                     }],
                     root,
+                    color: None,
                 });
                 state.active_workspace = id;
                 drop(state);
@@ -2520,6 +2538,7 @@ mod tests {
                     name: "one".into(),
                     active_tab: TabId(2),
                     root: None,
+                    color: None,
                     tabs: vec![Tab {
                         id: TabId(2),
                         name: "shell".into(),
@@ -2533,6 +2552,7 @@ mod tests {
                     name: "two".into(),
                     active_tab: TabId(5),
                     root: None,
+                    color: None,
                     tabs: vec![Tab {
                         id: TabId(5),
                         name: "agents".into(),
@@ -2559,6 +2579,7 @@ mod tests {
                 name: "one".into(),
                 active_tab: TabId(2),
                 root: None,
+                color: None,
                 tabs: vec![Tab {
                     id: TabId(2),
                     name: "agents".into(),
@@ -2621,6 +2642,7 @@ mod tests {
                     id: 10,
                     name: "one".into(),
                     root: Some(PathBuf::from("/tmp")),
+                    color: Some("#e7a33b".into()),
                     active_tab: 20,
                     tabs: vec![
                         persist::TabFile {
@@ -2668,6 +2690,7 @@ mod tests {
                     id: 11,
                     name: "two".into(),
                     root: None,
+                    color: None,
                     active_tab: 22,
                     tabs: vec![persist::TabFile {
                         id: 22,

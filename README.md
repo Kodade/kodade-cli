@@ -53,7 +53,7 @@ The default prefix is `ctrl+b`. After the prefix, the default actions are:
 | `r` / `W` | Rename / new workspace (`W` prompts for `NAME [PATH]`) |
 | `w` / `g` | Workspace picker / goto palette (fuzzy; type to filter, `enter` jumps) |
 | `alt+w` | Next workspace (cycle without the picker) |
-| `b` / `[` | Toggle sidebar / copy mode |
+| `b` / `[` | Cycle sidebar (full → compact → hidden) / copy mode |
 | `h` `j` `k` `l` or arrows | Focus left, down, up, right |
 | `H` `J` `K` `L` | Resize left, down, up, right |
 | `1`–`9` | Jump to that tab |
@@ -80,6 +80,15 @@ drag pane borders to resize; scroll over a pane to scroll; right-click a pane,
 tab, or workspace for its menu; the pane menu can break a pane out to its own
 tab or equalize the layout, and the tab menu can reorder tabs. In navigate mode, `j`/`k` move through the
 sidebar and `enter` activates a row; `esc` exits.
+
+The sidebar has three shapes cycled by `prefix b`: the full list, a compact
+3-column rail of workspace state dots, and a hidden 1-column gutter. It is
+configurable via `[sidebar]` (`width`, `collapsed`, `auto_hide_below`,
+`agents_panel`) and auto-hides on narrow terminals. Every workspace can be
+folded (`enter` in navigate, `*` expands all; remembered per session), an agents
+panel below the workspaces lists agent panes by urgency, and each workspace
+carries a color swatch (right-click → `Color…`, or an auto-hashed fallback). See
+[docs/CONFIG.md](docs/CONFIG.md#settings).
 
 Dragging inside a pane selects text and copies it on release
 (`mouse.copy_on_select`, OSC 52 so it works over SSH); double-click selects a

@@ -13,6 +13,7 @@ mod remote;
 mod render;
 mod selection;
 mod settings;
+mod state;
 
 use anyhow::{anyhow, Context, Result};
 use clap::Parser;

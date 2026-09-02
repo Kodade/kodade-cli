@@ -144,6 +144,12 @@ pub enum ClientMessage {
         state: AgentStateKind,
         source: String,
     },
+    /// Set (or clear) a workspace's sidebar swatch color, as a `#rrggbb` hex
+    /// string. `None` clears it back to the auto-hashed fallback (#19).
+    SetWorkspaceColor {
+        id: WorkspaceId,
+        color: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -254,6 +260,10 @@ pub struct WorkspaceInfo {
     pub state: AgentStateKind,
     /// Root directory new panes in this workspace start in, if one is set.
     pub root: Option<PathBuf>,
+    /// Optional sidebar swatch color as `#rrggbb`; `None` uses the auto-hashed
+    /// fallback in the client (#19). Older daemons omit it.
+    #[serde(default)]
+    pub color: Option<String>,
     /// Metadata for every tab, including panes outside the active screen.
     pub tabs: Vec<SidebarTabInfo>,
 }
@@ -384,6 +394,7 @@ mod tests {
                 active: true,
                 state: AgentStateKind::Idle,
                 root: Some(PathBuf::from("/tmp/repo")),
+                color: None,
                 tabs: vec![SidebarTabInfo {
                     id: TabId(2),
                     name: "shell".into(),

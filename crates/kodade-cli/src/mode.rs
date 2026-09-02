@@ -2,8 +2,6 @@ use std::time::Instant;
 
 use kodade_cli_proto::{PaneId, TabId, WorkspaceId};
 
-use crate::render::SidebarTarget;
-
 pub const OSC52_LIMIT: usize = 100_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -524,15 +522,6 @@ fn base64(input: &[u8]) -> String {
     out
 }
 
-pub fn navigate(rows: &[SidebarTarget], current: Option<usize>, delta: isize) -> Option<usize> {
-    (!rows.is_empty()).then(|| {
-        current
-            .unwrap_or(0)
-            .saturating_add_signed(delta)
-            .min(rows.len() - 1)
-    })
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MenuTarget {
     Pane(PaneId),
@@ -555,6 +544,8 @@ pub enum MenuAction {
     MoveRight,
     /// Open the help overlay (#6); present on every target.
     Help,
+    /// Cycle a workspace's sidebar swatch through the preset colors (#19).
+    Color,
 }
 #[derive(Debug, Clone)]
 pub struct Menu {
@@ -583,7 +574,12 @@ impl Menu {
                 MenuAction::Close,
                 MenuAction::Help,
             ],
-            MenuTarget::Workspace(_) => &[MenuAction::Rename, MenuAction::Close, MenuAction::Help],
+            MenuTarget::Workspace(_) => &[
+                MenuAction::Rename,
+                MenuAction::Color,
+                MenuAction::Close,
+                MenuAction::Help,
+            ],
         }
     }
     pub fn move_by(&mut self, delta: isize) {
@@ -724,15 +720,6 @@ mod tests {
     fn osc52_encodes_and_limits() {
         assert_eq!(osc52("hi").0, "\x1b]52;c;aGk=\x07");
         assert!(osc52(&"a".repeat(OSC52_LIMIT + 1)).1);
-    }
-    #[test]
-    fn navigate_traverses_sidebar_rows() {
-        let rows = vec![
-            SidebarTarget::Workspace(WorkspaceId(1)),
-            SidebarTarget::Tab(TabId(2)),
-        ];
-        assert_eq!(navigate(&rows, Some(0), 1), Some(1));
-        assert_eq!(navigate(&rows, Some(1), 1), Some(1));
     }
     #[test]
     fn menu_hit_tests_popup_bounds() {

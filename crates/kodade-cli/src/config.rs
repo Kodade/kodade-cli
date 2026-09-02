@@ -11,7 +11,17 @@ const CONFIG_DIR: &str = ".config/kodade-cli";
 pub struct Config {
     pub theme: ThemeChoice,
     pub mouse: bool,
+    /// `[sidebar] show` (alias: top-level `sidebar = true`): show the sidebar
+    /// when the TUI starts.
     pub sidebar: bool,
+    /// `[sidebar] width` in columns, clamped to 16–40 (#19).
+    pub sidebar_width: u16,
+    /// `[sidebar] collapsed`: what `prefix b`/auto-hide fall back to (#19).
+    pub sidebar_collapsed: CollapsedMode,
+    /// `[sidebar] auto_hide_below`: hide the sidebar under this many columns (#19).
+    pub sidebar_auto_hide_below: u16,
+    /// `[sidebar] agents_panel`: show the agents panel below the workspaces (#19).
+    pub sidebar_agents_panel: bool,
     /// `mouse.copy_on_select` — copy as soon as a mouse drag ends (#12).
     pub copy_on_select: bool,
     /// `mouse.scroll_lines` — rows per wheel notch (#12).
@@ -132,6 +142,30 @@ pub enum ThemeChoice {
     Auto,
     Named,
 }
+
+/// What a collapsed sidebar looks like (`prefix b` first step, or auto-hide).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CollapsedMode {
+    /// A 3-column rail: one state dot per workspace.
+    Compact,
+    /// A 1-column gutter, as in v0.1.
+    Hidden,
+}
+
+impl CollapsedMode {
+    fn parse(name: &str) -> Option<Self> {
+        match name {
+            "compact" => Some(Self::Compact),
+            "hidden" => Some(Self::Hidden),
+            _ => None,
+        }
+    }
+}
+
+/// Sidebar width bounds (#19).
+pub const SIDEBAR_WIDTH_MIN: u16 = 16;
+pub const SIDEBAR_WIDTH_MAX: u16 = 40;
+pub const SIDEBAR_WIDTH_DEFAULT: u16 = 24;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Action {
@@ -366,7 +400,8 @@ impl Action {
 struct FileConfig {
     theme: Option<String>,
     mouse: Option<Section<MouseTable>>,
-    sidebar: Option<bool>,
+    /// Bare `sidebar = true` (0.1 shape) or a `[sidebar]` table (#19).
+    sidebar: Option<Section<SidebarTable>>,
     notify: Option<Section<NotifyTable>>,
     paste: Option<Section<PasteTable>>,
     keys: Option<HashMap<String, Chords>>,
@@ -426,6 +461,19 @@ struct NotifyTable {
 #[derive(Debug, Deserialize, Default)]
 struct PasteTable {
     sanitize: Option<bool>,
+    #[serde(flatten)]
+    extra: HashMap<String, toml::Value>,
+}
+
+/// The `[sidebar]` table (#19). Every key is optional; a bare `sidebar = true`
+/// keeps working via the `Section` wrapper.
+#[derive(Debug, Deserialize, Default)]
+struct SidebarTable {
+    show: Option<bool>,
+    width: Option<u16>,
+    collapsed: Option<String>,
+    auto_hide_below: Option<u16>,
+    agents_panel: Option<bool>,
     #[serde(flatten)]
     extra: HashMap<String, toml::Value>,
 }
@@ -530,6 +578,10 @@ impl Default for Config {
             theme: ThemeChoice::Auto,
             mouse: true,
             sidebar: true,
+            sidebar_width: SIDEBAR_WIDTH_DEFAULT,
+            sidebar_collapsed: CollapsedMode::Compact,
+            sidebar_auto_hide_below: 100,
+            sidebar_agents_panel: true,
             copy_on_select: true,
             scroll_lines: 3,
             passthrough: true,
@@ -647,7 +699,31 @@ impl Config {
             }
             None => {}
         }
-        config.sidebar = file.sidebar.unwrap_or(config.sidebar);
+        match file.sidebar {
+            // Pre-0.2 `sidebar = true` toggles visibility only.
+            Some(Section::Enabled(show)) => config.sidebar = show,
+            Some(Section::Table(table)) => {
+                config.sidebar = table.show.unwrap_or(config.sidebar);
+                if let Some(width) = table.width {
+                    config.sidebar_width = width.clamp(SIDEBAR_WIDTH_MIN, SIDEBAR_WIDTH_MAX);
+                }
+                if let Some(name) = &table.collapsed {
+                    match CollapsedMode::parse(name) {
+                        Some(mode) => config.sidebar_collapsed = mode,
+                        None => config
+                            .warnings
+                            .push(format!("unknown sidebar.collapsed {name}")),
+                    }
+                }
+                config.sidebar_auto_hide_below = table
+                    .auto_hide_below
+                    .unwrap_or(config.sidebar_auto_hide_below);
+                config.sidebar_agents_panel =
+                    table.agents_panel.unwrap_or(config.sidebar_agents_panel);
+                config.warn_unknown("sidebar.", &table.extra);
+            }
+            None => {}
+        }
         if let Some(right) = file.status.and_then(|status| status.right) {
             // Unknown widget names warn and are skipped, keeping the rest.
             let mut widgets = Vec::new();
@@ -804,7 +880,16 @@ impl Config {
     pub fn to_toml(&self) -> String {
         let mut out = String::new();
         let _ = writeln!(out, "theme = {}", toml_string(self.theme_name()));
-        let _ = writeln!(out, "sidebar = {}", self.sidebar);
+        let _ = writeln!(out, "\n[sidebar]");
+        let _ = writeln!(out, "show = {}", self.sidebar);
+        let _ = writeln!(out, "width = {}", self.sidebar_width);
+        let collapsed = match self.sidebar_collapsed {
+            CollapsedMode::Compact => "compact",
+            CollapsedMode::Hidden => "hidden",
+        };
+        let _ = writeln!(out, "collapsed = {}", toml_string(collapsed));
+        let _ = writeln!(out, "auto_hide_below = {}", self.sidebar_auto_hide_below);
+        let _ = writeln!(out, "agents_panel = {}", self.sidebar_agents_panel);
         let _ = writeln!(out, "\n[mouse]");
         let _ = writeln!(out, "enabled = {}", self.mouse);
         let _ = writeln!(out, "copy_on_select = {}", self.copy_on_select);
@@ -1802,6 +1887,34 @@ red = \"#abcdef\"
             config.action(parse_key_chord("z").unwrap()),
             Some(Action::Zoom)
         );
+    }
+
+    #[test]
+    fn sidebar_accepts_a_boolean_or_a_table_and_clamps_width() {
+        // Pre-0.2 alias: a bare boolean only toggles visibility.
+        let alias = Config::from_file(
+            toml::from_str::<FileConfig>("sidebar = false").expect("alias parses"),
+        );
+        assert!(!alias.sidebar);
+        assert_eq!(alias.sidebar_width, SIDEBAR_WIDTH_DEFAULT);
+        // Table form with all keys; width clamps to 16–40.
+        let table = Config::from_file(
+            toml::from_str::<FileConfig>(
+                "[sidebar]\nshow = false\nwidth = 80\ncollapsed = \"hidden\"\nauto_hide_below = 60\nagents_panel = false\n",
+            )
+            .expect("table parses"),
+        );
+        assert!(!table.sidebar);
+        assert_eq!(table.sidebar_width, SIDEBAR_WIDTH_MAX);
+        assert_eq!(table.sidebar_collapsed, CollapsedMode::Hidden);
+        assert_eq!(table.sidebar_auto_hide_below, 60);
+        assert!(!table.sidebar_agents_panel);
+        assert!(table.warnings.is_empty());
+        // A too-small width clamps up to the minimum.
+        let narrow = Config::from_file(
+            toml::from_str::<FileConfig>("[sidebar]\nwidth = 4\n").expect("narrow parses"),
+        );
+        assert_eq!(narrow.sidebar_width, SIDEBAR_WIDTH_MIN);
     }
 
     #[test]

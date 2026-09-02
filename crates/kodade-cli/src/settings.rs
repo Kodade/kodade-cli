@@ -102,7 +102,17 @@ pub fn write(path: &Path, config: &Config) -> Result<(), String> {
         .map_err(|error| format!("{}: {error}", path.display()))?;
     let root = doc.as_table_mut();
     set(root, "theme", config.theme_name().into());
-    set(root, "sidebar", config.sidebar.into());
+    // Keep whatever shape the file uses: a `[sidebar]` table stores `show`,
+    // otherwise a bare `sidebar = true` boolean (the 0.1 alias).
+    if doc.get("sidebar").is_some_and(Item::is_table_like) {
+        set(
+            table_mut(&mut doc, "sidebar"),
+            "show",
+            config.sidebar.into(),
+        );
+    } else {
+        set(doc.as_table_mut(), "sidebar", config.sidebar.into());
+    }
     // Keep whatever shape the file already uses: a bare `mouse = true` stays a
     // boolean unless copy_on_select needs the table form.
     let mouse_is_table = doc.get("mouse").is_some_and(Item::is_table_like);

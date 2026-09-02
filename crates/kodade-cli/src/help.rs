@@ -337,7 +337,16 @@ fn write_seen(path: &std::path::Path) {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let _ = std::fs::write(path, "help_seen = true\n");
+    // Merge into the existing state file so sidebar collapse state (#19) and any
+    // other keys survive; only `help_seen` is touched here.
+    let mut table = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|source| source.parse::<toml::Table>().ok())
+        .unwrap_or_default();
+    table.insert("help_seen".into(), toml::Value::Boolean(true));
+    if let Ok(text) = toml::to_string(&table) {
+        let _ = std::fs::write(path, text);
+    }
 }
 
 // --- action metadata -------------------------------------------------------
