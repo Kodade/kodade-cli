@@ -1,4 +1,4 @@
-use std::{collections::HashMap, fs, io::Write, path::PathBuf};
+use std::{collections::HashMap, fmt::Write as _, fs, io::Write, path::PathBuf};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use kodade_cli_proto::{ClientMessage, Direction};
@@ -12,9 +12,18 @@ pub struct Config {
     pub theme: ThemeChoice,
     pub mouse: bool,
     pub sidebar: bool,
+    /// `mouse.copy_on_select` — consumed by the drag-selection work (#12).
+    pub copy_on_select: bool,
+    /// `notify.enabled` — consumed by the notification work (#10).
+    pub notify: bool,
     pub prefix: KeyEvent,
+    /// Chords that fire after the prefix key.
     bindings: HashMap<KeyEvent, Action>,
+    /// Chords that fire on their own (ctrl/alt chords without `prefix+`).
+    globals: HashMap<KeyEvent, Action>,
     named_theme: Option<String>,
+    /// Problems found while loading; printed by `load` and `config validate`.
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -68,59 +77,72 @@ pub enum Action {
     ResizeMode,
     BreakPane,
     LayoutEven,
+    // Config (#20).
+    ReloadConfig,
+    Settings,
 }
+
+/// Every remappable action and its config name. Single source of truth for
+/// `Action::parse`, `config show`, the docs table, and the help overlay (#6).
+const ACTIONS: &[(&str, Action)] = &[
+    ("split_right", Action::SplitRight),
+    ("split_down", Action::SplitDown),
+    ("close_pane", Action::ClosePane),
+    ("new_tab", Action::NewTab),
+    ("next_tab", Action::NextTab),
+    ("prev_tab", Action::PrevTab),
+    ("zoom", Action::Zoom),
+    ("detach", Action::Detach),
+    ("rename", Action::Rename),
+    ("workspace_next", Action::WorkspaceNext),
+    ("new_workspace", Action::NewWorkspace),
+    ("sidebar_toggle", Action::SidebarToggle),
+    ("focus_up", Action::FocusUp),
+    ("focus_down", Action::FocusDown),
+    ("focus_left", Action::FocusLeft),
+    ("focus_right", Action::FocusRight),
+    ("resize_up", Action::ResizeUp),
+    ("resize_down", Action::ResizeDown),
+    ("resize_left", Action::ResizeLeft),
+    ("resize_right", Action::ResizeRight),
+    ("navigate", Action::Navigate),
+    ("copy_mode", Action::CopyMode),
+    ("select_tab_1", Action::SelectTabIndex(1)),
+    ("select_tab_2", Action::SelectTabIndex(2)),
+    ("select_tab_3", Action::SelectTabIndex(3)),
+    ("select_tab_4", Action::SelectTabIndex(4)),
+    ("select_tab_5", Action::SelectTabIndex(5)),
+    ("select_tab_6", Action::SelectTabIndex(6)),
+    ("select_tab_7", Action::SelectTabIndex(7)),
+    ("select_tab_8", Action::SelectTabIndex(8)),
+    ("select_tab_9", Action::SelectTabIndex(9)),
+    ("close_tab", Action::CloseTab),
+    ("rename_tab", Action::RenameTab),
+    ("rename_workspace", Action::RenameWorkspace),
+    ("close_workspace", Action::CloseWorkspace),
+    ("swap_up", Action::SwapUp),
+    ("swap_down", Action::SwapDown),
+    ("swap_left", Action::SwapLeft),
+    ("swap_right", Action::SwapRight),
+    ("move_tab_left", Action::MoveTabLeft),
+    ("move_tab_right", Action::MoveTabRight),
+    ("next_pane", Action::NextPane),
+    ("prev_pane", Action::PrevPane),
+    ("last_pane", Action::LastPane),
+    ("workspace_prev", Action::WorkspacePrev),
+    ("resize_mode", Action::ResizeMode),
+    ("break_pane", Action::BreakPane),
+    ("layout_even", Action::LayoutEven),
+    ("reload_config", Action::ReloadConfig),
+    ("settings", Action::Settings),
+];
 
 impl Action {
     fn parse(name: &str) -> Option<Self> {
-        // `select_tab_1` .. `select_tab_9` share one parametrised action.
-        if let Some(index) = name.strip_prefix("select_tab_") {
-            return match index.parse::<u8>() {
-                Ok(index @ 1..=9) => Some(Self::SelectTabIndex(index)),
-                _ => None,
-            };
-        }
-        Some(match name {
-            "split_right" => Self::SplitRight,
-            "split_down" => Self::SplitDown,
-            "close_pane" => Self::ClosePane,
-            "new_tab" => Self::NewTab,
-            "next_tab" => Self::NextTab,
-            "prev_tab" => Self::PrevTab,
-            "zoom" => Self::Zoom,
-            "detach" => Self::Detach,
-            "rename" => Self::Rename,
-            "workspace_next" => Self::WorkspaceNext,
-            "new_workspace" => Self::NewWorkspace,
-            "sidebar_toggle" => Self::SidebarToggle,
-            "focus_up" => Self::FocusUp,
-            "focus_down" => Self::FocusDown,
-            "focus_left" => Self::FocusLeft,
-            "focus_right" => Self::FocusRight,
-            "resize_up" => Self::ResizeUp,
-            "resize_down" => Self::ResizeDown,
-            "resize_left" => Self::ResizeLeft,
-            "resize_right" => Self::ResizeRight,
-            "navigate" => Self::Navigate,
-            "copy_mode" => Self::CopyMode,
-            "close_tab" => Self::CloseTab,
-            "rename_tab" => Self::RenameTab,
-            "rename_workspace" => Self::RenameWorkspace,
-            "close_workspace" => Self::CloseWorkspace,
-            "swap_up" => Self::SwapUp,
-            "swap_down" => Self::SwapDown,
-            "swap_left" => Self::SwapLeft,
-            "swap_right" => Self::SwapRight,
-            "move_tab_left" => Self::MoveTabLeft,
-            "move_tab_right" => Self::MoveTabRight,
-            "next_pane" => Self::NextPane,
-            "prev_pane" => Self::PrevPane,
-            "last_pane" => Self::LastPane,
-            "workspace_prev" => Self::WorkspacePrev,
-            "resize_mode" => Self::ResizeMode,
-            "break_pane" => Self::BreakPane,
-            "layout_even" => Self::LayoutEven,
-            _ => return None,
-        })
+        ACTIONS
+            .iter()
+            .find(|(candidate, _)| *candidate == name)
+            .map(|(_, action)| *action)
     }
 
     pub fn message(self) -> Option<ClientMessage> {
@@ -197,6 +219,8 @@ impl Action {
             | Self::RenameWorkspace
             | Self::LastPane
             | Self::ResizeMode => return None,
+            // Client-side only: they never reach the daemon.
+            Self::ReloadConfig | Self::Settings => return None,
         })
     }
 }
@@ -204,9 +228,55 @@ impl Action {
 #[derive(Debug, Deserialize, Default)]
 struct FileConfig {
     theme: Option<String>,
-    mouse: Option<bool>,
+    mouse: Option<Section<MouseTable>>,
     sidebar: Option<bool>,
-    keys: Option<HashMap<String, String>>,
+    notify: Option<Section<NotifyTable>>,
+    keys: Option<HashMap<String, Chords>>,
+}
+
+/// A setting that accepts either a bare `key = true` boolean (the pre-0.2
+/// shape) or a `[key]` table. Both stay valid forever.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum Section<T> {
+    Enabled(bool),
+    Table(T),
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct MouseTable {
+    enabled: Option<bool>,
+    copy_on_select: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct NotifyTable {
+    enabled: Option<bool>,
+}
+
+/// A binding value: one chord or a list of chords.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum Chords {
+    One(String),
+    Many(Vec<String>),
+}
+
+// Test configs are written as plain strings.
+#[cfg(test)]
+impl From<&str> for Chords {
+    fn from(value: &str) -> Self {
+        Self::One(value.to_string())
+    }
+}
+
+impl Chords {
+    fn list(&self) -> Vec<&str> {
+        match self {
+            Self::One(chord) => vec![chord.as_str()],
+            Self::Many(chords) => chords.iter().map(String::as_str).collect(),
+        }
+    }
 }
 
 impl Default for Config {
@@ -227,6 +297,9 @@ impl Default for Config {
             ("W", Action::NewWorkspace),
             ("b", Action::SidebarToggle),
             ("[", Action::CopyMode),
+            // #14 took `R` for rename_workspace, so reload is prefix+ctrl+r.
+            ("prefix+ctrl+r", Action::ReloadConfig),
+            ("s", Action::Settings),
             ("up", Action::FocusUp),
             ("down", Action::FocusDown),
             ("left", Action::FocusLeft),
@@ -271,69 +344,195 @@ impl Default for Config {
             theme: ThemeChoice::Auto,
             mouse: true,
             sidebar: true,
+            copy_on_select: true,
+            notify: true,
             prefix: parse_key_chord("ctrl+b").expect("built-in prefix is valid"),
             bindings,
+            // Defaults are all prefixed; global chords are opt-in per config.
+            globals: HashMap::new(),
             named_theme: None,
+            warnings: Vec::new(),
         }
     }
 }
 
 impl Config {
+    /// Loads the config, printing any warnings. Never fails: a broken file
+    /// degrades to the defaults.
     pub fn load() -> Self {
-        let path = config_dir().join("config.toml");
+        let config = match Self::load_checked() {
+            Ok(config) => config,
+            Err(error) => {
+                eprintln!("kodade-cli: warning: {error}, using defaults");
+                Self::default()
+            }
+        };
+        for warning in &config.warnings {
+            eprintln!("kodade-cli: warning: {warning}");
+        }
+        config
+    }
+
+    /// Loads the config, reporting a missing-or-invalid TOML file as an error
+    /// so live reload (`prefix R`) can keep the previous config.
+    pub fn load_checked() -> Result<Self, String> {
+        let path = config_path();
         let Ok(source) = fs::read_to_string(&path) else {
-            return Self::default();
+            return Ok(Self::default());
         };
-        let Ok(file) = toml::from_str::<FileConfig>(&source) else {
-            eprintln!(
-                "kodade-cli: warning: invalid config {}, using defaults",
-                path.display()
-            );
-            return Self::default();
-        };
-        Self::from_file(file)
+        let file = toml::from_str::<FileConfig>(&source)
+            .map_err(|error| format!("invalid config {}: {error}", path.display()))?;
+        Ok(Self::from_file(file))
     }
 
     fn from_file(file: FileConfig) -> Self {
         let mut config = Self::default();
         if let Some(theme) = file.theme {
-            config.theme = match theme.as_str() {
-                "dark" => ThemeChoice::Dark,
-                "light" => ThemeChoice::Light,
-                "auto" => ThemeChoice::Auto,
-                _ => ThemeChoice::Named,
-            };
-            config.named_theme = Some(theme);
+            config.set_theme(&theme);
         }
-        config.mouse = file.mouse.unwrap_or(config.mouse);
+        match file.mouse {
+            Some(Section::Enabled(enabled)) => config.mouse = enabled,
+            Some(Section::Table(table)) => {
+                config.mouse = table.enabled.unwrap_or(config.mouse);
+                config.copy_on_select = table.copy_on_select.unwrap_or(config.copy_on_select);
+            }
+            None => {}
+        }
+        match file.notify {
+            Some(Section::Enabled(enabled)) => config.notify = enabled,
+            Some(Section::Table(table)) => config.notify = table.enabled.unwrap_or(config.notify),
+            None => {}
+        }
         config.sidebar = file.sidebar.unwrap_or(config.sidebar);
         if let Some(keys) = file.keys {
-            for (name, binding) in keys {
-                if name == "prefix" {
-                    match parse_key_chord(&binding) {
-                        Ok(key) => config.prefix = key,
-                        Err(error) => eprintln!("kodade-cli: warning: invalid key prefix: {error}"),
-                    }
-                    continue;
-                }
-                let Some(action) = Action::parse(&name) else {
-                    eprintln!("kodade-cli: warning: unknown key action {name}");
-                    continue;
-                };
-                match parse_key_chord(&binding) {
-                    Ok(key) => {
-                        config.bindings.retain(|_, mapped| *mapped != action);
-                        config.bindings.insert(key, action);
-                    }
-                    Err(error) => eprintln!("kodade-cli: warning: invalid key {name}: {error}"),
-                }
+            // Sorted so warnings and overrides are deterministic.
+            let mut entries = keys.iter().collect::<Vec<_>>();
+            entries.sort_by_key(|(left, _)| *left);
+            for (name, chords) in entries {
+                config.apply_binding(name, chords);
             }
         }
         config
     }
 
+    // Applies one `[keys]` entry: `prefix` or an action with one or more chords.
+    fn apply_binding(&mut self, name: &str, chords: &Chords) {
+        if name == "prefix" {
+            match parse_binding(chords.list().first().copied().unwrap_or("")) {
+                Ok(binding) => self.prefix = binding.key,
+                Err(error) => self.warnings.push(format!("invalid key prefix: {error}")),
+            }
+            return;
+        }
+        let Some(action) = Action::parse(name) else {
+            self.warnings.push(format!("unknown key action {name}"));
+            return;
+        };
+        let parsed = chords
+            .list()
+            .into_iter()
+            .filter_map(|chord| match parse_binding(chord) {
+                Ok(binding) => Some(binding),
+                Err(error) => {
+                    self.warnings.push(format!("invalid key {name}: {error}"));
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        if parsed.is_empty() {
+            return;
+        }
+        // An override replaces the action's defaults, aliases included.
+        self.bindings.retain(|_, mapped| *mapped != action);
+        self.globals.retain(|_, mapped| *mapped != action);
+        for binding in parsed {
+            if binding.global {
+                self.globals.insert(binding.key, action);
+            } else {
+                self.bindings.insert(binding.key, action);
+            }
+        }
+    }
+
+    /// Applies a theme name (`auto`, an alias, a built-in, or a user theme).
+    pub fn set_theme(&mut self, name: &str) {
+        self.theme = match name {
+            "dark" => ThemeChoice::Dark,
+            "light" => ThemeChoice::Light,
+            "auto" => ThemeChoice::Auto,
+            _ => ThemeChoice::Named,
+        };
+        self.named_theme = Some(name.to_string());
+    }
+
+    /// The configured theme name, as it appears in config.toml.
+    pub fn theme_name(&self) -> &str {
+        self.named_theme.as_deref().unwrap_or("auto")
+    }
+
+    /// Every remappable action and its config name.
+    pub fn actions() -> &'static [(&'static str, Action)] {
+        ACTIONS
+    }
+
+    /// Chords bound to an action, rendered back to config text. Prefixed
+    /// chords render bare (`%`) unless they carry a modifier (`prefix+ctrl+x`);
+    /// global chords render as themselves (`ctrl+alt+v`).
+    pub fn chords_for(&self, action: Action) -> Vec<String> {
+        let mut chords = self
+            .bindings
+            .iter()
+            .filter(|(_, mapped)| **mapped == action)
+            .map(|(key, _)| {
+                let text = render_chord(*key);
+                if key.modifiers.is_empty() {
+                    text
+                } else {
+                    format!("prefix+{text}")
+                }
+            })
+            .chain(
+                self.globals
+                    .iter()
+                    .filter(|(_, mapped)| **mapped == action)
+                    .map(|(key, _)| render_chord(*key)),
+            )
+            .collect::<Vec<_>>();
+        chords.sort();
+        chords
+    }
+
+    /// The effective config as TOML, for `kodade-cli config show`.
+    pub fn to_toml(&self) -> String {
+        let mut out = String::new();
+        let _ = writeln!(out, "theme = {}", toml_string(self.theme_name()));
+        let _ = writeln!(out, "sidebar = {}", self.sidebar);
+        let _ = writeln!(out, "\n[mouse]");
+        let _ = writeln!(out, "enabled = {}", self.mouse);
+        let _ = writeln!(out, "copy_on_select = {}", self.copy_on_select);
+        let _ = writeln!(out, "\n[notify]");
+        let _ = writeln!(out, "enabled = {}", self.notify);
+        let _ = writeln!(out, "\n[keys]");
+        let _ = writeln!(out, "prefix = {}", toml_string(&render_chord(self.prefix)));
+        for (name, action) in Self::actions() {
+            let chords = self
+                .chords_for(*action)
+                .into_iter()
+                .map(|chord| toml_string(&chord))
+                .collect::<Vec<_>>();
+            let _ = writeln!(out, "{name} = [{}]", chords.join(", "));
+        }
+        out
+    }
+
+    /// Action bound to a key pressed after the prefix.
     pub fn action(&self, key: KeyEvent) -> Option<Action> {
-        self.bindings.get(&key).copied()
+        self.bindings.get(&normalize_key(key)).copied()
+    }
+
+    /// Action bound to an unprefixed global chord.
+    pub fn global_action(&self, key: KeyEvent) -> Option<Action> {
+        self.globals.get(&normalize_key(key)).copied()
     }
 
     pub fn resolve_theme(&self) -> Theme {
@@ -370,29 +569,145 @@ fn builtin_theme(name: &str) -> Option<Theme> {
     }
 }
 
+/// A parsed binding: the chord plus whether it fires without the prefix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Binding {
+    pub key: KeyEvent,
+    pub global: bool,
+}
+
+/// Parses `[prefix+][ctrl+][alt+][shift+]key` in any modifier order. A chord
+/// with ctrl or alt and no explicit `prefix+` is global.
+pub fn parse_binding(value: &str) -> Result<Binding, String> {
+    let whole = value.trim();
+    let mut rest = whole;
+    let mut modifiers = KeyModifiers::NONE;
+    let mut prefixed = false;
+    loop {
+        let lower = rest.to_ascii_lowercase();
+        let eaten = if lower.starts_with("ctrl+") {
+            modifiers |= KeyModifiers::CONTROL;
+            5
+        } else if lower.starts_with("alt+") {
+            modifiers |= KeyModifiers::ALT;
+            4
+        } else if lower.starts_with("shift+") {
+            modifiers |= KeyModifiers::SHIFT;
+            6
+        } else if lower.starts_with("prefix+") {
+            prefixed = true;
+            7
+        } else {
+            break;
+        };
+        rest = &rest[eaten..];
+    }
+    if rest.is_empty() {
+        return Err(format!("unsupported key chord {whole}"));
+    }
+    let key = normalize_key(KeyEvent::new(key_code(rest, whole)?, modifiers));
+    let global = !prefixed
+        && key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
+    Ok(Binding { key, global })
+}
+
+/// Parses a chord that is always prefix-relative (the prefix key itself, and
+/// the built-in defaults).
 pub fn parse_key_chord(value: &str) -> Result<KeyEvent, String> {
-    let value = value.trim();
-    let (modifier, key) = if let Some(key) = value.strip_prefix("ctrl+") {
-        (KeyModifiers::CONTROL, key)
-    } else if let Some(key) = value.strip_prefix("alt+") {
-        (KeyModifiers::ALT, key)
-    } else {
-        (KeyModifiers::NONE, value)
-    };
-    let code = match key {
+    parse_binding(value).map(|binding| binding.key)
+}
+
+// Named keys, F1-F12, or a single character.
+fn key_code(key: &str, whole: &str) -> Result<KeyCode, String> {
+    let lower = key.to_ascii_lowercase();
+    Ok(match lower.as_str() {
         "up" => KeyCode::Up,
         "down" => KeyCode::Down,
         "left" => KeyCode::Left,
         "right" => KeyCode::Right,
         "tab" => KeyCode::Tab,
-        _ if key.len() == 2 && key.starts_with('F') => key[1..]
-            .parse::<u8>()
-            .map(KeyCode::F)
-            .map_err(|_| format!("unsupported key chord {value}"))?,
-        _ if key.chars().count() == 1 => KeyCode::Char(key.chars().next().unwrap()),
-        _ => return Err(format!("unsupported key chord {value}")),
-    };
-    Ok(KeyEvent::new(code, modifier))
+        "enter" => KeyCode::Enter,
+        "esc" | "escape" => KeyCode::Esc,
+        "space" => KeyCode::Char(' '),
+        "backspace" => KeyCode::Backspace,
+        "home" => KeyCode::Home,
+        "end" => KeyCode::End,
+        "pageup" => KeyCode::PageUp,
+        "pagedown" => KeyCode::PageDown,
+        "delete" | "del" => KeyCode::Delete,
+        _ => {
+            if let Some(digits) = lower.strip_prefix('f') {
+                if !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit()) {
+                    return match digits.parse::<u8>() {
+                        Ok(number @ 1..=12) => Ok(KeyCode::F(number)),
+                        _ => Err(format!("unsupported key chord {whole}")),
+                    };
+                }
+            }
+            match key.chars().count() {
+                1 => KeyCode::Char(key.chars().next().expect("one char")),
+                _ => return Err(format!("unsupported key chord {whole}")),
+            }
+        }
+    })
+}
+
+/// `shift+x` and `X` are the same binding: letters normalize to the uppercase
+/// character without SHIFT, so `l` and `L` stay distinct. Non-letters keep the
+/// SHIFT modifier because their unshifted character is a different key.
+pub fn normalize_key(key: KeyEvent) -> KeyEvent {
+    match key.code {
+        KeyCode::Char(c) if c.is_alphabetic() && key.modifiers.contains(KeyModifiers::SHIFT) => {
+            let upper = c.to_uppercase().next().unwrap_or(c);
+            KeyEvent::new(KeyCode::Char(upper), key.modifiers - KeyModifiers::SHIFT)
+        }
+        _ => key,
+    }
+}
+
+// Quotes a value for `config show`; chords include `"` and `\\`.
+fn toml_string(value: &str) -> String {
+    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+/// Renders a chord back to config text (`ctrl+alt+v`, `F5`, `%`).
+pub fn render_chord(key: KeyEvent) -> String {
+    let mut text = String::new();
+    if key.modifiers.contains(KeyModifiers::CONTROL) {
+        text.push_str("ctrl+");
+    }
+    if key.modifiers.contains(KeyModifiers::ALT) {
+        text.push_str("alt+");
+    }
+    if key.modifiers.contains(KeyModifiers::SHIFT) {
+        text.push_str("shift+");
+    }
+    match key.code {
+        KeyCode::Char(' ') => text.push_str("space"),
+        KeyCode::Char(c) => text.push(c),
+        KeyCode::Up => text.push_str("up"),
+        KeyCode::Down => text.push_str("down"),
+        KeyCode::Left => text.push_str("left"),
+        KeyCode::Right => text.push_str("right"),
+        KeyCode::Tab => text.push_str("tab"),
+        KeyCode::Enter => text.push_str("enter"),
+        KeyCode::Esc => text.push_str("esc"),
+        KeyCode::Backspace => text.push_str("backspace"),
+        KeyCode::Home => text.push_str("home"),
+        KeyCode::End => text.push_str("end"),
+        KeyCode::PageUp => text.push_str("pageup"),
+        KeyCode::PageDown => text.push_str("pagedown"),
+        KeyCode::Delete => text.push_str("delete"),
+        KeyCode::F(number) => {
+            let _ = write!(text, "F{number}");
+        }
+        other => {
+            let _ = write!(text, "{other:?}");
+        }
+    }
+    text
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -602,6 +917,36 @@ fn config_dir() -> PathBuf {
         .join(CONFIG_DIR)
 }
 
+/// The config file the CLI reads and the settings overlay writes back to.
+pub fn config_path() -> PathBuf {
+    config_dir().join("config.toml")
+}
+
+/// Theme names offered by the settings overlay: `auto`, the built-ins, then
+/// every `*.toml` in the user themes directory.
+pub fn theme_names() -> Vec<String> {
+    let mut names = vec![
+        "auto".to_string(),
+        "kodade-dark".to_string(),
+        "kodade-light".to_string(),
+        "tokyo-night".to_string(),
+    ];
+    if let Ok(entries) = fs::read_dir(config_dir().join("themes")) {
+        let mut user = entries
+            .flatten()
+            .filter_map(|entry| {
+                let path = entry.path();
+                (path.extension()? == "toml")
+                    .then(|| path.file_stem()?.to_str().map(str::to_owned))?
+            })
+            .filter(|name| !names.contains(name))
+            .collect::<Vec<_>>();
+        user.sort();
+        names.extend(user);
+    }
+    names
+}
+
 fn load_user_theme(name: &str) -> Option<Theme> {
     let path = config_dir().join("themes").join(format!("{name}.toml"));
     fs::read_to_string(path)
@@ -789,7 +1134,7 @@ red = \"#abcdef\"
     }
 
     #[test]
-    fn parses_key_chords() {
+    fn parses_key_chords_in_any_modifier_order() {
         assert_eq!(
             parse_key_chord("ctrl+b"),
             Ok(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL))
@@ -798,11 +1143,115 @@ red = \"#abcdef\"
             parse_key_chord("alt+x"),
             Ok(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::ALT))
         );
+        assert_eq!(parse_key_chord("alt+ctrl+v"), parse_key_chord("ctrl+alt+v"));
         assert_eq!(
-            parse_key_chord("F1"),
-            Ok(KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE))
+            parse_key_chord("F12"),
+            Ok(KeyEvent::new(KeyCode::F(12), KeyModifiers::NONE))
         );
-        assert!(parse_key_chord("shift+x").is_err());
+        for (text, code) in [
+            ("enter", KeyCode::Enter),
+            ("esc", KeyCode::Esc),
+            ("space", KeyCode::Char(' ')),
+            ("backspace", KeyCode::Backspace),
+            ("tab", KeyCode::Tab),
+            ("home", KeyCode::Home),
+            ("end", KeyCode::End),
+            ("pageup", KeyCode::PageUp),
+            ("pagedown", KeyCode::PageDown),
+            ("delete", KeyCode::Delete),
+            ("up", KeyCode::Up),
+            ("down", KeyCode::Down),
+            ("left", KeyCode::Left),
+            ("right", KeyCode::Right),
+        ] {
+            assert_eq!(
+                parse_key_chord(text),
+                Ok(KeyEvent::new(code, KeyModifiers::NONE)),
+                "{text}"
+            );
+        }
+        assert!(parse_key_chord("ctrl+nope").is_err());
+        assert!(parse_key_chord("F13").is_err());
+        assert!(parse_key_chord("ctrl+").is_err());
+    }
+
+    #[test]
+    fn shift_normalizes_letters_but_not_other_keys() {
+        // `shift+x` is the same binding as `X`, and neither carries SHIFT.
+        assert_eq!(parse_key_chord("shift+x"), parse_key_chord("X"));
+        assert_eq!(
+            parse_key_chord("shift+x"),
+            Ok(KeyEvent::new(KeyCode::Char('X'), KeyModifiers::NONE))
+        );
+        assert_eq!(
+            parse_key_chord("ctrl+shift+l"),
+            Ok(KeyEvent::new(KeyCode::Char('L'), KeyModifiers::CONTROL))
+        );
+        // Non-letters keep SHIFT: their unshifted form is a different key.
+        assert_eq!(
+            parse_key_chord("shift+tab"),
+            Ok(KeyEvent::new(KeyCode::Tab, KeyModifiers::SHIFT))
+        );
+        // A terminal that reports SHIFT with an uppercase letter still matches.
+        let defaults = Config::default();
+        assert_eq!(
+            defaults.action(KeyEvent::new(KeyCode::Char('L'), KeyModifiers::SHIFT)),
+            defaults.action(KeyEvent::new(KeyCode::Char('L'), KeyModifiers::NONE))
+        );
+    }
+
+    #[test]
+    fn chords_render_back_to_config_text() {
+        assert_eq!(
+            render_chord(parse_key_chord("ctrl+alt+v").unwrap()),
+            "ctrl+alt+v"
+        );
+        assert_eq!(render_chord(parse_key_chord("F5").unwrap()), "F5");
+        assert_eq!(render_chord(parse_key_chord("space").unwrap()), "space");
+        assert_eq!(render_chord(parse_key_chord("%").unwrap()), "%");
+        assert_eq!(
+            render_chord(parse_key_chord("shift+tab").unwrap()),
+            "shift+tab"
+        );
+    }
+
+    #[test]
+    fn ctrl_and_alt_chords_are_global_unless_prefix_qualified() {
+        assert!(parse_binding("ctrl+alt+v").unwrap().global);
+        assert!(parse_binding("alt+h").unwrap().global);
+        assert!(!parse_binding("prefix+ctrl+alt+v").unwrap().global);
+        assert!(!parse_binding("%").unwrap().global);
+        assert!(!parse_binding("X").unwrap().global);
+        // Defaults are all prefixed; nothing fires without the prefix.
+        assert_eq!(
+            Config::default().global_action(parse_key_chord("ctrl+alt+v").unwrap()),
+            None
+        );
+    }
+
+    #[test]
+    fn default_bindings_are_unique() {
+        // Catches two actions claiming the same default chord after a merge.
+        let defaults = Config::default();
+        let mut seen = Vec::new();
+        for action in Config::actions().iter().map(|(_, action)| *action) {
+            for chord in defaults.chords_for(action) {
+                assert!(!seen.contains(&chord), "duplicate default binding {chord}");
+                seen.push(chord);
+            }
+        }
+    }
+
+    fn keys(entries: Vec<(&str, Chords)>) -> FileConfig {
+        FileConfig {
+            keys: Some(
+                entries
+                    .into_iter()
+                    .map(|(name, chords)| (name.to_string(), chords))
+                    .collect(),
+            ),
+            ..FileConfig::default()
+        }
     }
 
     #[test]
@@ -849,8 +1298,9 @@ red = \"#abcdef\"
             remapped.action(parse_key_chord("<").unwrap()),
             Some(Action::MoveTabLeft)
         );
+        // #20 grammar: a bare alt chord is global, so it fires without the prefix.
         assert_eq!(
-            remapped.action(parse_key_chord("alt+w").unwrap()),
+            remapped.global_action(parse_key_chord("alt+w").unwrap()),
             Some(Action::WorkspacePrev)
         );
         assert_eq!(
@@ -907,14 +1357,86 @@ red = \"#abcdef\"
             defaults.action(parse_key_chord("%").unwrap()),
             Some(Action::SplitRight)
         );
-        let config = Config::from_file(FileConfig {
-            keys: Some(HashMap::from([("split_right".into(), "s".into())])),
-            ..FileConfig::default()
-        });
+        let config = Config::from_file(keys(vec![("split_right", "s".into())]));
         assert_eq!(config.action(parse_key_chord("%").unwrap()), None);
         assert_eq!(
             config.action(parse_key_chord("s").unwrap()),
             Some(Action::SplitRight)
         );
+    }
+
+    #[test]
+    fn binding_arrays_bind_prefixed_and_global_chords() {
+        // The issue's acceptance case: both fire, the second without the prefix.
+        let config = Config::from_file(keys(vec![(
+            "split_right",
+            Chords::Many(vec!["%".into(), "ctrl+alt+v".into()]),
+        )]));
+        assert_eq!(
+            config.action(parse_key_chord("%").unwrap()),
+            Some(Action::SplitRight)
+        );
+        assert_eq!(
+            config.global_action(parse_key_chord("ctrl+alt+v").unwrap()),
+            Some(Action::SplitRight)
+        );
+        // Not reachable through the prefix, and the prefixed chord is not global.
+        assert_eq!(config.action(parse_key_chord("ctrl+alt+v").unwrap()), None);
+        assert_eq!(config.global_action(parse_key_chord("%").unwrap()), None);
+        assert_eq!(
+            config.chords_for(Action::SplitRight),
+            vec!["%".to_string(), "ctrl+alt+v".to_string()]
+        );
+    }
+
+    #[test]
+    fn invalid_and_unknown_keys_become_warnings() {
+        let config = Config::from_file(keys(vec![
+            ("zoom", "nope".into()),
+            ("not_an_action", "z".into()),
+        ]));
+        assert_eq!(config.warnings.len(), 2);
+        // A rejected override leaves the default in place.
+        assert_eq!(
+            config.action(parse_key_chord("z").unwrap()),
+            Some(Action::Zoom)
+        );
+    }
+
+    #[test]
+    fn mouse_accepts_a_boolean_or_a_table() {
+        // Pre-0.2 shape.
+        let legacy = toml::from_str::<FileConfig>("mouse = false").expect("legacy config parses");
+        let legacy = Config::from_file(legacy);
+        assert!(!legacy.mouse);
+        assert!(legacy.copy_on_select);
+        // Table shape with the new keys.
+        let table = toml::from_str::<FileConfig>(
+            "[mouse]\nenabled = true\ncopy_on_select = false\n\n[notify]\nenabled = false\n",
+        )
+        .expect("table config parses");
+        let table = Config::from_file(table);
+        assert!(table.mouse);
+        assert!(!table.copy_on_select);
+        assert!(!table.notify);
+        // `notify = true` scalar also works.
+        let scalar = Config::from_file(
+            toml::from_str::<FileConfig>("notify = false").expect("scalar notify parses"),
+        );
+        assert!(!scalar.notify);
+    }
+
+    #[test]
+    fn effective_config_prints_as_toml() {
+        let toml_text = Config::default().to_toml();
+        assert!(toml_text.contains("theme = \"auto\""));
+        assert!(toml_text.contains("split_down = [\"\\\"\"]"));
+        assert!(toml_text.contains("[mouse]"));
+        assert!(toml_text.contains("copy_on_select = true"));
+        assert!(toml_text.contains("[notify]"));
+        assert!(toml_text.contains("prefix = \"ctrl+b\""));
+        assert!(toml_text.contains("split_right = [\"%\"]"));
+        // Round-trips into the loader.
+        toml::from_str::<FileConfig>(&toml_text).expect("effective config parses");
     }
 }

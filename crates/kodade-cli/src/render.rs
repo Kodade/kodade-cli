@@ -16,6 +16,7 @@ use crate::{
     config::Theme,
     input::{tab_spans, TabSpan},
     mode::{CopyMode, Menu, MenuAction},
+    overlay::{render_overlay, Overlay},
 };
 
 pub const TAB_PREFIX: &str = " Ködade · ";
@@ -53,6 +54,8 @@ pub struct Ui<'a> {
     pub resize: bool,
     /// Pending yes/no prompt text (#14).
     pub confirm: Option<&'a str>,
+    /// Settings menu (#20); the help overlay and pickers reuse the same widget.
+    pub settings: Option<&'a Overlay>,
     pub note: Option<&'a str>,
 }
 
@@ -68,6 +71,7 @@ pub fn render(frame: &mut Frame, layout: &LayoutSnapshot, ui: &Ui, theme: &Theme
         menu,
         resize,
         confirm,
+        settings,
         note,
     } = *ui;
     let areas = Layout::default()
@@ -154,7 +158,7 @@ pub fn render(frame: &mut Frame, layout: &LayoutSnapshot, ui: &Ui, theme: &Theme
     } else if navigate.is_some() {
         " navigate · j/k move · enter activate · esc exit".into()
     } else if prefix {
-        " prefix: % \" b hjkl c n p w W x z d r · 1-9 X T R D o O ; ! = alt+hjkl alt+r".into()
+        " prefix: % \" b hjkl c n p s w W x z d r · 1-9 X T R D o O ; ! = alt+hjkl alt+r".into()
     } else {
         format!(" session · {workspace}")
     };
@@ -170,6 +174,9 @@ pub fn render(frame: &mut Frame, layout: &LayoutSnapshot, ui: &Ui, theme: &Theme
     }
     if let Some(menu) = menu {
         render_menu(frame, menu, frame.area(), theme);
+    }
+    if let Some(settings) = settings {
+        render_overlay(frame, frame.area(), settings, theme);
     }
 }
 
@@ -812,6 +819,7 @@ mod tests {
             menu: None,
             resize: false,
             confirm: None,
+            settings: None,
             note: None,
         };
         let mut terminal = Terminal::new(TestBackend::new(40, 10)).expect("test terminal");
