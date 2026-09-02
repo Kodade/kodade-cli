@@ -71,7 +71,8 @@ and a purple-free ANSI palette, matching the desktop app. `theme = "auto"`
 background; `tokyo-night` and custom themes are also available. See the
 [Themes](docs/CONFIG.md#themes) section for the schema.
 
-The scripting commands are:
+Run `kodade-cli --help` for the full command list and `kodade-cli --version`
+for the installed version. The scripting commands are:
 
 - `kodade-cli ls` — list sessions, workspaces, tabs, panes, and states.
 - `kodade-cli agent ls` — list recognized agents and states.
@@ -81,6 +82,13 @@ The scripting commands are:
 - `kodade-cli agent report PANE STATE` — report an agent state to the daemon.
 - `kodade-cli send PANE TEXT` — send text followed by a newline (`--no-newline` is also supported).
 - `kodade-cli kill-session` — stop the current session.
+
+Text and names may start with `-` (`kodade-cli send 1 -y`), and `--` forces
+the next value through verbatim when it collides with a flag
+(`kodade-cli send 1 -- --no-newline`).
+
+`ls`, `agent ls`, and `agent explain` also accept `--json`, which prints the
+matching protocol snapshots for scripts.
 
 `kodade-cli integrate claude-code` prints Claude Code hook settings;
 `kodade-cli integrate claude-code --write` merges them into

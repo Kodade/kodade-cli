@@ -8,8 +8,10 @@ Ködade CLI is a Rust workspace with three crates:
   agent detection, and the Unix socket server. Its current modules include
   `agent.rs`, `manifest.rs`, and `layout.rs`.
 - `kodade-cli` owns the `kodade-cli` binary and its thin ratatui/crossterm TUI.
-  Its current modules are `config.rs`, `mode.rs`, `render.rs`, `input.rs`, and
-  `commands.rs`.
+  Its current modules are `cli.rs`, `app.rs`, `config.rs`, `mode.rs`,
+  `render.rs`, `input.rs`, and `commands.rs`. `cli.rs` holds the clap
+  definitions, `main.rs` only dispatches them, and `app.rs` holds the attached
+  client's `App` state plus its key, mouse, layout, and draw handlers.
 
 The daemon runs the user's shell as a login shell and keeps the PTY alive when
 a client disconnects. The client connects to the daemon, forwards input and
