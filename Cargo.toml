@@ -14,14 +14,16 @@ authors = ["ContractorKeith"]
 [workspace.dependencies]
 # `anyhow` keeps the small binary boundary readable without a custom error hierarchy yet.
 anyhow = "1"
+# clap gives the binary real subcommand help, typed flags, and future completions.
+clap = { version = "4", features = ["derive"] }
 # Crossterm and ratatui provide the portable terminal event and rendering stack.
-crossterm = "0.28"
+crossterm = "0.29"
 # `dirs` supplies the cross-platform home-directory fallback for socket state.
 dirs = "5"
 libc = "0.2"
 # Portable-pty hosts the login shell independently from the attaching client.
-portable-pty = "0.8"
-ratatui = "0.29"
+portable-pty = "0.9"
+ratatui = "0.30"
 # Serde JSON is the documented, script-friendly daemon protocol.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -30,4 +32,4 @@ toml = "0.8"
 # Tokio multiplexes clients while the blocking PTY reader uses its blocking pool.
 tokio = { version = "1", features = ["io-util", "macros", "net", "process", "rt-multi-thread", "sync", "time"] }
 # vt100 makes the daemon the durable owner of screen and scrollback state.
-vt100 = "0.15"
+vt100 = "0.16"

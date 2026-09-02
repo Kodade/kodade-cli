@@ -1,6 +1,7 @@
 use anyhow::{anyhow, bail, Context, Result};
 use kodade_cli_proto::{
-    decode, encode, AgentStateKind, ClientMessage, LayoutSnapshot, PaneId, QueryKind, ServerMessage,
+    decode, encode, AgentStateKind, ClientMessage, LayoutSnapshot, PaneId, PaneSnapshot, QueryKind,
+    ServerMessage,
 };
 use serde_json::{json, Value};
 use std::{fs, path::Path};
@@ -8,145 +9,6 @@ use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::UnixStream,
 };
-
-pub const DEFAULT_SESSION: &str = "default";
-
-#[derive(Debug, PartialEq, Eq)]
-pub enum Command {
-    Attach {
-        session: String,
-    },
-    Daemon {
-        session: String,
-    },
-    Ls {
-        session: String,
-        agents_only: bool,
-    },
-    AgentAttach {
-        session: String,
-        pane: PaneId,
-    },
-    Rename {
-        session: String,
-        pane: PaneId,
-        name: String,
-    },
-    Explain {
-        session: String,
-        pane: PaneId,
-    },
-    Report {
-        session: String,
-        pane: PaneId,
-        state: AgentStateKind,
-        source: String,
-    },
-    Send {
-        session: String,
-        pane: PaneId,
-        bytes: Vec<u8>,
-    },
-    KillSession {
-        session: String,
-    },
-    Integrate {
-        write: bool,
-    },
-}
-
-pub fn parse(args: &[String]) -> Result<Command> {
-    if args.first().is_some_and(|arg| arg == "daemon") {
-        return Ok(Command::Daemon {
-            session: args
-                .get(1)
-                .cloned()
-                .unwrap_or_else(|| DEFAULT_SESSION.into()),
-        });
-    }
-    let (session, args) = match args {
-        [flag, session, rest @ ..] if flag == "-s" || flag == "--session" => {
-            (session.clone(), rest)
-        }
-        _ => (DEFAULT_SESSION.into(), args),
-    };
-    match args {
-        [] => Ok(Command::Attach { session }),
-        [command] if command == "ls" => Ok(Command::Ls {
-            session,
-            agents_only: false,
-        }),
-        [command] if command == "kill-session" => Ok(Command::KillSession { session }),
-        [command, agent] if command == "integrate" && agent == "claude-code" => {
-            Ok(Command::Integrate { write: false })
-        }
-        [command, agent, flag]
-            if command == "integrate" && agent == "claude-code" && flag == "--write" =>
-        {
-            Ok(Command::Integrate { write: true })
-        }
-        [command, _] if command == "integrate" => bail!("no integration available yet"),
-        [command, pane, text] if command == "send" => Ok(Command::Send {
-            session,
-            pane: pane_id(pane)?,
-            bytes: format!("{text}\r").into_bytes(),
-        }),
-        [command, pane, text, flag] if command == "send" && flag == "--no-newline" => {
-            Ok(Command::Send {
-                session,
-                pane: pane_id(pane)?,
-                bytes: text.as_bytes().to_vec(),
-            })
-        }
-        [agent, command] if agent == "agent" && command == "ls" => Ok(Command::Ls {
-            session,
-            agents_only: true,
-        }),
-        [agent, command, pane] if agent == "agent" && command == "attach" => {
-            Ok(Command::AgentAttach {
-                session,
-                pane: pane_id(pane)?,
-            })
-        }
-        [agent, command, pane, name] if agent == "agent" && command == "rename" => {
-            Ok(Command::Rename {
-                session,
-                pane: pane_id(pane)?,
-                name: name.clone(),
-            })
-        }
-        [agent, command, pane] if agent == "agent" && command == "explain" => {
-            Ok(Command::Explain {
-                session,
-                pane: pane_id(pane)?,
-            })
-        }
-        [agent, command, pane, state, flag, hook_session]
-            if agent == "agent" && command == "report" && flag == "-s" =>
-        {
-            Ok(Command::Report {
-                session: hook_session.clone(),
-                pane: pane_id(pane)?,
-                state: parse_state(state)?,
-                source: "cli".into(),
-            })
-        }
-        [agent, command, pane, state, rest @ ..] if agent == "agent" && command == "report" => {
-            let source = match rest {
-                [] => "cli".into(),
-                [flag, value] if flag == "--source" => value.clone(),
-                _ => bail!("usage: kodade-cli agent report <pane-id> <state> [--source NAME]"),
-            };
-            Ok(Command::Report {
-                session,
-                pane: pane_id(pane)?,
-                state: parse_state(state)?,
-                source,
-            })
-        }
-        _ => bail!("usage: kodade-cli [-s SESSION] [ls | agent | send | kill-session | integrate]"),
-    }
-}
 
 pub fn integrate_claude_code(write: bool) -> Result<()> {
     let snippet = claude_hooks();
@@ -280,7 +142,8 @@ pub fn format_ls(layout: &LayoutSnapshot) -> String {
     lines.join("\n")
 }
 
-pub fn format_agents(layout: &LayoutSnapshot) -> String {
+/// Panes with a recognized agent, ordered by pane id — the `agent ls` set.
+pub fn agent_panes(layout: &LayoutSnapshot) -> Vec<&PaneSnapshot> {
     let mut panes: Vec<_> = layout
         .panes
         .iter()
@@ -288,6 +151,10 @@ pub fn format_agents(layout: &LayoutSnapshot) -> String {
         .collect();
     panes.sort_by_key(|pane| pane.id.0);
     panes
+}
+
+pub fn format_agents(layout: &LayoutSnapshot) -> String {
+    agent_panes(layout)
         .into_iter()
         .map(|pane| {
             format!(
@@ -320,13 +187,6 @@ pub fn state_name(state: AgentStateKind) -> &'static str {
     }
 }
 
-fn pane_id(value: &str) -> Result<PaneId> {
-    value
-        .parse()
-        .map(PaneId)
-        .with_context(|| format!("invalid pane id '{value}'"))
-}
-
 pub fn layout_query() -> ClientMessage {
     ClientMessage::Query(QueryKind::Layout)
 }
@@ -334,9 +194,7 @@ pub fn layout_query() -> ClientMessage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kodade_cli_proto::{
-        LayoutTree, PaneSnapshot, Screen, TabId, TabInfo, WorkspaceId, WorkspaceInfo,
-    };
+    use kodade_cli_proto::{LayoutTree, Screen, TabId, TabInfo, WorkspaceId, WorkspaceInfo};
 
     fn fixture() -> LayoutSnapshot {
         LayoutSnapshot {
@@ -384,42 +242,9 @@ mod tests {
     }
 
     #[test]
-    fn parses_session_commands_and_report_states() {
-        assert_eq!(
-            parse(&[
-                "-s".into(),
-                "work".into(),
-                "agent".into(),
-                "report".into(),
-                "7".into(),
-                "working".into(),
-                "--source".into(),
-                "hook".into()
-            ])
-            .unwrap(),
-            Command::Report {
-                session: "work".into(),
-                pane: PaneId(7),
-                state: AgentStateKind::Working,
-                source: "hook".into()
-            }
-        );
+    fn parses_reported_agent_states() {
         assert_eq!(parse_state("done").unwrap(), AgentStateKind::Done);
         assert!(parse_state("busy").is_err());
-        assert_eq!(
-            parse(&[
-                "send".into(),
-                "7".into(),
-                "hello".into(),
-                "--no-newline".into()
-            ])
-            .unwrap(),
-            Command::Send {
-                session: "default".into(),
-                pane: PaneId(7),
-                bytes: b"hello".to_vec()
-            }
-        );
     }
 
     #[test]

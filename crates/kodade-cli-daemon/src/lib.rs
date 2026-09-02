@@ -54,11 +54,23 @@ struct Tab {
     focused: PaneId,
     zoomed: bool,
 }
+/// vt100 0.16 reports the OSC window title through callbacks instead of `Screen::title`.
+#[derive(Default)]
+struct PtyCallbacks {
+    title: String,
+}
+impl vt100::Callbacks for PtyCallbacks {
+    fn set_window_title(&mut self, _: &mut vt100::Screen, title: &[u8]) {
+        self.title = String::from_utf8_lossy(title).into_owned();
+    }
+}
+type PtyParser = vt100::Parser<PtyCallbacks>;
+
 struct Pane {
     title: Mutex<String>,
     writer: Mutex<Box<dyn Write + Send>>,
     master: Mutex<Box<dyn MasterPty + Send>>,
-    parser: Arc<Mutex<vt100::Parser>>,
+    parser: Arc<Mutex<PtyParser>>,
     scroll_offset: Mutex<usize>,
     last_output: Arc<Mutex<Instant>>,
     hook: Mutex<Option<ReportedHook>>,
@@ -957,7 +969,12 @@ impl Pane {
             .context("spawn login shell in PTY")?;
         let writer = pair.master.take_writer()?;
         let reader = pair.master.try_clone_reader()?;
-        let parser = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, 10_000)));
+        let parser = Arc::new(Mutex::new(PtyParser::new_with_callbacks(
+            rows,
+            cols,
+            10_000,
+            PtyCallbacks::default(),
+        )));
         let last_output = Arc::new(Mutex::new(Instant::now()));
         read_pty(
             reader,
@@ -986,7 +1003,7 @@ impl Pane {
             .lock()
             .expect("scroll offset lock poisoned");
         let mut parser = self.parser.lock().expect("PTY parser lock poisoned");
-        parser.set_scrollback(*offset);
+        parser.screen_mut().set_scrollback(*offset);
         *offset = parser.screen().scrollback();
         snapshot(&parser)
     }
@@ -1003,6 +1020,7 @@ impl Pane {
         self.parser
             .lock()
             .map_err(|_| anyhow!("PTY parser lock poisoned"))?
+            .screen_mut()
             .set_size(rows, cols);
         Ok(())
     }
@@ -1022,7 +1040,7 @@ impl Pane {
             .expect("scroll offset lock poisoned");
         let mut parser = self.parser.lock().expect("PTY parser lock poisoned");
         *offset = scroll_offset_after_delta(*offset, delta, usize::MAX);
-        parser.set_scrollback(*offset);
+        parser.screen_mut().set_scrollback(*offset);
         *offset = parser.screen().scrollback();
     }
     fn reset_scrollback(&self) {
@@ -1034,6 +1052,7 @@ impl Pane {
         self.parser
             .lock()
             .expect("PTY parser lock poisoned")
+            .screen_mut()
             .set_scrollback(0);
     }
     fn scroll_offset(&self) -> usize {
@@ -1046,10 +1065,7 @@ impl Pane {
     fn detect(&self, manifests: &[manifest::Manifest], now: Instant) -> agent::Detection {
         let (screen, title) = {
             let parser = self.parser.lock().expect("PTY parser lock poisoned");
-            (
-                parser.screen().contents(),
-                parser.screen().title().to_owned(),
-            )
+            (parser.screen().contents(), parser.callbacks().title.clone())
         };
         // portable-pty obtains the foreground process-group leader from the PTY itself.
         // `ps` turns that portable pid into a basename without sysctl; unavailable leaders fall
@@ -1124,7 +1140,7 @@ fn scroll_offset_after_delta(offset: usize, delta: i16, available: usize) -> usi
 /// PTY reading blocks, so parser ownership stays in Tokio's blocking pool.
 fn read_pty(
     mut reader: Box<dyn Read + Send>,
-    parser: Arc<Mutex<vt100::Parser>>,
+    parser: Arc<Mutex<PtyParser>>,
     last_output: Arc<Mutex<Instant>>,
     updates: broadcast::Sender<()>,
 ) {
@@ -1143,7 +1159,7 @@ fn read_pty(
         }
     });
 }
-fn snapshot(parser: &vt100::Parser) -> Screen {
+fn snapshot(parser: &PtyParser) -> Screen {
     let (cursor_row, cursor_col) = parser.screen().cursor_position();
     Screen {
         contents: parser.screen().contents(),
@@ -1272,9 +1288,17 @@ mod tests {
     }
     #[test]
     fn vt100_snapshot_retains_terminal_contents() {
-        let mut parser = vt100::Parser::new(3, 10, 100);
+        let mut parser = PtyParser::new_with_callbacks(3, 10, 100, PtyCallbacks::default());
         parser.process(b"hello\r\nworld");
         assert!(snapshot(&parser).contents.contains("hello"));
+    }
+    #[test]
+    fn osc_window_title_reaches_the_detection_callback() {
+        let mut parser = PtyParser::new_with_callbacks(3, 20, 100, PtyCallbacks::default());
+        parser.process(b"\x1b]2;claude\x07");
+        assert_eq!(parser.callbacks().title, "claude");
+        parser.process(b"\x1b]0;codex\x07");
+        assert_eq!(parser.callbacks().title, "codex");
     }
     #[test]
     fn pane_sizes_exclude_client_borders() {
