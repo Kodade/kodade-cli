@@ -19,9 +19,7 @@ cargo fmt && cargo clippy
 ```
 
 ## Architecture
-Planned: Rust workspace with a daemon (PTY host, session state) and a thin TUI
-client (ratatui) speaking over a Unix socket. See docs/PRD.md — the PRD is the
-source of truth until code lands.
+Rust workspace: `kodade-cli-proto` (socket types), `kodade-cli-daemon` (PTY host, session state, agent detection), `kodade-cli` (ratatui client + scripting CLI). See docs/DEVELOPMENT.md. v0.2.0 milestone plan and binding design decisions: docs/features/v0-2-parity/PLAN.md.
 
 ## Conventions & Gotchas
 - Köd[Name] uses the umlaut in prose, docs, comments, and UI strings. ASCII
