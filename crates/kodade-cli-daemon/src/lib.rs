@@ -12,7 +12,7 @@ use std::{
     io::{Read, Write},
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         Arc, Mutex,
     },
     time::{Duration, Instant},
@@ -20,10 +20,10 @@ use std::{
 
 use anyhow::{anyhow, bail, Context, Result};
 use kodade_cli_proto::{
-    decode, encode, AgentInfo, AgentStateKind, CellColor, ClientMessage, Direction, LayoutSnapshot,
-    LayoutTree, Notification, PaneId, PaneSnapshot, QueryKind, Run, Screen, ServerMessage,
-    SidebarTabInfo, SplitAxis, TabId, TabInfo, WorkspaceId, WorkspaceInfo, ATTR_BOLD, ATTR_DIM,
-    ATTR_INVERSE, ATTR_ITALIC, ATTR_UNDERLINE, PROTOCOL_VERSION,
+    decode, encode, schema_message, AgentInfo, AgentStateKind, CellColor, ClientMessage, Direction,
+    Event, LayoutSnapshot, LayoutTree, Notification, PaneId, PaneSnapshot, QueryKind, Run, Screen,
+    ServerMessage, SidebarTabInfo, SplitAxis, TabId, TabInfo, WorkspaceId, WorkspaceInfo,
+    ATTR_BOLD, ATTR_DIM, ATTR_INVERSE, ATTR_ITALIC, ATTR_UNDERLINE, PROTOCOL_VERSION,
 };
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use tokio::{
@@ -33,7 +33,8 @@ use tokio::{
 };
 
 struct Session {
-    name: String,
+    /// Session name; behind a lock because `session rename` moves it (#16).
+    name: Mutex<String>,
     state: Mutex<SessionState>,
     panes: Mutex<HashMap<PaneId, Arc<Pane>>>,
     updates: broadcast::Sender<()>,
@@ -54,6 +55,16 @@ struct Session {
     /// Monotonic high-water mark for `Notification.seq`; also the id a freshly
     /// attached client uses so it never replays the backlog.
     notify_seq: AtomicU64,
+    /// Session events for subscribed connections (#16). Nothing is buffered:
+    /// a client that is not subscribed when an event fires never sees it.
+    events: broadcast::Sender<Event>,
+    /// Number of connections currently subscribed. While it is non-zero the
+    /// daemon snapshots on a timer so agent-state transitions are detected even
+    /// with no client attached (detection only runs inside `snapshot`).
+    subscribers: AtomicUsize,
+    /// Path of the bound socket file. `session rename` renames the file in
+    /// place, so teardown reads it from here rather than from the start value.
+    socket: Mutex<PathBuf>,
 }
 struct SessionState {
     workspaces: Vec<Workspace>,
@@ -122,16 +133,25 @@ struct ProcessEvidence {
 }
 
 pub fn socket_path(session: &str) -> PathBuf {
+    socket_dir().join(format!("{session}.sock"))
+}
+
+/// Directory holding one `<session>.sock` per live session. `session ls` scans
+/// it, so it is part of the public surface.
+pub fn socket_dir() -> PathBuf {
     let runtime = env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from);
     let home = dirs::home_dir();
     let uid = env::var("UID").unwrap_or_else(|_| "unknown".to_owned());
     socket_path_for(
-        session,
+        "unused",
         runtime.as_deref(),
         home.as_deref(),
         &uid,
         cfg!(target_os = "macos"),
     )
+    .parent()
+    .expect("socket path always has a parent directory")
+    .to_path_buf()
 }
 
 fn socket_path_for(
@@ -165,9 +185,15 @@ pub async fn run(session_name: String) -> Result<()> {
     let listener = UnixListener::bind(&socket).context("bind Ködade CLI socket")?;
     // Binding succeeded, so no live daemon owns this session: safe to restore.
     let session = Arc::new(load_session(&session_name)?);
+    // The socket name wins over whatever the state file recorded (it may have
+    // been renamed or copied), so `save` and teardown stay on this path.
+    *session.name.lock().expect("name lock poisoned") = session_name.clone();
+    *session.socket.lock().expect("socket lock poisoned") = socket.clone();
     let mut shutdown = session.shutdown.subscribe();
     // Debounced layout persistence runs alongside the accept loop.
     tokio::spawn(persist_loop(Arc::clone(&session)));
+    // Keeps agent detection running for event subscribers with no TUI attached.
+    tokio::spawn(subscriber_tick(Arc::clone(&session)));
     // Flush state on SIGTERM so a stopped daemon (e.g. logout) can be restored.
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .context("install SIGTERM handler")?;
@@ -176,23 +202,22 @@ pub async fn run(session_name: String) -> Result<()> {
             _ = shutdown.recv() => {
                 // `kill-session` is deliberate: drop the state file so it does
                 // not resurrect on the next cold start.
-                persist::remove_session_file(&session_name);
+                persist::remove_session_file(&session.session_name());
                 drop(listener);
-                let _ = fs::remove_file(&socket);
+                let _ = fs::remove_file(session.socket_path());
                 return Ok(());
             }
             _ = sigterm.recv() => {
                 session.save();
                 drop(listener);
-                let _ = fs::remove_file(&socket);
+                let _ = fs::remove_file(session.socket_path());
                 return Ok(());
             }
             accepted = listener.accept() => {
                 let (stream, _) = accepted?;
                 let session = Arc::clone(&session);
-                let session_name = session_name.clone();
                 tokio::spawn(async move {
-                    if let Err(error) = serve_client(stream, session, session_name).await {
+                    if let Err(error) = serve_client(stream, session).await {
                         eprintln!("Ködade CLI client disconnected: {error:#}");
                     }
                 });
@@ -262,10 +287,12 @@ fn validate_session_name(session: &str) -> Result<()> {
 
 impl Session {
     fn spawn(cols: u16, rows: u16, name: String) -> Result<Self> {
+        let name_for_socket = name.clone();
         let (updates, _) = broadcast::channel(64);
         let (shutdown, _) = broadcast::channel(16);
+        let (events, _) = broadcast::channel(256);
         let session = Self {
-            name,
+            name: Mutex::new(name),
             state: Mutex::new(SessionState {
                 workspaces: Vec::new(),
                 active_workspace: WorkspaceId(1),
@@ -280,6 +307,9 @@ impl Session {
             restored: AtomicBool::new(false),
             notifications: Mutex::new(Vec::new()),
             notify_seq: AtomicU64::new(0),
+            events,
+            subscribers: AtomicUsize::new(0),
+            socket: Mutex::new(socket_path(&name_for_socket)),
         };
         let pane = session.new_pane("shell", None, None)?;
         let tab = Tab {
@@ -312,8 +342,9 @@ impl Session {
     fn restore(file: persist::SessionFile, resume_agents: bool) -> Result<Self> {
         let (updates, _) = broadcast::channel(64);
         let (shutdown, _) = broadcast::channel(16);
+        let (events, _) = broadcast::channel(256);
         let session = Self {
-            name: file.name.clone(),
+            name: Mutex::new(file.name.clone()),
             state: Mutex::new(SessionState {
                 workspaces: Vec::new(),
                 active_workspace: WorkspaceId(1),
@@ -328,6 +359,9 @@ impl Session {
             restored: AtomicBool::new(true),
             notifications: Mutex::new(Vec::new()),
             notify_seq: AtomicU64::new(0),
+            events,
+            subscribers: AtomicUsize::new(0),
+            socket: Mutex::new(socket_path(&file.name)),
         };
         let mut workspaces = Vec::new();
         let mut workspace_ids: HashMap<u64, WorkspaceId> = HashMap::new();
@@ -433,7 +467,7 @@ impl Session {
             .collect();
         persist::SessionFile {
             version: 1,
-            name: self.name.clone(),
+            name: self.session_name(),
             active_workspace: state.active_workspace.0,
             workspaces,
         }
@@ -442,15 +476,13 @@ impl Session {
     /// Persist the current layout to this session's state file. Best-effort:
     /// errors are logged, never propagated to the client-facing loop.
     fn save(&self) {
-        let Some(path) = persist::session_file_path(&self.name) else {
+        let name = self.session_name();
+        let Some(path) = persist::session_file_path(&name) else {
             return;
         };
         let file = self.build_file();
         if let Err(error) = persist::write_session_file(&path, &file) {
-            eprintln!(
-                "Ködade CLI could not persist session '{}': {error:#}",
-                self.name
-            );
+            eprintln!("Ködade CLI could not persist session '{name}': {error:#}");
         }
     }
 
@@ -469,20 +501,42 @@ impl Session {
         WorkspaceId(self.next_id())
     }
 
+    /// Current session name (see [`Session::name`]).
+    fn session_name(&self) -> String {
+        self.name.lock().expect("name lock poisoned").clone()
+    }
+
+    /// Publish a session event to subscribed connections. Never fails: with no
+    /// subscribers the send is a no-op.
+    fn emit(&self, event: Event) {
+        let _ = self.events.send(event);
+    }
+
     fn new_pane(
         &self,
         title: &str,
         cwd: Option<PathBuf>,
         command: Option<Vec<String>>,
     ) -> Result<PaneId> {
-        let id = self.pane_id();
+        self.new_pane_with_id(self.pane_id(), title, cwd, command)
+    }
+
+    /// Spawn a pane under a caller-chosen id, used by `layout apply` so a pane
+    /// that is already alive keeps its id.
+    fn new_pane_with_id(
+        &self,
+        id: PaneId,
+        title: &str,
+        cwd: Option<PathBuf>,
+        command: Option<Vec<String>>,
+    ) -> Result<PaneId> {
         let (cols, rows) = *self.size.lock().expect("size lock poisoned");
         let pane = Arc::new(Pane::spawn(
             id,
             title,
             cols,
             rows,
-            self.name.clone(),
+            self.session_name(),
             self.updates.clone(),
             cwd,
             command,
@@ -491,6 +545,7 @@ impl Session {
             .lock()
             .expect("pane lock poisoned")
             .insert(id, pane);
+        self.emit(Event::PaneOpened { pane: id });
         Ok(id)
     }
 
@@ -672,6 +727,15 @@ impl Session {
             let previous = pane.last_state();
             let age = pane.track_state(detection.state, now);
             ages.insert(*id, age);
+            // The `track_state` write above makes this fire once per real
+            // transition even when several clients snapshot concurrently.
+            if let Some(from) = previous.filter(|from| *from != detection.state) {
+                self.emit(Event::AgentStateChanged {
+                    pane: *id,
+                    from,
+                    to: detection.state,
+                });
+            }
             let agent_known = detection.agent.is_some() || detection.from_hook;
             if should_notify(previous, detection.state, agent_known) {
                 if let Some((workspace, tab)) = locate_pane(&state, *id) {
@@ -743,6 +807,58 @@ impl Session {
         })
     }
 
+    /// Snapshot one pane wherever it lives, including background tabs and
+    /// workspaces that `snapshot` (active tab only) leaves out. This is what
+    /// `agent wait` / `pane wait-output` poll.
+    fn pane_snapshot(&self, id: PaneId) -> Result<PaneSnapshot> {
+        let (focused, location) = {
+            let state = self
+                .state
+                .lock()
+                .map_err(|_| anyhow!("state lock poisoned"))?;
+            let focused = state
+                .workspaces
+                .iter()
+                .flat_map(|workspace| workspace.tabs.iter())
+                .any(|tab| tab.focused == id);
+            (focused, locate_pane(&state, id))
+        };
+        let pane = self
+            .panes
+            .lock()
+            .map_err(|_| anyhow!("pane lock poisoned"))?
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| anyhow!("pane {} not found", id.0))?;
+        if location.is_none() {
+            bail!("pane {} not found", id.0);
+        }
+        let now = Instant::now();
+        let detection = pane.detect(&self.manifests, now);
+        let previous = pane.last_state();
+        let age = pane.track_state(detection.state, now);
+        if let Some(from) = previous.filter(|from| *from != detection.state) {
+            self.emit(Event::AgentStateChanged {
+                pane: id,
+                from,
+                to: detection.state,
+            });
+        }
+        let title = pane.title.lock().expect("title lock poisoned").clone();
+        Ok(PaneSnapshot {
+            id,
+            title,
+            focused,
+            scroll_offset: pane.scroll_offset(),
+            screen: pane.snapshot(),
+            agent: detection.agent.clone(),
+            state: detection.state,
+            state_reason: detection.reason.clone(),
+            state_age_secs: age,
+            cwd: pane.cwd(now),
+        })
+    }
+
     /// Queues a notification with the next sequence number, capping the ring at
     /// 64 so a long-lived session never grows the queue without bound.
     fn push_notification(
@@ -763,10 +879,15 @@ impl Session {
             state,
             seq,
         });
+        let notification = queue.last().cloned().expect("just pushed");
         let overflow = queue.len().saturating_sub(64);
         if overflow > 0 {
             queue.drain(0..overflow);
         }
+        drop(queue);
+        // Subscribed connections read notifications off the event stream; #10's
+        // `ServerMessage::Notification` stays for plain attached clients.
+        self.emit(Event::Notification(notification));
     }
 
     /// Highest sequence handed out so far. A client records this at attach time
@@ -838,10 +959,13 @@ impl Session {
 
     fn handle(&self, message: ClientMessage) -> Result<()> {
         match message {
-            // `Version` is answered directly in `serve_client`.
-            ClientMessage::Query(_) => {}
-            // Handled directly in `serve_client`, which replies with `PaneText`.
-            ClientMessage::ReadPane { .. } => {}
+            // `Version` / `Session` / `Schema` queries, `Subscribe`, and
+            // `ReadPane` are answered by `serve_client`; no state changes here.
+            ClientMessage::Query(_) | ClientMessage::Subscribe | ClientMessage::ReadPane { .. } => {
+            }
+            ClientMessage::ApplyLayout(file) => self.apply_layout(file)?,
+            ClientMessage::MovePaneToTab { pane, tab } => self.move_pane_to_tab(pane, tab)?,
+            ClientMessage::RenameSession { name } => self.rename_session(&name)?,
             ClientMessage::Hello {
                 cols,
                 rows,
@@ -972,6 +1096,7 @@ impl Session {
                 });
                 workspace.active_tab = id;
                 drop(state);
+                self.emit(Event::TabOpened { tab: id });
                 self.resize_current()?;
             }
             ClientMessage::NewPane {
@@ -1079,8 +1204,11 @@ impl Session {
                     .state
                     .lock()
                     .map_err(|_| anyhow!("state lock poisoned"))?;
-                break_pane(&mut state);
+                let opened = break_pane(&mut state);
                 drop(state);
+                if let Some(tab) = opened {
+                    self.emit(Event::TabOpened { tab });
+                }
                 self.resize_current()?;
             }
             ClientMessage::EqualizeLayout => {
@@ -1133,9 +1261,10 @@ impl Session {
                     .flat_map(|workspace| workspace.tabs.iter_mut())
                     .find(|tab| tab.id == id)
                 {
-                    tab.name = name;
+                    tab.name = name.clone();
                 }
                 drop(state);
+                self.emit(Event::TabRenamed { tab: id, name });
                 self.notify();
             }
             ClientMessage::RenameWorkspaceId { id, name } => {
@@ -1144,9 +1273,13 @@ impl Session {
                     .lock()
                     .map_err(|_| anyhow!("state lock poisoned"))?;
                 if let Some(workspace) = state.workspaces.iter_mut().find(|item| item.id == id) {
-                    workspace.name = name;
+                    workspace.name = name.clone();
                 }
                 drop(state);
+                self.emit(Event::WorkspaceRenamed {
+                    workspace: id,
+                    name,
+                });
                 self.notify();
             }
             ClientMessage::SetWorkspaceColor { id, color } => {
@@ -1191,6 +1324,8 @@ impl Session {
                 });
                 state.active_workspace = id;
                 drop(state);
+                self.emit(Event::WorkspaceOpened { workspace: id });
+                self.emit(Event::TabOpened { tab: tab_id });
                 self.resize_current()?;
             }
             ClientMessage::SelectWorkspace { id } => {
@@ -1226,7 +1361,11 @@ impl Session {
                     .state
                     .lock()
                     .map_err(|_| anyhow!("state lock poisoned"))?;
-                Self::active_tab_mut(&mut state).name = name;
+                let tab = Self::active_tab_mut(&mut state);
+                tab.name = name.clone();
+                let id = tab.id;
+                drop(state);
+                self.emit(Event::TabRenamed { tab: id, name });
                 self.notify();
             }
             ClientMessage::RenameWorkspace { name } => {
@@ -1240,7 +1379,12 @@ impl Session {
                     .iter_mut()
                     .find(|item| item.id == active)
                     .expect("active workspace exists")
-                    .name = name;
+                    .name = name.clone();
+                drop(state);
+                self.emit(Event::WorkspaceRenamed {
+                    workspace: active,
+                    name,
+                });
                 self.notify();
             }
             ClientMessage::ResizePane { direction, cells } => {
@@ -1333,6 +1477,7 @@ impl Session {
             .then(|| self.new_pane("shell", None, None))
             .transpose()?;
         let removed;
+        let mut events = Vec::new();
         {
             let mut state = self
                 .state
@@ -1361,8 +1506,9 @@ impl Session {
                     removed = Some(focused);
                 }
                 None if tab_count > 1 => {
-                    workspace.tabs.remove(tab_index);
+                    let closed = workspace.tabs.remove(tab_index).id;
                     workspace.active_tab = workspace.tabs[tab_index.saturating_sub(1)].id;
+                    events.push(Event::TabClosed { tab: closed });
                     removed = Some(focused);
                 }
                 None => {
@@ -1380,6 +1526,10 @@ impl Session {
                 .lock()
                 .map_err(|_| anyhow!("pane lock poisoned"))?
                 .remove(&id);
+            self.emit(Event::PaneClosed { pane: id });
+        }
+        for event in events {
+            self.emit(event);
         }
         self.resize_current()
     }
@@ -1399,6 +1549,7 @@ impl Session {
             .then(|| self.new_pane("shell", None, None))
             .transpose()?;
         let fresh_tab = needs_fresh.then(|| self.tab_id());
+        let mut events = Vec::new();
         let pane_ids = {
             let mut state = self
                 .state
@@ -1419,6 +1570,7 @@ impl Session {
             let tab = workspace.tabs.remove(index);
             let mut ids = Vec::new();
             layout::leaves(&tab.tree, &mut ids);
+            events.push(Event::TabClosed { tab: id });
             if workspace.tabs.is_empty() {
                 let pane = fresh.expect("final tab receives a replacement pane");
                 let tab_id = fresh_tab.expect("final tab receives a replacement tab");
@@ -1429,6 +1581,7 @@ impl Session {
                     focused: pane,
                     zoomed: false,
                 });
+                events.push(Event::TabOpened { tab: tab_id });
             }
             workspace.active_tab = workspace.tabs[index.saturating_sub(1)].id;
             ids
@@ -1437,10 +1590,14 @@ impl Session {
             .panes
             .lock()
             .map_err(|_| anyhow!("pane lock poisoned"))?;
-        for id in pane_ids {
-            panes.remove(&id);
+        for pane in pane_ids {
+            panes.remove(&pane);
+            self.emit(Event::PaneClosed { pane });
         }
         drop(panes);
+        for event in events {
+            self.emit(event);
+        }
         self.resize_current()
     }
 
@@ -1457,6 +1614,7 @@ impl Session {
             .then(|| self.new_pane("shell", None, None))
             .transpose()?;
         let fresh_tab = needs_fresh.then(|| self.tab_id());
+        let mut events = Vec::new();
         let pane_ids = {
             let mut state = self
                 .state
@@ -1471,11 +1629,14 @@ impl Session {
                 None => return Ok(()),
             };
             if state.workspaces.len() == 1 {
+                // The last workspace is reset, not removed: its tabs go away and
+                // a fresh one takes their place, so no `WorkspaceClosed` here.
                 let workspace = &mut state.workspaces[index];
                 let old_tabs = std::mem::take(&mut workspace.tabs);
                 let mut ids = Vec::new();
                 for tab in old_tabs {
                     layout::leaves(&tab.tree, &mut ids);
+                    events.push(Event::TabClosed { tab: tab.id });
                 }
                 let pane = fresh.expect("final workspace receives a replacement pane");
                 let tab_id = fresh_tab.expect("final workspace receives a replacement tab");
@@ -1487,13 +1648,16 @@ impl Session {
                     zoomed: false,
                 });
                 workspace.active_tab = tab_id;
+                events.push(Event::TabOpened { tab: tab_id });
                 ids
             } else {
                 let workspace = state.workspaces.remove(index);
                 let mut ids = Vec::new();
                 for tab in workspace.tabs {
                     layout::leaves(&tab.tree, &mut ids);
+                    events.push(Event::TabClosed { tab: tab.id });
                 }
+                events.push(Event::WorkspaceClosed { workspace: id });
                 state.active_workspace = state.workspaces[index.saturating_sub(1)].id;
                 ids
             }
@@ -1502,12 +1666,363 @@ impl Session {
             .panes
             .lock()
             .map_err(|_| anyhow!("pane lock poisoned"))?;
-        for id in pane_ids {
-            panes.remove(&id);
+        for pane in pane_ids {
+            panes.remove(&pane);
+            self.emit(Event::PaneClosed { pane });
         }
         drop(panes);
+        for event in events {
+            self.emit(event);
+        }
         self.resize_current()
     }
+}
+
+impl Session {
+    /// Move a pane into another existing tab, splitting that tab's focused pane.
+    /// The pane keeps its PTY. A tab left empty by the move is closed, and a
+    /// workspace that would be left with no tabs at all gets a fresh shell tab
+    /// so later lookups (`active_tab`) always find one.
+    fn move_pane_to_tab(&self, pane: PaneId, tab: TabId) -> Result<()> {
+        // Decide up front whether the source workspace would be emptied; the
+        // replacement pane has to be spawned before the state lock is taken.
+        let needs_fresh = {
+            let state = self
+                .state
+                .lock()
+                .map_err(|_| anyhow!("state lock poisoned"))?;
+            let source = locate_tab_of_pane(&state, pane);
+            let target = locate_tab(&state, tab);
+            match (source, target) {
+                (Some((source_ws, source_tab)), Some((target_ws, _))) => {
+                    let workspace = &state.workspaces[source_ws];
+                    let only_leaf =
+                        matches!(workspace.tabs[source_tab].tree, LayoutTree::Leaf { .. });
+                    only_leaf && workspace.tabs.len() == 1 && source_ws != target_ws
+                }
+                _ => false,
+            }
+        };
+        let fresh_pane = needs_fresh
+            .then(|| self.new_pane("shell", None, None))
+            .transpose()?;
+        let fresh_tab = needs_fresh.then(|| self.tab_id());
+        let mut events = Vec::new();
+        {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| anyhow!("state lock poisoned"))?;
+            let Some((workspace_index, tab_index)) = locate_tab_of_pane(&state, pane) else {
+                bail!("pane {} not found", pane.0);
+            };
+            if state.workspaces[workspace_index].tabs[tab_index].id == tab {
+                return Ok(()); // Already there: nothing to move.
+            }
+            let Some((target_workspace, _)) = locate_tab(&state, tab) else {
+                bail!("tab {} not found", tab.0);
+            };
+            // Detach from the source tab, dropping the tab when it empties.
+            let workspace = &mut state.workspaces[workspace_index];
+            match layout::close(workspace.tabs[tab_index].tree.clone(), pane) {
+                Some(tree) => {
+                    let source = &mut workspace.tabs[tab_index];
+                    source.tree = tree;
+                    source.zoomed = false;
+                    let mut leaves = Vec::new();
+                    layout::leaves(&source.tree, &mut leaves);
+                    source.focused = leaves[0];
+                }
+                None if workspace.tabs.len() > 1 => {
+                    let removed = workspace.tabs.remove(tab_index).id;
+                    if workspace.active_tab == removed {
+                        workspace.active_tab = workspace.tabs[tab_index.saturating_sub(1)].id;
+                    }
+                    events.push(Event::TabClosed { tab: removed });
+                }
+                // The source workspace's only tab: it cannot be left empty, so
+                // it is replaced by a fresh shell tab (a workspace always has
+                // at least one tab). Moving inside the same workspace would
+                // instead destroy the tab we are moving into, so that is an error.
+                None if workspace_index != target_workspace => {
+                    let removed = workspace.tabs.remove(tab_index).id;
+                    let pane = fresh_pane.expect("emptied workspace received a pane");
+                    let tab_id = fresh_tab.expect("emptied workspace received a tab");
+                    workspace.tabs.push(Tab {
+                        id: tab_id,
+                        name: "shell".into(),
+                        tree: LayoutTree::Leaf { pane },
+                        focused: pane,
+                        zoomed: false,
+                    });
+                    workspace.active_tab = tab_id;
+                    events.push(Event::TabClosed { tab: removed });
+                    events.push(Event::TabOpened { tab: tab_id });
+                }
+                None => bail!("a workspace's last pane cannot be moved"),
+            }
+            // Re-resolve the target: removing a tab may have shifted indices.
+            let workspace = &mut state.workspaces[target_workspace];
+            let Some(target) = workspace.tabs.iter_mut().find(|item| item.id == tab) else {
+                bail!("tab {} not found", tab.0);
+            };
+            let focused = target.focused;
+            layout::split(&mut target.tree, focused, SplitAxis::Horizontal, pane);
+            target.focused = pane;
+            target.zoomed = false;
+            workspace.active_tab = tab;
+            let active = workspace.id;
+            // A cross-workspace move follows the pane, like `pane focus` does.
+            state.active_workspace = active;
+        }
+        for event in events {
+            self.emit(event);
+        }
+        self.resize_current()
+    }
+
+    /// Rename a live session: the bound socket file and the state file move with
+    /// it, so `-s NEW` reaches the same daemon and PTYs.
+    fn rename_session(&self, new_name: &str) -> Result<()> {
+        validate_session_name(new_name)?;
+        let old_name = self.session_name();
+        if old_name == new_name {
+            return Ok(());
+        }
+        let old_socket = self.socket_path();
+        let new_socket = socket_path(new_name);
+        // Link-then-unlink instead of `exists()` + `rename`: `hard_link` fails
+        // when the target exists, so two daemons cannot race onto one name.
+        // The listener stays bound to the inode, so it answers on both paths
+        // until the old one is unlinked.
+        match fs::hard_link(&old_socket, &new_socket) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                bail!("session '{new_name}' already exists");
+            }
+            Err(error) => {
+                return Err(error).context("link the session socket to its new name");
+            }
+        }
+        fs::remove_file(&old_socket).context("remove the old session socket")?;
+        *self.socket.lock().expect("socket lock poisoned") = new_socket.clone();
+        *self.name.lock().expect("name lock poisoned") = new_name.to_owned();
+        persist::remove_session_file(&old_name);
+        self.save();
+        self.emit(Event::SessionRenamed {
+            name: new_name.to_owned(),
+            socket: new_socket,
+        });
+        self.notify();
+        Ok(())
+    }
+
+    fn socket_path(&self) -> PathBuf {
+        self.socket.lock().expect("socket lock poisoned").clone()
+    }
+
+    /// Replace the layout with a persisted one (`layout apply`). Panes whose ids
+    /// are still alive keep their PTY; every other pane named by a saved tree is
+    /// spawned fresh through the same path a cold restore uses — including the
+    /// saved command, run through the login shell in the saved cwd. Panes the
+    /// file does not mention are closed. A spawn failure leaves the session
+    /// untouched (the panes spawned so far are dropped).
+    fn apply_layout(&self, file: kodade_cli_proto::SessionFile) -> Result<()> {
+        file.validate()?;
+        let live: Vec<PaneId> = self
+            .panes
+            .lock()
+            .map_err(|_| anyhow!("pane lock poisoned"))?
+            .keys()
+            .copied()
+            .collect();
+        let mut spawned: Vec<PaneId> = Vec::new();
+        match self.build_applied_workspaces(&file, &live, &mut spawned) {
+            Ok((workspaces, used, highest)) => {
+                let (before_tabs, before_workspaces) = {
+                    let state = self
+                        .state
+                        .lock()
+                        .map_err(|_| anyhow!("state lock poisoned"))?;
+                    let tabs: Vec<TabId> = state
+                        .workspaces
+                        .iter()
+                        .flat_map(|workspace| workspace.tabs.iter().map(|tab| tab.id))
+                        .collect();
+                    let ids: Vec<WorkspaceId> =
+                        state.workspaces.iter().map(|item| item.id).collect();
+                    (tabs, ids)
+                };
+                let after_tabs: Vec<TabId> = workspaces
+                    .iter()
+                    .flat_map(|workspace| workspace.tabs.iter().map(|tab| tab.id))
+                    .collect();
+                let after_workspaces: Vec<WorkspaceId> =
+                    workspaces.iter().map(|item| item.id).collect();
+                let active_workspace = workspaces
+                    .iter()
+                    .find(|workspace| workspace.id == WorkspaceId(file.active_workspace))
+                    .map(|workspace| workspace.id)
+                    .unwrap_or(workspaces[0].id);
+                {
+                    let mut state = self
+                        .state
+                        .lock()
+                        .map_err(|_| anyhow!("state lock poisoned"))?;
+                    state.workspaces = workspaces;
+                    state.active_workspace = active_workspace;
+                    // Ids from the file are now in use, so never hand them out again.
+                    state.next_id = state.next_id.max(highest);
+                }
+                let mut panes = self
+                    .panes
+                    .lock()
+                    .map_err(|_| anyhow!("pane lock poisoned"))?;
+                for pane in live.into_iter().filter(|id| !used.contains(id)) {
+                    panes.remove(&pane);
+                    self.emit(Event::PaneClosed { pane });
+                }
+                drop(panes);
+                for tab in before_tabs.iter().filter(|id| !after_tabs.contains(id)) {
+                    self.emit(Event::TabClosed { tab: *tab });
+                }
+                for workspace in before_workspaces
+                    .iter()
+                    .filter(|id| !after_workspaces.contains(id))
+                {
+                    self.emit(Event::WorkspaceClosed {
+                        workspace: *workspace,
+                    });
+                }
+                for workspace in after_workspaces
+                    .iter()
+                    .filter(|id| !before_workspaces.contains(id))
+                {
+                    self.emit(Event::WorkspaceOpened {
+                        workspace: *workspace,
+                    });
+                }
+                for tab in after_tabs.iter().filter(|id| !before_tabs.contains(id)) {
+                    self.emit(Event::TabOpened { tab: *tab });
+                }
+                self.resize_current()
+            }
+            Err(error) => {
+                // Roll back: the session state was never touched, so dropping the
+                // panes spawned so far restores the pre-apply world exactly.
+                let mut panes = self
+                    .panes
+                    .lock()
+                    .map_err(|_| anyhow!("pane lock poisoned"))?;
+                for pane in &spawned {
+                    panes.remove(pane);
+                }
+                drop(panes);
+                for pane in spawned {
+                    self.emit(Event::PaneClosed { pane });
+                }
+                Err(error)
+            }
+        }
+    }
+
+    /// Build the workspace list `apply_layout` will install, spawning the panes
+    /// a saved tree names that are not already alive. Records every spawn in
+    /// `spawned` so the caller can undo them when a later spawn fails.
+    #[allow(clippy::type_complexity)]
+    fn build_applied_workspaces(
+        &self,
+        file: &kodade_cli_proto::SessionFile,
+        live: &[PaneId],
+        spawned: &mut Vec<PaneId>,
+    ) -> Result<(Vec<Workspace>, Vec<PaneId>, u64)> {
+        let mut workspaces = Vec::new();
+        let mut used: Vec<PaneId> = Vec::new();
+        let mut highest = 0;
+        for saved in &file.workspaces {
+            let mut tabs = Vec::new();
+            for saved_tab in &saved.tabs {
+                // The tree is the layout of record; `panes` only carries the
+                // metadata for the ids it names (validate keeps them in step).
+                let mut leaves = Vec::new();
+                layout::leaves(&saved_tab.tree, &mut leaves);
+                for id in &leaves {
+                    highest = highest.max(id.0);
+                    used.push(*id);
+                    if live.contains(id) {
+                        continue;
+                    }
+                    let saved_pane = saved_tab
+                        .panes
+                        .iter()
+                        .find(|pane| pane.id == id.0)
+                        .ok_or_else(|| {
+                            anyhow!("tab {} has no entry for pane {}", saved_tab.id, id.0)
+                        })?;
+                    let cwd = restore_cwd(saved_pane.cwd.clone(), saved.root.clone());
+                    self.new_pane_with_id(*id, &saved_pane.title, cwd, saved_pane.command.clone())?;
+                    spawned.push(*id);
+                }
+                let focused = if leaves.contains(&PaneId(saved_tab.focused)) {
+                    PaneId(saved_tab.focused)
+                } else {
+                    leaves[0]
+                };
+                highest = highest.max(saved_tab.id);
+                tabs.push(Tab {
+                    id: TabId(saved_tab.id),
+                    name: saved_tab.name.clone(),
+                    tree: saved_tab.tree.clone(),
+                    focused,
+                    zoomed: saved_tab.zoomed,
+                });
+            }
+            highest = highest.max(saved.id);
+            let active_tab = tabs
+                .iter()
+                .find(|tab| tab.id == TabId(saved.active_tab))
+                .map(|tab| tab.id)
+                .unwrap_or(tabs[0].id);
+            workspaces.push(Workspace {
+                id: WorkspaceId(saved.id),
+                name: saved.name.clone(),
+                tabs,
+                active_tab,
+                root: saved.root.clone(),
+                color: saved.color.clone(),
+            });
+        }
+        Ok((workspaces, used, highest))
+    }
+}
+
+/// Index of the workspace and tab holding `pane`, if any.
+fn locate_tab_of_pane(state: &SessionState, pane: PaneId) -> Option<(usize, usize)> {
+    state
+        .workspaces
+        .iter()
+        .enumerate()
+        .find_map(|(workspace, item)| {
+            item.tabs
+                .iter()
+                .position(|item| layout::contains(&item.tree, pane))
+                .map(|index| (workspace, index))
+        })
+}
+
+/// Index of the workspace and tab with id `tab`, if any. Tab ids are global, so
+/// this searches every workspace.
+fn locate_tab(state: &SessionState, tab: TabId) -> Option<(usize, usize)> {
+    state
+        .workspaces
+        .iter()
+        .enumerate()
+        .find_map(|(index, item)| {
+            item.tabs
+                .iter()
+                .position(|item| item.id == tab)
+                .map(|position| (index, position))
+        })
 }
 
 fn sidebar_tab_info(
@@ -1561,23 +2076,16 @@ fn move_tab(workspace: &mut Workspace, delta: i8) -> bool {
 
 /// Move the focused pane into a new tab of its own, keeping its PTY alive.
 /// A tab holding a single pane has nothing to break out, so it is a no-op.
-fn break_pane(state: &mut SessionState) -> bool {
+fn break_pane(state: &mut SessionState) -> Option<TabId> {
     let active = state.active_workspace;
-    let Some(workspace) = state.workspaces.iter_mut().find(|item| item.id == active) else {
-        return false;
-    };
-    let Some(index) = workspace
+    let workspace = state.workspaces.iter_mut().find(|item| item.id == active)?;
+    let index = workspace
         .tabs
         .iter()
-        .position(|tab| tab.id == workspace.active_tab)
-    else {
-        return false;
-    };
+        .position(|tab| tab.id == workspace.active_tab)?;
     let source = &mut workspace.tabs[index];
     let pane = source.focused;
-    let Some(tree) = layout::close(source.tree.clone(), pane) else {
-        return false;
-    };
+    let tree = layout::close(source.tree.clone(), pane)?;
     source.tree = tree;
     source.zoomed = false;
     let mut remaining = Vec::new();
@@ -1602,7 +2110,7 @@ fn break_pane(state: &mut SessionState) -> bool {
         },
     );
     workspace.active_tab = id;
-    true
+    Some(id)
 }
 
 /// Focus a pane wherever it lives, activating its tab and workspace first.
@@ -1678,7 +2186,12 @@ impl Pane {
             command.cwd(dir);
         }
         command.env("KODADE_PANE", id.0.to_string());
+        command.env("KODADE_SOCKET", socket_path(&session));
         command.env("KODADE_SESSION", session);
+        // Scripts inside a pane call the same binary that hosts them.
+        if let Ok(exe) = env::current_exe() {
+            command.env("KODADE_BIN", exe);
+        }
         pair.slave
             .spawn_command(command)
             .context("spawn login shell in PTY")?;
@@ -2227,11 +2740,15 @@ fn pane_sizes(tree: &LayoutTree, width: u16, height: u16, output: &mut Vec<(Pane
     }
 }
 
-async fn serve_client(stream: UnixStream, session: Arc<Session>, name: String) -> Result<()> {
+async fn serve_client(stream: UnixStream, session: Arc<Session>) -> Result<()> {
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader).lines();
     let mut updates = session.updates.subscribe();
+    let mut events = session.events.subscribe();
     let mut shutdown = session.shutdown.subscribe();
+    // Set by `Subscribe`: this connection then receives every session event.
+    let mut subscribed = false;
+    let mut subscription: Option<SubscriberGuard> = None;
     let mut process_timer = tokio::time::interval(Duration::from_secs(2));
     process_timer.tick().await;
     let mut last_snapshot = Instant::now() - Duration::from_millis(16);
@@ -2244,12 +2761,6 @@ async fn serve_client(stream: UnixStream, session: Arc<Session>, name: String) -
             line = reader.next_line() => {
                 let Some(line) = line? else { return Ok(()); };
                 let message = decode::<ClientMessage>(line.as_bytes())?;
-                // Version probe: answer and keep the connection open so a caller
-                // can follow up on the same socket.
-                if let ClientMessage::Query(QueryKind::Version) = message {
-                    write_server(&mut writer, &ServerMessage::Version { version: PROTOCOL_VERSION }).await?;
-                    continue;
-                }
                 // A client whose protocol version differs cannot be served; tell
                 // it plainly and close so it fails fast instead of misbehaving.
                 if let ClientMessage::Hello { version, .. } = message {
@@ -2262,29 +2773,65 @@ async fn serve_client(stream: UnixStream, session: Arc<Session>, name: String) -
                         return Ok(());
                     }
                 }
-                // `ReadPane` replies with pane text, not a layout snapshot.
-                if let ClientMessage::ReadPane { id, scrollback, lines } = message {
-                    match session.read_pane_text(id, scrollback, lines) {
-                        Ok((text, scrollback_lines)) => {
-                            write_server(&mut writer, &ServerMessage::PaneText { id, text, scrollback_lines }).await?;
-                        }
-                        Err(error) => {
-                            write_server(&mut writer, &ServerMessage::Error { message: error.to_string() }).await?;
-                            return Ok(());
-                        }
+                // Read-only messages answer directly; they never touch state.
+                match message {
+                    // Version probe: answer and keep the connection open so a
+                    // caller can follow up on the same socket.
+                    ClientMessage::Query(QueryKind::Version) => {
+                        write_server(&mut writer, &ServerMessage::Version { version: PROTOCOL_VERSION }).await?;
+                        continue;
                     }
-                    continue;
+                    ClientMessage::ReadPane { id, scrollback, lines } => {
+                        match session.read_pane_text(id, scrollback, lines) {
+                            Ok((text, scrollback_lines)) => {
+                                write_server(&mut writer, &ServerMessage::PaneText { id, text, scrollback_lines }).await?;
+                            }
+                            Err(error) => {
+                                write_server(&mut writer, &ServerMessage::Error { message: error.to_string() }).await?;
+                                return Ok(());
+                            }
+                        }
+                        continue;
+                    }
+                    ClientMessage::Query(QueryKind::Pane(id)) => {
+                        match session.pane_snapshot(id) {
+                            Ok(pane) => write_server(&mut writer, &ServerMessage::Pane(pane)).await?,
+                            Err(error) => {
+                                write_server(&mut writer, &ServerMessage::Error { message: error.to_string() }).await?;
+                                return Ok(());
+                            }
+                        }
+                        continue;
+                    }
+                    ClientMessage::Query(QueryKind::Session) => {
+                        write_server(&mut writer, &ServerMessage::Session(session.build_file())).await?;
+                        continue;
+                    }
+                    ClientMessage::Query(QueryKind::Schema) => {
+                        write_server(&mut writer, &schema_message()).await?;
+                        continue;
+                    }
+                    ClientMessage::Subscribe => {
+                        // Counted once per connection; the guard decrements it
+                        // however this loop exits.
+                        if subscription.is_none() {
+                            session.subscribers.fetch_add(1, Ordering::Relaxed);
+                            subscription = Some(SubscriberGuard(Arc::clone(&session)));
+                        }
+                        subscribed = true;
+                    }
+                    _ => {}
                 }
                 let hello = matches!(message, ClientMessage::Hello { .. });
                 let kill = matches!(message, ClientMessage::KillSession);
                 match session.handle(message) {
                     Ok(()) if hello => {
                         initialized = true;
-                        write_server(&mut writer, &ServerMessage::Welcome { session: name.clone(), version: PROTOCOL_VERSION }).await?;
+                        write_server(&mut writer, &ServerMessage::Welcome { session: session.session_name(), version: PROTOCOL_VERSION }).await?;
                         // The first client attach sees `restored: true`; clear it
                         // afterward so later snapshots (and `ls`) report normally.
                         write_server(&mut writer, &ServerMessage::Layout(session.snapshot()?)).await?;
-                        send_notifications(&mut writer, &session, &mut last_notify_seq).await?;
+                        send_notifications(&mut writer, &session, &mut last_notify_seq, subscribed).await?;
                         session.clear_restored();
                     }
                     Ok(()) if kill => {
@@ -2293,7 +2840,7 @@ async fn serve_client(stream: UnixStream, session: Arc<Session>, name: String) -
                     }
                     Ok(()) => {
                         write_server(&mut writer, &ServerMessage::Layout(session.snapshot()?)).await?;
-                        send_notifications(&mut writer, &session, &mut last_notify_seq).await?;
+                        send_notifications(&mut writer, &session, &mut last_notify_seq, subscribed).await?;
                     }
                     Err(error) => {
                         write_server(&mut writer, &ServerMessage::Error { message: error.to_string() }).await?;
@@ -2309,7 +2856,7 @@ async fn serve_client(stream: UnixStream, session: Arc<Session>, name: String) -
                     let remaining = Duration::from_millis(16).saturating_sub(last_snapshot.elapsed());
                     if !remaining.is_zero() { tokio::time::sleep(remaining).await; }
                     write_server(&mut writer, &ServerMessage::Layout(session.snapshot()?)).await?;
-                    send_notifications(&mut writer, &session, &mut last_notify_seq).await?;
+                    send_notifications(&mut writer, &session, &mut last_notify_seq, subscribed).await?;
                     last_snapshot = Instant::now();
                 }
                 Err(broadcast::error::RecvError::Closed) => return Ok(()),
@@ -2317,10 +2864,20 @@ async fn serve_client(stream: UnixStream, session: Arc<Session>, name: String) -
             _ = process_timer.tick() => {
                 if initialized {
                     write_server(&mut writer, &ServerMessage::Layout(session.snapshot()?)).await?;
-                    send_notifications(&mut writer, &session, &mut last_notify_seq).await?;
+                    send_notifications(&mut writer, &session, &mut last_notify_seq, subscribed).await?;
                     last_snapshot = Instant::now();
                 }
             }
+            event = events.recv() => match event {
+                Ok(event) => {
+                    if subscribed {
+                        write_server(&mut writer, &ServerMessage::Event(event)).await?;
+                    }
+                }
+                // A slow subscriber just misses events; it never stalls the session.
+                Err(broadcast::error::RecvError::Lagged(_)) => {}
+                Err(broadcast::error::RecvError::Closed) => return Ok(()),
+            },
             _ = shutdown.recv() => {
                 write_server(&mut writer, &ServerMessage::Shutdown).await?;
                 return Ok(());
@@ -2328,6 +2885,39 @@ async fn serve_client(stream: UnixStream, session: Arc<Session>, name: String) -
         }
     }
 }
+/// Keeps `Session::subscribers` accurate: dropped when the connection ends,
+/// whichever way `serve_client` returns.
+struct SubscriberGuard(Arc<Session>);
+
+impl Drop for SubscriberGuard {
+    fn drop(&mut self) {
+        self.0.subscribers.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// How often the daemon refreshes state while someone is subscribed.
+const SUBSCRIBER_TICK: Duration = Duration::from_secs(2);
+
+/// Refresh the session snapshot on a timer while at least one connection is
+/// subscribed. Agent detection only runs inside `snapshot`, so without this a
+/// `kodade-cli events` stream with no attached TUI would never see a state
+/// change (#16).
+async fn subscriber_tick(session: Arc<Session>) {
+    let mut timer = tokio::time::interval(SUBSCRIBER_TICK);
+    timer.tick().await; // The first tick completes immediately.
+    loop {
+        timer.tick().await;
+        tick_subscribers(&session);
+    }
+}
+
+/// One tick of [`subscriber_tick`], split out so tests can drive it directly.
+fn tick_subscribers(session: &Session) {
+    if session.subscribers.load(Ordering::Relaxed) > 0 {
+        let _ = session.snapshot();
+    }
+}
+
 async fn write_server(
     writer: &mut tokio::net::unix::OwnedWriteHalf,
     message: &ServerMessage,
@@ -2342,10 +2932,14 @@ async fn send_notifications(
     writer: &mut tokio::net::unix::OwnedWriteHalf,
     session: &Arc<Session>,
     last_seq: &mut u64,
+    subscribed: bool,
 ) -> Result<()> {
     for notification in session.notifications_since(*last_seq) {
         *last_seq = (*last_seq).max(notification.seq);
-        write_server(writer, &ServerMessage::Notification(notification)).await?;
+        // Subscribers already receive these as `Event::Notification`.
+        if !subscribed {
+            write_server(writer, &ServerMessage::Notification(notification)).await?;
+        }
     }
     Ok(())
 }
@@ -2612,7 +3206,7 @@ mod tests {
     #[test]
     fn break_pane_moves_the_focused_leaf_into_a_new_tab() {
         let mut state = split_state();
-        assert!(break_pane(&mut state));
+        assert!(break_pane(&mut state).is_some());
         let workspace = &state.workspaces[0];
         assert_eq!(workspace.tabs.len(), 2);
         // Source tab keeps the remaining pane and focus lands on it.
@@ -2622,7 +3216,7 @@ mod tests {
         assert_eq!(workspace.tabs[1].tree, LayoutTree::Leaf { pane: PaneId(4) });
         assert_eq!(workspace.active_tab, workspace.tabs[1].id);
         // A single-pane tab has nothing to break out.
-        assert!(!break_pane(&mut state));
+        assert!(break_pane(&mut state).is_none());
     }
 
     #[test]
@@ -2926,7 +3520,7 @@ mod tests {
                 while let Ok((stream, _)) = listener.accept().await {
                     let session = Arc::clone(&session);
                     tokio::spawn(async move {
-                        let _ = serve_client(stream, session, "notify".into()).await;
+                        let _ = serve_client(stream, session).await;
                     });
                 }
             })
@@ -3012,7 +3606,7 @@ mod tests {
                 while let Ok((stream, _)) = listener.accept().await {
                     let session = Arc::clone(&session);
                     tokio::spawn(async move {
-                        let _ = serve_client(stream, session, "version".into()).await;
+                        let _ = serve_client(stream, session).await;
                     });
                 }
             })
@@ -3061,6 +3655,313 @@ mod tests {
                 version: PROTOCOL_VERSION
             }
         );
+
+        accept.abort();
+        let _ = fs::remove_file(&socket);
+        let _ = fs::remove_dir(&directory);
+    }
+    #[tokio::test]
+    async fn subscribe_streams_agent_state_changes() {
+        let directory =
+            std::env::temp_dir().join(format!("kodade-cli-events-{}", std::process::id()));
+        fs::create_dir_all(&directory).expect("create test directory");
+        let socket = directory.join("events.sock");
+        let _ = fs::remove_file(&socket);
+        let listener = UnixListener::bind(&socket).expect("bind test socket");
+        let session = Arc::new(Session::spawn(80, 24, "events".into()).expect("spawn session"));
+        let accept = {
+            let session = Arc::clone(&session);
+            tokio::spawn(async move {
+                while let Ok((stream, _)) = listener.accept().await {
+                    let session = Arc::clone(&session);
+                    tokio::spawn(async move {
+                        let _ = serve_client(stream, session).await;
+                    });
+                }
+            })
+        };
+
+        // Subscriber: the reply snapshot also settles the pane's baseline state.
+        let (reader, mut writer) = UnixStream::connect(&socket)
+            .await
+            .expect("connect subscriber")
+            .into_split();
+        let mut lines = BufReader::new(reader).lines();
+        writer
+            .write_all(&encode(&ClientMessage::Subscribe).unwrap())
+            .await
+            .expect("subscribe");
+        let pane = match next_server_message(&mut lines).await {
+            ServerMessage::Layout(layout) => layout.panes[0].id,
+            other => panic!("expected the subscribe reply layout, got {other:?}"),
+        };
+
+        // A hook-style connection reports the pane blocked.
+        let (_r, mut reporter) = UnixStream::connect(&socket)
+            .await
+            .expect("connect reporter")
+            .into_split();
+        reporter
+            .write_all(
+                &encode(&ClientMessage::AgentState {
+                    pane,
+                    state: AgentStateKind::Blocked,
+                    source: "test".into(),
+                })
+                .unwrap(),
+            )
+            .await
+            .expect("report blocked");
+
+        let event = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let ServerMessage::Event(Event::AgentStateChanged { pane, from, to }) =
+                    next_server_message(&mut lines).await
+                {
+                    break (pane, from, to);
+                }
+            }
+        })
+        .await
+        .expect("agent state change arrives within 2s");
+        assert_eq!(event.0, pane);
+        assert_eq!(event.2, AgentStateKind::Blocked);
+
+        accept.abort();
+        let _ = fs::remove_file(&socket);
+        let _ = fs::remove_dir(&directory);
+    }
+
+    #[tokio::test]
+    async fn applying_an_exported_layout_keeps_live_panes() {
+        let session = Session::spawn(80, 24, "apply".into()).expect("spawn session");
+        session
+            .handle(ClientMessage::SplitRight)
+            .expect("split the first pane");
+        let exported = session.build_file();
+        let before: Vec<PaneId> = {
+            let panes = session.panes.lock().expect("pane lock");
+            let mut ids: Vec<_> = panes.keys().copied().collect();
+            ids.sort_by_key(|id| id.0);
+            ids
+        };
+        assert_eq!(before.len(), 2);
+
+        // Re-applying the same file is a no-op for live panes.
+        session
+            .handle(ClientMessage::ApplyLayout(exported.clone()))
+            .expect("apply the exported layout");
+        let after: Vec<PaneId> = {
+            let panes = session.panes.lock().expect("pane lock");
+            let mut ids: Vec<_> = panes.keys().copied().collect();
+            ids.sort_by_key(|id| id.0);
+            ids
+        };
+        assert_eq!(before, after);
+
+        // Dropping a pane from the file closes it and rebuilds the tree.
+        let mut trimmed = exported;
+        let tab = &mut trimmed.workspaces[0].tabs[0];
+        let keep = before[0];
+        tab.tree = LayoutTree::Leaf { pane: keep };
+        tab.focused = keep.0;
+        tab.panes.retain(|pane| pane.id == keep.0);
+        session
+            .handle(ClientMessage::ApplyLayout(trimmed))
+            .expect("apply the trimmed layout");
+        let remaining: Vec<PaneId> = session
+            .panes
+            .lock()
+            .expect("pane lock")
+            .keys()
+            .copied()
+            .collect();
+        assert_eq!(remaining, vec![keep]);
+    }
+    #[tokio::test]
+    async fn moving_a_workspaces_last_pane_leaves_it_a_working_tab() {
+        // Regression: the move used to remove the source workspace's only tab,
+        // after which any `active_tab` lookup panicked and poisoned the lock.
+        let session = Session::spawn(80, 24, "move".into()).expect("spawn session");
+        session
+            .handle(ClientMessage::NewWorkspace {
+                name: "two".into(),
+                root: None,
+            })
+            .expect("second workspace");
+        let (first_workspace, moved_pane, target_tab) = {
+            let state = session.state.lock().expect("state lock");
+            (
+                state.workspaces[0].id,
+                state.workspaces[0].tabs[0].focused,
+                state.workspaces[1].tabs[0].id,
+            )
+        };
+        session
+            .handle(ClientMessage::MovePaneToTab {
+                pane: moved_pane,
+                tab: target_tab,
+            })
+            .expect("move across workspaces");
+        {
+            let state = session.state.lock().expect("state lock");
+            let source = &state.workspaces[0];
+            assert_eq!(source.id, first_workspace);
+            assert_eq!(source.tabs.len(), 1, "source workspace kept a tab");
+            assert!(
+                source.tabs.iter().any(|tab| tab.id == source.active_tab),
+                "active tab still resolves"
+            );
+            // The moved pane now lives in the target workspace's tab.
+            assert!(layout::contains(
+                &state.workspaces[1].tabs[0].tree,
+                moved_pane
+            ));
+        }
+        // Both of these used to panic on `active tab exists`.
+        session
+            .handle(ClientMessage::SelectWorkspace {
+                id: first_workspace,
+            })
+            .expect("select the source workspace");
+        session.snapshot().expect("snapshot after the move");
+    }
+
+    #[tokio::test]
+    async fn pane_query_reaches_panes_outside_the_active_tab() {
+        let directory =
+            std::env::temp_dir().join(format!("kodade-cli-panequery-{}", std::process::id()));
+        fs::create_dir_all(&directory).expect("create test directory");
+        let socket = directory.join("panequery.sock");
+        let _ = fs::remove_file(&socket);
+        let listener = UnixListener::bind(&socket).expect("bind test socket");
+        let session = Arc::new(Session::spawn(80, 24, "panequery".into()).expect("spawn session"));
+        let background = {
+            let state = session.state.lock().expect("state lock");
+            state.workspaces[0].tabs[0].focused
+        };
+        // A second tab takes over, leaving the first pane in the background.
+        session.handle(ClientMessage::NewTab).expect("new tab");
+        let accept = {
+            let session = Arc::clone(&session);
+            tokio::spawn(async move {
+                while let Ok((stream, _)) = listener.accept().await {
+                    let session = Arc::clone(&session);
+                    tokio::spawn(async move {
+                        let _ = serve_client(stream, session).await;
+                    });
+                }
+            })
+        };
+        let (reader, mut writer) = UnixStream::connect(&socket)
+            .await
+            .expect("connect client")
+            .into_split();
+        let mut lines = BufReader::new(reader).lines();
+
+        // The layout only carries the active tab, which is why `agent wait`
+        // polls `Query(Pane)` instead.
+        writer
+            .write_all(&encode(&ClientMessage::Query(QueryKind::Layout)).unwrap())
+            .await
+            .expect("query layout");
+        match next_server_message(&mut lines).await {
+            ServerMessage::Layout(layout) => {
+                assert!(layout.panes.iter().all(|pane| pane.id != background));
+            }
+            other => panic!("expected a layout, got {other:?}"),
+        }
+
+        writer
+            .write_all(&encode(&ClientMessage::Query(QueryKind::Pane(background))).unwrap())
+            .await
+            .expect("query pane");
+        match next_server_message(&mut lines).await {
+            ServerMessage::Pane(pane) => assert_eq!(pane.id, background),
+            other => panic!("expected the background pane, got {other:?}"),
+        }
+
+        // An unknown pane is a clean error, not a hang.
+        writer
+            .write_all(&encode(&ClientMessage::Query(QueryKind::Pane(PaneId(9999)))).unwrap())
+            .await
+            .expect("query missing pane");
+        assert!(matches!(
+            next_server_message(&mut lines).await,
+            ServerMessage::Error { .. }
+        ));
+
+        accept.abort();
+        let _ = fs::remove_file(&socket);
+        let _ = fs::remove_dir(&directory);
+    }
+
+    #[tokio::test]
+    async fn subscriber_tick_detects_state_changes_with_no_client_attached() {
+        let directory =
+            std::env::temp_dir().join(format!("kodade-cli-tick-{}", std::process::id()));
+        fs::create_dir_all(&directory).expect("create test directory");
+        let socket = directory.join("tick.sock");
+        let _ = fs::remove_file(&socket);
+        let listener = UnixListener::bind(&socket).expect("bind test socket");
+        let session = Arc::new(Session::spawn(80, 24, "tick".into()).expect("spawn session"));
+        let accept = {
+            let session = Arc::clone(&session);
+            tokio::spawn(async move {
+                while let Ok((stream, _)) = listener.accept().await {
+                    let session = Arc::clone(&session);
+                    tokio::spawn(async move {
+                        let _ = serve_client(stream, session).await;
+                    });
+                }
+            })
+        };
+        // A bare `kodade-cli events` subscriber: no Hello, no TUI anywhere.
+        let (reader, mut writer) = UnixStream::connect(&socket)
+            .await
+            .expect("connect subscriber")
+            .into_split();
+        let mut lines = BufReader::new(reader).lines();
+        writer
+            .write_all(&encode(&ClientMessage::Subscribe).unwrap())
+            .await
+            .expect("subscribe");
+        let pane = match next_server_message(&mut lines).await {
+            ServerMessage::Layout(layout) => layout.panes[0].id,
+            other => panic!("expected the subscribe reply layout, got {other:?}"),
+        };
+        // The daemon counts the subscription, which is what arms the tick.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while session.subscribers.load(Ordering::Relaxed) == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("subscription is counted");
+
+        // Report the state directly on the session: no connection sends a
+        // message, so nothing but the tick can run detection.
+        session
+            .handle(ClientMessage::AgentState {
+                pane,
+                state: AgentStateKind::Blocked,
+                source: "test".into(),
+            })
+            .expect("report blocked");
+        tokio::spawn(subscriber_tick(Arc::clone(&session)));
+
+        let event = tokio::time::timeout(Duration::from_secs(8), async {
+            loop {
+                if let ServerMessage::Event(Event::AgentStateChanged { pane, to, .. }) =
+                    next_server_message(&mut lines).await
+                {
+                    break (pane, to);
+                }
+            }
+        })
+        .await
+        .expect("the tick delivers the transition");
+        assert_eq!(event, (pane, AgentStateKind::Blocked));
 
         accept.abort();
         let _ = fs::remove_file(&socket);

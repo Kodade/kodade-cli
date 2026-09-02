@@ -91,34 +91,23 @@ Socket paths are selected in this order:
 
 Session names must be non-empty path components. They cannot contain `/` or be
 `.` or `..`. The daemon removes a socket file only when it cannot connect to a
-live daemon at that path.
+live daemon at that path. `session rename` renames the socket file in place: the
+listener stays bound, so the same daemon and its PTYs answer on the new path.
+
+Every message, its JSON shape, the `Subscribe` event stream, the schema query,
+and the environment variables a pane receives are documented in
+[SOCKET-API.md](SOCKET-API.md) — that file is the contract for any other client
+(the desktop app included), so update it in the same change as a protocol
+change.
 
 ## Protocol versioning (#23)
 
 `kodade-cli-proto` exports `PROTOCOL_VERSION: u32` (currently `1`). Both ends
 check it at attach time so a stale binary fails fast with a clear message
 instead of misbehaving. Bump it whenever a client and daemon can no longer
-understand each other.
-
-The handshake:
-
-- The client's first message is `Hello { cols, rows, version }`. The `version`
-  field carries `#[serde(default)]`, so a pre-versioning client that omits it
-  decodes as version `0` rather than failing to parse.
-- The daemon compares `Hello.version` to its own `PROTOCOL_VERSION`. A match is
-  answered with `Welcome { session, version }` followed by the first `Layout`.
-  A mismatch is answered with `Error { message: "protocol version mismatch:
-  client N, daemon M — upgrade kodade-cli on both ends" }` and the connection
-  closes.
-- The client verifies `Welcome.version` before it puts the terminal into raw
-  mode. An unexpected value (or the daemon's `Error`) prints the same message
-  and exits `1`, so the user never sees a half-drawn screen.
-- `Query(Version)` is a cheap probe: the daemon replies with `Version {
-  version }` and keeps the connection open. `--remote` uses it to check
-  compatibility before attaching.
-
-This section is the versioning reference; when the #16 `docs/SOCKET-API.md`
-lands it should link back here (this branch predates that file).
+understand each other. The handshake, the `Query(Version)` probe, and the
+compatibility rules are documented in
+[SOCKET-API.md](SOCKET-API.md#schema-and-versioning).
 
 ## Remote mode (#23)
 
@@ -153,9 +142,8 @@ reconnects without a fresh handshake. Because the daemon keeps session state,
 dropping the tunnel and re-running `--remote` reattaches — the client's `Hello`
 re-sends the terminal size, so a differently-sized terminal simply re-fits.
 
-`--remote HOST session ls` runs the remote `session ls` over the control
-connection and prefixes each line with `host:` (the `session` group lands with
-#16; this branch ships `session path`). The command builders (`version_args`,
+`--remote HOST session ls|path|kill|rename` runs the verb on the host over the
+control connection; `ls` prefixes each line with `host:`. The command builders (`version_args`,
 `socket_path_args`, `start_daemon_args`, `tunnel_args`, `run_args`) and the
 local socket resolver are unit-tested in `remote.rs`; the live tunnel path is
 only exercised against a real host.

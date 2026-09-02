@@ -16,6 +16,9 @@ authors = ["ContractorKeith"]
 anyhow = "1"
 # clap gives the binary real subcommand help, typed flags, and future completions.
 clap = { version = "4", features = ["derive"] }
+# `clap_complete` generates the zsh/bash/fish completion scripts from the same
+# command tree, so the shipped completions can never drift from the CLI (#16).
+clap_complete = "4"
 # Crossterm and ratatui provide the portable terminal event and rendering stack.
 crossterm = "0.29"
 # `dirs` supplies the cross-platform home-directory fallback for socket state.

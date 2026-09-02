@@ -4,6 +4,7 @@ mod commands;
 mod config;
 mod help;
 mod input;
+mod keys;
 mod mode;
 mod notify;
 mod overlay;
@@ -22,7 +23,10 @@ use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use kodade_cli_proto::{decode, encode, ClientMessage, ServerMessage, SplitAxis, PROTOCOL_VERSION};
+use kodade_cli_proto::{
+    decode, encode, ClientMessage, Direction, Event, QueryKind, ServerMessage, SplitAxis,
+    PROTOCOL_VERSION,
+};
 use ratatui::{backend::CrosstermBackend, Terminal};
 use std::{env, path::Path, process::Stdio, time::Duration};
 use tokio::{
@@ -45,6 +49,10 @@ async fn main() -> Result<()> {
             cli::Command::Ls { .. }
                 | cli::Command::Agent { .. }
                 | cli::Command::Pane { .. }
+                | cli::Command::Tab { .. }
+                | cli::Command::Workspace { .. }
+                | cli::Command::Layout { .. }
+                | cli::Command::Events { .. }
                 | cli::Command::Send { .. }
                 | cli::Command::New { .. }
                 | cli::Command::Run { .. }
@@ -106,27 +114,9 @@ async fn main() -> Result<()> {
             )?;
             Ok(())
         }
+        // `new` is the alias of `workspace new`.
         Some(cli::Command::New { workspace, path }) => {
-            let layout =
-                commands::layout(commands::request(&socket, commands::layout_query()).await?)?;
-            // Selecting an existing name is idempotent; otherwise create it.
-            if let Ok(id) = commands::resolve_workspace(&layout, &workspace) {
-                commands::request(&socket, ClientMessage::SelectWorkspace { id }).await?;
-                println!("{}", id.0);
-            } else {
-                let reply = commands::layout(
-                    commands::request(
-                        &socket,
-                        ClientMessage::NewWorkspace {
-                            name: workspace,
-                            root: path,
-                        },
-                    )
-                    .await?,
-                )?;
-                println!("{}", reply.active_workspace.0);
-            }
-            Ok(())
+            new_workspace(&socket, workspace, path).await
         }
         Some(cli::Command::Run {
             workspace,
@@ -225,7 +215,343 @@ async fn main() -> Result<()> {
                 commands::integrate_codex(write, force)
             }
         },
+        Some(cli::Command::Tab { command }) => tab(&socket, command).await,
+        Some(cli::Command::Workspace { command }) => workspace(&socket, command).await,
+        Some(cli::Command::Layout { command }) => layout_command(&socket, command).await,
+        Some(cli::Command::Events { json }) => commands::stream_events(&socket, json).await,
+        Some(cli::Command::Completion { shell }) => {
+            let mut command = <cli::Cli as clap::CommandFactory>::command();
+            clap_complete::generate(
+                shell,
+                &mut command,
+                "kodade-cli",
+                &mut std::io::stdout().lock(),
+            );
+            Ok(())
+        }
     }
+}
+
+/// `pane` subcommands. Pane-targeted actions the daemon only applies to the
+/// focused pane are prefixed with a `FocusPaneId`, which is also what the
+/// equivalent key binding would do.
+async fn pane(socket: &Path, command: cli::PaneCommand) -> Result<()> {
+    match command {
+        cli::PaneCommand::Read {
+            pane,
+            lines,
+            scrollback,
+        } => {
+            let reply = commands::request(
+                socket,
+                ClientMessage::ReadPane {
+                    id: pane,
+                    scrollback,
+                    lines,
+                },
+            )
+            .await?;
+            match reply {
+                ServerMessage::PaneText { text, .. } => {
+                    println!("{text}");
+                    Ok(())
+                }
+                other => anyhow::bail!("unexpected reply: {other:?}"),
+            }
+        }
+        cli::PaneCommand::Ls { json } => {
+            let layout =
+                commands::layout(commands::request(socket, commands::layout_query()).await?)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&layout.panes)?);
+            } else {
+                println!("{}", commands::format_panes(&layout));
+            }
+            Ok(())
+        }
+        cli::PaneCommand::SendKeys {
+            pane,
+            keys,
+            literal,
+        } => {
+            let bytes = if literal {
+                keys::literal(&keys)
+            } else {
+                keys::parse_all(&keys)?
+            };
+            commands::layout(
+                commands::request(socket, ClientMessage::SendToPane { id: pane, bytes }).await?,
+            )?;
+            Ok(())
+        }
+        cli::PaneCommand::Kill { pane } => focus_then(socket, pane, ClientMessage::ClosePane).await,
+        cli::PaneCommand::Focus { pane } => {
+            commands::layout(
+                commands::request(socket, ClientMessage::FocusPaneId { id: pane }).await?,
+            )?;
+            Ok(())
+        }
+        cli::PaneCommand::Zoom { pane } => focus_then(socket, pane, ClientMessage::ZoomPane).await,
+        cli::PaneCommand::Swap { pane, direction } => {
+            focus_then(
+                socket,
+                pane,
+                ClientMessage::SwapPane {
+                    direction: Direction::from(direction),
+                },
+            )
+            .await
+        }
+        cli::PaneCommand::Resize {
+            pane,
+            direction,
+            cells,
+        } => {
+            focus_then(
+                socket,
+                pane,
+                ClientMessage::ResizePane {
+                    direction: Direction::from(direction),
+                    cells,
+                },
+            )
+            .await
+        }
+        cli::PaneCommand::Move { pane, tab } => {
+            let layout =
+                commands::layout(commands::request(socket, commands::layout_query()).await?)?;
+            let tab = commands::resolve_tab_anywhere(&layout, &tab)?;
+            commands::layout(
+                commands::request(socket, ClientMessage::MovePaneToTab { pane, tab }).await?,
+            )?;
+            Ok(())
+        }
+        cli::PaneCommand::WaitOutput {
+            pane,
+            text,
+            timeout,
+        } => {
+            let reached = commands::poll_pane(socket, pane, timeout, |snapshot| {
+                snapshot.screen.contents.contains(&text)
+            })
+            .await?;
+            if !reached {
+                std::process::exit(2);
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Focus a pane, then run a message the daemon applies to the focused pane.
+async fn focus_then(
+    socket: &Path,
+    pane: kodade_cli_proto::PaneId,
+    message: ClientMessage,
+) -> Result<()> {
+    commands::layout(commands::request(socket, ClientMessage::FocusPaneId { id: pane }).await?)?;
+    commands::layout(commands::request(socket, message).await?)?;
+    Ok(())
+}
+
+/// `tab` subcommands; TAB is a name or an id in the active workspace.
+async fn tab(socket: &Path, command: cli::TabCommand) -> Result<()> {
+    match command {
+        cli::TabCommand::Ls { json } => {
+            let layout =
+                commands::layout(commands::request(socket, commands::layout_query()).await?)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&layout.tabs)?);
+            } else {
+                println!("{}", commands::format_tabs(&layout.tabs));
+            }
+            Ok(())
+        }
+        cli::TabCommand::New { workspace, name } => {
+            let (ws, _) = resolve_target(socket, workspace, None).await?;
+            let reply = commands::layout(
+                commands::request(
+                    socket,
+                    ClientMessage::NewPane {
+                        workspace: ws,
+                        tab: None,
+                        split: None,
+                        command: None,
+                        name,
+                    },
+                )
+                .await?,
+            )?;
+            println!("{}", commands::focused_pane(&reply)?.0);
+            Ok(())
+        }
+        cli::TabCommand::Close { tab } => {
+            let id = resolve_tab_name(socket, &tab).await?;
+            commands::layout(commands::request(socket, ClientMessage::CloseTab { id }).await?)?;
+            Ok(())
+        }
+        cli::TabCommand::Rename { tab, name } => {
+            let id = resolve_tab_name(socket, &tab).await?;
+            commands::layout(
+                commands::request(socket, ClientMessage::RenameTabId { id, name }).await?,
+            )?;
+            Ok(())
+        }
+        cli::TabCommand::Select { tab } => {
+            let id = resolve_tab_name(socket, &tab).await?;
+            commands::layout(commands::request(socket, ClientMessage::SelectTab { id }).await?)?;
+            Ok(())
+        }
+    }
+}
+
+/// `workspace` subcommands; WS is a name or an id.
+async fn workspace(socket: &Path, command: cli::WorkspaceCommand) -> Result<()> {
+    match command {
+        cli::WorkspaceCommand::Ls { json } => {
+            let layout =
+                commands::layout(commands::request(socket, commands::layout_query()).await?)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&layout.workspaces)?);
+            } else {
+                println!("{}", commands::format_workspaces(&layout.workspaces));
+            }
+            Ok(())
+        }
+        // Same idempotent create-or-select as the top-level `new` alias.
+        cli::WorkspaceCommand::New { name, path } => new_workspace(socket, name, path).await,
+        cli::WorkspaceCommand::Close { workspace } => {
+            let id = resolve_workspace_name(socket, &workspace).await?;
+            commands::layout(
+                commands::request(socket, ClientMessage::CloseWorkspace { id }).await?,
+            )?;
+            Ok(())
+        }
+        cli::WorkspaceCommand::Rename { workspace, name } => {
+            let id = resolve_workspace_name(socket, &workspace).await?;
+            commands::layout(
+                commands::request(socket, ClientMessage::RenameWorkspaceId { id, name }).await?,
+            )?;
+            Ok(())
+        }
+        cli::WorkspaceCommand::Color { workspace, color } => {
+            let id = resolve_workspace_name(socket, &workspace).await?;
+            // `off` clears the override; the daemon validates the hex form.
+            let color = (color != "off").then_some(color);
+            commands::layout(
+                commands::request(socket, ClientMessage::SetWorkspaceColor { id, color }).await?,
+            )?;
+            Ok(())
+        }
+        cli::WorkspaceCommand::Select { workspace } => {
+            let id = resolve_workspace_name(socket, &workspace).await?;
+            commands::layout(
+                commands::request(socket, ClientMessage::SelectWorkspace { id }).await?,
+            )?;
+            Ok(())
+        }
+    }
+}
+
+/// `session` subcommands. Locally `ls` probes every socket in the runtime
+/// directory; with `--remote` every verb runs on the host over SSH (#23).
+async fn session_command(
+    remote: Option<&str>,
+    session: &str,
+    command: cli::SessionCommand,
+) -> Result<()> {
+    if let Some(host) = remote {
+        return remote::run_session(host, session, &command).await;
+    }
+    match command {
+        cli::SessionCommand::Path => {
+            println!("{}", kodade_cli_daemon::socket_path(session).display());
+            Ok(())
+        }
+        cli::SessionCommand::Ls { json } => {
+            let entries = commands::session_entries().await?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&entries)?);
+            } else if !entries.is_empty() {
+                println!("{}", commands::format_sessions(&entries));
+            }
+            Ok(())
+        }
+        cli::SessionCommand::Kill { name } => {
+            let target =
+                kodade_cli_daemon::socket_path(&name.unwrap_or_else(|| session.to_owned()));
+            match commands::request(&target, ClientMessage::KillSession).await? {
+                ServerMessage::Shutdown => Ok(()),
+                message => commands::layout(message).map(|_| ()),
+            }
+        }
+        cli::SessionCommand::Rename { name } => {
+            let socket = kodade_cli_daemon::socket_path(session);
+            commands::layout(
+                commands::request(&socket, ClientMessage::RenameSession { name }).await?,
+            )?;
+            Ok(())
+        }
+    }
+}
+
+/// `layout export|apply` over the persistence JSON.
+async fn layout_command(socket: &Path, command: cli::LayoutCommand) -> Result<()> {
+    match command {
+        cli::LayoutCommand::Export { file } => {
+            let exported = commands::session_file(
+                commands::request(socket, ClientMessage::Query(QueryKind::Session)).await?,
+            )?;
+            let json = format!("{}\n", serde_json::to_string_pretty(&exported)?);
+            match file {
+                Some(path) => std::fs::write(&path, json)
+                    .with_context(|| format!("write {}", path.display()))?,
+                None => print!("{json}"),
+            }
+            Ok(())
+        }
+        cli::LayoutCommand::Apply { file } => {
+            let text = std::fs::read_to_string(&file)
+                .with_context(|| format!("read {}", file.display()))?;
+            let parsed = serde_json::from_str(&text).context("parse the layout file")?;
+            commands::layout(commands::request(socket, ClientMessage::ApplyLayout(parsed)).await?)?;
+            Ok(())
+        }
+    }
+}
+
+/// Create a workspace, or select it when the name already exists.
+async fn new_workspace(
+    socket: &Path,
+    name: String,
+    path: Option<std::path::PathBuf>,
+) -> Result<()> {
+    let layout = commands::layout(commands::request(socket, commands::layout_query()).await?)?;
+    if let Ok(id) = commands::resolve_workspace(&layout, &name) {
+        commands::request(socket, ClientMessage::SelectWorkspace { id }).await?;
+        println!("{}", id.0);
+    } else {
+        let reply = commands::layout(
+            commands::request(socket, ClientMessage::NewWorkspace { name, root: path }).await?,
+        )?;
+        println!("{}", reply.active_workspace.0);
+    }
+    Ok(())
+}
+
+/// Resolve a tab name or id against a fresh snapshot.
+async fn resolve_tab_name(socket: &Path, needle: &str) -> Result<kodade_cli_proto::TabId> {
+    let layout = commands::layout(commands::request(socket, commands::layout_query()).await?)?;
+    commands::resolve_tab(&layout, None, needle)
+}
+
+/// Resolve a workspace name or id against a fresh snapshot.
+async fn resolve_workspace_name(
+    socket: &Path,
+    needle: &str,
+) -> Result<kodade_cli_proto::WorkspaceId> {
+    let layout = commands::layout(commands::request(socket, commands::layout_query()).await?)?;
+    commands::resolve_workspace(&layout, needle)
 }
 
 /// Resolve optional `-w`/`-t` names to ids, fetching one layout snapshot only
@@ -288,24 +614,6 @@ fn config_command(command: cli::ConfigCommand) {
     }
 }
 
-/// `session` subcommands. Locally these inspect this host's daemon; with
-/// `--remote` they run on the host over SSH (#23).
-async fn session_command(
-    remote: Option<&str>,
-    session: &str,
-    command: cli::SessionCommand,
-) -> Result<()> {
-    if let Some(host) = remote {
-        return remote::run_session(host, session, &command).await;
-    }
-    match command {
-        cli::SessionCommand::Path => {
-            println!("{}", kodade_cli_daemon::socket_path(session).display());
-            Ok(())
-        }
-    }
-}
-
 /// `agent` subcommands: read pane state or report it back to the daemon.
 async fn agent(
     socket: &Path,
@@ -350,6 +658,19 @@ async fn agent(
             }
             Ok(())
         }
+        cli::AgentCommand::Wait {
+            pane,
+            state,
+            timeout,
+        } => {
+            let reached =
+                commands::poll_pane(socket, pane, timeout, |snapshot| snapshot.state == state)
+                    .await?;
+            if !reached {
+                std::process::exit(2);
+            }
+            Ok(())
+        }
         cli::AgentCommand::UpdateManifests => commands::update_manifests(),
         cli::AgentCommand::Report {
             pane,
@@ -368,34 +689,6 @@ async fn agent(
                 .await?,
             )?;
             Ok(())
-        }
-    }
-}
-
-/// `pane` subcommands: read a pane's text for scripting.
-async fn pane(socket: &Path, command: cli::PaneCommand) -> Result<()> {
-    match command {
-        cli::PaneCommand::Read {
-            pane,
-            lines,
-            scrollback,
-        } => {
-            let reply = commands::request(
-                socket,
-                ClientMessage::ReadPane {
-                    id: pane,
-                    scrollback,
-                    lines,
-                },
-            )
-            .await?;
-            match reply {
-                ServerMessage::PaneText { text, .. } => {
-                    println!("{text}");
-                    Ok(())
-                }
-                other => anyhow::bail!("unexpected reply: {other:?}"),
-            }
         }
     }
 }
@@ -460,6 +753,12 @@ async fn tui(
         })?)
         .await?;
     handshake(&mut lines, &mut state).await?;
+    // Subscribe so the TUI learns about session-level changes (a rename moves
+    // the socket under it). Subscribed connections receive notifications as
+    // `Event::Notification` instead of `ServerMessage::Notification`.
+    writer
+        .write_all(&encode(&ClientMessage::Subscribe)?)
+        .await?;
     let (tx, mut rx) = mpsc::channel(16);
     tokio::spawn(async move {
         while let Ok(Some(line)) = lines.next_line().await {
@@ -468,6 +767,12 @@ async fn tui(
                 Ok(ServerMessage::Welcome { session, .. }) => app::Update::Session(session),
                 Ok(ServerMessage::Notification(notification)) => {
                     app::Update::Notification(notification)
+                }
+                Ok(ServerMessage::Event(Event::Notification(notification))) => {
+                    app::Update::Notification(notification)
+                }
+                Ok(ServerMessage::Event(Event::SessionRenamed { name, socket })) => {
+                    app::Update::SessionRenamed { name, socket }
                 }
                 _ => continue,
             };
