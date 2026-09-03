@@ -14,6 +14,14 @@ macOS arm64/x86_64 and Linux arm64/x86_64, packages each binary with
 `LICENSE`, `NOTICE`, and `README.md`, and publishes four tarballs plus
 `SHA256SUMS` to a GitHub Release.
 
+A final `homebrew` job renders `Formula/kodade-cli.rb` from `SHA256SUMS` with
+`scripts/homebrew-formula.sh` and pushes it to
+[Kodade/homebrew-tap](https://github.com/Kodade/homebrew-tap). It needs the
+repository secret `HOMEBREW_TAP_TOKEN`: a fine-grained personal access token
+with `Contents: read and write` on `Kodade/homebrew-tap` only. Without the
+secret the job prints the rendered formula and warns instead of failing;
+commit it to the tap by hand in that case.
+
 To test the installer locally against a published release, run the script with
 the release repository's normal latest-release endpoint:
 

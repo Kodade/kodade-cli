@@ -20,7 +20,19 @@ on the releases page, installable with the command below.
 
 ## Install
 
-Install a prebuilt binary with:
+With Homebrew (macOS and Linux):
+
+```bash
+brew tap kodade/tap
+brew trust kodade/tap   # Homebrew 6 and later; not needed on older versions
+brew install kodade-cli
+```
+
+Later releases arrive with `brew upgrade`. The formula lives in
+[Kodade/homebrew-tap](https://github.com/Kodade/homebrew-tap) and is updated
+by the release workflow.
+
+Without Homebrew, install a prebuilt binary with:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Kodade/kodade-cli/main/install.sh | sh
