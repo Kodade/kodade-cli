@@ -22,7 +22,7 @@ clap_complete = "4"
 # Crossterm and ratatui provide the portable terminal event and rendering stack.
 crossterm = "0.29"
 # `dirs` supplies the cross-platform home-directory fallback for socket state.
-dirs = "5"
+dirs = "6"
 libc = "0.2"
 # Portable-pty hosts the login shell independently from the attaching client.
 portable-pty = "0.9"
