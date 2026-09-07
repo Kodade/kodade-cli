@@ -7,8 +7,18 @@ tabs contain panes. It is the terminal-native companion to the
 
 ## Status
 
-v0.1.0 is released: prebuilt binaries for macOS and Linux (arm64/x86_64) are
-on the releases page, installable with the command below.
+Prebuilt binaries for macOS and Linux (arm64/x86_64) are published on the
+releases page, installable with the command below.
+
+### v0.2.1
+
+- Dark theme with charcoal backgrounds, off-white text, and the existing orange accents.
+- Stable scrollback while new output arrives, plus prefixed PageUp/PageDown scrolling.
+- Shift-wheel local history override and immediate copy-mode wheel scrolling.
+
+After upgrading, start a new session to use the updated daemon. Existing
+sessions keep their running daemon until stopped; save work in those panes
+before stopping them.
 
 | Milestone | Scope | Status |
 |---|---|---|
@@ -172,8 +182,8 @@ and rebuilt with fresh panes on the next cold start; a corrupt file degrades to
 a clean start and `kodade-cli ls` marks a restored session `(restored)`. Set
 `[session] resume_agents = true` to re-run an agent's resume command on restore.
 
-The CLI ships the Ködade look: warm neutrals with the amber accent `#E7A33B`
-and a purple-free ANSI palette, matching the desktop app. `theme = "auto"`
+The CLI's dark theme uses charcoal backgrounds and off-white text with the
+Ködade orange accent `#E7A33B` and a purple-free ANSI palette. `theme = "auto"`
 (the default) picks `kodade-dark` or `kodade-light` from the terminal
 background; `tokyo-night` and custom themes are also available. See the
 [Themes](docs/CONFIG.md#themes) section for the schema.
