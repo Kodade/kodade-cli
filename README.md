@@ -67,6 +67,7 @@ The default prefix is `ctrl+b`. After the prefix, the default actions are:
 | `w` / `g` | Workspace picker / goto palette (fuzzy; type to filter, `enter` jumps) |
 | `alt+w` | Next workspace (cycle without the picker) |
 | `b` / `[` | Cycle sidebar (full → compact → hidden) / copy mode |
+| `PageUp` / `PageDown` | Scroll the focused pane's local history by one page / back toward live output |
 | `h` `j` `k` `l` or arrows | Focus left, down, up, right |
 | `H` `J` `K` `L` | Resize left, down, up, right |
 | `1`–`9` | Jump to that tab |
@@ -107,8 +108,14 @@ Dragging inside a pane selects text and copies it on release
 (`mouse.copy_on_select`, OSC 52 so it works over SSH); double-click selects a
 word, triple-click a line, and ctrl/cmd-click opens the URL under the pointer
 with `ui.link_command`. Panes running a mouse-aware program (vim, lazygit,
-htop) get the events themselves unless `mouse.passthrough = false`, and
-`prefix m` turns capture off when you want the terminal's own selection. See
+htop) get the events themselves unless `mouse.passthrough = false`. Hold
+`shift` while wheeling to inspect Ködade CLI's local history; once history is
+open, wheel down returns to live output before wheel events return to the
+application. `prefix PageUp` and `prefix PageDown` provide the same local
+history controls without taking ordinary PageUp/PageDown from the application.
+Alternate-screen applications have no local history while their alternate
+screen is active. `prefix m` turns capture off when you want the terminal's
+own selection. See
 [docs/CONFIG.md](docs/CONFIG.md#mouse).
 
 Copy mode (`prefix [`) freezes the pane's full scrollback and navigates it with

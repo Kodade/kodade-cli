@@ -82,7 +82,13 @@ and — with `mouse.clear_on_output = true` — when the pane redraws.
 
 When the program in a pane turns on mouse reporting (vim, lazygit, htop) and
 `mouse.passthrough` is on, mouse events inside that pane are forwarded to it as
-SGR (1006) sequences instead of selecting text. The tab bar, sidebar, pane
+SGR (1006) sequences instead of selecting text. Hold `shift` while wheeling to
+keep the event local and scroll Ködade CLI history; after opening history,
+wheel down returns to live output before events pass back to the application.
+`prefix PageUp` and `prefix PageDown` scroll that local history by one page
+without reserving the application's ordinary PageUp/PageDown keys.
+Alternate-screen applications (such as full-screen editors) have no local
+history while the alternate screen is active. The tab bar, sidebar, pane
 borders, and ctrl/cmd-clicks always stay with Ködade CLI.
 
 `prefix m` toggles capture for the session without editing the config, which
@@ -212,6 +218,8 @@ modifier (`ctrl+…`/`alt+…`) fires globally.
 | `goto` | `g` |
 | `navigate` | `n` |
 | `copy_mode` | `[` |
+| `scroll_up` | `pageup` |
+| `scroll_down` | `pagedown` |
 | `resize_mode` | `prefix+alt+r` |
 | `settings` | `s` |
 | `help` | `?` |

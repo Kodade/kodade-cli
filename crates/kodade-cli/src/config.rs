@@ -199,6 +199,10 @@ pub enum Action {
     ResizeRight,
     Navigate,
     CopyMode,
+    /// Scroll the focused pane's local history by one visible page.
+    ScrollUp,
+    /// Return the focused pane's local history toward live output.
+    ScrollDown,
     // Layout management (#14). The payload is the one-based tab position.
     SelectTabIndex(u8),
     CloseTab,
@@ -261,6 +265,8 @@ const ACTIONS: &[(&str, Action)] = &[
     ("resize_right", Action::ResizeRight),
     ("navigate", Action::Navigate),
     ("copy_mode", Action::CopyMode),
+    ("scroll_up", Action::ScrollUp),
+    ("scroll_down", Action::ScrollDown),
     ("select_tab_1", Action::SelectTabIndex(1)),
     ("select_tab_2", Action::SelectTabIndex(2)),
     ("select_tab_3", Action::SelectTabIndex(3)),
@@ -379,7 +385,7 @@ impl Action {
             Self::LayoutEven => ClientMessage::EqualizeLayout,
             Self::Detach | Self::Rename | Self::SidebarToggle => return None,
             // M3b reserves these names without introducing their modes early.
-            Self::Navigate | Self::CopyMode => return None,
+            Self::Navigate | Self::CopyMode | Self::ScrollUp | Self::ScrollDown => return None,
             // Handled in `App`: these need snapshot context or a prompt.
             Self::CloseTab
             | Self::CloseWorkspace
@@ -532,6 +538,8 @@ impl Default for Config {
             ("G", Action::WorktreeNew),
             ("b", Action::SidebarToggle),
             ("[", Action::CopyMode),
+            ("pageup", Action::ScrollUp),
+            ("pagedown", Action::ScrollDown),
             // #14 took `R` for rename_workspace, so reload is prefix+ctrl+r.
             ("prefix+ctrl+r", Action::ReloadConfig),
             ("s", Action::Settings),
@@ -1847,6 +1855,14 @@ red = \"#abcdef\"
         assert_eq!(
             defaults.action(parse_key_chord("m").unwrap()),
             Some(Action::MouseToggle)
+        );
+        assert_eq!(
+            defaults.action(parse_key_chord("pageup").unwrap()),
+            Some(Action::ScrollUp)
+        );
+        assert_eq!(
+            defaults.action(parse_key_chord("pagedown").unwrap()),
+            Some(Action::ScrollDown)
         );
     }
 
