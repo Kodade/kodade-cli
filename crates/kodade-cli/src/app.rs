@@ -1625,8 +1625,9 @@ impl App {
         if self.menu.is_some() && is_wheel(mouse.kind) {
             return Ok(());
         }
-        // Copy mode owns its history viewport. It must never send wheel events
-        // to the daemon's live pane.
+        // Over the copied pane, wheel input moves copy mode's viewport instead
+        // of that pane's daemon-backed viewport. Other panes keep normal wheel
+        // routing below.
         if let Some(copy_pane) = self.copy.as_ref().map(|copy| copy.pane) {
             let area = self.content_area(term)?;
             let current = self.layout.as_ref().expect("layout present");
@@ -2612,6 +2613,8 @@ mod tests {
             column: 12,
             ..over_copy
         };
+        // `None` deliberately falls through to the other pane's normal wheel
+        // handling instead of changing the copied pane's viewport.
         assert_eq!(
             copy_wheel_delta(&rects, PaneId(1), over_other_pane, 3),
             None

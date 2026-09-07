@@ -121,6 +121,8 @@ own selection. See
 Copy mode (`prefix [`) freezes the pane's full scrollback and navigates it with
 vi motions over the whole history, not just the visible screen. The status bar
 shows `copy · LINE/TOTAL · / search · v V select · y copy · e editor · esc`.
+Wheel over that copied pane scrolls the copy-mode viewport; wheel over another
+pane keeps that pane's normal local-history behavior.
 
 | Key | Action |
 |---|---|
