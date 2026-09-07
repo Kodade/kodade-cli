@@ -1171,6 +1171,19 @@ impl App {
         term: &mut Term,
     ) -> Result<Flow> {
         match action {
+            config::Action::ScrollUp | config::Action::ScrollDown => {
+                if let Some(layout) = &self.layout {
+                    if let Some(pane) = layout.panes.iter().find(|pane| pane.focused) {
+                        let page = pane.screen.rows.len().clamp(1, i16::MAX as usize) as i16;
+                        let delta = if matches!(action, config::Action::ScrollUp) {
+                            page
+                        } else {
+                            -page
+                        };
+                        write(writer, &ClientMessage::ScrollPane { id: pane.id, delta }).await?;
+                    }
+                }
+            }
             config::Action::DisplayPanes => {
                 self.flash_until = Some(Instant::now() + FLASH);
             }
@@ -1607,6 +1620,27 @@ impl App {
             }
             return Ok(());
         }
+        // Context menus own the wheel while open; do not scroll a pane behind
+        // an actionable menu.
+        if self.menu.is_some() && is_wheel(mouse.kind) {
+            return Ok(());
+        }
+        // Over the copied pane, wheel input moves copy mode's viewport instead
+        // of that pane's daemon-backed viewport. Other panes keep normal wheel
+        // routing below.
+        if let Some(copy_pane) = self.copy.as_ref().map(|copy| copy.pane) {
+            let area = self.content_area(term)?;
+            let current = self.layout.as_ref().expect("layout present");
+            let rects = render::pane_rects_for(current, area);
+            if let Some(delta) =
+                copy_wheel_delta(&rects, copy_pane, mouse, self.config.scroll_lines)
+            {
+                if let Some(copy) = &mut self.copy {
+                    copy.scroll_viewport(delta);
+                }
+                return Ok(());
+            }
+        }
         // A pane app that turned mouse reporting on gets the event verbatim.
         if self.passthrough(mouse, writer, term).await? {
             return Ok(());
@@ -1643,12 +1677,8 @@ impl App {
                 let current = self.layout.as_ref().expect("layout present");
                 let rects = render::pane_rects_for(current, area);
                 if let Some(id) = input::pane_at(&rects, mouse.column, mouse.row) {
-                    let step = self.config.scroll_lines;
-                    let delta = if matches!(mouse.kind, MouseEventKind::ScrollUp) {
-                        step
-                    } else {
-                        -step
-                    };
+                    let delta = wheel_delta(mouse.kind, self.config.scroll_lines)
+                        .expect("wheel event has a scroll delta");
                     write(writer, &ClientMessage::ScrollPane { id, delta }).await?;
                 }
             }
@@ -1779,11 +1809,18 @@ impl App {
         let Some((id, (col, row))) = pane_cell_at(&rects, mouse.column, mouse.row) else {
             return Ok(false);
         };
-        if !current
-            .panes
-            .iter()
-            .any(|pane| pane.id == id && pane.screen.mouse_reporting)
-        {
+        let Some(pane) = current.panes.iter().find(|pane| pane.id == id) else {
+            return Ok(false);
+        };
+        // Once local history is open, both wheel directions stay local until
+        // the user reaches the live screen. Sending a wheel event to the pane
+        // would otherwise reset scrollback before it can scroll down.
+        if !pane_consumes_mouse(
+            mouse.kind,
+            mouse.modifiers,
+            pane.screen.mouse_reporting,
+            pane.scroll_offset,
+        ) {
             return Ok(false);
         }
         let bytes = selection::sgr_mouse(mouse.kind, mouse.modifiers, col, row);
@@ -2150,6 +2187,46 @@ fn inner_area(rect: Rect) -> Rect {
     )
 }
 
+/// Positive deltas move backward through terminal history.
+fn wheel_delta(kind: MouseEventKind, lines: i16) -> Option<i16> {
+    let lines = lines.max(1);
+    match kind {
+        MouseEventKind::ScrollUp => Some(lines),
+        MouseEventKind::ScrollDown => Some(-lines),
+        _ => None,
+    }
+}
+
+fn is_wheel(kind: MouseEventKind) -> bool {
+    wheel_delta(kind, 1).is_some()
+}
+
+/// Whether a pane application should receive this mouse event. Shift-wheel
+/// always reserves local history, and history remains local until live output.
+fn pane_consumes_mouse(
+    kind: MouseEventKind,
+    modifiers: KeyModifiers,
+    mouse_reporting: bool,
+    scroll_offset: usize,
+) -> bool {
+    mouse_reporting
+        && !(is_wheel(kind) && (scroll_offset > 0 || modifiers.contains(KeyModifiers::SHIFT)))
+}
+
+/// A wheel event changes copy mode only when it is over copy mode's own pane.
+/// The copy buffer is oldest-first, so wheel-up moves toward lower line indexes.
+fn copy_wheel_delta(
+    rects: &[(PaneId, Rect)],
+    copy_pane: PaneId,
+    mouse: MouseEvent,
+    lines: i16,
+) -> Option<isize> {
+    (input::pane_at(rects, mouse.column, mouse.row) == Some(copy_pane))
+        .then(|| wheel_delta(mouse.kind, lines))
+        .flatten()
+        .map(|delta| -(delta as isize))
+}
+
 /// Turns terminal mouse reporting on or off after a settings change.
 fn set_mouse_capture(term: &mut Term, enabled: bool) -> Result<()> {
     if enabled {
@@ -2503,6 +2580,93 @@ mod tests {
         // Dragging past an edge keeps selecting the last cell.
         assert_eq!(clamped_cell(rects[0].1, 200, 200), (17, 7));
         assert_eq!(clamped_cell(rects[0].1, 0, 0), (0, 0));
+    }
+
+    #[test]
+    fn wheel_deltas_clamp_invalid_config_and_keep_direction() {
+        assert_eq!(wheel_delta(MouseEventKind::ScrollUp, 3), Some(3));
+        assert_eq!(wheel_delta(MouseEventKind::ScrollDown, 3), Some(-3));
+        assert_eq!(wheel_delta(MouseEventKind::ScrollUp, 0), Some(1));
+        assert_eq!(wheel_delta(MouseEventKind::Moved, 3), None);
+    }
+
+    #[test]
+    fn wheel_up_moves_copy_mode_toward_older_lines() {
+        let mut copy =
+            mode::CopyMode::new(PaneId(1), (0..20).map(|line| line.to_string()).collect(), 5);
+        let before = copy.cursor.row;
+        let bottom_top = copy.top;
+        let rects = [
+            (PaneId(1), Rect::new(0, 0, 10, 10)),
+            (PaneId(2), Rect::new(10, 0, 10, 10)),
+        ];
+        let over_copy = MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 2,
+            row: 2,
+            modifiers: KeyModifiers::NONE,
+        };
+        copy.scroll_viewport(copy_wheel_delta(&rects, PaneId(1), over_copy, 3).unwrap());
+        assert_eq!(copy.cursor.row, before - 3);
+        assert_eq!(copy.top, bottom_top - 3);
+        let over_other_pane = MouseEvent {
+            column: 12,
+            ..over_copy
+        };
+        // `None` deliberately falls through to the other pane's normal wheel
+        // handling instead of changing the copied pane's viewport.
+        assert_eq!(
+            copy_wheel_delta(&rects, PaneId(1), over_other_pane, 3),
+            None
+        );
+        let down = MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            ..over_copy
+        };
+        copy.scroll_viewport(copy_wheel_delta(&rects, PaneId(1), down, 99).unwrap());
+        assert_eq!(copy.top, bottom_top);
+        copy.scroll_viewport(copy_wheel_delta(&rects, PaneId(1), over_copy, i16::MAX).unwrap());
+        assert_eq!(copy.top, 0);
+    }
+
+    #[test]
+    fn shift_wheel_is_reserved_for_local_history_but_shift_click_is_not() {
+        let shifted_wheel = MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::SHIFT,
+        };
+        let shifted_click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::SHIFT,
+        };
+        assert!(!pane_consumes_mouse(
+            shifted_wheel.kind,
+            shifted_wheel.modifiers,
+            true,
+            0
+        ));
+        assert!(pane_consumes_mouse(
+            shifted_click.kind,
+            shifted_click.modifiers,
+            true,
+            0
+        ));
+        assert!(!pane_consumes_mouse(
+            MouseEventKind::ScrollDown,
+            KeyModifiers::NONE,
+            true,
+            2
+        ));
+        assert!(pane_consumes_mouse(
+            MouseEventKind::ScrollDown,
+            KeyModifiers::NONE,
+            true,
+            0
+        ));
     }
 
     #[test]

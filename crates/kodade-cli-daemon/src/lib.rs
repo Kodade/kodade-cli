@@ -111,7 +111,6 @@ struct Pane {
     writer: Mutex<Box<dyn Write + Send>>,
     master: Mutex<Box<dyn MasterPty + Send>>,
     parser: Arc<Mutex<PtyParser>>,
-    scroll_offset: Mutex<usize>,
     last_output: Arc<Mutex<Instant>>,
     hook: Mutex<Option<ReportedHook>>,
     spawn_process: String,
@@ -777,18 +776,24 @@ impl Session {
         let snapshots = ids
             .into_iter()
             .filter_map(|id| {
-                panes.get(&id).map(|pane| PaneSnapshot {
-                    id,
-                    title: pane.title.lock().expect("title lock poisoned").clone(),
-                    focused: id == tab.focused,
-                    scroll_offset: pane.scroll_offset(),
-                    screen: pane.snapshot(),
-                    agent: detections[&id].agent.clone(),
-                    state: detections[&id].state,
-                    state_reason: detections[&id].reason.clone(),
-                    state_age_secs: ages[&id],
-                    // `detect` already refreshed this pane's cache this tick.
-                    cwd: pane.cwd(now),
+                panes.get(&id).map(|pane| {
+                    // vt100 advances its own offset as output arrives while a
+                    // user reads history. Keep that one source of truth and
+                    // snapshot it atomically with the visible cells.
+                    let (screen, scroll_offset) = pane.snapshot();
+                    PaneSnapshot {
+                        id,
+                        title: pane.title.lock().expect("title lock poisoned").clone(),
+                        focused: id == tab.focused,
+                        scroll_offset,
+                        screen,
+                        agent: detections[&id].agent.clone(),
+                        state: detections[&id].state,
+                        state_reason: detections[&id].reason.clone(),
+                        state_age_secs: ages[&id],
+                        // `detect` already refreshed this pane's cache this tick.
+                        cwd: pane.cwd(now),
+                    }
                 })
             })
             .collect();
@@ -872,12 +877,13 @@ impl Session {
             });
         }
         let title = pane.title.lock().expect("title lock poisoned").clone();
+        let (screen, scroll_offset) = pane.snapshot();
         Ok(PaneSnapshot {
             id,
             title,
             focused,
-            scroll_offset: pane.scroll_offset(),
-            screen: pane.snapshot(),
+            scroll_offset,
+            screen,
             agent: detection.agent.clone(),
             state: detection.state,
             state_reason: detection.reason.clone(),
@@ -2379,7 +2385,6 @@ impl Pane {
             writer: Mutex::new(writer),
             master: Mutex::new(pair.master),
             parser,
-            scroll_offset: Mutex::new(0),
             last_output,
             hook: Mutex::new(None),
             spawn_process,
@@ -2395,26 +2400,17 @@ impl Pane {
             state_since: Mutex::new(Instant::now()),
         })
     }
-    fn snapshot(&self) -> Screen {
-        let mut offset = self
-            .scroll_offset
-            .lock()
-            .expect("scroll offset lock poisoned");
-        let mut parser = self.parser.lock().expect("PTY parser lock poisoned");
-        parser.screen_mut().set_scrollback(*offset);
-        *offset = parser.screen().scrollback();
-        snapshot(&parser)
+    fn snapshot(&self) -> (Screen, usize) {
+        let parser = self.parser.lock().expect("PTY parser lock poisoned");
+        (snapshot(&parser), parser.screen().scrollback())
     }
     /// Full pane text for copy mode / `pane read`. With `scrollback`, walks the
     /// vt100 history and appends the visible screen; otherwise just the visible
     /// screen. `lines` keeps the last N lines. Returns the text and its line
     /// count. The pane's live scroll offset is saved and restored.
     fn read_text(&self, scrollback: bool, lines: Option<usize>) -> (String, usize) {
-        let offset = *self
-            .scroll_offset
-            .lock()
-            .expect("scroll offset lock poisoned");
         let mut parser = self.parser.lock().expect("PTY parser lock poisoned");
+        let offset = parser.screen().scrollback();
         let mut history = if scrollback {
             read_history(&mut parser)
         } else {
@@ -2468,38 +2464,22 @@ impl Pane {
         Ok(())
     }
     fn scroll(&self, delta: i16) {
-        let mut offset = self
-            .scroll_offset
-            .lock()
-            .expect("scroll offset lock poisoned");
         let mut parser = self.parser.lock().expect("PTY parser lock poisoned");
-        *offset = scroll_offset_after_delta(*offset, delta, usize::MAX);
-        parser.screen_mut().set_scrollback(*offset);
-        *offset = parser.screen().scrollback();
+        let offset = scroll_offset_after_delta(parser.screen().scrollback(), delta, usize::MAX);
+        parser.screen_mut().set_scrollback(offset);
     }
     fn reset_scrollback(&self) {
-        let mut offset = self
-            .scroll_offset
-            .lock()
-            .expect("scroll offset lock poisoned");
-        *offset = 0;
         self.parser
             .lock()
             .expect("PTY parser lock poisoned")
             .screen_mut()
             .set_scrollback(0);
     }
-    fn scroll_offset(&self) -> usize {
-        *self
-            .scroll_offset
-            .lock()
-            .expect("scroll offset lock poisoned")
-    }
-
     fn detect(&self, manifests: &[manifest::Manifest], now: Instant) -> agent::Detection {
         let (screen, title) = {
-            let parser = self.parser.lock().expect("PTY parser lock poisoned");
-            (parser.screen().contents(), parser.callbacks().title.clone())
+            let mut parser = self.parser.lock().expect("PTY parser lock poisoned");
+            let screen = live_screen_contents(&mut parser);
+            (screen, parser.callbacks().title.clone())
         };
         // portable-pty obtains the foreground process-group leader from the PTY itself.
         // `ps` turns that portable pid into a basename without sysctl; unavailable leaders fall
@@ -2780,6 +2760,15 @@ fn read_history(parser: &mut PtyParser) -> Vec<String> {
         }
     }
     lines
+}
+
+/// Read the live grid without disturbing a user's local-history viewport.
+fn live_screen_contents(parser: &mut PtyParser) -> String {
+    let offset = parser.screen().scrollback();
+    parser.screen_mut().set_scrollback(0);
+    let contents = parser.screen().contents();
+    parser.screen_mut().set_scrollback(offset);
+    contents
 }
 /// Build a wire `Screen` from the pane's terminal state: plain `contents` for
 /// copy mode plus one styled run list per visible row (#7).
@@ -3298,6 +3287,78 @@ mod tests {
     fn scroll_offset_clamps_to_available_history() {
         assert_eq!(scroll_offset_after_delta(1, 99, 2), 2);
         assert_eq!(scroll_offset_after_delta(1, -99, 2), 0);
+    }
+
+    #[tokio::test]
+    async fn pane_snapshot_keeps_history_anchored_while_output_arrives() {
+        let (updates, _) = broadcast::channel(1);
+        // A quiet command avoids the user's interactive login-shell prompt
+        // racing the synthetic terminal output below.
+        let mut pane = Pane::spawn(
+            PaneId(1),
+            "test",
+            20,
+            2,
+            "scroll-test".into(),
+            updates,
+            None,
+            Some(vec!["sleep".into(), "60".into()]),
+        )
+        .expect("test pane");
+        // The reader keeps the original parser, so shell profile output cannot
+        // race the synthetic parser this regression test controls.
+        pane.parser = Arc::new(Mutex::new(PtyParser::new_with_callbacks(
+            2,
+            20,
+            100,
+            PtyCallbacks::default(),
+        )));
+        {
+            let mut parser = pane.parser.lock().expect("parser lock");
+            parser.process(b"one\r\ntwo\r\nthree\r\nfour\r\n");
+        }
+        pane.scroll(2);
+        let before = pane.snapshot().0.contents;
+        pane.parser
+            .lock()
+            .expect("parser lock")
+            .process(b"five\r\n");
+        let (after, offset) = pane.snapshot();
+        assert_eq!(offset, 3);
+        assert_eq!(after.contents, before);
+        pane.scroll(i16::MAX);
+        let (_, oldest) = pane.snapshot();
+        assert!(oldest >= 3);
+        pane.scroll(i16::MAX);
+        assert_eq!(pane.snapshot().1, oldest);
+        pane.scroll(i16::MIN);
+        assert_eq!(pane.snapshot().1, 0);
+    }
+
+    #[test]
+    fn alternate_screen_has_no_local_history_and_restores_normal_screen() {
+        let mut parser = PtyParser::new_with_callbacks(2, 20, 100, PtyCallbacks::default());
+        parser.process(b"one\r\ntwo\r\nthree\r\n");
+        parser.process(b"\x1b[?1049halt\r\n");
+        assert!(parser.screen().alternate_screen());
+        parser.screen_mut().set_scrollback(usize::MAX);
+        assert_eq!(parser.screen().scrollback(), 0);
+        parser.process(b"\x1b[?1049l");
+        assert!(!parser.screen().alternate_screen());
+        assert!(parser.screen().contents().contains("three"));
+    }
+
+    #[test]
+    fn live_detection_screen_ignores_history_viewport() {
+        let mut parser = PtyParser::new_with_callbacks(2, 20, 100, PtyCallbacks::default());
+        parser.process(b"old\r\nolder\r\nlive\r\nnow\r\n");
+        parser.screen_mut().set_scrollback(2);
+        let offset = parser.screen().scrollback();
+        assert_eq!(offset, 2);
+        let history = parser.screen().contents();
+        let live = live_screen_contents(&mut parser);
+        assert_ne!(live, history);
+        assert_eq!(parser.screen().scrollback(), offset);
     }
     #[test]
     fn focus_pane_id_activates_its_workspace_and_tab() {

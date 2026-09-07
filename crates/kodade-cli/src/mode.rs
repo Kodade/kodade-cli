@@ -150,6 +150,15 @@ impl CopyMode {
             .min(self.line_count().saturating_sub(1));
         self.after_move();
     }
+    /// Move the viewport without waiting for the cursor to reach its edge.
+    /// The cursor keeps its row within that viewport when possible.
+    pub fn scroll_viewport(&mut self, delta: isize) {
+        let relative_row = self.cursor.row.saturating_sub(self.top);
+        let max_top = self.line_count().saturating_sub(self.height);
+        self.top = self.top.saturating_add_signed(delta).min(max_top);
+        self.cursor.row = (self.top + relative_row).min(self.line_count().saturating_sub(1));
+        self.clamp();
+    }
     pub fn move_cols(&mut self, delta: isize) {
         self.cursor.col = self
             .cursor

@@ -363,7 +363,9 @@ fn group_of(action: Action) -> Group {
         | MoveTabRight => Group::Tabs,
         WorkspaceNext | WorkspacePrev | WorkspacePicker | NewWorkspace | WorktreeNew
         | RenameWorkspace | CloseWorkspace => Group::Workspaces,
-        Navigate | Goto | CopyMode | ResizeMode | Settings | Help => Group::Modes,
+        Navigate | Goto | CopyMode | ScrollUp | ScrollDown | ResizeMode | Settings | Help => {
+            Group::Modes
+        }
         Detach | SidebarToggle | ReloadConfig | PasteBuffer | MouseToggle | NotificationJump => {
             Group::Other
         }
@@ -399,6 +401,8 @@ fn label_of(action: Action) -> String {
         ResizeRight => "resize right".into(),
         Navigate => "navigate".into(),
         CopyMode => "copy mode".into(),
+        ScrollUp => "scroll history up".into(),
+        ScrollDown => "scroll history down".into(),
         SelectTabIndex(index) => format!("select tab {index}"),
         CloseTab => "close tab".into(),
         RenameTab => "rename tab".into(),
