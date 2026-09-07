@@ -1471,12 +1471,19 @@ mod tests {
     fn kodade_dark_populates_expanded_schema() {
         let theme = Theme::kodade_dark();
         assert_eq!(theme.accent, Color::Rgb(0xE7, 0xA3, 0x3B));
-        assert_eq!(theme.bg, Color::Rgb(0x2a, 0x28, 0x25));
+        assert_eq!(theme.bg, Color::Rgb(0x18, 0x18, 0x18));
+        assert_eq!(theme.surface, Color::Rgb(0x11, 0x11, 0x11));
+        assert_eq!(theme.text, Color::Rgb(0xE8, 0xE8, 0xE8));
+        assert_eq!(theme.dim, Color::Rgb(0xA3, 0xA3, 0xA3));
         assert_eq!(theme.cursor, Color::Rgb(0xe2, 0xb8, 0x6e));
-        assert_eq!(theme.tab_active_bg, Color::Rgb(0x38, 0x35, 0x2f));
+        assert_eq!(theme.tab_active_bg, Color::Rgb(0x29, 0x29, 0x29));
         // ANSI table parsed, purple-free magenta slot.
+        assert_eq!(theme.ansi[0], theme.bg);
         assert_eq!(theme.ansi[2], Color::Rgb(0xa8, 0xc8, 0x7f)); // green
         assert_eq!(theme.ansi[5], Color::Rgb(0xd9, 0x8a, 0x5b)); // "magenta"
+        assert_eq!(theme.ansi[7], theme.text);
+        assert_eq!(theme.ansi[8], theme.dim);
+        assert_eq!(theme.ansi[15], Color::Rgb(0xFA, 0xFA, 0xFA));
     }
 
     #[test]

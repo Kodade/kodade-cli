@@ -413,8 +413,9 @@ uppercase letters (`L`) all keep their meaning.
 ## Themes
 
 Built-in themes: `kodade-dark`, `kodade-light`, and `tokyo-night` (the old
-Tokyo Night palette, kept as an extra). The Ködade themes are warm neutrals
-with the Ködade amber accent `#E7A33B` and a purple-free ANSI palette.
+Tokyo Night palette, kept as an extra). `kodade-dark` uses neutral charcoal
+backgrounds and off-white text. The Ködade themes retain the orange accent
+`#E7A33B` and a purple-free ANSI palette.
 
 `theme` accepts:
 
