@@ -26,6 +26,7 @@ use std::{
 };
 
 use anyhow::{anyhow, bail, Context, Result};
+use base64::{engine::general_purpose::STANDARD, Engine};
 use kodade_cli_proto::{
     decode, encode, schema_message, AgentInfo, AgentStateKind, CellColor, ClientMessage, Direction,
     Event, InvocationContext, LayoutSnapshot, LayoutTree, ManifestInfo, NativeSession,
@@ -171,12 +172,23 @@ struct StoredSelection {
 #[derive(Default)]
 struct PtyCallbacks {
     title: String,
+    clipboard: Option<(Vec<u8>, Vec<u8>)>,
     graphics: graphics::Store,
     graphics_tracker: graphics::Tracker,
 }
 impl vt100::Callbacks for PtyCallbacks {
     fn set_window_title(&mut self, _: &mut vt100::Screen, title: &[u8]) {
         self.title = String::from_utf8_lossy(title).into_owned();
+    }
+    fn copy_to_clipboard(&mut self, _: &mut vt100::Screen, ty: &[u8], data: &[u8]) {
+        self.record_clipboard(ty, data);
+    }
+}
+impl PtyCallbacks {
+    fn record_clipboard(&mut self, ty: &[u8], data: &[u8]) {
+        if data.len() <= 140_000 {
+            self.clipboard = Some((ty.to_vec(), data.to_vec()));
+        }
     }
 }
 type PtyParser = vt100::Parser<PtyCallbacks>;
@@ -1752,6 +1764,29 @@ impl Session {
             .lock()
             .map_err(|_| anyhow!("view dispatch lock poisoned"))?;
         self.pane_snapshot(id)
+    }
+
+    /// Consume one OSC 52 write only for this attached connection's focused
+    /// pane. Clipboard data is neither replayed nor exposed through queries.
+    fn take_view_clipboard(&self, view: &ClientView) -> Option<ServerMessage> {
+        let focused = {
+            let state = self.state.lock().ok()?;
+            Self::view_selection(&state, Some(view)).2
+        };
+        let pane = self.panes.lock().ok()?.get(&focused).cloned()?;
+        let (selection, encoded) = pane.parser.lock().ok()?.callbacks_mut().clipboard.take()?;
+        if selection.as_slice() != b"c" {
+            return None;
+        }
+        let bytes = STANDARD.decode(encoded).ok()?;
+        if bytes.len() > 100_000 {
+            return None;
+        }
+        let text = String::from_utf8(bytes).ok()?;
+        Some(ServerMessage::Clipboard {
+            pane: focused,
+            text,
+        })
     }
 
     /// Queues a notification with the next sequence number, capping the ring at
@@ -4617,6 +4652,9 @@ async fn serve_client(stream: UnixStream, session: Arc<Session>) -> Result<()> {
                     if !remaining.is_zero() { tokio::time::sleep(remaining).await; }
                     write_server(&mut writer, &ServerMessage::Layout(session.snapshot_for_client(&view)?)).await?;
                     send_notifications(&mut writer, &session, &mut last_notify_seq, subscribed).await?;
+                    if let Some(clipboard) = session.take_view_clipboard(&view) {
+                        write_server(&mut writer, &clipboard).await?;
+                    }
                     last_snapshot = Instant::now();
                 }
                 Err(broadcast::error::RecvError::Closed) => return Ok(()),
@@ -4625,6 +4663,9 @@ async fn serve_client(stream: UnixStream, session: Arc<Session>) -> Result<()> {
                 if initialized {
                     write_server(&mut writer, &ServerMessage::Layout(session.snapshot_for_client(&view)?)).await?;
                     send_notifications(&mut writer, &session, &mut last_notify_seq, subscribed).await?;
+                    if let Some(clipboard) = session.take_view_clipboard(&view) {
+                        write_server(&mut writer, &clipboard).await?;
+                    }
                     last_snapshot = Instant::now();
                 }
             }
@@ -4706,6 +4747,52 @@ async fn send_notifications(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn osc52_callback_keeps_only_bounded_copy_requests() {
+        let mut parser = PtyParser::new_with_callbacks(2, 10, 10, PtyCallbacks::default());
+        parser.process(b"\x1b]52;c;aGk=\x07");
+        assert_eq!(
+            parser.callbacks().clipboard.as_ref().map(|(_, data)| data),
+            Some(&b"aGk=".to_vec())
+        );
+        // OSC 52 queries invoke the separate paste callback and never replace
+        // the pending copy request.
+        parser.process(b"\x1b]52;c;?\x07");
+        assert_eq!(
+            parser.callbacks().clipboard.as_ref().map(|(_, data)| data),
+            Some(&b"aGk=".to_vec())
+        );
+        parser
+            .callbacks_mut()
+            .record_clipboard(b"c", &vec![b'a'; 140_001]);
+        assert_eq!(
+            parser.callbacks().clipboard.as_ref().map(|(_, data)| data),
+            Some(&b"aGk=".to_vec())
+        );
+    }
+
+    #[tokio::test]
+    async fn pane_clipboard_is_one_shot_and_validated_for_the_attached_view() {
+        let session = Session::spawn(80, 24, "clipboard-view".into()).expect("session");
+        let view = session.new_client_view().expect("view");
+        let focused = Session::view_selection(&session.state.lock().unwrap(), Some(&view)).2;
+        let pane = session.panes.lock().unwrap()[&focused].clone();
+        pane.parser
+            .lock()
+            .unwrap()
+            .process(b"\x1b]52;c;aGVsbG8=\x07");
+        assert!(matches!(
+            session.take_view_clipboard(&view),
+            Some(ServerMessage::Clipboard { pane, text }) if pane == focused && text == "hello"
+        ));
+        assert!(session.take_view_clipboard(&view).is_none());
+        pane.parser
+            .lock()
+            .unwrap()
+            .process(b"\x1b]52;c;not-base64!\x07");
+        assert!(session.take_view_clipboard(&view).is_none());
+    }
+
     #[test]
     fn graphics_follow_bottom_row_autowrap_and_scroll_commands() {
         let mut parser = PtyParser::new_with_callbacks(4, 10, 100, PtyCallbacks::default());

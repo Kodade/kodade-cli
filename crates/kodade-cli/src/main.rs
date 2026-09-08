@@ -3,6 +3,7 @@ mod atomic_file;
 mod attention;
 mod automation;
 mod cli;
+mod clipboard;
 mod commands;
 mod config;
 mod connection;
@@ -1495,6 +1496,9 @@ async fn tui(
             let update = match decode(line.as_bytes()) {
                 Ok(ServerMessage::Layout(layout)) => app::Update::Layout(layout),
                 Ok(ServerMessage::Welcome { session, .. }) => app::Update::Session(session),
+                Ok(ServerMessage::Clipboard { pane, text }) => {
+                    app::Update::Clipboard { pane, text }
+                }
                 Ok(ServerMessage::Notification(notification)) => {
                     app::Update::Notification(notification)
                 }

@@ -465,6 +465,12 @@ pub struct ManifestInfo {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ServerMessage {
+    /// A pane requested an OSC 52 clipboard write. This is delivered only to
+    /// the attached client currently viewing that pane.
+    Clipboard {
+        pane: PaneId,
+        text: String,
+    },
     ImagePasted {
         pane: PaneId,
         path: PathBuf,
@@ -1018,6 +1024,7 @@ pub const CLIENT_MESSAGE_NAMES: &[&str] = &[
 
 /// Every `ServerMessage` variant name (see [`CLIENT_MESSAGE_NAMES`]).
 pub const SERVER_MESSAGE_NAMES: &[&str] = &[
+    "Clipboard",
     "ImagePasted",
     "Welcome",
     "Layout",
@@ -1094,6 +1101,7 @@ pub fn client_message_name(message: &ClientMessage) -> &'static str {
 /// Variant name of a server message (see [`client_message_name`]).
 pub fn server_message_name(message: &ServerMessage) -> &'static str {
     match message {
+        ServerMessage::Clipboard { .. } => "Clipboard",
         ServerMessage::ImagePasted { .. } => "ImagePasted",
         ServerMessage::Welcome { .. } => "Welcome",
         ServerMessage::Layout(_) => "Layout",
@@ -1380,6 +1388,10 @@ mod tests {
             seq: 1,
         };
         vec![
+            ServerMessage::Clipboard {
+                pane: PaneId(1),
+                text: "copied".into(),
+            },
             ServerMessage::ImagePasted {
                 pane: PaneId(1),
                 path: "/tmp/image.png".into(),

@@ -76,6 +76,10 @@ type Term = Terminal<CrosstermBackend<std::io::Stdout>>;
 
 /// Server messages the attached client acts on; the reader task drops the rest.
 pub enum Update {
+    Clipboard {
+        pane: PaneId,
+        text: String,
+    },
     RequestError(String),
     Layout(LayoutSnapshot),
     Session(String),
@@ -1036,6 +1040,14 @@ impl App {
                     continue;
                 }
                 match update {
+                    Update::Clipboard { pane, text } => {
+                        let _ = pane;
+                        if let Err(error) =
+                            crate::clipboard::copy(text, endpoint != EndpointId::Local).await
+                        {
+                            self.set_note(format!(" clipboard: {error:#}"));
+                        }
+                    }
                     Update::Layout(layout) => {
                         self.handle_layout(layout);
                         self.replay_pending_notifications();
@@ -1350,7 +1362,7 @@ impl App {
         &mut self,
         key: KeyEvent,
         writer: &mut Router,
-        term: &mut Term,
+        _term: &mut Term,
     ) -> Result<()> {
         let Some(mut cm) = self.copy.take() else {
             return Ok(());
@@ -1417,18 +1429,13 @@ impl App {
                 cm.anchor = Some(cm.cursor);
             }
 
-            // Yank the selection (or current line) through OSC 52.
+            // Yank the selection (or current line) through the local clipboard,
+            // with OSC 52 retained for SSH and unavailable host tools.
             KeyCode::Char('y') => {
                 let text = cm.yank_text();
                 self.paste_buffer = text.clone();
-                let (payload, truncated) = mode::osc52(&text);
-                execute!(term.backend_mut(), crossterm::style::Print(payload))?;
-                term.backend_mut().flush()?;
-                self.set_note(if truncated {
-                    " copied (truncated to 100KB)"
-                } else {
-                    " copied"
-                });
+                crate::clipboard::copy(text, self.selected_endpoint != EndpointId::Local).await?;
+                self.set_note(" copied");
                 keep = false;
             }
 
