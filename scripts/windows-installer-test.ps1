@@ -18,6 +18,18 @@ try {
     $installed = Join-Path $dest 'kodade-cli.exe'
     if ((& $installed --version).Trim() -ne "kodade-cli $version") { throw 'installer did not install the exact executable' }
     'old bytes' | Set-Content $installed; ('0' * 64 + "  $name") | Set-Content $sums
-    try { & (Join-Path $PSScriptRoot '..\install.ps1') -InstallDir $dest -Repository fixture/test; throw 'installer accepted a bad checksum' } catch { if ((Get-Content $installed -Raw).Trim() -ne 'old bytes') { throw 'bad checksum replaced existing executable' } }
+    try { & (Join-Path $PSScriptRoot '..\install.ps1') -InstallDir $dest -Repository fixture/test; throw 'installer accepted a bad checksum' } catch { if ($_ -notmatch 'Checksum') { throw 'checksum rejection was not actionable' }; if ((Get-Content $installed -Raw).Trim() -ne 'old bytes') { throw 'bad checksum replaced existing executable' } }
+    Copy-Item $Binary $installed -Force
+    $metadata.tag_name = 'v999.0.0'
+    try { & (Join-Path $PSScriptRoot '..\install.ps1') -InstallDir $dest -Repository fixture/test; throw 'installer accepted mismatched release metadata' } catch { if ((& $installed --version).Trim() -ne "kodade-cli $version") { throw 'version mismatch replaced existing executable' } }
+    $metadata.tag_name = "v$version"
+    "$(Get-FileHash -Algorithm SHA256 $zip | Select-Object -Expand Hash)  $name" | Set-Content $sums
+    'unexpected' | Set-Content (Join-Path $package 'extra.txt'); Compress-Archive -Path $package -DestinationPath $zip -Force
+    "$(Get-FileHash -Algorithm SHA256 $zip | Select-Object -Expand Hash)  $name" | Set-Content $sums
+    try { & (Join-Path $PSScriptRoot '..\install.ps1') -InstallDir $dest -Repository fixture/test; throw 'installer accepted an unexpected ZIP entry' } catch { if ((& $installed --version).Trim() -ne "kodade-cli $version") { throw 'unexpected ZIP entry replaced existing executable' } }
+    Remove-Item (Join-Path $package 'extra.txt'); Compress-Archive -Path $package -DestinationPath $zip -Force
+    "$(Get-FileHash -Algorithm SHA256 $zip | Select-Object -Expand Hash)  $name" | Set-Content $sums
+    $lock = [IO.File]::Open($installed, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::None)
+    try { try { & (Join-Path $PSScriptRoot '..\install.ps1') -InstallDir $dest -Repository fixture/test; throw 'installer replaced a locked executable' } catch { if (Get-ChildItem $dest -Filter '.kodade-cli-*.exe') { throw 'locked replacement leaked staged executable' } } } finally { $lock.Dispose() }
     Write-Host 'Windows installer fixture passed: real ZIP/version, spaced path, checksum refusal preserves prior bytes'
 } finally { if (Test-Path $root) { Remove-Item $root -Recurse -Force } }

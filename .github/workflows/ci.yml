@@ -47,6 +47,10 @@ jobs:
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo build
       - run: cargo test
+      - name: Verify PowerShell Windows installer
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: ./scripts/windows-installer-test.ps1
       - name: Download Unix SSH fixture binary
         if: runner.os == 'Windows'
         uses: actions/download-artifact@v4
@@ -57,7 +61,3 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: ./scripts/windows-smoke.ps1
-      - name: Verify PowerShell Windows installer
-        if: runner.os == 'Windows'
-        shell: powershell
-        run: ./scripts/windows-installer-test.ps1
