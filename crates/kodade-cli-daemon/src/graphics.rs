@@ -175,6 +175,7 @@ impl Tracker {
         };
         let alternate = screen.alternate_screen();
         let (height, width) = screen.size();
+        let (height, width) = (height.get(), width.get());
         let (row, col) = screen.cursor_position();
         let margin = &mut self.margins[usize::from(alternate)];
         let (top, bottom) = margin.unwrap_or((0, height - 1));

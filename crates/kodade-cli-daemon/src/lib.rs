@@ -16,6 +16,7 @@ use std::{
     collections::{HashMap, HashSet},
     env, fs,
     io::{Read, Write},
+    num::NonZeroU16,
     os::unix::fs::FileTypeExt,
     path::{Path, PathBuf},
     sync::{
@@ -180,6 +181,18 @@ impl vt100::Callbacks for PtyCallbacks {
     }
 }
 type PtyParser = vt100::Parser<PtyCallbacks>;
+
+fn terminal_size(rows: u16, cols: u16) -> (NonZeroU16, NonZeroU16) {
+    (
+        NonZeroU16::new(rows.max(1)).expect("clamped rows"),
+        NonZeroU16::new(cols.max(1)).expect("clamped cols"),
+    )
+}
+
+fn pty_parser(rows: u16, cols: u16, scrollback: usize, callbacks: PtyCallbacks) -> PtyParser {
+    let (rows, cols) = terminal_size(rows, cols);
+    PtyParser::new_with_callbacks(rows, cols, scrollback, callbacks)
+}
 
 struct Pane {
     title: Mutex<String>,
@@ -3493,8 +3506,7 @@ impl Pane {
             .context("spawn login shell in PTY")?;
         let writer = Arc::new(Mutex::new(pair.master.take_writer()?));
         let reader = pair.master.try_clone_reader()?;
-        let mut restored_parser =
-            PtyParser::new_with_callbacks(rows, cols, 10_000, PtyCallbacks::default());
+        let mut restored_parser = pty_parser(rows, cols, 10_000, PtyCallbacks::default());
         if let Some(replay) = replay.as_ref() {
             restore_screen(&mut restored_parser, &replay.screen, &replay.text);
         }
@@ -3590,7 +3602,7 @@ impl Pane {
             .map_err(|_| anyhow!("PTY parser lock poisoned"))?
             .screen()
             .size()
-            == (rows, cols)
+            == terminal_size(rows, cols)
         {
             return Ok(());
         }
@@ -3607,7 +3619,7 @@ impl Pane {
             .lock()
             .map_err(|_| anyhow!("PTY parser lock poisoned"))?
             .screen_mut()
-            .set_size(rows, cols);
+            .set_size(terminal_size(rows, cols).0, terminal_size(rows, cols).1);
         Ok(())
     }
     fn write(&self, bytes: &[u8]) -> Result<()> {
@@ -4103,12 +4115,15 @@ fn read_pty(
                             replies.extend(result.reply);
                             if let Some((rows, cols)) = result.advance {
                                 let (height, width) = parser.screen().size();
-                                let rows = rows.min(height);
+                                let rows = rows.min(height.get());
                                 graphics_text(&mut parser, &vec![b'\n'; usize::from(rows)]);
                                 parser.process(
                                     format!(
                                         "\x1b[{}G",
-                                        cursor.1.saturating_add(cols).min(width.saturating_sub(1))
+                                        cursor
+                                            .1
+                                            .saturating_add(cols)
+                                            .min(width.get().saturating_sub(1))
                                             + 1
                                     )
                                     .as_bytes(),
@@ -4153,6 +4168,7 @@ fn graphics_text(parser: &mut PtyParser, text: &[u8]) {
 /// parser so it can be unit-tested on a synthetic buffer.
 fn read_history(parser: &mut PtyParser) -> Vec<String> {
     let (rows, cols) = parser.screen().size();
+    let (rows, cols) = (rows.get(), cols.get());
     let rows = rows as usize;
     parser.screen_mut().set_scrollback(usize::MAX);
     let max = parser.screen().scrollback();
@@ -4208,6 +4224,7 @@ fn snapshot(parser: &PtyParser) -> Screen {
     let screen = parser.screen();
     let (cursor_row, cursor_col) = screen.cursor_position();
     let (rows, cols) = screen.size();
+    let (rows, cols) = (rows.get(), cols.get());
     Screen {
         contents: screen.contents(),
         cursor_row,
@@ -4226,6 +4243,7 @@ fn snapshot(parser: &PtyParser) -> Screen {
 /// Rebuild recent text and the saved visible grid before the PTY reader starts.
 fn restore_screen(parser: &mut PtyParser, screen: &Screen, history: &str) {
     let (rows, cols) = parser.screen().size();
+    let (rows, cols) = (rows.get(), cols.get());
     if screen.rows.len() > usize::from(rows)
         || screen.rows.iter().any(|row| row.len() > usize::from(cols))
     {
@@ -4708,7 +4726,7 @@ async fn send_notifications(
 mod tests {
     #[test]
     fn graphics_follow_bottom_row_autowrap_and_scroll_commands() {
-        let mut parser = PtyParser::new_with_callbacks(4, 10, 100, PtyCallbacks::default());
+        let mut parser = pty_parser(4, 10, 100, PtyCallbacks::default());
         parser.callbacks_mut().graphics.command(
             b"a=T,f=24,s=1,v=1,i=7,c=1,r=1,C=1;AAAA",
             (2, 0),
@@ -4858,14 +4876,14 @@ mod tests {
     }
     #[test]
     fn vt100_snapshot_retains_terminal_contents() {
-        let mut parser = PtyParser::new_with_callbacks(3, 10, 100, PtyCallbacks::default());
+        let mut parser = pty_parser(3, 10, 100, PtyCallbacks::default());
         parser.process(b"hello\r\nworld");
         assert!(snapshot(&parser).contents.contains("hello"));
     }
     #[test]
     fn read_history_recovers_full_scrollback() {
         // A 24-row screen with plenty of scrollback fed 3000 numbered lines.
-        let mut parser = PtyParser::new_with_callbacks(24, 20, 10_000, PtyCallbacks::default());
+        let mut parser = pty_parser(24, 20, 10_000, PtyCallbacks::default());
         for n in 1..=3000 {
             parser.process(format!("{n}\r\n").as_bytes());
         }
@@ -4885,7 +4903,7 @@ mod tests {
     /// Paint an 80x24-style sample with the escape sequences a colored `ls`,
     /// a prompt, and a 256/RGB-color TUI would emit.
     fn mixed_sample(rows: u16, cols: u16) -> PtyParser {
-        let mut parser = PtyParser::new_with_callbacks(rows, cols, 100, PtyCallbacks::default());
+        let mut parser = pty_parser(rows, cols, 100, PtyCallbacks::default());
         for row in 0..rows {
             let line = match row % 4 {
                 0 => format!("\x1b[0;34mdir-{row:03}\x1b[0m  \x1b[0;32mrun.sh\x1b[0m  plain.txt"),
@@ -4907,7 +4925,7 @@ mod tests {
 
     #[test]
     fn snapshot_coalesces_colors_and_attributes_into_runs() {
-        let mut parser = PtyParser::new_with_callbacks(2, 20, 100, PtyCallbacks::default());
+        let mut parser = pty_parser(2, 20, 100, PtyCallbacks::default());
         parser.process(b"\x1b[31mred\x1b[1mbold\x1b[0mplain");
         let screen = snapshot(&parser);
         let runs = &screen.rows[0];
@@ -4926,7 +4944,7 @@ mod tests {
 
     #[test]
     fn snapshot_keeps_wide_chars_in_two_columns() {
-        let mut parser = PtyParser::new_with_callbacks(1, 10, 100, PtyCallbacks::default());
+        let mut parser = pty_parser(1, 10, 100, PtyCallbacks::default());
         parser.process("宽x".as_bytes());
         let screen = snapshot(&parser);
         let text: String = screen.rows[0].iter().map(|run| run.text.as_str()).collect();
@@ -4937,7 +4955,7 @@ mod tests {
 
     #[test]
     fn snapshot_reports_terminal_modes() {
-        let mut parser = PtyParser::new_with_callbacks(2, 10, 100, PtyCallbacks::default());
+        let mut parser = pty_parser(2, 10, 100, PtyCallbacks::default());
         parser.process(b"\x1b[?2004h\x1b[?1000h\x1b[?25l");
         let screen = snapshot(&parser);
         assert!(screen.bracketed_paste);
@@ -4975,7 +4993,7 @@ mod tests {
 
     #[test]
     fn osc_window_title_reaches_the_detection_callback() {
-        let mut parser = PtyParser::new_with_callbacks(3, 20, 100, PtyCallbacks::default());
+        let mut parser = pty_parser(3, 20, 100, PtyCallbacks::default());
         parser.process(b"\x1b]2;claude\x07");
         assert_eq!(parser.callbacks().title, "claude");
         parser.process(b"\x1b]0;codex\x07");
@@ -5087,10 +5105,10 @@ mod tests {
 
     #[test]
     fn cold_history_replay_restores_formatted_active_screen() {
-        let mut source = PtyParser::new_with_callbacks(3, 20, 100, PtyCallbacks::default());
+        let mut source = pty_parser(3, 20, 100, PtyCallbacks::default());
         source.process(b"\x1b[31mred ready\x1b[0m");
         let saved = snapshot(&source);
-        let mut restored = PtyParser::new_with_callbacks(3, 20, 100, PtyCallbacks::default());
+        let mut restored = pty_parser(3, 20, 100, PtyCallbacks::default());
         restore_screen(
             &mut restored,
             &saved,
@@ -5122,12 +5140,7 @@ mod tests {
         .expect("test pane");
         // The reader keeps the original parser, so shell profile output cannot
         // race the synthetic parser this regression test controls.
-        pane.parser = Arc::new(Mutex::new(PtyParser::new_with_callbacks(
-            2,
-            20,
-            100,
-            PtyCallbacks::default(),
-        )));
+        pane.parser = Arc::new(Mutex::new(pty_parser(2, 20, 100, PtyCallbacks::default())));
         {
             let mut parser = pane.parser.lock().expect("parser lock");
             parser.process(b"one\r\ntwo\r\nthree\r\nfour\r\n");
@@ -5152,7 +5165,7 @@ mod tests {
 
     #[test]
     fn alternate_screen_has_no_local_history_and_restores_normal_screen() {
-        let mut parser = PtyParser::new_with_callbacks(2, 20, 100, PtyCallbacks::default());
+        let mut parser = pty_parser(2, 20, 100, PtyCallbacks::default());
         parser.process(b"one\r\ntwo\r\nthree\r\n");
         parser.process(b"\x1b[?1049halt\r\n");
         assert!(parser.screen().alternate_screen());
@@ -5165,7 +5178,7 @@ mod tests {
 
     #[test]
     fn live_detection_screen_ignores_history_viewport() {
-        let mut parser = PtyParser::new_with_callbacks(2, 20, 100, PtyCallbacks::default());
+        let mut parser = pty_parser(2, 20, 100, PtyCallbacks::default());
         parser.process(b"old\r\nolder\r\nlive\r\nnow\r\n");
         parser.screen_mut().set_scrollback(2);
         let offset = parser.screen().scrollback();
@@ -6865,5 +6878,36 @@ mod tests {
         accept.abort();
         let _ = fs::remove_file(&socket);
         let _ = fs::remove_dir(&directory);
+    }
+}
+
+#[cfg(test)]
+mod parser_safety_regressions {
+    use super::*;
+
+    #[test]
+    fn one_row_wrapped_output_never_underflows() {
+        let mut parser = PtyParser::new_with_callbacks(
+            NonZeroU16::new(1).unwrap(),
+            NonZeroU16::new(6).unwrap(),
+            64,
+            PtyCallbacks::default(),
+        );
+        parser.process(b"12345678901234567890");
+        assert_eq!(parser.screen().contents().trim(), "90");
+    }
+
+    #[test]
+    fn wide_erase_after_resize_never_panics() {
+        let mut parser = PtyParser::new_with_callbacks(
+            NonZeroU16::new(2).unwrap(),
+            NonZeroU16::new(4).unwrap(),
+            64,
+            PtyCallbacks::default(),
+        );
+        parser.process("宽界".as_bytes());
+        parser.set_size(NonZeroU16::new(1).unwrap(), NonZeroU16::new(2).unwrap());
+        parser.process(b"\x1b[2J\x1b[K");
+        assert!(parser.screen().contents().trim().is_empty());
     }
 }
