@@ -602,7 +602,11 @@ pub async fn run_action_with_context(
         let mut command = tokio::process::Command::new(
             std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".into()),
         );
-        command.args(["/D", "/C", &action.command]);
+        command.args(["/D", "/C"]);
+        // `cmd /C` parses the remaining command line itself. Passing the
+        // action through normal argv quoting makes redirections and quoted
+        // paths part of one literal argument instead.
+        command.raw_arg(&action.command);
         command
     };
     command
