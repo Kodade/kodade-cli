@@ -7,10 +7,12 @@ mod commands;
 mod config;
 mod connection;
 mod doctor;
+mod endpoints;
 mod help;
 mod input;
 mod integrations;
 mod keys;
+mod machines;
 mod mode;
 mod notify;
 mod overlay;
@@ -22,14 +24,10 @@ mod render;
 mod selection;
 mod settings;
 mod state;
+mod terminal;
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{CommandFactory, FromArgMatches};
-use crossterm::{
-    event::{DisableBracketedPaste, EnableBracketedPaste},
-    execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
-};
 use kodade_cli_proto::{
     decode, encode, ClientMessage, Direction, Event, QueryKind, ServerMessage, SplitAxis,
     PROTOCOL_VERSION,
@@ -117,7 +115,7 @@ async fn main() -> Result<()> {
     // print its warnings twice.
     match command {
         // No subcommand attaches the TUI to the session.
-        None => attach(&socket, &session, &config::Config::load()).await,
+        None => attach(&socket, &session, &config::Config::load(), remote.is_none()).await,
         Some(cli::Command::Doctor { json }) => {
             if let Some(host) = remote.as_deref() {
                 remote::run_doctor(host, &session, json).await
@@ -131,6 +129,7 @@ async fn main() -> Result<()> {
         Some(cli::Command::Session { command }) => {
             session_command(remote.as_deref(), &socket, &session, command).await
         }
+        Some(cli::Command::Machine { command }) => machine(command),
         Some(cli::Command::Worktree { command }) => worktree(&socket, command).await,
         Some(cli::Command::Ls { json }) => {
             let layout =
@@ -292,6 +291,57 @@ async fn main() -> Result<()> {
             Ok(())
         }
     }
+}
+
+fn machine(command: cli::MachineCommand) -> Result<()> {
+    let mut catalog = machines::load()?;
+    match command {
+        cli::MachineCommand::List { json } => {
+            if json {
+                println!("{}", serde_json::to_string_pretty(&catalog.machines)?);
+            } else {
+                for machine in &catalog.machines {
+                    println!(
+                        "{}\t{}\t{}\t{}",
+                        machine.id,
+                        if machine.enabled {
+                            "enabled"
+                        } else {
+                            "disabled"
+                        },
+                        machine.label,
+                        machine.target
+                    );
+                }
+            }
+        }
+        cli::MachineCommand::Add {
+            target,
+            label,
+            session,
+        } => {
+            let profile = catalog.add(label, target, session)?;
+            println!("{}", profile.id);
+            machines::save(&catalog)?;
+        }
+        cli::MachineCommand::Rename { id, label } => {
+            catalog.get_mut(&id)?.label = label;
+            machines::save(&catalog)?;
+        }
+        cli::MachineCommand::Enable { id } => {
+            catalog.get_mut(&id)?.enabled = true;
+            machines::save(&catalog)?;
+        }
+        cli::MachineCommand::Disable { id } => {
+            catalog.get_mut(&id)?.enabled = false;
+            machines::save(&catalog)?;
+        }
+        cli::MachineCommand::Remove { id } => {
+            catalog.remove(&id)?;
+            machines::save(&catalog)?;
+        }
+    }
+    Ok(())
 }
 
 /// `pane` subcommands. Pane-targeted actions the daemon only applies to the
@@ -807,7 +857,7 @@ async fn agent(
         cli::AgentCommand::Attach { target } => {
             let target = contextual_agent_target(&target, socket, session, remote)?;
             automation::focus(socket, &target).await?;
-            attach(socket, session, config).await
+            attach(socket, session, config, remote.is_none()).await
         }
         cli::AgentCommand::Rename { target, name } => {
             let target = contextual_agent_target(&target, socket, session, remote)?;
@@ -961,12 +1011,22 @@ async fn worktree(socket: &Path, command: cli::WorktreeCommand) -> Result<()> {
 /// background when the socket is the local path and nothing answers. A remote
 /// (forwarded) socket is never auto-started here — `remote::resolve_socket`
 /// already ensured the remote daemon is up.
-async fn attach(socket: &Path, session: &str, config: &config::Config) -> Result<()> {
+async fn attach(
+    socket: &Path,
+    session: &str,
+    config: &config::Config,
+    load_machines: bool,
+) -> Result<()> {
     // Only spawn a daemon for this host's own socket; a `--remote` tunnel socket
     // differs from the local path and must not trigger a local daemon.
     let can_spawn = socket == kodade_cli_daemon::socket_path(session).as_path();
     let stream = connection::connect(socket, session, can_spawn).await?;
-    tui(stream, config, session, socket).await
+    let profiles = if load_machines {
+        machines::load()?.machines
+    } else {
+        Vec::new()
+    };
+    tui(stream, config, session, socket, profiles).await
 }
 
 /// Sets up the terminal, hands the socket to `App`, and always restores it.
@@ -975,6 +1035,7 @@ async fn tui(
     config: &config::Config,
     session: &str,
     socket: &Path,
+    profiles: Vec<machines::MachineProfile>,
 ) -> Result<()> {
     let (reader, mut writer) = stream.into_split();
     let mut lines = BufReader::new(reader).lines();
@@ -1001,7 +1062,35 @@ async fn tui(
     writer
         .write_all(&encode(&ClientMessage::Subscribe)?)
         .await?;
-    let (tx, mut rx) = mpsc::channel(16);
+    let (tx, mut rx) = mpsc::channel(64);
+    let (command_tx, mut command_rx) = mpsc::channel(64);
+    let mut router = endpoints::Router::new(endpoints::EndpointId::Local);
+    router.register(endpoints::EndpointId::Local, command_tx);
+    state.configure_machines(&profiles);
+    for profile in profiles.into_iter().filter(|profile| profile.enabled) {
+        let (machine_tx, machine_rx) = mpsc::channel(64);
+        let id = endpoints::EndpointId::Machine(profile.id.clone());
+        router.register(id, machine_tx);
+        endpoints::spawn_machine(
+            profile,
+            session.to_string(),
+            state.pane_cols(cols),
+            rows,
+            tx.clone(),
+            machine_rx,
+        );
+    }
+    tokio::spawn(async move {
+        while let Some(message) = command_rx.recv().await {
+            let Ok(encoded) = encode(&message) else {
+                break;
+            };
+            if writer.write_all(&encoded).await.is_err() {
+                break;
+            }
+        }
+    });
+    let reader_tx = tx.clone();
     tokio::spawn(async move {
         while let Ok(Some(line)) = lines.next_line().await {
             let update = match decode(line.as_bytes()) {
@@ -1016,31 +1105,34 @@ async fn tui(
                 Ok(ServerMessage::Event(Event::SessionRenamed { name, socket })) => {
                     app::Update::SessionRenamed { name, socket }
                 }
+                Ok(ServerMessage::Error { message }) => {
+                    app::Update::EndpointFailed { reason: message }
+                }
+                Ok(ServerMessage::Shutdown) => app::Update::EndpointFailed {
+                    reason: "local endpoint shut down".into(),
+                },
                 _ => continue,
             };
-            if tx.send(update).await.is_err() {
+            if reader_tx
+                .send((endpoints::EndpointId::Local, update))
+                .await
+                .is_err()
+            {
                 break;
             }
         }
+        let _ = reader_tx
+            .send((
+                endpoints::EndpointId::Local,
+                app::Update::EndpointFailed {
+                    reason: "local endpoint disconnected".into(),
+                },
+            ))
+            .await;
     });
-    enable_raw_mode()?;
-    let mut stdout = std::io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
-    // Bracketed paste lets the client tell a paste from typing (#21).
-    execute!(stdout, EnableBracketedPaste)?;
-    if config.mouse {
-        execute!(stdout, crossterm::event::EnableMouseCapture)?;
-    }
-    let mut term = Terminal::new(CrosstermBackend::new(stdout))?;
-    let result = state.run(&mut term, &mut writer, &mut rx).await;
-    disable_raw_mode()?;
-    execute!(term.backend_mut(), DisableBracketedPaste)?;
-    execute!(term.backend_mut(), LeaveAlternateScreen)?;
-    if config.mouse {
-        execute!(term.backend_mut(), crossterm::event::DisableMouseCapture)?;
-    }
-    term.show_cursor()?;
-    result
+    let _modes = terminal::TerminalModes::enter(config.mouse)?;
+    let mut term = Terminal::new(CrosstermBackend::new(std::io::stdout()))?;
+    state.run(&mut term, &mut router, &mut rx, &tx).await
 }
 
 /// Read the daemon's opening `Welcome` and verify its protocol version before

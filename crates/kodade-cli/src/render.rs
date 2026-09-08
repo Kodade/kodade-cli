@@ -16,6 +16,7 @@ use ratatui::{
 
 use crate::{
     config::{Config, StatusWidget, Theme},
+    endpoints::EndpointId,
     input::{tab_spans, TabSpan},
     mode::{menu_origin_x, CopyMode, Menu, MenuAction, MENU_WIDTH},
     overlay::{self, render_overlay, Overlay},
@@ -53,6 +54,7 @@ impl SidebarMode {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SidebarTarget {
+    Endpoint(EndpointId),
     Workspace(WorkspaceId),
     Tab(TabId),
     Pane(PaneId),
@@ -63,6 +65,7 @@ pub enum SidebarTarget {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SidebarKind {
     Heading,
+    Endpoint,
     Workspace,
     Tab,
     Pane,
@@ -152,6 +155,8 @@ pub struct Ui<'a> {
     pub picker: Option<&'a crate::picker::Picker>,
     /// Mutually-exclusive command center, attention inbox, or welcome overlay.
     pub center: Option<&'a Overlay>,
+    /// Client-side endpoint rows, retained even while a remote is offline.
+    pub machines: &'a [(EndpointId, String, String, bool)],
 }
 
 pub fn render(frame: &mut Frame, layout: &LayoutSnapshot, ui: &Ui, theme: &Theme) {
@@ -182,6 +187,7 @@ pub fn render(frame: &mut Frame, layout: &LayoutSnapshot, ui: &Ui, theme: &Theme
         help,
         picker,
         center,
+        machines,
     } = *ui;
     let areas = Layout::default()
         .direction(LayoutDirection::Horizontal)
@@ -195,6 +201,7 @@ pub fn render(frame: &mut Frame, layout: &LayoutSnapshot, ui: &Ui, theme: &Theme
             navigate,
             collapsed,
             agents_panel,
+            machines,
             theme,
         ),
         SidebarMode::Compact => render_sidebar_rail(frame, layout, areas[0], theme),
@@ -912,6 +919,40 @@ pub fn sidebar_rows(
     SidebarModel { workspaces, agents }
 }
 
+/// Client endpoint rows lead the same scrollable model as workspaces and
+/// agents. Endpoint identity is part of the target, so daemon-local ids may
+/// collide safely across machines.
+pub fn sidebar_rows_with_machines(
+    layout: &LayoutSnapshot,
+    collapsed: &HashSet<WorkspaceId>,
+    agents_panel: bool,
+    machines: &[(EndpointId, String, String, bool)],
+) -> SidebarModel {
+    let mut model = sidebar_rows(layout, collapsed, agents_panel);
+    if !machines.is_empty() {
+        let mut rows = vec![heading_row("machines")];
+        rows.extend(
+            machines
+                .iter()
+                .map(|(id, label, status, selected)| SidebarRow {
+                    kind: SidebarKind::Endpoint,
+                    target: Some(SidebarTarget::Endpoint(id.clone())),
+                    label: format!("{} {} · {status}", if *selected { "›" } else { " " }, label),
+                    state: if status == "online" {
+                        AgentStateKind::Working
+                    } else {
+                        AgentStateKind::Unknown
+                    },
+                    dim: !selected,
+                    color: None,
+                }),
+        );
+        rows.append(&mut model.workspaces);
+        model.workspaces = rows;
+    }
+    model
+}
+
 /// Workspaces in sidebar order: each top-level workspace followed by its
 /// worktree children (`parent` points at it), then any worktree whose parent is
 /// not open. The bool flags a worktree workspace so it renders nested (#22).
@@ -1112,6 +1153,7 @@ pub fn auto_color(name: &str) -> Color {
     Color::Indexed(PALETTE[(hash as usize) % PALETTE.len()])
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_sidebar(
     frame: &mut Frame,
     layout: &LayoutSnapshot,
@@ -1119,13 +1161,14 @@ fn render_sidebar(
     navigate: Option<usize>,
     collapsed: &HashSet<WorkspaceId>,
     agents_panel: bool,
+    machines: &[(EndpointId, String, String, bool)],
     theme: &Theme,
 ) {
     frame.render_widget(
         Block::default().style(Style::default().bg(theme.sidebar_bg)),
         area,
     );
-    let model = sidebar_rows(layout, collapsed, agents_panel);
+    let model = sidebar_rows_with_machines(layout, collapsed, agents_panel, machines);
     let place = sidebar_layout(area.height, &model, navigate);
     // Workspaces list (scrolled to keep the selected row visible).
     for screen in 0..place.ws_height {
@@ -1538,6 +1581,33 @@ mod tests {
     }
 
     #[test]
+    fn machine_targets_do_not_collide_with_daemon_ids() {
+        let layout = snapshot();
+        let machines = vec![
+            (EndpointId::Local, "Local".into(), "online".into(), true),
+            (
+                EndpointId::Machine("m1".into()),
+                "Build".into(),
+                "online".into(),
+                false,
+            ),
+        ];
+        let model = sidebar_rows_with_machines(&layout, &no_collapse(), true, &machines);
+        assert_eq!(
+            model.workspaces[1].target,
+            Some(SidebarTarget::Endpoint(EndpointId::Local))
+        );
+        assert_eq!(
+            model.workspaces[2].target,
+            Some(SidebarTarget::Endpoint(EndpointId::Machine("m1".into())))
+        );
+        assert!(model
+            .into_flat()
+            .iter()
+            .any(|row| matches!(row.target, Some(SidebarTarget::Pane(_)))));
+    }
+
+    #[test]
     fn worktree_workspaces_nest_under_their_parent_with_branch_labels() {
         let mut layout = snapshot();
         // The active workspace is a repo on `main`; add a worktree child of it.
@@ -1900,6 +1970,7 @@ mod tests {
             help: None,
             picker: None,
             center: None,
+            machines: &[],
         };
         let mut terminal = Terminal::new(TestBackend::new(40, 10)).expect("test terminal");
         terminal
@@ -2045,6 +2116,7 @@ mod tests {
             help: None,
             picker: None,
             center: None,
+            machines: &[],
         };
         let mut terminal = Terminal::new(TestBackend::new(80, 12)).expect("test terminal");
         terminal
