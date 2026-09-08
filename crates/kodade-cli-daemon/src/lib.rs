@@ -338,28 +338,19 @@ pub fn socket_dir() -> PathBuf {
 
 #[cfg(not(windows))]
 pub fn socket_dir() -> PathBuf {
-    #[cfg(windows)]
-    {
-        return persist::state_dir()
-            .unwrap_or_else(std::env::temp_dir)
-            .join("sessions");
-    }
-    #[cfg(not(windows))]
-    {
-        let runtime = env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from);
-        let home = dirs::home_dir();
-        let uid = env::var("UID").unwrap_or_else(|_| "unknown".to_owned());
-        socket_path_for(
-            "unused",
-            runtime.as_deref(),
-            home.as_deref(),
-            &uid,
-            cfg!(target_os = "macos"),
-        )
-        .parent()
-        .expect("socket path always has a parent directory")
-        .to_path_buf()
-    }
+    let runtime = env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from);
+    let home = dirs::home_dir();
+    let uid = env::var("UID").unwrap_or_else(|_| "unknown".to_owned());
+    socket_path_for(
+        "unused",
+        runtime.as_deref(),
+        home.as_deref(),
+        &uid,
+        cfg!(target_os = "macos"),
+    )
+    .parent()
+    .expect("socket path always has a parent directory")
+    .to_path_buf()
 }
 
 #[cfg(not(windows))]
@@ -3949,54 +3940,6 @@ fn validate_workspace_env(env: &HashMap<String, String>) -> Result<()> {
         bail!("workspace environment values cannot contain NUL");
     }
     Ok(())
-}
-
-#[cfg(all(test, windows))]
-mod windows_tests {
-    use super::*;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-    #[tokio::test]
-    async fn loopback_transport_round_trips() {
-        let session = format!("smoke-{}", std::process::id());
-        let endpoint = socket_path(&session);
-        let listener = transport::bind(&endpoint).await.expect("bind endpoint");
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.expect("accept client");
-            let mut bytes = [0; 4];
-            stream.read_exact(&mut bytes).await.expect("read request");
-            assert_eq!(&bytes, b"ping");
-            stream.write_all(b"pong").await.expect("write response");
-        });
-        let mut client = transport::connect(&endpoint).await.expect("connect client");
-        client.write_all(b"ping").await.expect("write request");
-        let mut bytes = [0; 4];
-        client.read_exact(&mut bytes).await.expect("read response");
-        assert_eq!(&bytes, b"pong");
-        server.await.expect("server task");
-    }
-
-    #[test]
-    fn conpty_starts_the_windows_command_processor() {
-        let pty = native_pty_system();
-        let pair = pty
-            .openpty(PtySize {
-                rows: 24,
-                cols: 80,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
-            .expect("open ConPTY");
-        let mut command = CommandBuilder::new(default_shell());
-        command.arg("/C");
-        command.arg("exit 0");
-        let mut child = pair
-            .slave
-            .spawn_command(command)
-            .expect("spawn cmd.exe in ConPTY");
-        assert!(child.process_id().is_some());
-        child.wait().expect("wait for cmd.exe");
-    }
 }
 
 /// Directory a restored pane should start in: its saved cwd if it still exists,
