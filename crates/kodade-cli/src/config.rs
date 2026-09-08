@@ -763,7 +763,7 @@ impl Config {
                 Err(error) => config
                     .warnings
                     .push(format!("configured command {}: {error}", command.label)),
-        }
+            }
         }
         if let Some(theme) = file.theme {
             config.set_theme(&theme);

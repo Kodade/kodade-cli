@@ -29,10 +29,9 @@ use anyhow::{anyhow, bail, Context, Result};
 use kodade_cli_proto::{
     decode, encode, schema_message, AgentInfo, AgentStateKind, CellColor, ClientMessage, Direction,
     Event, InvocationContext, LayoutSnapshot, LayoutTree, ManifestInfo, NativeSession,
-    Notification, PaneId,
-    PaneSnapshot, QueryKind, Run, Screen, ServerMessage, SidebarTabInfo, SplitAxis, TabId, TabInfo,
-    WorkspaceId, WorkspaceInfo, ATTR_BOLD, ATTR_DIM, ATTR_INVERSE, ATTR_ITALIC, ATTR_UNDERLINE,
-    PROTOCOL_VERSION,
+    Notification, PaneId, PaneSnapshot, QueryKind, Run, Screen, ServerMessage, SidebarTabInfo,
+    SplitAxis, TabId, TabInfo, WorkspaceId, WorkspaceInfo, ATTR_BOLD, ATTR_DIM, ATTR_INVERSE,
+    ATTR_ITALIC, ATTR_UNDERLINE, PROTOCOL_VERSION,
 };
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use tokio::{
@@ -947,6 +946,7 @@ impl Session {
     ) -> Result<PaneId> {
         self.new_pane_with_id_replay(id, title, cwd, command, None, context_file, HashMap::new())
     }
+    #[allow(clippy::too_many_arguments)]
     fn new_pane_with_id_replay(
         &self,
         id: PaneId,
@@ -1023,7 +1023,12 @@ impl Session {
         context_file: Option<ContextFile>,
     ) -> Result<PaneId> {
         self.new_pane_with_id_replay(
-            self.pane_id(), title, cwd, command, None, context_file,
+            self.pane_id(),
+            title,
+            cwd,
+            command,
+            None,
+            context_file,
             self.workspace_env(workspace)?,
         )
     }
@@ -1091,7 +1096,8 @@ impl Session {
         let context_file = context
             .map(|context| ContextFile::create(&context))
             .transpose()?;
-        let pane = self.new_workspace_pane_with_context(target, &title, cwd, command, context_file)?;
+        let pane =
+            self.new_workspace_pane_with_context(target, &title, cwd, command, context_file)?;
         // Allocate the tab id up front; `tab_id` locks state and must not be
         // called while the guard below is held.
         let new_tab_id = self.tab_id();
@@ -6597,6 +6603,7 @@ mod tests {
                         "printf %s \"$KODADE_ISSUE52\"; sleep 1".into(),
                     ]),
                     name: Some(name.into()),
+                    context: None,
                 })
                 .expect("spawn pane");
         }
@@ -6646,6 +6653,7 @@ mod tests {
                     "printf %s \"$KODADE_ISSUE52\"; sleep 1".into(),
                 ]),
                 name: Some("restored".into()),
+                context: None,
             })
             .expect("spawn restored pane");
         tokio::time::sleep(Duration::from_millis(300)).await;

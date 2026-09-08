@@ -216,6 +216,7 @@ mod tests {
                 name: "test".into(),
                 root: None,
                 color: None,
+                env: Default::default(),
                 active_tab: 2,
                 tabs: vec![TabFile {
                     id: 2,
