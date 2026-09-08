@@ -249,6 +249,7 @@ impl vte::Perform for Controls {
             return;
         }
         self.0 = match byte {
+            b'D' => Some(Control::Index),
             b'M' => Some(Control::ReverseIndex),
             b'c' => Some(Control::Reset),
             _ => None,
@@ -346,7 +347,10 @@ impl Tracker {
 }
 
 impl Store {
-    fn delete_matching(&mut self, mut matches: impl FnMut(&ImagePlacement) -> bool) {
+    fn delete_matching(
+        &mut self,
+        mut matches: impl FnMut(&ImagePlacement) -> bool,
+    ) -> HashSet<u32> {
         let mut deleted = HashSet::new();
         loop {
             let before = self.placements.len();
@@ -362,6 +366,7 @@ impl Store {
                 break;
             }
         }
+        deleted.into_iter().map(|(image, _)| image).collect()
     }
 
     fn remove_unused_images(&mut self) {
@@ -659,9 +664,11 @@ impl Store {
             let placement = number(&params, "p", 0)?;
             match mode {
                 "a" | "A" => self.clear(alternate),
-                "i" | "I" => self.delete_matching(|p| {
-                    p.image == id && (placement == 0 || p.placement == placement)
-                }),
+                "i" | "I" => {
+                    self.delete_matching(|p| {
+                        p.image == id && (placement == 0 || p.placement == placement)
+                    });
+                }
                 "p" | "P" | "q" | "Q" | "c" | "C" | "x" | "X" | "y" | "Y" | "z" | "Z" => {
                     let cell_col = number(&params, "x", 0)?;
                     let cell_row = number(&params, "y", 0)?;
@@ -750,6 +757,18 @@ impl Store {
             {
                 bail!("pane image quota exceeded; delete unused images");
             }
+            // Re-transmitting an image deletes its old placements. Remove
+            // descendants too: relative placements have their parent's
+            // lifetime, even when they belong to another image.
+            let deleted_images = self.delete_matching(|placement| placement.image == id);
+            let used_images: HashSet<_> = self
+                .placements
+                .iter()
+                .map(|entry| entry.placement.image)
+                .collect();
+            self.images.retain(|image, _| {
+                *image == id || !deleted_images.contains(image) || used_images.contains(image)
+            });
             self.revision += 1;
             self.images.insert(
                 id,
@@ -762,7 +781,6 @@ impl Store {
                     data: STANDARD.encode(bytes),
                 },
             );
-            self.placements.retain(|entry| entry.placement.image != id);
         }
         if matches!(action, "p" | "T") {
             let image = self.images.get(&id).context("image not found")?;
@@ -896,7 +914,7 @@ impl PlacementSpec {
                 .transpose()
                 .context("invalid z index")?
                 .unwrap_or(0),
-            advance: !virtual_placement && number(params, "C", 0)? == 0,
+            advance: !virtual_placement && parent.is_none() && number(params, "C", 0)? == 0,
             virtual_placement,
             parent,
             relative_offset: (
@@ -1095,6 +1113,10 @@ mod tests {
         store.command(b"a=t,f=24,s=1,v=1,i=8;AAAA", (0, 0), false);
         let relative = store.command(b"a=p,i=8,p=4,P=7,Q=3,H=2,V=-1", (9, 9), false);
         assert!(String::from_utf8_lossy(&relative.reply).contains("OK"));
+        assert_eq!(
+            relative.advance, None,
+            "relative placements never move the cursor"
+        );
         let placements = store.placements(false, 0);
         let base = placements.iter().find(|p| p.image == 7).unwrap();
         assert_eq!((base.x_offset, base.y_offset), (3, 4));
@@ -1104,6 +1126,23 @@ mod tests {
             store.command(b"a=p,i=8,p=5,P=99,Q=1", (0, 0), false).reply,
             b"\x1b_Gi=8,p=5;EINVAL:ENOPARENT: parent placement not found\x1b\\"
         );
+    }
+
+    #[test]
+    fn retransmitting_a_parent_removes_relative_children() {
+        let mut store = Store::default();
+        store.command(b"a=t,f=24,s=1,v=1,i=7;AAAA", (0, 0), false);
+        store.command(b"a=p,i=7,p=1,C=1", (0, 0), false);
+        store.command(b"a=t,f=24,s=1,v=1,i=8;AAAA", (0, 0), false);
+        store.command(b"a=p,i=8,p=1,P=7,Q=1", (4, 4), false);
+        store.command(b"a=t,f=24,s=1,v=1,i=9;AAAA", (0, 0), false);
+        assert!(store.placements(false, 0).iter().any(|p| p.image == 8));
+
+        store.command(b"a=t,f=24,s=1,v=1,i=7;AQID", (0, 0), false);
+
+        assert!(store.placements(false, 0).is_empty());
+        assert!(!store.images.contains_key(&8));
+        assert!(store.images.contains_key(&9));
     }
 
     #[test]

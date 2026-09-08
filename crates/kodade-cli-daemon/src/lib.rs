@@ -4773,6 +4773,20 @@ mod tests {
     }
 
     #[test]
+    fn graphics_follow_escape_index_at_the_bottom_margin() {
+        let mut parser = pty_parser(4, 10, 100, PtyCallbacks::default());
+        parser.callbacks_mut().graphics.command(
+            b"a=T,f=24,s=1,v=1,i=7,c=1,r=1,C=1;AAAA",
+            (2, 0),
+            false,
+        );
+
+        graphics_text(&mut parser, b"\x1b[4;1H\x1bD");
+
+        assert_eq!(parser.callbacks().graphics.placements(false, 0)[0].row, 1);
+    }
+
+    #[test]
     fn unicode_placeholders_keep_distinct_underline_placement_ids() {
         let mut parser = pty_parser(1, 3, 0, PtyCallbacks::default());
         parser.callbacks_mut().graphics.command(
