@@ -21,6 +21,9 @@ pub struct State {
     /// Whether the help overlay has been shown once (#6).
     #[serde(default)]
     pub help_seen: bool,
+    /// Whether the first-run command-center welcome was dismissed.
+    #[serde(default)]
+    pub onboarding_seen: bool,
     /// Collapsed sidebar workspaces, keyed by session, then workspace name (#19).
     #[serde(default)]
     pub collapsed: HashMap<String, Vec<String>>,

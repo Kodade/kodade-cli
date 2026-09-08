@@ -188,6 +188,10 @@ pub enum Action {
     WorkspacePicker,
     /// Fuzzy goto palette over every workspace, tab, and agent pane (#17).
     Goto,
+    /// Search and execute actions or start a supported agent in a new tab.
+    CommandCenter,
+    /// Review unread agent notifications with their context.
+    Attention,
     SidebarToggle,
     FocusUp,
     FocusDown,
@@ -252,6 +256,8 @@ const ACTIONS: &[(&str, Action)] = &[
     ("workspace_next", Action::WorkspaceNext),
     ("workspace_picker", Action::WorkspacePicker),
     ("goto", Action::Goto),
+    ("command_center", Action::CommandCenter),
+    ("attention", Action::Attention),
     ("new_workspace", Action::NewWorkspace),
     ("worktree_new", Action::WorktreeNew),
     ("sidebar_toggle", Action::SidebarToggle),
@@ -385,7 +391,12 @@ impl Action {
             Self::LayoutEven => ClientMessage::EqualizeLayout,
             Self::Detach | Self::Rename | Self::SidebarToggle => return None,
             // M3b reserves these names without introducing their modes early.
-            Self::Navigate | Self::CopyMode | Self::ScrollUp | Self::ScrollDown => return None,
+            Self::Navigate
+            | Self::CopyMode
+            | Self::ScrollUp
+            | Self::ScrollDown
+            | Self::CommandCenter
+            | Self::Attention => return None,
             // Handled in `App`: these need snapshot context or a prompt.
             Self::CloseTab
             | Self::CloseWorkspace
@@ -534,6 +545,8 @@ impl Default for Config {
             ("w", Action::WorkspacePicker),
             ("alt+w", Action::WorkspaceNext),
             ("g", Action::Goto),
+            ("space", Action::CommandCenter),
+            ("A", Action::Attention),
             ("W", Action::NewWorkspace),
             ("G", Action::WorktreeNew),
             ("b", Action::SidebarToggle),
