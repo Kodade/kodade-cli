@@ -82,8 +82,27 @@ fn read_file(params: &BTreeMap<String, String>, payload: &[u8]) -> Result<Vec<u8
     }
     let file = options.open(&resolved).context("cannot open image file")?;
     ensure!(file.metadata()?.is_file(), "image must be a regular file");
+    verify_owner(&file)?;
     let _cleanup = temporary.then(|| TemporaryFile(path.to_path_buf()));
     read_range(file, params)
+}
+
+/// A pane may only consume media it owns. Verify the descriptor after opening
+/// so a rename between pathname checks cannot substitute another user's file.
+#[cfg(unix)]
+fn verify_owner(file: &File) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    ensure!(
+        file.metadata()?.uid() == unsafe { libc::geteuid() },
+        "image media must be owned by the daemon user"
+    );
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn verify_owner(_: &File) -> Result<()> {
+    Ok(())
 }
 
 fn read_range(mut file: File, params: &BTreeMap<String, String>) -> Result<Vec<u8>> {
@@ -140,6 +159,7 @@ fn read_shared_memory(params: &BTreeMap<String, String>, payload: &[u8]) -> Resu
     let fd = unsafe { libc::shm_open(name.as_ptr(), libc::O_RDONLY, 0) };
     ensure!(fd >= 0, "shared memory unavailable");
     let file = unsafe { File::from_raw_fd(fd) };
+    verify_owner(&file)?;
     // Once opened, our descriptor stays valid and no path is left behind.
     unsafe {
         libc::shm_unlink(name.as_ptr());

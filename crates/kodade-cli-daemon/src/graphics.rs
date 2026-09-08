@@ -2167,6 +2167,29 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn foreign_owned_file_media_is_rejected_without_deleting_the_source() {
+        use std::os::unix::fs::MetadataExt;
+
+        let path = std::path::Path::new("/etc/hosts");
+        assert!(path.is_file());
+        assert_ne!(
+            path.metadata().unwrap().uid(),
+            unsafe { libc::geteuid() },
+            "the fixture must be owned by another user"
+        );
+        let request = format!(
+            "a=q,t=f,f=24,s=1,v=1,i=7;{}",
+            STANDARD.encode(path.as_os_str().as_encoded_bytes())
+        );
+        let reply = Store::default()
+            .command(request.as_bytes(), (0, 0), false)
+            .reply;
+        assert!(String::from_utf8_lossy(&reply).contains("EINVAL"));
+        assert!(path.exists(), "rejected media must remain untouched");
+    }
+
     #[test]
     fn image_numbers_allocate_ids_and_target_the_newest_transmission() {
         let mut store = Store::default();
