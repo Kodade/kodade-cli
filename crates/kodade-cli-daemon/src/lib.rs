@@ -177,6 +177,9 @@ struct PtyCallbacks {
     clipboard: Option<(u64, Vec<u8>, Vec<u8>)>,
     graphics: graphics::Store,
     graphics_tracker: graphics::Tracker,
+    graphics_placeholder: Vec<u8>,
+    graphics_unicode: graphics::UnicodeTracker,
+    graphics_virtual_style: graphics::VirtualStyle,
     hyperlinks: hyperlinks::Tracker,
     sync_tail: Vec<u8>,
     sync_frozen: Option<(Instant, Screen)>,
@@ -3719,10 +3722,7 @@ impl Pane {
             .parser
             .lock()
             .map_err(|_| anyhow!("PTY parser lock poisoned"))?;
-        parser
-            .screen_mut()
-            .set_size(terminal_size(rows, cols).0, terminal_size(rows, cols).1);
-        parser.callbacks_mut().hyperlinks.resize(rows, cols);
+        resize_parser(&mut parser, rows, cols);
         Ok(())
     }
     fn write(&self, bytes: &[u8]) -> Result<()> {
@@ -4263,10 +4263,14 @@ fn read_pty(
                         graphics::Token::Graphics(frame) => {
                             let cursor = parser.screen().cursor_position();
                             let alternate = parser.screen().alternate_screen();
-                            let result = parser
-                                .callbacks_mut()
-                                .graphics
-                                .command(&frame, cursor, alternate);
+                            let mut graphics = std::mem::take(&mut parser.callbacks_mut().graphics);
+                            let result = graphics.command_with_screen(
+                                &frame,
+                                cursor,
+                                alternate,
+                                Some(parser.screen()),
+                            );
+                            parser.callbacks_mut().graphics = graphics;
                             replies.extend(result.reply);
                             if let Some((rows, cols)) = result.advance {
                                 let (height, width) = parser.screen().size();
@@ -4305,37 +4309,88 @@ fn graphics_text(parser: &mut PtyParser, text: &[u8]) {
     let mut tracker = std::mem::take(&mut parser.callbacks_mut().graphics_tracker);
     let mut store = std::mem::take(&mut parser.callbacks_mut().graphics);
     let mut hyperlinks = std::mem::take(&mut parser.callbacks_mut().hyperlinks);
-    for &byte in text {
-        let before_alt = parser.screen().alternate_screen();
-        tracker.feed(byte, parser.screen(), &mut store);
-        hyperlinks.feed(byte, parser.screen());
-        let tail = &mut parser.callbacks_mut().sync_tail;
-        tail.push(byte);
-        if tail.len() > 8 {
-            tail.remove(0);
+    let mut style = std::mem::take(&mut parser.callbacks_mut().graphics_virtual_style);
+    let mut placeholder = std::mem::take(&mut parser.callbacks_mut().graphics_placeholder);
+    let mut unicode = std::mem::take(&mut parser.callbacks_mut().graphics_unicode);
+    for &raw in text {
+        style.feed(raw);
+        let chars = unicode.feed(raw);
+        let mut placeholder_cell = None;
+        for c in chars {
+            if c == '\u{10eeee}' {
+                placeholder_cell = Some(());
+            } else if let Some(index) = graphics::kitty_diacritic_index(c) {
+                store.add_virtual_diacritic(index);
+            } else {
+                store.end_virtual_sequence();
+            }
         }
-        if tail.ends_with(b"\x1b[?2026h") {
-            // `snapshot` reads callback-owned metadata. Put the state borrowed
-            // for byte-by-byte tracking back before freezing the complete frame.
-            parser.callbacks_mut().graphics = store;
-            parser.callbacks_mut().hyperlinks = hyperlinks;
-            let frame = snapshot(parser);
-            parser.callbacks_mut().sync_frozen = Some((Instant::now(), frame));
-            store = std::mem::take(&mut parser.callbacks_mut().graphics);
-            hyperlinks = std::mem::take(&mut parser.callbacks_mut().hyperlinks);
-        } else if tail.ends_with(b"\x1b[?2026l") {
-            parser.callbacks_mut().sync_frozen = None;
+        for normalized in graphics::normalize_unicode_placeholders(&mut placeholder, &[raw]) {
+            let before_alt = parser.screen().alternate_screen();
+            let printed = tracker.feed(normalized.byte, parser.screen(), &mut store);
+            hyperlinks.feed(normalized.byte, parser.screen());
+            let tail = &mut parser.callbacks_mut().sync_tail;
+            tail.push(normalized.byte);
+            if tail.len() > 8 {
+                tail.remove(0);
+            }
+            if tail.ends_with(b"\x1b[?2026h") {
+                // `snapshot` reads callback-owned metadata. Put the state borrowed
+                // for byte-by-byte tracking back before freezing the complete frame.
+                parser.callbacks_mut().graphics = store;
+                parser.callbacks_mut().hyperlinks = hyperlinks;
+                let frame = snapshot(parser);
+                parser.callbacks_mut().sync_frozen = Some((Instant::now(), frame));
+                store = std::mem::take(&mut parser.callbacks_mut().graphics);
+                hyperlinks = std::mem::take(&mut parser.callbacks_mut().hyperlinks);
+            } else if tail.ends_with(b"\x1b[?2026l") {
+                parser.callbacks_mut().sync_frozen = None;
+            }
+            parser.process(&[normalized.byte]);
+            let alternate = parser.screen().alternate_screen();
+            if printed > 0 {
+                let (row, end) = parser.screen().cursor_position();
+                for col in end.saturating_sub(printed)..end {
+                    store.clear_virtual_cell(alternate, row, col);
+                }
+            }
+            if alternate && !before_alt {
+                store.clear_screen(true);
+                hyperlinks.clear_alternate();
+            }
         }
-        parser.process(&[byte]);
-        let alternate = parser.screen().alternate_screen();
-        if alternate && !before_alt {
-            store.clear(true);
-            hyperlinks.clear_alternate();
+        if placeholder_cell.is_some() {
+            let alternate = parser.screen().alternate_screen();
+            let (row, col) = parser.screen().cursor_position();
+            store.record_virtual_cell(alternate, row, col.saturating_sub(1), style.ids());
         }
     }
     parser.callbacks_mut().graphics_tracker = tracker;
     parser.callbacks_mut().graphics = store;
+    parser.callbacks_mut().graphics_virtual_style = style;
+    parser.callbacks_mut().graphics_placeholder = placeholder;
+    parser.callbacks_mut().graphics_unicode = unicode;
     parser.callbacks_mut().hyperlinks = hyperlinks;
+}
+
+fn resize_parser(parser: &mut PtyParser, rows: u16, cols: u16) {
+    let active = parser.screen().alternate_screen();
+    let before_row = parser.screen().cursor_position().0;
+    parser
+        .screen_mut()
+        .set_size(terminal_size(rows, cols).0, terminal_size(rows, cols).1);
+    let after_row = parser.screen().cursor_position().0;
+    let mut graphics = std::mem::take(&mut parser.callbacks_mut().graphics);
+    graphics.resize_virtual_cells(
+        active,
+        i32::from(after_row) - i32::from(before_row),
+        rows.max(1),
+        cols.max(1),
+    );
+    let callbacks = parser.callbacks_mut();
+    callbacks.graphics = graphics;
+    callbacks.graphics_tracker.reset_resize();
+    callbacks.hyperlinks.resize(rows, cols);
 }
 
 /// Collect the pane's full scrollback plus visible screen as plain-text lines,
@@ -4409,10 +4464,11 @@ fn snapshot(parser: &PtyParser) -> Screen {
         rows: (0..rows).map(|row| screen_row(screen, row, cols)).collect(),
         bracketed_paste: screen.bracketed_paste(),
         mouse_reporting: screen.mouse_protocol_mode() != vt100::MouseProtocolMode::None,
-        graphics: parser
-            .callbacks()
-            .graphics
-            .placements(screen.alternate_screen(), screen.scrollback()),
+        graphics: parser.callbacks().graphics.placements_with_screen(
+            screen.alternate_screen(),
+            screen.scrollback(),
+            Some(screen),
+        ),
         links: parser
             .callbacks()
             .hyperlinks
@@ -4932,6 +4988,8 @@ async fn send_notifications(
 
 #[cfg(test)]
 mod tests {
+    use base64::Engine;
+
     #[test]
     fn osc52_callback_keeps_only_bounded_copy_requests() {
         let mut parser = pty_parser(2, 10, 10, PtyCallbacks::default());
@@ -5192,6 +5250,199 @@ mod tests {
         graphics_text(&mut parser, b"\x1b[2J");
         assert!(parser.callbacks().graphics.placements(false, 0).is_empty());
     }
+
+    #[test]
+    fn graphics_follow_escape_index_at_the_bottom_margin() {
+        let mut parser = pty_parser(4, 10, 100, PtyCallbacks::default());
+        parser.callbacks_mut().graphics.command(
+            b"a=T,f=24,s=1,v=1,i=7,c=1,r=1,C=1;AAAA",
+            (2, 0),
+            false,
+        );
+
+        graphics_text(&mut parser, b"\x1b[4;1H\x1bD");
+
+        assert_eq!(parser.callbacks().graphics.placements(false, 0)[0].row, 1);
+    }
+
+    #[test]
+    fn unicode_placeholders_keep_distinct_underline_placement_ids() {
+        let mut parser = pty_parser(1, 3, 0, PtyCallbacks::default());
+        parser.callbacks_mut().graphics.command(
+            b"a=t,f=24,s=3,v=1,i=7;AAAAAAAAAAAA",
+            (0, 0),
+            false,
+        );
+        for placement in [3, 4] {
+            parser.callbacks_mut().graphics.command(
+                format!("a=p,i=7,p={placement},U=1,c=3,r=1").as_bytes(),
+                (0, 0),
+                false,
+            );
+        }
+        graphics_text(
+            &mut parser,
+            b"\x1b[38;2;0;0;7;58;2;0;0;3m\xf4\x8e\xbb\xae\x1b[58;2;0;0;4m\xf4\x8e\xbb\xae",
+        );
+        let placements = snapshot(&parser).graphics;
+        assert_eq!(placements.len(), 2);
+        assert_eq!(placements[0].placement, 3);
+        assert_eq!(placements[1].placement, 4);
+    }
+
+    #[test]
+    fn unicode_placeholder_uses_diacritic_source_coordinates_across_pty_reads() {
+        let mut parser = pty_parser(4, 12, 0, PtyCallbacks::default());
+        let pixels = base64::engine::general_purpose::STANDARD.encode(vec![0; 100 * 80 * 3]);
+        parser.callbacks_mut().graphics.command(
+            format!("a=t,f=24,s=100,v=80,i=16777223;{pixels}").as_bytes(),
+            (0, 0),
+            false,
+        );
+        parser.callbacks_mut().graphics.command(
+            b"a=p,i=16777223,p=3,U=1,c=4,r=2,x=10,y=20,w=80,h=40",
+            (0, 0),
+            false,
+        );
+
+        // The placeholder is on screen row 3/column 9, but its source cell
+        // is row 1/column 2. Feed every UTF-8 byte through the real PTY path.
+        let text = "\x1b[3;9H\x1b[38;2;0;0;7;58;2;0;0;3m\u{10eeee}\u{030d}\u{030e}\u{030d}\x1b[0m";
+        for chunk in text.as_bytes().chunks(1) {
+            graphics_text(&mut parser, chunk);
+        }
+        let placement = snapshot(&parser).graphics.remove(0);
+        assert_eq!(placement.image, 16_777_223);
+        assert_eq!(placement.placement, 3);
+        assert_eq!((placement.col, placement.row), (8, 2));
+        assert_eq!(
+            (
+                placement.source_x,
+                placement.source_y,
+                placement.source_width,
+                placement.source_height,
+            ),
+            (50, 40, 20, 20)
+        );
+    }
+
+    #[test]
+    fn virtual_image_source_crop_survives_normal_scrollback() {
+        let mut parser = pty_parser(2, 12, 10, PtyCallbacks::default());
+        let pixels = base64::engine::general_purpose::STANDARD.encode(vec![0; 100 * 80 * 3]);
+        parser.callbacks_mut().graphics.command(
+            format!("a=t,f=24,s=100,v=80,i=7;{pixels}").as_bytes(),
+            (0, 0),
+            false,
+        );
+        parser.callbacks_mut().graphics.command(
+            b"a=p,i=7,p=3,U=1,c=4,r=2,x=10,y=20,w=80,h=40",
+            (0, 0),
+            false,
+        );
+
+        graphics_text(
+            &mut parser,
+            "\x1b[1;1H\x1b[38;2;0;0;7;58;2;0;0;3m\u{10eeee}\u{030d}\u{030e}\x1b[0m\x1b[2;1Hlive\n"
+                .as_bytes(),
+        );
+        assert!(snapshot(&parser).graphics.is_empty());
+
+        parser.screen_mut().set_scrollback(1);
+        let placement = snapshot(&parser).graphics.remove(0);
+        assert_eq!((placement.row, placement.col), (0, 0));
+        assert_eq!(
+            (
+                placement.source_x,
+                placement.source_y,
+                placement.source_width,
+                placement.source_height,
+            ),
+            (50, 40, 20, 20)
+        );
+        parser.screen_mut().set_scrollback(0);
+        graphics_text(&mut parser, b"\x1b[2J");
+        parser.screen_mut().set_scrollback(1);
+        assert_eq!(
+            snapshot(&parser).graphics.len(),
+            1,
+            "ED2 preserves history images"
+        );
+        parser.screen_mut().set_scrollback(0);
+        graphics_text(&mut parser, b"\x1b[3J");
+        parser.screen_mut().set_scrollback(1);
+        assert!(
+            snapshot(&parser).graphics.is_empty(),
+            "ED3 clears history images"
+        );
+    }
+
+    #[test]
+    fn shrinking_a_virtual_image_column_cannot_revive_it_on_expand() {
+        let mut parser = pty_parser(2, 4, 10, PtyCallbacks::default());
+        parser
+            .callbacks_mut()
+            .graphics
+            .command(b"a=t,f=24,s=2,v=1,i=7;AAAAAAAA", (0, 0), false);
+        parser
+            .callbacks_mut()
+            .graphics
+            .command(b"a=p,i=7,p=3,U=1,c=2,r=1", (0, 0), false);
+        graphics_text(
+            &mut parser,
+            "\x1b[1;4H\x1b[38;2;0;0;7;58;2;0;0;3m\u{10eeee}\x1b[0m".as_bytes(),
+        );
+        assert_eq!(snapshot(&parser).graphics.len(), 1);
+
+        resize_parser(&mut parser, 2, 2);
+        resize_parser(&mut parser, 2, 4);
+        assert!(snapshot(&parser).graphics.is_empty());
+    }
+
+    #[test]
+    fn growing_normal_history_moves_virtual_cells_with_vt100() {
+        let mut parser = pty_parser(2, 4, 10, PtyCallbacks::default());
+        parser
+            .callbacks_mut()
+            .graphics
+            .command(b"a=t,f=24,s=2,v=1,i=7;AAAAAAAA", (0, 0), false);
+        parser
+            .callbacks_mut()
+            .graphics
+            .command(b"a=p,i=7,p=3,U=1,c=2,r=1", (0, 0), false);
+        graphics_text(
+            &mut parser,
+            "\x1b[1;1H\x1b[38;2;0;0;7;58;2;0;0;3m\u{10eeee}\x1b[0m\x1b[2;1Hx\n".as_bytes(),
+        );
+        assert!(snapshot(&parser).graphics.is_empty());
+
+        resize_parser(&mut parser, 3, 4);
+        let placement = snapshot(&parser).graphics.remove(0);
+        assert_eq!((placement.row, placement.col), (0, 0));
+    }
+
+    #[test]
+    fn virtual_placeholders_follow_wrap_and_wide_overwrite() {
+        let mut parser = pty_parser(2, 2, 10, PtyCallbacks::default());
+        parser
+            .callbacks_mut()
+            .graphics
+            .command(b"a=t,f=24,s=2,v=1,i=7;AAAAAAAA", (0, 0), false);
+        parser
+            .callbacks_mut()
+            .graphics
+            .command(b"a=p,i=7,p=1,U=1,c=2,r=1", (0, 0), false);
+        graphics_text(
+            &mut parser,
+            "ab\x1b[38;2;0;0;7m\u{10eeee}\u{10eeee}".as_bytes(),
+        );
+        let screen = snapshot(&parser);
+        assert_eq!(screen.graphics.len(), 2);
+        assert_eq!((screen.graphics[0].row, screen.graphics[0].col), (1, 0));
+        graphics_text(&mut parser, "\x1b[2;1H\x1b[0m界".as_bytes());
+        assert!(snapshot(&parser).graphics.is_empty());
+    }
+
     use super::*;
 
     #[tokio::test]

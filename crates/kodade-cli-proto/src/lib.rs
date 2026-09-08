@@ -814,6 +814,9 @@ pub struct ImagePlacement {
     pub source_y: u32,
     pub source_width: u32,
     pub source_height: u32,
+    /// Pixel displacement from the placement cell's upper-left corner.
+    pub x_offset: u32,
+    pub y_offset: u32,
     pub z: i32,
 }
 
