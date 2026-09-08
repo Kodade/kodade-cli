@@ -270,10 +270,10 @@ fn upload_args(
 ) -> Vec<String> {
     let mut args = control_opts(control_path);
     args.push(host.into());
-    // Values originate from a verified local artifact / package metadata, and
-    // are constrained to digits or a semantic version before interpolation.
-    args.push(format!(
-        "set -eu; umask 077; dest=\"$HOME/.local/bin/kodade-cli\"; dir=\"${{dest%/*}}\"; mkdir -p \"$dir\"; tmp=$(mktemp \"$dir/.kodade-cli.XXXXXX\"); trap 'rm -f \"$tmp\"' EXIT HUP INT TERM; cat >\"$tmp\"; bytes=$(wc -c <\"$tmp\" | tr -d '[:space:]'); [ \"$bytes\" = \"{expected_bytes}\" ]; if command -v sha256sum >/dev/null 2>&1; then actual=$(sha256sum \"$tmp\" | awk '{{print $1}}'); else actual=$(shasum -a 256 \"$tmp\" | awk '{{print $1}}'); fi; [ \"$actual\" = \"{expected_sha256}\" ]; chmod 755 \"$tmp\"; LC_ALL=C \"$tmp\" --version | grep -Fx \"kodade-cli {expected_version}\" >/dev/null; mv -f \"$tmp\" \"$dest\"; trap - EXIT"
+    args.push(crate::remote_prepare::upload_command(
+        expected_bytes,
+        expected_sha256,
+        expected_version,
     ));
     args
 }
@@ -326,6 +326,10 @@ pub async fn connect_endpoint(host: &str, session: &str) -> Result<(PathBuf, Tun
             "could not run kodade-cli on {host}: {}\nIf it is missing, install it there with:\n    {INSTALL_HINT}",
             String::from_utf8_lossy(&probe.stderr).trim()
         );
+    }
+
+    if !crate::remote_prepare::version_is_compatible(&probe.stdout) {
+        bail!("{host} has an incompatible kodade-cli; run `kodade-cli machine prepare {host} --install`");
     }
 
     // Start the remote daemon if needed. It is a no-op / harmless error when one

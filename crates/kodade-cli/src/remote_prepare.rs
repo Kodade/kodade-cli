@@ -112,7 +112,7 @@ pub(crate) fn arch_to_target(value: &str) -> Result<&'static str> {
 }
 
 async fn upload(args: Vec<String>, binary: &[u8]) -> Result<()> {
-    let mut child = Command::new("ssh")
+    let child = Command::new("ssh")
         .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
@@ -120,20 +120,38 @@ async fn upload(args: Vec<String>, binary: &[u8]) -> Result<()> {
         .kill_on_drop(true)
         .spawn()
         .context("start remote install")?;
+    upload_to_child(child, binary, Duration::from_secs(45)).await
+}
+
+// Drain diagnostics while uploading: a remote process may fill stderr before
+// reading stdin. One deadline covers both backpressure and process completion.
+async fn upload_to_child(
+    mut child: tokio::process::Child,
+    binary: &[u8],
+    deadline: Duration,
+) -> Result<()> {
     use tokio::io::AsyncWriteExt;
     let mut stdin = child
         .stdin
         .take()
         .context("remote install stdin unavailable")?;
-    stdin
-        .write_all(binary)
+    let write = async move {
+        stdin
+            .write_all(binary)
+            .await
+            .context("upload verified remote binary")?;
+        drop(stdin);
+        Ok::<_, anyhow::Error>(())
+    };
+    let wait = async move {
+        child
+            .wait_with_output()
+            .await
+            .context("wait for remote install")
+    };
+    let (_, output) = tokio::time::timeout(deadline, async { tokio::try_join!(write, wait) })
         .await
-        .context("upload verified remote binary")?;
-    drop(stdin);
-    let output = tokio::time::timeout(Duration::from_secs(45), child.wait_with_output())
-        .await
-        .context("remote install timed out")?
-        .context("wait for remote install")?;
+        .context("remote install timed out")??;
     if !output.status.success() {
         bail!(
             "remote install failed: {}",
@@ -155,4 +173,50 @@ async fn ssh_output(args: &[String]) -> Result<std::process::Output> {
     .await
     .context("SSH command timed out after 30s")?
     .context("run ssh")
+}
+
+/// All interpolated values come from a checksum-verified local release.
+pub fn upload_command(
+    expected_bytes: usize,
+    expected_sha256: &str,
+    expected_version: &str,
+) -> String {
+    format!(
+        "set -eu; umask 077; dest=\"$HOME/.local/bin/kodade-cli\"; dir=\"${{dest%/*}}\"; mkdir -p \"$dir\"; tmp=$(mktemp \"$dir/.kodade-cli.XXXXXX\"); trap 'rm -f \"$tmp\"' EXIT HUP INT TERM; cat >\"$tmp\"; bytes=$(wc -c <\"$tmp\" | tr -d '[:space:]'); [ \"$bytes\" = \"{expected_bytes}\" ]; if command -v sha256sum >/dev/null 2>&1; then actual=$(sha256sum \"$tmp\" | awk '{{print $1}}'); else actual=$(shasum -a 256 \"$tmp\" | awk '{{print $1}}'); fi; [ \"$actual\" = \"{expected_sha256}\" ]; chmod 755 \"$tmp\"; LC_ALL=C \"$tmp\" --version | grep -Fx \"kodade-cli {expected_version}\" >/dev/null; mv -f \"$tmp\" \"$dest\"; trap - EXIT"
+    )
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    fn process(command: &str) -> tokio::process::Child {
+        Command::new("sh")
+            .args(["-c", command])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn upload_deadline_includes_a_peer_that_never_reads() {
+        let child = process("exec sleep 30");
+        let start = std::time::Instant::now();
+        let error = upload_to_child(child, &vec![0; 2 * 1024 * 1024], Duration::from_millis(100))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("timed out"), "{error:#}");
+        assert!(start.elapsed() < Duration::from_secs(2));
+    }
+
+    #[tokio::test]
+    async fn upload_drains_stderr_before_the_peer_reads_stdin() {
+        let child = process("dd if=/dev/zero bs=65536 count=8 1>&2 2>/dev/null; cat >/dev/null");
+        upload_to_child(child, &vec![0; 2 * 1024 * 1024], Duration::from_secs(5))
+            .await
+            .unwrap();
+    }
 }

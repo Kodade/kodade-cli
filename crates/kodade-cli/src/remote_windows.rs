@@ -72,9 +72,10 @@ fn probe(host: &str) -> Vec<String> {
     ssh_args(host, "uname -s; uname -m")
 }
 fn upload(host: &str, bytes: usize, checksum: &str, version: &str) -> Vec<String> {
-    ssh_args(host, &format!(
-        "set -eu; umask 077; dest=\"$HOME/.local/bin/kodade-cli\"; dir=\"${{dest%/*}}\"; mkdir -p \"$dir\"; tmp=$(mktemp \"$dir/.kodade-cli.XXXXXX\"); trap 'rm -f \"$tmp\"' EXIT HUP INT TERM; cat >\"$tmp\"; [ \"$(wc -c <\"$tmp\" | tr -d '[:space:]')\" = \"{bytes}\" ]; if command -v sha256sum >/dev/null 2>&1; then actual=$(sha256sum \"$tmp\" | awk '{{print $1}}'); else actual=$(shasum -a 256 \"$tmp\" | awk '{{print $1}}'); fi; [ \"$actual\" = \"{checksum}\" ]; chmod 755 \"$tmp\"; LC_ALL=C \"$tmp\" --version | grep -Fx \"kodade-cli {version}\" >/dev/null; mv -f \"$tmp\" \"$dest\"; trap - EXIT"
-    ))
+    ssh_args(
+        host,
+        &remote_prepare::upload_command(bytes, checksum, version),
+    )
 }
 pub async fn prepare_machine(host: &str, install: bool) -> Result<()> {
     validate_host(host)?;
