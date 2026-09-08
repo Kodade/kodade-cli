@@ -15,11 +15,14 @@ use std::{
     collections::HashMap,
     env, fs,
     io::{Read, Write},
-    os::unix::fs::FileTypeExt,
+    os::{
+        fd::{AsRawFd, FromRawFd},
+        unix::fs::FileTypeExt,
+    },
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
-        Arc, Mutex,
+        Arc, Condvar, Mutex,
     },
     time::{Duration, Instant},
 };
@@ -175,6 +178,7 @@ struct Pane {
     master: Mutex<Box<dyn MasterPty + Send>>,
     parser: Arc<Mutex<PtyParser>>,
     last_output: Arc<Mutex<Instant>>,
+    reader: Arc<ReaderControl>,
     hook: Mutex<Option<ReportedHook>>,
     spawn_process: String,
     /// The command this pane was spawned with and the directory it started in,
@@ -198,12 +202,96 @@ struct Pane {
 /// Closing a pane terminates its process so the PTY reader thread exits.
 impl Drop for Pane {
     fn drop(&mut self) {
+        self.reader.shutdown();
         if let Ok(mut child) = self.child.lock() {
             if let Some(mut child) = child.take() {
                 let _ = child.kill();
                 let _ = child.wait();
             }
         }
+    }
+}
+
+/// Coordinates a PTY reader at poll/read boundaries. A handoff waits for the
+/// acknowledgement before another process receives a duplicated master.
+struct ReaderControl {
+    state: Mutex<ReaderState>,
+    changed: Condvar,
+}
+
+struct ReaderState {
+    paused: bool,
+    acknowledged: bool,
+    shutdown: bool,
+}
+
+impl ReaderControl {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(ReaderState {
+                paused: false,
+                acknowledged: false,
+                shutdown: false,
+            }),
+            changed: Condvar::new(),
+        }
+    }
+
+    #[allow(dead_code)] // Called by the live-handoff commit phase.
+    fn pause(&self, timeout: Duration) -> Result<()> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow!("PTY reader control lock poisoned"))?;
+        state.paused = true;
+        state.acknowledged = false;
+        self.changed.notify_all();
+        let (state, _) = self
+            .changed
+            .wait_timeout_while(state, timeout, |state| {
+                !state.acknowledged && !state.shutdown
+            })
+            .map_err(|_| anyhow!("PTY reader control lock poisoned"))?;
+        if state.acknowledged {
+            Ok(())
+        } else {
+            bail!("timed out waiting for PTY reader to quiesce")
+        }
+    }
+
+    #[allow(dead_code)] // Called when an import rejects or times out.
+    fn resume(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.paused = false;
+            state.acknowledged = false;
+            self.changed.notify_all();
+        }
+    }
+
+    fn shutdown(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.shutdown = true;
+            state.paused = false;
+            self.changed.notify_all();
+        }
+    }
+
+    /// Returns false once teardown begins. The acknowledgement is published
+    /// before waiting, so a caller that observes it knows no read is active.
+    fn wait_if_paused(&self) -> bool {
+        let mut state = match self.state.lock() {
+            Ok(state) => state,
+            Err(_) => return false,
+        };
+        while state.paused && !state.shutdown {
+            state.acknowledged = true;
+            self.changed.notify_all();
+            state = match self.changed.wait(state) {
+                Ok(state) => state,
+                Err(_) => return false,
+            };
+        }
+        !state.shutdown
     }
 }
 
@@ -2991,7 +3079,18 @@ impl Pane {
             .spawn_command(command)
             .context("spawn login shell in PTY")?;
         let writer = pair.master.take_writer()?;
-        let reader = pair.master.try_clone_reader()?;
+        // `dup` gives the poll loop its own descriptor. We must not toggle
+        // O_NONBLOCK on a cloned open-file description because that would also
+        // change the PTY writer used for pane input.
+        let master_fd = pair
+            .master
+            .as_raw_fd()
+            .ok_or_else(|| anyhow!("PTY master has no Unix descriptor"))?;
+        let reader_fd = unsafe { libc::dup(master_fd) };
+        if reader_fd < 0 {
+            return Err(std::io::Error::last_os_error()).context("duplicate PTY reader");
+        }
+        let reader = unsafe { fs::File::from_raw_fd(reader_fd) };
         let parser = Arc::new(Mutex::new(PtyParser::new_with_callbacks(
             rows,
             cols,
@@ -2999,11 +3098,13 @@ impl Pane {
             PtyCallbacks::default(),
         )));
         let last_output = Arc::new(Mutex::new(Instant::now()));
+        let reader_control = Arc::new(ReaderControl::new());
         read_pty(
             reader,
             Arc::clone(&parser),
             Arc::clone(&last_output),
             updates,
+            Arc::clone(&reader_control),
         );
         Ok(Self {
             title: Mutex::new(title.into()),
@@ -3011,6 +3112,7 @@ impl Pane {
             master: Mutex::new(pair.master),
             parser,
             last_output,
+            reader: reader_control,
             hook: Mutex::new(None),
             spawn_process,
             spawn_command: run,
@@ -3397,16 +3499,45 @@ fn is_hex_color(value: &str) -> bool {
         .is_some_and(|rest| rest.len() == 6 && rest.bytes().all(|b| b.is_ascii_hexdigit()))
 }
 
-/// PTY reading blocks, so parser ownership stays in Tokio's blocking pool.
+/// Poll a private duplicate of the PTY master. Polling at 50 ms bounds the
+/// handoff pause acknowledgement without changing flags on the shared writer.
 fn read_pty(
-    mut reader: Box<dyn Read + Send>,
+    mut reader: fs::File,
     parser: Arc<Mutex<PtyParser>>,
     last_output: Arc<Mutex<Instant>>,
     updates: broadcast::Sender<()>,
+    control: Arc<ReaderControl>,
 ) {
     tokio::task::spawn_blocking(move || {
         let mut bytes = [0_u8; 4096];
-        while let Ok(count) = reader.read(&mut bytes) {
+        loop {
+            if !control.wait_if_paused() {
+                break;
+            }
+            let mut ready = libc::pollfd {
+                fd: reader.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let polled = unsafe { libc::poll(&mut ready, 1, 50) };
+            if polled < 0 {
+                if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                break;
+            }
+            if polled == 0 || ready.revents & libc::POLLIN == 0 {
+                continue;
+            }
+            // A pause may have arrived while poll was asleep; acknowledge it
+            // before consuming the readable byte stream.
+            if !control.wait_if_paused() {
+                break;
+            }
+            let count = match reader.read(&mut bytes) {
+                Ok(count) => count,
+                Err(_) => break,
+            };
             if count == 0 {
                 break;
             }
@@ -4143,6 +4274,54 @@ mod tests {
         assert_eq!(pane.snapshot().1, oldest);
         pane.scroll(i16::MIN);
         assert_eq!(pane.snapshot().1, 0);
+    }
+
+    #[tokio::test]
+    async fn paused_pty_reader_stops_parser_until_resumed() {
+        let (updates, _) = broadcast::channel(8);
+        let pane = Pane::spawn(
+            PaneId(1), "ticker", 40, 4, "pause-test".into(), hook_socket_path(), updates,
+            None,
+            Some(vec!["sh".into(), "-c".into(), "i=0; while [ $i -lt 40 ]; do printf 'tick-%s\\n' \"$i\"; i=$((i+1)); sleep 0.03; done".into()]),
+        ).expect("spawn ticker");
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        pane.reader
+            .pause(Duration::from_secs(1))
+            .expect("reader acknowledges pause");
+        let before = pane.snapshot().0.contents;
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(
+            pane.snapshot().0.contents,
+            before,
+            "reader consumed output after acknowledging pause"
+        );
+        pane.reader.resume();
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        assert_ne!(
+            pane.snapshot().0.contents,
+            before,
+            "reader did not catch buffered output after resume"
+        );
+    }
+
+    #[test]
+    fn paused_reader_shutdown_wakes_without_hanging() {
+        let control = Arc::new(ReaderControl::new());
+        let reader = Arc::clone(&control);
+        let worker = std::thread::spawn(move || reader.wait_if_paused());
+        // The first worker call can return before pause is requested. Exercise
+        // the blocked state deterministically with a second waiting thread.
+        let _ = worker.join();
+        let reader = Arc::clone(&control);
+        let worker = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(10));
+            reader.wait_if_paused()
+        });
+        control
+            .pause(Duration::from_secs(1))
+            .expect("reader paused");
+        control.shutdown();
+        assert!(!worker.join().expect("reader thread joins"));
     }
 
     #[test]
