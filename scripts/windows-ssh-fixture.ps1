@@ -70,10 +70,11 @@ try {
 
     Write-Host 'installing Unix OpenSSH server'
     Invoke-Wsl @('sh', '-lc', 'apk add --no-cache openssh')
-    $remoteBinary = Join-Path $distroRoot 'root/.local/bin/kodade-cli'
-    New-Item -ItemType Directory -Force -Path (Split-Path $remoteBinary) | Out-Null
-    Copy-Item -LiteralPath $LinuxBinary -Destination $remoteBinary
-    Invoke-Wsl @('sh', '-lc', 'chmod 700 /root/.local/bin/kodade-cli && mkdir -p /root/.ssh && chmod 700 /root/.ssh')
+    # WSL imports keep their filesystem opaque to Windows. Copy through the
+    # distro's mounted Windows path so the running Unix instance sees the binary.
+    $linuxSource = (Invoke-Native 'wsl.exe' @('-d', $distro, '--', 'wslpath', '-a', $LinuxBinary) 30).Trim()
+    $quotedSource = $linuxSource.Replace("'", "'\''")
+    Invoke-Wsl @('sh', '-lc', "mkdir -p /root/.local/bin /root/.ssh && cp '$quotedSource' /root/.local/bin/kodade-cli && chmod 700 /root/.local/bin/kodade-cli /root/.ssh")
 
     $sshDirectory = Join-Path $clientHome '.ssh'
     New-Item -ItemType Directory -Force -Path $sshDirectory | Out-Null
