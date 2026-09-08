@@ -188,7 +188,7 @@ PID and approved executable; absent evidence fails closed. Grok lifecycle hooks
 follow the vendor event table. This proves the tested adapter contracts and
 retirement behavior, not every future release of every agent CLI.
 
-Final integrated workflow gates pass: 241 client tests, 112 daemon tests, eight
+Previous integrated workflow gates passed: 241 client tests, 112 daemon tests, eight
 protocol tests, three real agent automation integration tests and one guide
 integration test. The full branch review also corrected a stdout-dependent mouse
 fixture and macOS canonical worktree-path assertion.
@@ -197,3 +197,24 @@ The final source comparison additionally tracks OSC 8 pane links, synchronized
 output and native/remote clipboard behavior (#58). A real one-row wrap test
 exposed a crash in the existing parser dependency; #59 upgrades the maintained
 parser fork and adds wrapping/resize regressions before the final release.
+
+## v0.3.0 Unix release candidate
+
+The candidate is a Linux/macOS release only. It will publish four standalone
+archives (Linux and macOS on arm64 and x86_64); native Windows binaries,
+installation, upgrades, and SSH preparation are deferred and are not part of
+this release's evidence.
+
+Previously reviewed evidence is recorded above for machines, agent workflows,
+updates, graphics, and terminal behavior. The Unix candidate also combines the
+terminal links/clipboard, extended graphics, negotiated keyboard input, and
+live-handoff changes. Those implementation reviews do not establish a v0.3.0
+release by themselves.
+
+Still pending before publication: the full integrated Unix diff review, the
+required Unix test and CI gates, final Linux/macOS runner evidence, the v0.3.0
+tag, the four release archives and `SHA256SUMS`, and Homebrew publication. The
+release notes must continue to state the v0.2.1 migration limit: an existing
+v0.2.1 daemon cannot hand off its running panes. Users can leave that session
+running and begin a separately named v0.3.0 session; `session upgrade` applies
+only after a session is already served by a v0.3.0 Unix daemon.

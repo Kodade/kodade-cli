@@ -787,16 +787,16 @@ mod tests {
 
     #[test]
     fn fixture_download_rejects_a_bad_checksum_before_remote_upload() {
-        let metadata = br#"{"tag_name":"v0.2.1","assets":[{"name":"SHA256SUMS","browser_download_url":"sums"},{"name":"kodade-cli-0.2.1-x86_64-unknown-linux-gnu.tar.gz","browser_download_url":"archive"}]}"#;
+        let version = env!("CARGO_PKG_VERSION");
+        let archive = format!("kodade-cli-{version}-x86_64-unknown-linux-gnu.tar.gz");
+        let metadata = format!(
+            r#"{{"tag_name":"v{version}","assets":[{{"name":"SHA256SUMS","browser_download_url":"sums"}},{{"name":"{archive}","browser_download_url":"archive"}}]}}"#
+        );
         let error = verified_release_binary("Linux", "x86_64", |url| match url {
             "https://api.github.com/repos/Kodade/kodade-cli/releases/latest" => {
-                Ok(metadata.to_vec())
+                Ok(metadata.as_bytes().to_vec())
             }
-            "sums" => Ok(format!(
-                "{}  kodade-cli-0.2.1-x86_64-unknown-linux-gnu.tar.gz\n",
-                "0".repeat(64)
-            )
-            .into_bytes()),
+            "sums" => Ok(format!("{}  {archive}\n", "0".repeat(64),).into_bytes()),
             "archive" => Ok(b"fixture archive".to_vec()),
             _ => bail!("unexpected fixture URL {url}"),
         })

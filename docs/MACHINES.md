@@ -46,7 +46,7 @@ existing profile, run `kodade-cli machine prepare Build --install`. Without
 `--install`, preparation reports the missing binary and changes nothing.
 Prepared binaries use their absolute user-owned path, so non-login SSH PATH
 settings do not affect future connections. Linux and macOS x86_64/aarch64
-release archives are supported; Windows preparation awaits native archives.
+release archives are supported for v0.3.0; Windows preparation is deferred.
 
 Verification includes separate localhost OpenSSH client/server environments,
 concurrent tunnels, a real controlling PTY switching between colliding local

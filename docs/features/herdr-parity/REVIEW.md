@@ -1,6 +1,6 @@
 # Ködade CLI versus HerdR
 
-Reference: [HerdR `9e01168`](https://github.com/herdrdev/herdr/tree/9e01168b140ce8e3821131345dc82bc2bf9994eb), compared with Ködade's original `84af09e` and this delivery. This is a source and behavior comparison, not a claim about every future HerdR release or every version of an agent CLI. The [delivery ledger](PLAN.md) records merge and verification status.
+Reference: [HerdR `9e01168`](https://github.com/herdrdev/herdr/tree/9e01168b140ce8e3821131345dc82bc2bf9994eb), compared with Ködade's original `84af09e` and the v0.3.0 Unix release candidate. This is a source and behavior comparison, not a claim about every future HerdR release or every version of an agent CLI. This review records previously reviewed work; the [delivery ledger](PLAN.md) separates it from final release evidence still pending.
 
 ## What HerdR had that was missing
 
@@ -22,12 +22,12 @@ The largest gaps were outside basic splitting and navigation. Ködade already ha
 | Images | No terminal graphics or image paste | Bounded Kitty image subset, private PNG attachments, remote paste and host cleanup (#35) |
 | Small terminals | Full layout became unusable at narrow widths | Focused projection with accessible pane switching; original split tree preserved (#40) |
 | Installation maintenance | No verified built-in update/bootstrap flow | Version and checksum checks, bounded downloads/extraction, failed-install preservation, stable/preview selection (#41, #45) |
-| Windows | Unix-only transport | Native ConPTY and authenticated local transport, Windows archives and SSH bridge (#36; see final runner evidence in PLAN.md) |
-| Live upgrades | Restarting the daemon restarted its panes | Transactional Unix PTY transfer, rollback, client reconnect and preserved live context (#42; see final runner evidence in PLAN.md) |
+| Windows | Unix-only transport | Deferred from v0.3.0. This release supports only Linux and macOS; Windows work is not release evidence. |
+| Live upgrades | Restarting the daemon restarted its panes | Transactional Unix PTY transfer, rollback, client reconnect and preserved live context (#42). A v0.2.1 daemon predates this contract and needs a separate-session migration. |
 | Extended graphics | File, temporary-file, shared-memory, compressed media and virtual/relative placement gaps | Bounded media decoding and ownership, Unicode placeholders and relative geometry; real PTY and host rendering proof (#61) |
-| Keyboard negotiation | Enhanced input and terminal capability queries missing | Per-pane keyboard negotiation and supported capability replies (#64; final input/runner review pending in PLAN.md) |
-| Windows remote bootstrap | Windows client could not prepare Unix hosts | Shared verified installer and exact compatibility preflight (#66; final native runner evidence pending in PLAN.md) |
-| Terminal polish | Labeled OSC 8 links, synchronized output and native copy were absent | Tracked and verified as #58, alongside parser crash regressions in #59 |
+| Keyboard negotiation | Enhanced input and terminal capability queries missing | Per-pane keyboard negotiation and supported capability replies (#64); final Unix release evidence remains pending. |
+| Windows remote bootstrap | Windows client could not prepare Unix hosts | Deferred with native Windows support; it is outside the v0.3.0 release scope. |
+| Terminal polish | Labeled OSC 8 links, synchronized output and native copy were absent | Implemented in #58 with parser regressions addressed in #59; final Unix release evidence remains pending. |
 
 HerdR source anchors: [`src/client`](https://github.com/herdrdev/herdr/tree/9e01168b140ce8e3821131345dc82bc2bf9994eb/src/client), [`src/cli`](https://github.com/herdrdev/herdr/tree/9e01168b140ce8e3821131345dc82bc2bf9994eb/src/cli), [`src/integration`](https://github.com/herdrdev/herdr/tree/9e01168b140ce8e3821131345dc82bc2bf9994eb/src/integration), and [`src/platform`](https://github.com/herdrdev/herdr/tree/9e01168b140ce8e3821131345dc82bc2bf9994eb/src/platform).
 
@@ -57,6 +57,6 @@ Defaults should make the first session useful. Advanced commands, hooks and mach
 
 ## How to judge the result
 
-The strongest reasons to choose Ködade are the combined workflows: open local and SSH projects together; send a guarded prompt to the intended agent; run an extension with the exact selected text and pane context; resume the correct conversation; and update the workspace without losing running shells. These claims have focused real-process tests in addition to Rust unit tests.
+The strongest reasons to choose Ködade are the combined workflows: open local and SSH projects together; send a guarded prompt to the intended agent; run an extension with the exact selected text and pane context; resume the correct conversation; and, for a v0.3.0 Unix daemon, update the workspace without losing running shells. These claims have prior focused real-process tests in addition to Rust unit tests; final integrated release evidence remains pending.
 
-The documented limits remain part of the product contract. [Graphics](../../GRAPHICS.md) describes the supported Kitty subset. [Agent detection](../../AGENT-DETECTION.md) separates verified hook/native contracts from heuristic screen rules. Native live PTY handoff is a Unix capability. The ledger must remain explicit about actual operating-system runner results and release artifacts; a compiling platform branch or a printed fixture label is insufficient evidence.
+The documented limits remain part of the product contract. [Graphics](../../GRAPHICS.md) describes the supported Kitty subset. [Agent detection](../../AGENT-DETECTION.md) lists each lifecycle and exact-native-resume contract, and separates verified contracts from identification-only rules. Native live PTY handoff is a Unix capability. The ledger must remain explicit about actual operating-system runner results and release artifacts; a compiling platform branch or a printed fixture label is insufficient evidence.

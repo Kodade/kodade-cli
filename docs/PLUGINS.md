@@ -28,7 +28,7 @@ manifest_version = 1
 id = "hello-plugin"
 name = "Hello plugin"
 version = "0.1.0"
-min_kodade_version = "0.2.1"
+min_kodade_version = "0.3.0"
 
 [[actions]]
 id = "hello"
