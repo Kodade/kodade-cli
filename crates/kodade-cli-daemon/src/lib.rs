@@ -206,6 +206,9 @@ struct Pane {
     /// Kept so dropping the pane ends its process; otherwise the PTY reader
     /// thread never sees EOF (the daemon and the test runtime would wait forever).
     child: Mutex<Option<Box<dyn portable_pty::Child + Send>>>,
+    /// Adopted children cannot be waited by this daemon; signal only when the
+    /// PID still has the start identity captured during handoff.
+    adopted_child: Option<(i32, String)>,
     process: Mutex<ProcessEvidence>,
     // Tracks the current detected state and its start as one atomic transition,
     // so concurrent snapshots cannot publish the same change twice.
@@ -225,6 +228,11 @@ impl Drop for Pane {
             if let Some(mut child) = child.take() {
                 let _ = child.kill();
                 let _ = child.wait();
+            }
+        }
+        if let Some((pid, start)) = &self.adopted_child {
+            if proc::start_identity(*pid).as_deref() == Some(start) {
+                let _ = unsafe { libc::kill(*pid, libc::SIGTERM) };
             }
         }
     }
@@ -3283,6 +3291,7 @@ impl Pane {
             spawn_command: run,
             spawn_cwd: cwd,
             child: Mutex::new(Some(child)),
+            adopted_child: None,
             process: Mutex::new(ProcessEvidence {
                 pid: None,
                 name: None,
@@ -3432,6 +3441,9 @@ impl Pane {
             spawn_command: runtime.spawn_command,
             spawn_cwd: runtime.cwd,
             child: Mutex::new(None),
+            adopted_child: runtime
+                .start_identity
+                .map(|start| (runtime.child_pid, start)),
             process: Mutex::new(ProcessEvidence {
                 pid: (runtime.child_pid > 0).then_some(runtime.child_pid),
                 name: None,
