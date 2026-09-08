@@ -4966,6 +4966,20 @@ async fn send_notifications(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::OnceLock;
+
+    // portable-pty uses process-global terminal state on macOS.  Keep the
+    // integration tests parallel with ordinary tests, but never overlap two
+    // real PTY sessions.
+    static REAL_PTY_TEST_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+
+    async fn real_pty_test_lock() -> tokio::sync::MutexGuard<'static, ()> {
+        REAL_PTY_TEST_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await
+    }
+
     #[test]
     fn osc52_callback_keeps_only_bounded_copy_requests() {
         let mut parser = pty_parser(2, 10, 10, PtyCallbacks::default());
@@ -5027,6 +5041,7 @@ mod tests {
 
     #[tokio::test]
     async fn real_pty_osc52_reaches_only_the_live_focused_client() {
+        let _lock = real_pty_test_lock().await;
         let session = Arc::new(Session::spawn(80, 24, "clipboard-pty".into()).expect("session"));
         let (client, server) = UnixStream::pair().expect("socket pair");
         let server_task = tokio::spawn(serve_client(server, Arc::clone(&session)));
@@ -5080,6 +5095,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn real_pty_negotiates_kitty_input_and_receives_shift_enter() {
+        let _lock = real_pty_test_lock().await;
         let session = Session::spawn(80, 24, "keyboard-pty".into()).expect("session");
         session
             .handle(ClientMessage::Input {
@@ -5125,6 +5141,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn real_pty_receives_xtgettcap_reply() {
+        let _lock = real_pty_test_lock().await;
         let session = Session::spawn(80, 24, "capability-pty".into()).expect("session");
         session.handle(ClientMessage::Input { bytes: b"printf '\\033P+q5463\\033\\\\'; IFS= read -r value; printf '\\nbytes:'; printf '%s' \"$value\" | od -An -tx1\n".to_vec() }).expect("send capability query");
         tokio::time::sleep(Duration::from_millis(500)).await;

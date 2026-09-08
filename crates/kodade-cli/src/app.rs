@@ -3598,10 +3598,7 @@ pub fn bytes_for_mode(k: KeyEvent, modes: KeyboardModes) -> Option<Vec<u8>> {
     {
         return None;
     }
-    let functional = matches!(
-        k.code,
-        KeyCode::Up | KeyCode::Down | KeyCode::Right | KeyCode::Left
-    );
+    let functional = kitty_functional_key(k.code).is_some();
     if modes.kitty_flags & 1 != 0 || (modes.kitty_flags & 2 != 0 && functional) {
         let code = match k.code {
             KeyCode::Char(c) => c as u32,
@@ -3610,6 +3607,7 @@ pub fn bytes_for_mode(k: KeyEvent, modes: KeyboardModes) -> Option<Vec<u8>> {
             KeyCode::Backspace => 127,
             KeyCode::Esc => 27,
             KeyCode::Up | KeyCode::Down | KeyCode::Right | KeyCode::Left => 0,
+            _ if kitty_functional_key(k.code).is_some() => 0,
             _ if k.kind == KeyEventKind::Release => return None,
             _ => return bytes(k),
         };
@@ -3642,15 +3640,8 @@ pub fn bytes_for_mode(k: KeyEvent, modes: KeyboardModes) -> Option<Vec<u8>> {
                 KeyEventKind::Release => ":3",
             }
         };
-        if let KeyCode::Up | KeyCode::Down | KeyCode::Right | KeyCode::Left = k.code {
-            let final_byte = match k.code {
-                KeyCode::Up => 'A',
-                KeyCode::Down => 'B',
-                KeyCode::Right => 'C',
-                KeyCode::Left => 'D',
-                _ => unreachable!(),
-            };
-            return Some(format!("\x1b[1;{modifier}{event}{final_byte}").into_bytes());
+        if let Some((number, final_byte)) = kitty_functional_key(k.code) {
+            return Some(format!("\x1b[{number};{modifier}{event}{final_byte}").into_bytes());
         }
         return Some(format!("\x1b[{code};{modifier}{event}u").into_bytes());
     }
@@ -3679,6 +3670,36 @@ pub fn bytes_for_mode(k: KeyEvent, modes: KeyboardModes) -> Option<Vec<u8>> {
         }
     }
     bytes(k)
+}
+
+/// Kitty keeps these non-text keys in CSI's conventional functional forms.
+/// The same forms carry modifier and event-type parameters when negotiated.
+fn kitty_functional_key(code: KeyCode) -> Option<(u8, char)> {
+    Some(match code {
+        KeyCode::Up => (1, 'A'),
+        KeyCode::Down => (1, 'B'),
+        KeyCode::Right => (1, 'C'),
+        KeyCode::Left => (1, 'D'),
+        KeyCode::Home => (1, 'H'),
+        KeyCode::End => (1, 'F'),
+        KeyCode::Insert => (2, '~'),
+        KeyCode::Delete => (3, '~'),
+        KeyCode::PageUp => (5, '~'),
+        KeyCode::PageDown => (6, '~'),
+        KeyCode::F(1) => (1, 'P'),
+        KeyCode::F(2) => (1, 'Q'),
+        KeyCode::F(3) => (1, 'R'),
+        KeyCode::F(4) => (1, 'S'),
+        KeyCode::F(5) => (15, '~'),
+        KeyCode::F(6) => (17, '~'),
+        KeyCode::F(7) => (18, '~'),
+        KeyCode::F(8) => (19, '~'),
+        KeyCode::F(9) => (20, '~'),
+        KeyCode::F(10) => (21, '~'),
+        KeyCode::F(11) => (23, '~'),
+        KeyCode::F(12) => (24, '~'),
+        _ => return None,
+    })
 }
 
 #[cfg(test)]
@@ -3752,6 +3773,29 @@ mod tests {
                 modes,
             ),
             Some(b"\x1b[1;1:3D".to_vec())
+        );
+    }
+
+    #[test]
+    fn kitty_functional_keys_keep_modifiers_and_event_types() {
+        let modes = KeyboardModes {
+            kitty_flags: 3,
+            modify_other_keys: 0,
+        };
+        assert_eq!(
+            bytes_for_mode(KeyEvent::new(KeyCode::Home, KeyModifiers::CONTROL), modes),
+            Some(b"\x1b[1;5H".to_vec())
+        );
+        assert_eq!(
+            bytes_for_mode(
+                KeyEvent::new_with_kind(KeyCode::Delete, KeyModifiers::ALT, KeyEventKind::Release),
+                modes,
+            ),
+            Some(b"\x1b[3;3:3~".to_vec())
+        );
+        assert_eq!(
+            bytes_for_mode(KeyEvent::new(KeyCode::F(5), KeyModifiers::SHIFT), modes),
+            Some(b"\x1b[15;2~".to_vec())
         );
     }
 
