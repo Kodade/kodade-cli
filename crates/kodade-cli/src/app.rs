@@ -3891,6 +3891,32 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn configured_command_starts_without_blocking_the_tui() {
+        let config = config::Config::default();
+        let mut app = App::new(
+            &config,
+            "command-test",
+            PathBuf::from("/tmp/kodade-test.sock"),
+        );
+        let (mut writer, mut daemon) = test_router();
+        app.run_configured_command(
+            config::ConfiguredCommand {
+                label: "fixture".into(),
+                key: "prefix+f".into(),
+                command: "true".into(),
+                pane: false,
+                cwd: None,
+                contexts: vec![],
+            },
+            &mut writer,
+        )
+        .await
+        .unwrap();
+        assert!(app.note().unwrap().0.contains("fixture started"));
+        assert!(daemon.try_recv().is_err());
+    }
+
     #[test]
     fn mouse_selection_reaches_command_context_only_for_its_endpoint_and_pane() {
         use ratatui::{backend::CrosstermBackend, Terminal};
