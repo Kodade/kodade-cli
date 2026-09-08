@@ -19,3 +19,7 @@ vt100.workspace = true
 vte.workspace = true
 unicode-width.workspace = true
 png.workspace = true
+getrandom.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true

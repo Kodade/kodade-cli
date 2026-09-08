@@ -16,7 +16,7 @@ use kodade_cli_proto::{
     ServerMessage, SidebarTabInfo, SplitAxis, WorkspaceId, WorkspaceInfo,
 };
 use ratatui::{backend::CrosstermBackend, layout::Rect, style::Color, Frame, Terminal};
-#[cfg(test)]
+#[cfg(all(test, unix))]
 use ratatui::{TerminalOptions, Viewport};
 use std::{
     collections::HashMap,
@@ -3497,7 +3497,7 @@ pub fn bytes(k: KeyEvent) -> Option<Vec<u8>> {
     Some(b)
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 

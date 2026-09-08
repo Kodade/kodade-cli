@@ -37,3 +37,9 @@ The CLI updater consumes the GitHub release API and requires every published
 release to retain its matching platform archives and `SHA256SUMS`. Stable
 checks use the latest non-prerelease release; preview checks select the newest
 published prerelease.
+
+On Windows, a running executable cannot replace itself. After checksum
+verification, `kodade-cli update` schedules a replacement for when the current
+process exits. The helper retries the locked-file move for up to 10 seconds and
+keeps the old executable if the replacement fails. Rerun `kodade-cli --version`
+after the update command exits to verify the installed version.
