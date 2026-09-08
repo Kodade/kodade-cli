@@ -50,6 +50,7 @@ $env:LOCALAPPDATA = Join-Path $env:RUNNER_TEMP "kodade-cli-windows-smoke-$PID"
 $session = "windows-smoke-$PID"
 $resultPath = Join-Path $env:RUNNER_TEMP "kodade-conpty-result-$PID.txt"
 $hookResultPath = Join-Path $env:RUNNER_TEMP "kodade-hook-result-$PID.txt"
+$nodeScript = Join-Path $env:RUNNER_TEMP "kodade-hook-node-$PID.js"
 
 try {
     Write-Host 'starting native ConPTY daemon'
@@ -89,6 +90,34 @@ try {
     }
     if (-not $exited) { throw 'exited ConPTY child did not retain its output' }
 
+    Write-Host 'checking hook-backed Node identity and replacement refusal'
+    if ($null -eq (Get-Command node.exe -ErrorAction SilentlyContinue)) {
+        throw 'Windows runner has no node.exe for the hook identity smoke'
+    }
+@'
+const { spawn, spawnSync } = require("child_process");
+const report = state => spawnSync(process.env.KODADE_BIN, ["agent", "report", process.env.KODADE_PANE, state, "--source", "kodade:pi", "--native-agent", "pi"]);
+report("working");
+process.stdin.once("data", () => {
+  spawn("cmd.exe", ["/C", "ping 127.0.0.1 -n 10 > NUL"], { stdio: "inherit" });
+  process.exit(0);
+});
+setInterval(() => {}, 1000);
+'@ | Set-Content -LiteralPath $nodeScript -NoNewline
+    $nodePane = (Invoke-Native $bin @('--session', $session, 'run', '--', 'node.exe', $nodeScript)).Trim()
+    if ($nodePane -notmatch '^\d+$') { throw "Node run did not return a pane id: $nodePane" }
+    Wait-Until 'hook-backed Node identity' { (Invoke-Native $bin @('--session', $session, 'agent', 'read', 'Pi') 5).Length -gt 0 }
+    Invoke-Native $bin @('--session', $session, 'pane', 'send-keys', $nodePane, 'retire', 'Enter') | Out-Null
+    Wait-Until 'replacement process identity retirement' {
+        try { Invoke-Native $bin @('--session', $session, 'agent', 'read', 'Pi') 5 | Out-Null; $false } catch { $true }
+    } 10
+    try {
+        Invoke-Native $bin @('--session', $session, 'agent', 'prompt', 'Pi', 'SENTINEL-MUST-NOT-ARRIVE') 5 | Out-Null
+        throw 'stale hook identity accepted guarded input after Node replacement'
+    } catch {
+        if ($_.Exception.Message -match 'stale hook identity accepted') { throw }
+    }
+
     Write-Host 'checking renamed hook endpoint'
     # The pane inherited its private endpoint before the public name changes.
     # A report from that original pane proves its hook still reaches the daemon.
@@ -122,5 +151,6 @@ try {
     try { Invoke-Native $bin @('--session', $session, 'kill-session') 5 | Out-Null } catch { }
     Remove-Item -LiteralPath $resultPath -Force -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath $hookResultPath -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $nodeScript -Force -ErrorAction SilentlyContinue
     Remove-Item -Force -Recurse -ErrorAction SilentlyContinue $env:LOCALAPPDATA
 }

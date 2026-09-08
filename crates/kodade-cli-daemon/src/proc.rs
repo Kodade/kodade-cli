@@ -103,7 +103,7 @@ pub fn descendant_process(root: u32) -> Option<(i32, Option<String>)> {
     while let Some(parent) = queue.pop() {
         for child in entries.iter().filter(|entry| entry.parent == parent) {
             if !shell(&child.name) {
-                return Some((child.pid as i32, Some(child.name.clone())));
+                return Some((child.pid as i32, Some(windows_process_name(&child.name))));
             }
             queue.push(child.pid);
         }
@@ -111,9 +111,20 @@ pub fn descendant_process(root: u32) -> Option<(i32, Option<String>)> {
     entries.iter().find(|entry| entry.pid == root).map(|entry| {
         (
             root as i32,
-            (!shell(&entry.name)).then(|| entry.name.clone()),
+            (!shell(&entry.name)).then(|| windows_process_name(&entry.name)),
         )
     })
+}
+
+/// Toolhelp exposes executable filenames (`node.exe`), while manifests and
+/// hook adapters name the foreground program (`node`). Keep the identity in
+/// that shared form before comparing a hook to the live pane process.
+#[cfg(windows)]
+fn windows_process_name(name: &str) -> String {
+    name.strip_suffix(".exe")
+        .or_else(|| name.strip_suffix(".EXE"))
+        .unwrap_or(name)
+        .to_owned()
 }
 
 /// Wrap the pieces of a command so the login shell runs them verbatim. Each
