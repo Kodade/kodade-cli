@@ -3633,6 +3633,11 @@ fn valid_native_session(native: &NativeSession) -> bool {
             | ("kodade:codex", "codex", true, false)
             | ("kodade:gemini-cli", "gemini", true, false)
             | ("kodade:opencode", "opencode", true, false)
+            | ("kodade:copilot", "copilot", true, false)
+            | ("kodade:cursor", "cursor", true, false)
+            | ("kodade:droid", "droid", true, false)
+            | ("kodade:kimi", "kimi", true, false)
+            | ("kodade:qwen", "qwen", true, false)
             | ("kodade:pi", "pi", true, false)
             | ("kodade:pi", "pi", false, true)
     )
@@ -3659,6 +3664,21 @@ fn native_resume_argv(native: &NativeSession) -> Option<Vec<String>> {
         }
         ("kodade:opencode", "opencode", Some(id), None) => {
             Some(vec!["opencode".into(), "--session".into(), id.clone()])
+        }
+        ("kodade:copilot", "copilot", Some(id), None) => {
+            Some(vec!["copilot".into(), format!("--resume={id}")])
+        }
+        ("kodade:cursor", "cursor", Some(id), None) => {
+            Some(vec!["cursor-agent".into(), "--resume".into(), id.clone()])
+        }
+        ("kodade:droid", "droid", Some(id), None) => {
+            Some(vec!["droid".into(), "--resume".into(), id.clone()])
+        }
+        ("kodade:kimi", "kimi", Some(id), None) => {
+            Some(vec!["kimi".into(), "--session".into(), id.clone()])
+        }
+        ("kodade:qwen", "qwen", Some(id), None) => {
+            Some(vec!["qwen".into(), "--resume".into(), id.clone()])
         }
         ("kodade:pi", "pi", Some(id), None) => {
             Some(vec!["pi".into(), "--session".into(), id.clone()])

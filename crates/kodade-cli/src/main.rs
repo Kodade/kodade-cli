@@ -374,6 +374,41 @@ async fn main() -> Result<()> {
                     integrations::integrate_codex(write, force)
                 }
             }
+            cli::IntegrateCommand::Copilot { write, remove } => {
+                if remove {
+                    integrations::unintegrate_copilot()
+                } else {
+                    integrations::integrate_copilot(write)
+                }
+            }
+            cli::IntegrateCommand::Cursor { write, remove } => {
+                if remove {
+                    integrations::unintegrate_cursor()
+                } else {
+                    integrations::integrate_cursor(write)
+                }
+            }
+            cli::IntegrateCommand::Droid { write, remove } => {
+                if remove {
+                    integrations::unintegrate_droid()
+                } else {
+                    integrations::integrate_droid(write)
+                }
+            }
+            cli::IntegrateCommand::Kimi { write, remove } => {
+                if remove {
+                    integrations::unintegrate_kimi()
+                } else {
+                    integrations::integrate_kimi(write)
+                }
+            }
+            cli::IntegrateCommand::Qwen { write, remove } => {
+                if remove {
+                    integrations::unintegrate_qwen()
+                } else {
+                    integrations::integrate_qwen(write)
+                }
+            }
             cli::IntegrateCommand::OpenCode { write, remove } => {
                 if remove {
                     integrations::unintegrate_opencode()
@@ -1109,6 +1144,11 @@ fn hook_session_id(source: &str, agent: Option<&str>) -> Result<Option<String>> 
         ("kodade:claude-code", Some("claude")) | ("kodade:gemini-cli", Some("gemini")) => {
             "session_id"
         }
+        ("kodade:copilot", Some("copilot")) => "sessionId",
+        ("kodade:cursor", Some("cursor"))
+        | ("kodade:droid", Some("droid"))
+        | ("kodade:kimi", Some("kimi"))
+        | ("kodade:qwen", Some("qwen")) => "session_id",
         _ => return Ok(None),
     };
     Ok(value

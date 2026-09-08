@@ -699,6 +699,41 @@ pub enum IntegrateCommand {
         #[arg(long, conflicts_with = "write")]
         remove: bool,
     },
+    /// GitHub Copilot CLI lifecycle hooks.
+    Copilot {
+        #[arg(long)]
+        write: bool,
+        #[arg(long, conflicts_with = "write")]
+        remove: bool,
+    },
+    /// Cursor lifecycle hooks.
+    Cursor {
+        #[arg(long)]
+        write: bool,
+        #[arg(long, conflicts_with = "write")]
+        remove: bool,
+    },
+    /// Factory Droid lifecycle hooks.
+    Droid {
+        #[arg(long)]
+        write: bool,
+        #[arg(long, conflicts_with = "write")]
+        remove: bool,
+    },
+    /// Kimi Code lifecycle hooks.
+    Kimi {
+        #[arg(long)]
+        write: bool,
+        #[arg(long, conflicts_with = "write")]
+        remove: bool,
+    },
+    /// Qwen Code lifecycle hooks.
+    Qwen {
+        #[arg(long)]
+        write: bool,
+        #[arg(long, conflicts_with = "write")]
+        remove: bool,
+    },
     /// OpenCode local plugin (official API documented; fixture-tested here).
     OpenCode {
         #[arg(long)]

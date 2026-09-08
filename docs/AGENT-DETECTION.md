@@ -216,6 +216,28 @@ state, so detection does not depend on screen strings alone.
   for the workspace under its normal trust/settings policy; if it does not run
   the commands, Ködade continues with process and screen detection. Use
   `integrate codex --remove` to remove only Ködade's marked commands.
+- `integrate copilot [--write]` — writes Ködade's separate, versioned user hook
+  file at `~/.copilot/hooks/kodade-cli.json`: `userPromptSubmitted` → working,
+  `agentStop` → done, and `errorOccurred` → blocked. Copilot documents those
+  events and its `sessionId` payload in its [hooks reference](https://docs.github.com/en/copilot/reference/hooks-reference), and resumes the exact reported ID with `copilot --resume=ID`.
+- `integrate cursor [--write]` — merges `sessionStart` and
+  `beforeSubmitPrompt` → working plus `stop`/`sessionEnd` → done into
+  `~/.cursor/hooks.json`. Cursor documents that user hooks receive JSON on
+  stdin and provides the `session_id` payload and `cursor-agent --resume ID`
+  command in its [hooks](https://prod.cursor.com/docs/hooks) and [CLI parameter](https://docs.cursor.com/en/cli/reference/parameters) references.
+- `integrate droid [--write]` — merges `SessionStart`/`UserPromptSubmit` →
+  working, `Stop` → done, and permission notifications → blocked into
+  `~/.factory/hooks.json`. Factory documents the file, events, JSON
+  `session_id`, and `droid --resume ID` in its [hooks](https://docs.factory.ai/harness/hooks) and [CLI reference](https://docs.factory.ai/droid-cli/cli-reference).
+- `integrate kimi [--write]` — appends a clearly marked managed `[[hooks]]`
+  block to `~/.kimi-code/config.toml`: start/prompt → working, `Stop` → done,
+  and permission notifications → blocked. Reinstalling replaces only that
+  block; `--remove` deletes it. Kimi documents the TOML hook configuration and
+  JSON `session_id` payload in its [hooks reference](https://github.com/MoonshotAI/kimi-cli/blob/main/docs/en/customization/hooks.md), and resumes exact sessions with `kimi --session ID` in its [command reference](https://github.com/MoonshotAI/kimi-code/blob/main/docs/en/reference/kimi-command.md).
+- `integrate qwen [--write]` — merges `SessionStart`/`UserPromptSubmit` →
+  working, `Stop` → done, and `PermissionRequest` → blocked into
+  `~/.qwen/settings.json`. Qwen documents the hook event/payload contract and
+  `qwen --resume ID` in its [hooks](https://github.com/QwenLM/qwen-code/blob/main/docs/users/features/hooks.md) and [headless reference](https://github.com/QwenLM/qwen-code/blob/main/docs/users/features/headless.md).
 
 Merges are idempotent and never remove unrelated keys or hooks. A previously
 installed Ködade report hook for the same event is upgraded in place (matched

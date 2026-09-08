@@ -5,7 +5,18 @@ use serde_json::{json, Value};
 use std::{fs, path::Path};
 
 /// Integrations that install a lifecycle hook / notify entry for a known agent.
-pub const INTEGRATIONS: &[&str] = &["claude-code", "codex", "gemini-cli", "opencode", "pi"];
+pub const INTEGRATIONS: &[&str] = &[
+    "claude-code",
+    "codex",
+    "gemini-cli",
+    "copilot",
+    "cursor",
+    "droid",
+    "kimi",
+    "qwen",
+    "opencode",
+    "pi",
+];
 
 /// Marker shared by every Ködade-managed hook command. It is deliberately
 /// distinct from a user's arbitrary `kodade-cli` invocation.
@@ -31,6 +42,11 @@ pub fn integrate_list() -> Result<()> {
             "claude-code" => (".claude/settings.json", "hooks"),
             "codex" => (".codex/hooks.json", "hooks"),
             "gemini-cli" => (".gemini/settings.json", "hooks"),
+            "copilot" => (".copilot/hooks/kodade-cli.json", "hooks"),
+            "cursor" => (".cursor/hooks.json", "hooks"),
+            "droid" => (".factory/hooks.json", "hooks"),
+            "kimi" => (".kimi-code/config.toml", "hooks"),
+            "qwen" => (".qwen/settings.json", "hooks"),
             "opencode" => (
                 ".config/opencode/plugins/kodade-cli-agent-state.js",
                 "plugin (official docs; fixture-tested)",
@@ -54,6 +70,201 @@ pub fn integrate_list() -> Result<()> {
         println!("{agent:<12} {status:<10} {shown} ({mechanism})");
     }
     Ok(())
+}
+
+/// Copilot CLI uses independently-loaded, versioned hook documents.
+fn copilot_hooks() -> Value {
+    let command = |state| {
+        json!({
+            "type": "command",
+            "command": report_command(state, "kodade:copilot", "copilot", "sessionId"),
+            "timeoutSec": 5
+        })
+    };
+    json!({
+        "version": 1,
+        "hooks": {
+            "userPromptSubmitted": [command("working")],
+            "agentStop": [command("done")],
+            "errorOccurred": [command("blocked")]
+        }
+    })
+}
+
+pub fn integrate_copilot(write: bool) -> Result<()> {
+    let home = dirs::home_dir().ok_or_else(|| anyhow!("home directory unavailable"))?;
+    let path = home.join(".copilot/hooks/kodade-cli.json");
+    if !write {
+        println!("{}", serde_json::to_string_pretty(&copilot_hooks())?);
+        return Ok(());
+    }
+    write_owned_file(
+        &path,
+        &format!("{}\n", serde_json::to_string_pretty(&copilot_hooks())?),
+    )?;
+    println!("installed Copilot CLI hooks in {}", path.display());
+    Ok(())
+}
+
+pub fn unintegrate_copilot() -> Result<()> {
+    let home = dirs::home_dir().ok_or_else(|| anyhow!("home directory unavailable"))?;
+    remove_owned_file(&home.join(".copilot/hooks/kodade-cli.json"))
+}
+
+fn cursor_hooks() -> Value {
+    json!({
+        "sessionStart": [{ "command": report_command("working", "kodade:cursor", "cursor", "session_id") }],
+        "beforeSubmitPrompt": [{ "command": report_command("working", "kodade:cursor", "cursor", "session_id") }],
+        "stop": [{ "command": report_command("done", "kodade:cursor", "cursor", "session_id") }],
+        "sessionEnd": [{ "command": report_command("done", "kodade:cursor", "cursor", "session_id") }]
+    })
+}
+
+pub fn integrate_cursor(write: bool) -> Result<()> {
+    let home = dirs::home_dir().ok_or_else(|| anyhow!("home directory unavailable"))?;
+    let path = home.join(".cursor/hooks.json");
+    if !write {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({"version": 1, "hooks": cursor_hooks()}))?
+        );
+        return Ok(());
+    }
+    merge_versioned_hook_settings(&path, &cursor_hooks())?;
+    println!("installed Cursor hooks in {}", path.display());
+    Ok(())
+}
+
+pub fn unintegrate_cursor() -> Result<()> {
+    let home = dirs::home_dir().ok_or_else(|| anyhow!("home directory unavailable"))?;
+    remove_hook_settings(&home.join(".cursor/hooks.json"))
+}
+
+fn droid_hooks() -> Value {
+    json!({
+        "SessionStart": [{ "hooks": [{ "type": "command", "command": report_command("working", "kodade:droid", "droid", "session_id"), "timeout": 5 }] }],
+        "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": report_command("working", "kodade:droid", "droid", "session_id"), "timeout": 5 }] }],
+        "Stop": [{ "hooks": [{ "type": "command", "command": report_command("done", "kodade:droid", "droid", "session_id"), "timeout": 5 }] }],
+        "Notification": [{ "matcher": "permission_prompt|elicitation_dialog", "hooks": [{ "type": "command", "command": report_command("blocked", "kodade:droid", "droid", "session_id"), "timeout": 5 }] }]
+    })
+}
+
+pub fn integrate_droid(write: bool) -> Result<()> {
+    let home = dirs::home_dir().ok_or_else(|| anyhow!("home directory unavailable"))?;
+    let path = home.join(".factory/hooks.json");
+    if !write {
+        println!("{}", serde_json::to_string_pretty(&droid_hooks())?);
+        return Ok(());
+    }
+    merge_root_hook_settings(&path, &droid_hooks())?;
+    println!("installed Droid hooks in {}", path.display());
+    Ok(())
+}
+
+pub fn unintegrate_droid() -> Result<()> {
+    let home = dirs::home_dir().ok_or_else(|| anyhow!("home directory unavailable"))?;
+    remove_root_hook_settings(&home.join(".factory/hooks.json"))
+}
+
+fn qwen_hooks() -> Value {
+    json!({
+        "SessionStart": [{ "hooks": [{ "type": "command", "command": report_command("working", "kodade:qwen", "qwen", "session_id") }] }],
+        "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": report_command("working", "kodade:qwen", "qwen", "session_id") }] }],
+        "Stop": [{ "hooks": [{ "type": "command", "command": report_command("done", "kodade:qwen", "qwen", "session_id") }] }],
+        "PermissionRequest": [{ "hooks": [{ "type": "command", "command": report_command("blocked", "kodade:qwen", "qwen", "session_id") }] }]
+    })
+}
+
+pub fn integrate_qwen(write: bool) -> Result<()> {
+    let home = dirs::home_dir().ok_or_else(|| anyhow!("home directory unavailable"))?;
+    let path = home.join(".qwen/settings.json");
+    if !write {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({"hooks": qwen_hooks()}))?
+        );
+        return Ok(());
+    }
+    merge_hook_settings(&path, &qwen_hooks())?;
+    println!("installed Qwen Code hooks in {}", path.display());
+    Ok(())
+}
+
+pub fn unintegrate_qwen() -> Result<()> {
+    let home = dirs::home_dir().ok_or_else(|| anyhow!("home directory unavailable"))?;
+    remove_hook_settings(&home.join(".qwen/settings.json"))
+}
+
+const KIMI_HOOKS_BEGIN: &str = "# KODADE CLI managed hooks: begin";
+const KIMI_HOOKS_END: &str = "# KODADE CLI managed hooks: end";
+
+fn kimi_hooks_toml() -> String {
+    let command = |state| {
+        toml::Value::String(report_command(state, "kodade:kimi", "kimi", "session_id")).to_string()
+    };
+    [
+        KIMI_HOOKS_BEGIN.to_owned(),
+        format!("[[hooks]]\nevent = \"SessionStart\"\ncommand = {}\ntimeout = 5", command("working")),
+        format!("[[hooks]]\nevent = \"UserPromptSubmit\"\ncommand = {}\ntimeout = 5", command("working")),
+        format!("[[hooks]]\nevent = \"Stop\"\ncommand = {}\ntimeout = 5", command("done")),
+        format!("[[hooks]]\nevent = \"Notification\"\nmatcher = \"permission_prompt\"\ncommand = {}\ntimeout = 5", command("blocked")),
+        KIMI_HOOKS_END.to_owned(),
+    ].join("\n\n")
+}
+
+fn remove_kimi_hook_block(source: &str) -> String {
+    let Some(begin) = source.find(KIMI_HOOKS_BEGIN) else {
+        return source.to_owned();
+    };
+    let Some(end_offset) = source[begin..].find(KIMI_HOOKS_END) else {
+        return source.to_owned();
+    };
+    let end = begin + end_offset + KIMI_HOOKS_END.len();
+    format!("{}{}", &source[..begin], &source[end..])
+        .trim()
+        .to_owned()
+}
+
+pub fn integrate_kimi(write: bool) -> Result<()> {
+    let home = dirs::home_dir().ok_or_else(|| anyhow!("home directory unavailable"))?;
+    let path = home.join(".kimi-code/config.toml");
+    let hooks = kimi_hooks_toml();
+    if !write {
+        println!("{hooks}");
+        return Ok(());
+    }
+    let source = match fs::read_to_string(&path) {
+        Ok(source) => source,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(error.into()),
+    };
+    let preserved = remove_kimi_hook_block(&source);
+    let updated = if preserved.trim().is_empty() {
+        hooks
+    } else {
+        format!("{preserved}\n\n{hooks}")
+    };
+    toml::from_str::<toml::Value>(&updated).context("validate Kimi config.toml")?;
+    write_owned_file(&path, &format!("{updated}\n"))?;
+    println!("installed Kimi Code hooks in {}", path.display());
+    Ok(())
+}
+
+pub fn unintegrate_kimi() -> Result<()> {
+    let home = dirs::home_dir().ok_or_else(|| anyhow!("home directory unavailable"))?;
+    let path = home.join(".kimi-code/config.toml");
+    let source = match fs::read_to_string(&path) {
+        Ok(source) => source,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    if !source.contains(KIMI_HOOKS_BEGIN) {
+        return Ok(());
+    }
+    crate::atomic_file::write(
+        &path,
+        format!("{}\n", remove_kimi_hook_block(&source)).as_bytes(),
+    )
 }
 
 pub fn integrate_claude_code(write: bool) -> Result<()> {
@@ -364,6 +575,55 @@ fn merge_hook_settings(path: &Path, new_hooks: &Value) -> Result<()> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => json!({}),
         Err(error) => return Err(error.into()),
     };
+    merge_hooks_value(&mut settings, new_hooks)?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    crate::atomic_file::write(
+        path,
+        format!("{}\n", serde_json::to_string_pretty(&settings)?).as_bytes(),
+    )
+}
+
+fn merge_versioned_hook_settings(path: &Path, new_hooks: &Value) -> Result<()> {
+    let mut settings: Value = match fs::read_to_string(path) {
+        Ok(source) => serde_json::from_str(&source).context("parse hooks.json")?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => json!({ "version": 1 }),
+        Err(error) => return Err(error.into()),
+    };
+    let object = settings
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("hooks.json must be an object"))?;
+    object.entry("version").or_insert_with(|| json!(1));
+    merge_hooks_value(&mut settings, new_hooks)?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    crate::atomic_file::write(
+        path,
+        format!("{}\n", serde_json::to_string_pretty(&settings)?).as_bytes(),
+    )
+}
+
+fn merge_root_hook_settings(path: &Path, new_hooks: &Value) -> Result<()> {
+    let original: Value = match fs::read_to_string(path) {
+        Ok(source) => serde_json::from_str(&source).context("parse hooks.json")?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => json!({}),
+        Err(error) => return Err(error.into()),
+    };
+    let mut wrapper = json!({ "hooks": original });
+    merge_hooks_value(&mut wrapper, new_hooks)?;
+    let hooks = wrapper["hooks"].take();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    crate::atomic_file::write(
+        path,
+        format!("{}\n", serde_json::to_string_pretty(&hooks)?).as_bytes(),
+    )
+}
+
+fn merge_hooks_value(settings: &mut Value, new_hooks: &Value) -> Result<()> {
     let hooks = settings
         .as_object_mut()
         .ok_or_else(|| anyhow!("settings.json must be an object"))?
@@ -374,7 +634,10 @@ fn merge_hook_settings(path: &Path, new_hooks: &Value) -> Result<()> {
     for destination in hooks.values_mut().filter_map(Value::as_array_mut) {
         // Replace only our hooks; users can share an entry and its matcher.
         destination.retain_mut(|entry| {
-            let Some(nested) = entry["hooks"].as_array_mut() else {
+            if entry["command"].as_str().is_some_and(is_report_command) {
+                return false;
+            }
+            let Some(nested) = entry.get_mut("hooks").and_then(Value::as_array_mut) else {
                 return true;
             };
             let before = nested.len();
@@ -392,13 +655,6 @@ fn merge_hook_settings(path: &Path, new_hooks: &Value) -> Result<()> {
             .ok_or_else(|| anyhow!("hook event must be an array"))?;
         destination.extend(entries.as_array().expect("entries").iter().cloned());
     }
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    crate::atomic_file::write(
-        path,
-        format!("{}\n", serde_json::to_string_pretty(&settings)?).as_bytes(),
-    )?;
     Ok(())
 }
 
@@ -411,12 +667,37 @@ fn remove_hook_settings(path: &Path) -> Result<()> {
         Err(error) => return Err(error.into()),
     };
     let mut settings: Value = serde_json::from_str(&source).context("parse settings.json")?;
+    remove_hooks_value(&mut settings)?;
+    crate::atomic_file::write(
+        path,
+        format!("{}\n", serde_json::to_string_pretty(&settings)?).as_bytes(),
+    )
+}
+
+fn remove_root_hook_settings(path: &Path) -> Result<()> {
+    let mut hooks: Value = match fs::read_to_string(path) {
+        Ok(source) => serde_json::from_str(&source).context("parse hooks.json")?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    let mut wrapper = json!({ "hooks": hooks.take() });
+    remove_hooks_value(&mut wrapper)?;
+    crate::atomic_file::write(
+        path,
+        format!("{}\n", serde_json::to_string_pretty(&wrapper["hooks"])?).as_bytes(),
+    )
+}
+
+fn remove_hooks_value(settings: &mut Value) -> Result<()> {
     let Some(hooks) = settings.get_mut("hooks").and_then(Value::as_object_mut) else {
         return Ok(());
     };
     for destination in hooks.values_mut().filter_map(Value::as_array_mut) {
         destination.retain_mut(|entry| {
-            let Some(nested) = entry["hooks"].as_array_mut() else {
+            if entry["command"].as_str().is_some_and(is_report_command) {
+                return false;
+            }
+            let Some(nested) = entry.get_mut("hooks").and_then(Value::as_array_mut) else {
                 return true;
             };
             nested.retain(|hook| !hook["command"].as_str().is_some_and(is_report_command));
@@ -424,10 +705,6 @@ fn remove_hook_settings(path: &Path) -> Result<()> {
         });
     }
     hooks.retain(|_, entries| !entries.as_array().is_some_and(Vec::is_empty));
-    crate::atomic_file::write(
-        path,
-        format!("{}\n", serde_json::to_string_pretty(&settings)?).as_bytes(),
-    )?;
     Ok(())
 }
 
@@ -519,6 +796,78 @@ mod tests {
         assert!(codex.contains("--native-agent codex"));
         assert!(pi_extension().contains("getSessionFile"));
         assert!(opencode_plugin().contains("sessionID || event.properties?.sessionId"));
+    }
+
+    #[test]
+    fn verified_external_hook_shapes_preserve_lifecycle_and_session_keys() {
+        let copilot = copilot_hooks();
+        assert_eq!(copilot["version"], 1);
+        assert!(copilot["hooks"]["userPromptSubmitted"][0]["command"]
+            .as_str()
+            .is_some_and(|command| command.contains("--hook-json")));
+        assert!(cursor_hooks()["sessionStart"][0]["command"]
+            .as_str()
+            .is_some_and(|command| command.contains("kodade:cursor")));
+        for hooks in [droid_hooks(), qwen_hooks()] {
+            assert!(hooks["SessionStart"][0]["hooks"][0]["command"]
+                .as_str()
+                .is_some_and(|command| command.contains("--hook-json")));
+            assert!(hooks["Stop"][0]["hooks"][0]["command"]
+                .as_str()
+                .is_some_and(|command| command.contains(" done ")));
+        }
+    }
+
+    #[test]
+    fn versioned_and_root_hook_files_keep_user_entries() {
+        let temp = std::env::temp_dir().join(format!("kodade-extra-hooks-{}", std::process::id()));
+        fs::create_dir_all(&temp).unwrap();
+        let cursor = temp.join("cursor.json");
+        fs::write(
+            &cursor,
+            r#"{"version":1,"hooks":{"stop":[{"command":"echo keep"}]}}"#,
+        )
+        .unwrap();
+        merge_versioned_hook_settings(&cursor, &cursor_hooks()).unwrap();
+        merge_versioned_hook_settings(&cursor, &cursor_hooks()).unwrap();
+        let cursor_json: Value = serde_json::from_slice(&fs::read(&cursor).unwrap()).unwrap();
+        assert_eq!(cursor_json["hooks"]["stop"].as_array().unwrap().len(), 2);
+        remove_hook_settings(&cursor).unwrap();
+        let cursor_json: Value = serde_json::from_slice(&fs::read(&cursor).unwrap()).unwrap();
+        assert_eq!(
+            cursor_json["hooks"]["stop"],
+            json!([{ "command": "echo keep" }])
+        );
+
+        let droid = temp.join("droid.json");
+        fs::write(
+            &droid,
+            r#"{"Stop":[{"hooks":[{"type":"command","command":"echo keep"}]}]}"#,
+        )
+        .unwrap();
+        merge_root_hook_settings(&droid, &droid_hooks()).unwrap();
+        remove_root_hook_settings(&droid).unwrap();
+        let droid_json: Value = serde_json::from_slice(&fs::read(&droid).unwrap()).unwrap();
+        assert_eq!(
+            droid_json["Stop"],
+            json!([{ "hooks": [{ "type": "command", "command": "echo keep" }] }])
+        );
+        fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[test]
+    fn kimi_managed_block_is_idempotent_and_leaves_user_toml() {
+        let original = "default_model = \"kimi-code/k3\"\n";
+        let installed = format!("{original}\n{}\n", kimi_hooks_toml());
+        toml::from_str::<toml::Value>(&installed).unwrap();
+        let replaced = format!(
+            "{}\n{}\n",
+            remove_kimi_hook_block(&installed),
+            kimi_hooks_toml()
+        );
+        assert_eq!(replaced.matches(KIMI_HOOKS_BEGIN).count(), 1);
+        assert!(replaced.contains(original.trim()));
+        assert!(remove_kimi_hook_block(&replaced).contains(original.trim()));
     }
 
     #[test]
