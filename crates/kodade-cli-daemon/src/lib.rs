@@ -6500,7 +6500,7 @@ mod tests {
                 if session.snapshot().expect("snapshot").panes[0]
                     .screen
                     .contents
-                    .contains("bytes:1b50312b72353436333d33311b5c")
+                    .contains("bytes:1b50312b72353436331b5c")
                 {
                     break;
                 }

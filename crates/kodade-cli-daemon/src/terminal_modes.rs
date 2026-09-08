@@ -134,31 +134,34 @@ impl Modes {
     }
 
     fn xtgettcap(&mut self, query: &[u8]) {
-        let mut reply = Vec::new();
         for encoded in query.split(|byte| *byte == b';') {
             let Ok(name) = decode_hex(encoded) else {
                 self.extend_reply(b"\x1bP0+r\x1b\\");
-                return;
+                continue;
             };
-            let value: &[u8] = match name.as_slice() {
-                b"Tc" | b"Su" => b"1",
-                b"RGB" => b"8",
-                b"Ms" => b"\x1b]52;%p1%s;%p2%s\x07",
+            // Boolean capabilities have no value. Styled/colored underlines
+            // (Su) are not represented by the pane renderer and stay unknown.
+            let value: Option<&[u8]> = match name.as_slice() {
+                b"Tc" => None,
+                b"RGB" => Some(b"8"),
+                b"Ms" => Some(b"\x1b]52;%p1%s;%p2%s\x07"),
                 _ => {
-                    self.extend_reply(b"\x1bP0+r\x1b\\");
-                    return;
+                    let mut reply = b"\x1bP0+r".to_vec();
+                    reply.extend_from_slice(encoded);
+                    reply.extend_from_slice(b"\x1b\\");
+                    self.extend_reply(&reply);
+                    continue;
                 }
             };
-            if !reply.is_empty() {
-                reply.push(b';');
-            }
+            let mut reply = b"\x1bP1+r".to_vec();
             reply.extend_from_slice(encoded);
-            reply.push(b'=');
-            hex_encode(value, &mut reply);
+            if let Some(value) = value {
+                reply.push(b'=');
+                hex_encode(value, &mut reply);
+            }
+            reply.extend_from_slice(b"\x1b\\");
+            self.extend_reply(&reply);
         }
-        self.extend_reply(b"\x1bP1+r");
-        self.extend_reply(&reply);
-        self.extend_reply(b"\x1b\\");
     }
 
     fn extend_reply(&mut self, bytes: &[u8]) {
@@ -492,7 +495,7 @@ mod tests {
         }
         assert_eq!(
             m.take_replies(),
-            b"\x1bP1+r5463=31;524742=38;4d73=1b5d35323b25703125733b257032257307;5375=31\x1b\\"
+            b"\x1bP1+r5463\x1b\\\x1bP1+r524742=38\x1b\\\x1bP1+r4d73=1b5d35323b25703125733b257032257307\x1b\\\x1bP0+r5375\x1b\\"
         );
     }
 
@@ -508,7 +511,7 @@ mod tests {
         for byte in b"3\x1b\\" {
             target.feed(*byte);
         }
-        assert_eq!(target.take_replies(), b"\x1bP1+r5463=31\x1b\\");
+        assert_eq!(target.take_replies(), b"\x1bP1+r5463\x1b\\");
     }
 
     #[test]
