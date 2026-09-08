@@ -13,7 +13,6 @@ pub struct Modes {
     replies: Vec<u8>,
     capability_parser: vte::Parser,
     capability_events: CapabilityEvents,
-    reset_escaped: bool,
 }
 
 impl Modes {
@@ -30,11 +29,6 @@ impl Modes {
     }
 
     pub fn feed(&mut self, byte: u8) {
-        if self.reset_escaped && byte == b'c' {
-            *self = Self::default();
-            return;
-        }
-        self.reset_escaped = byte == 27;
         self.capability_events.completed = None;
         self.capability_parser
             .advance(&mut self.capability_events, &[byte]);
@@ -86,13 +80,16 @@ impl Modes {
             // Kitty keyboard protocol. The protocol requires independent main
             // and alternate-screen stacks; cap each stack to keep hostile PTY
             // output from accumulating state indefinitely.
-            (Some(b'>'), 'u') => self.push_keyboard(
-                alternate_screen,
-                (p(0).min(u16::from(SUPPORTED_KITTY_FLAGS)) as u8) & SUPPORTED_KITTY_FLAGS,
-            ),
+            (Some(b'>'), 'u') => self.push_keyboard(alternate_screen, kitty_flags(p(0))),
             (Some(b'='), 'u') => {
-                self.keyboard_mut(alternate_screen).kitty_flags =
-                    (p(0).min(u16::from(SUPPORTED_KITTY_FLAGS)) as u8) & SUPPORTED_KITTY_FLAGS
+                let flags = kitty_flags(p(0));
+                let keyboard = self.keyboard_mut(alternate_screen);
+                match p(1) {
+                    0 | 1 => keyboard.kitty_flags = flags,
+                    2 => keyboard.kitty_flags |= flags,
+                    3 => keyboard.kitty_flags &= !flags,
+                    _ => {}
+                }
             }
             (Some(b'<'), 'u') => self.pop_keyboard(alternate_screen, p(0).max(1) as usize),
             (Some(b'?'), 'u') => self.replies.extend_from_slice(
@@ -166,6 +163,10 @@ impl Modes {
             &mut self.main_keyboard
         }
     }
+}
+
+fn kitty_flags(flags: u16) -> u8 {
+    (flags & u16::from(SUPPORTED_KITTY_FLAGS)) as u8
 }
 
 #[derive(Default)]
@@ -252,6 +253,18 @@ mod tests {
         assert_eq!(m.keyboard(true).kitty_flags, 0);
         m.csi((24, 80), (0, 0), false, Some(b'<'), &[&[1]], 'u');
         assert_eq!(m.keyboard(false).kitty_flags, 0);
+    }
+
+    #[test]
+    fn kitty_set_modes_apply_flags_without_promoting_unsupported_bits() {
+        let mut m = Modes::default();
+        m.csi((24, 80), (0, 0), false, Some(b'='), &[&[8]], 'u');
+        assert_eq!(m.keyboard(false).kitty_flags, 0);
+        m.csi((24, 80), (0, 0), false, Some(b'='), &[&[1]], 'u');
+        m.csi((24, 80), (0, 0), false, Some(b'='), &[&[2], &[2]], 'u');
+        assert_eq!(m.keyboard(false).kitty_flags, 3);
+        m.csi((24, 80), (0, 0), false, Some(b'='), &[&[1], &[3]], 'u');
+        assert_eq!(m.keyboard(false).kitty_flags, 2);
     }
 
     #[test]

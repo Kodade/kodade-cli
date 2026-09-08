@@ -128,6 +128,15 @@ struct DragState {
     last: u16,
 }
 
+/// A press belongs to the pane and endpoint that received it even if mouse
+/// focus changes before crossterm reports its release.
+#[derive(Clone)]
+struct ForwardedKey {
+    endpoint: EndpointId,
+    pane: PaneId,
+    keyboard: KeyboardModes,
+}
+
 pub struct App {
     graphics: crate::graphics::Renderer,
     image_clipboard: crate::image_paste::Clipboard,
@@ -144,7 +153,7 @@ pub struct App {
     local_session: String,
     catalog_checked: Instant,
     prefix: bool,
-    forwarded_keys: HashSet<(KeyCode, KeyModifiers)>,
+    forwarded_keys: HashMap<(KeyCode, KeyModifiers), ForwardedKey>,
     rename: bool,
     /// The `prefix W` workspace prompt reuses the rename text buffer (`name`).
     new_workspace: bool,
@@ -306,7 +315,7 @@ impl App {
             graphics: crate::graphics::Renderer::default(),
             image_clipboard: crate::image_paste::Clipboard::default(),
             prefix: false,
-            forwarded_keys: HashSet::new(),
+            forwarded_keys: HashMap::new(),
             rename: false,
             new_workspace: false,
             worktree_new: false,
@@ -1163,24 +1172,15 @@ impl App {
         term: &mut Term,
     ) -> Result<Flow> {
         if key.kind == KeyEventKind::Release {
-            let owned = self.forwarded_keys.remove(&(key.code, key.modifiers));
-            let modal = self.prefix
-                || self.rename
-                || self.new_workspace
-                || self.worktree_new
-                || self.worktree_confirm.is_some()
-                || self.confirm.is_some()
-                || self.copy.is_some()
-                || self.menu.is_some()
-                || self.help.is_some()
-                || self.center.is_some()
-                || self.settings.is_some()
-                || self.picker.is_some()
-                || self.navigate.is_some()
-                || self.resize;
-            if owned && !modal {
-                if let Some(bytes) = bytes_for_mode(key, self.focused_keyboard()) {
-                    write(writer, &ClientMessage::Input { bytes }).await?;
+            if let Some(owner) = self.forwarded_keys.remove(&(key.code, key.modifiers)) {
+                if let Some(bytes) = bytes_for_mode(key, owner.keyboard) {
+                    writer.send_to(
+                        &owner.endpoint,
+                        ClientMessage::SendToPane {
+                            id: owner.pane,
+                            bytes,
+                        },
+                    )?;
                 }
             }
             return Ok(Flow::Continue);
@@ -1229,7 +1229,16 @@ impl App {
             if let Some(bytes) = bytes_for_mode(key, keyboard) {
                 write(writer, &ClientMessage::Input { bytes }).await?;
                 if key.kind == KeyEventKind::Press {
-                    self.forwarded_keys.insert((key.code, key.modifiers));
+                    if let Some(pane) = self.focused_pane {
+                        self.forwarded_keys.insert(
+                            (key.code, key.modifiers),
+                            ForwardedKey {
+                                endpoint: self.selected_endpoint.clone(),
+                                pane,
+                                keyboard,
+                            },
+                        );
+                    }
                 }
             }
         } else if let Some(bytes) = bytes_for_mode(key, keyboard) {
@@ -3574,7 +3583,9 @@ pub fn bytes(k: KeyEvent) -> Option<Vec<u8>> {
 /// Encode only modes a pane explicitly negotiated; legacy terminals retain the
 /// historical bytes above.
 pub fn bytes_for_mode(k: KeyEvent, modes: KeyboardModes) -> Option<Vec<u8>> {
-    if k.kind == KeyEventKind::Release && modes.kitty_flags & 2 == 0 {
+    // Event types alone do not change legacy encodings; only emit releases for
+    // keys that the negotiated disambiguation mode represents as CSI sequences.
+    if k.kind == KeyEventKind::Release && modes.kitty_flags & 0b11 != 0b11 {
         return None;
     }
     if modes.kitty_flags & 1 != 0 {
@@ -3584,10 +3595,7 @@ pub fn bytes_for_mode(k: KeyEvent, modes: KeyboardModes) -> Option<Vec<u8>> {
             KeyCode::Tab => 9,
             KeyCode::Backspace => 127,
             KeyCode::Esc => 27,
-            KeyCode::Up => 57352,
-            KeyCode::Down => 57353,
-            KeyCode::Right => 57351,
-            KeyCode::Left => 57350,
+            KeyCode::Up | KeyCode::Down | KeyCode::Right | KeyCode::Left => 0,
             _ if k.kind == KeyEventKind::Release => return None,
             _ => return bytes(k),
         };
@@ -3620,6 +3628,16 @@ pub fn bytes_for_mode(k: KeyEvent, modes: KeyboardModes) -> Option<Vec<u8>> {
                 KeyEventKind::Release => ":3",
             }
         };
+        if let KeyCode::Up | KeyCode::Down | KeyCode::Right | KeyCode::Left = k.code {
+            let final_byte = match k.code {
+                KeyCode::Up => 'A',
+                KeyCode::Down => 'B',
+                KeyCode::Right => 'C',
+                KeyCode::Left => 'D',
+                _ => unreachable!(),
+            };
+            return Some(format!("\x1b[1;{modifier}{event}{final_byte}").into_bytes());
+        }
         return Some(format!("\x1b[{code};{modifier}{event}u").into_bytes());
     }
     let modify_other_keys = match modes.modify_other_keys {
@@ -3686,6 +3704,41 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn kitty_arrows_use_the_functional_csi_form() {
+        let modes = KeyboardModes {
+            kitty_flags: 3,
+            modify_other_keys: 0,
+        };
+        assert_eq!(
+            bytes_for_mode(KeyEvent::new(KeyCode::Up, KeyModifiers::CONTROL), modes),
+            Some(b"\x1b[1;5A".to_vec())
+        );
+        assert_eq!(
+            bytes_for_mode(
+                KeyEvent::new_with_kind(KeyCode::Left, KeyModifiers::NONE, KeyEventKind::Release),
+                modes,
+            ),
+            Some(b"\x1b[1;1:3D".to_vec())
+        );
+    }
+
+    #[test]
+    fn event_types_without_disambiguation_do_not_duplicate_legacy_input() {
+        let modes = KeyboardModes {
+            kitty_flags: 2,
+            modify_other_keys: 0,
+        };
+        let press = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE);
+        let release = KeyEvent::new_with_kind(
+            KeyCode::Char('x'),
+            KeyModifiers::NONE,
+            KeyEventKind::Release,
+        );
+        assert_eq!(bytes_for_mode(press, modes), Some(b"x".to_vec()));
+        assert_eq!(bytes_for_mode(release, modes), None);
     }
 
     #[test]
@@ -3955,6 +4008,116 @@ mod tests {
         router.register(EndpointId::Local, tx);
         router.mark_online(EndpointId::Local);
         (router, rx)
+    }
+
+    fn keyboard_layout(pane: PaneId, keyboard: KeyboardModes) -> LayoutSnapshot {
+        let mut layout = layout_named(&["keyboard"]);
+        layout.tabs = vec![kodade_cli_proto::TabInfo {
+            id: kodade_cli_proto::TabId(1),
+            name: "shell".into(),
+            active: true,
+            state: AgentStateKind::Idle,
+        }];
+        layout.tree = kodade_cli_proto::LayoutTree::Leaf { pane };
+        layout.panes = vec![kodade_cli_proto::PaneSnapshot {
+            id: pane,
+            title: "shell".into(),
+            focused: true,
+            scroll_offset: 0,
+            screen: Screen {
+                keyboard,
+                ..Screen::default()
+            },
+            agent: Some("shell".into()),
+            agent_generation: 0,
+            activity_revision: 0,
+            state: AgentStateKind::Idle,
+            state_reason: String::new(),
+            state_age_secs: 0,
+            cwd: None,
+        }];
+        layout
+    }
+
+    #[tokio::test]
+    async fn key_release_stays_with_the_pane_that_received_its_press() {
+        let config = config::Config::default();
+        let mut app = App::new(&config, "keyboard-test", PathBuf::from("/tmp/kodade.sock"));
+        app.handle_layout(keyboard_layout(
+            PaneId(1),
+            KeyboardModes {
+                kitty_flags: 3,
+                modify_other_keys: 0,
+            },
+        ));
+        let (local_tx, mut local_rx) = mpsc::channel(8);
+        let (remote_tx, mut remote_rx) = mpsc::channel(8);
+        let remote = EndpointId::Machine("other".into());
+        let mut writer = Router::new(EndpointId::Local);
+        writer.register(EndpointId::Local, local_tx);
+        writer.register(remote.clone(), remote_tx);
+        writer.mark_online(EndpointId::Local);
+        writer.mark_online(remote.clone());
+        let mut term = Terminal::with_options(
+            CrosstermBackend::new(std::io::stdout()),
+            TerminalOptions {
+                viewport: Viewport::Fixed(Rect::new(0, 0, 120, 30)),
+            },
+        )
+        .unwrap();
+        let press = KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT);
+        app.handle_key(press, &mut writer, &mut term).await.unwrap();
+        assert_eq!(
+            local_rx.recv().await,
+            Some(ClientMessage::Input {
+                bytes: b"\x1b[13;2u".to_vec()
+            })
+        );
+        app.selected_endpoint = remote;
+        app.focused_pane = Some(PaneId(99));
+        let release =
+            KeyEvent::new_with_kind(KeyCode::Enter, KeyModifiers::SHIFT, KeyEventKind::Release);
+        app.handle_key(release, &mut writer, &mut term)
+            .await
+            .unwrap();
+        assert_eq!(
+            local_rx.recv().await,
+            Some(ClientMessage::SendToPane {
+                id: PaneId(1),
+                bytes: b"\x1b[13;2:3u".to_vec()
+            })
+        );
+        assert!(remote_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn prefix_press_and_release_are_both_swallowed() {
+        let config = config::Config::default();
+        let mut app = App::new(&config, "keyboard-test", PathBuf::from("/tmp/kodade.sock"));
+        app.handle_layout(keyboard_layout(
+            PaneId(1),
+            KeyboardModes {
+                kitty_flags: 3,
+                modify_other_keys: 0,
+            },
+        ));
+        app.prefix = true;
+        let (mut writer, mut daemon) = test_router();
+        let mut term = Terminal::with_options(
+            CrosstermBackend::new(std::io::stdout()),
+            TerminalOptions {
+                viewport: Viewport::Fixed(Rect::new(0, 0, 120, 30)),
+            },
+        )
+        .unwrap();
+        let press = KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT);
+        app.handle_key(press, &mut writer, &mut term).await.unwrap();
+        let release =
+            KeyEvent::new_with_kind(KeyCode::Enter, KeyModifiers::SHIFT, KeyEventKind::Release);
+        app.handle_key(release, &mut writer, &mut term)
+            .await
+            .unwrap();
+        assert!(daemon.try_recv().is_err());
     }
 
     #[tokio::test]

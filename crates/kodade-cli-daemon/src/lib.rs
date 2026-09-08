@@ -4312,9 +4312,6 @@ fn read_pty(
                         }
                     }
                 }
-                for byte in &bytes[..count] {
-                    parser.callbacks_mut().terminal_modes.feed(*byte);
-                }
                 replies.extend(parser.callbacks_mut().terminal_modes.take_replies());
             }
             if !replies.is_empty() {
@@ -4355,6 +4352,10 @@ fn graphics_text(parser: &mut PtyParser, text: &[u8]) {
         } else if tail.ends_with(b"\x1b[?2026l") {
             parser.callbacks_mut().sync_frozen = None;
         }
+        // Keep DCS capability tracking in the same byte order as vt100's
+        // callbacks. In particular, a following RIS clears a completed query
+        // instead of a post-chunk scanner adding its reply after the reset.
+        parser.callbacks_mut().terminal_modes.feed(byte);
         parser.process(&[byte]);
         let alternate = parser.screen().alternate_screen();
         if alternate && !before_alt {
@@ -5533,6 +5534,17 @@ mod tests {
         assert_eq!(snapshot(&parser).keyboard.kitty_flags, 1);
         parser.process(b"\x1b[?1049l");
         assert_eq!(snapshot(&parser).keyboard.kitty_flags, 3);
+    }
+
+    #[test]
+    fn ris_after_capability_query_in_one_chunk_leaves_no_late_reply() {
+        let mut parser = pty_parser(2, 10, 100, PtyCallbacks::default());
+        graphics_text(&mut parser, b"\x1bP+q5463\x1b\\\x1bc");
+        assert!(parser
+            .callbacks_mut()
+            .terminal_modes
+            .take_replies()
+            .is_empty());
     }
 
     #[test]
