@@ -52,13 +52,15 @@ files, or through POSIX shared memory on Unix daemons. File ranges use `O/S`;
 symlinks are followed, special files are rejected, and only named protocol
 files inside temporary directories are deleted. POSIX shared memory is
 unlinked after opening. All of these sources stay on the pane's daemon machine;
-remote clients receive normalized pixel data. Zlib (`o=z`) compression uses the
-existing workspace's flate2 dependency and is bounded before image validation.
-Both compressed and uncompressed data count against the per-image limits.
+remote clients receive normalized pixel data. Zlib (`o=z`) compression is
+bounded before image validation. Both compressed and uncompressed data count
+against the per-image limits.
 
-Animation, virtual Unicode and relative placements, pixel placement offsets,
-and the remaining delete selectors are not implemented on this branch yet.
-Unsupported modes return an error.
+Virtual Unicode placements, relative placements (up to eight parents), pixel
+placement offsets, and visible-cell, column, row, z-index, image-range and
+image-id delete selectors are retained for local and remote clients. Animation
+is unsupported and returns an error.
+
 
 ## Verification
 

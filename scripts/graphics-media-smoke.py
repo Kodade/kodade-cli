@@ -15,6 +15,11 @@ import zlib
 
 binary = Path(sys.argv[1] if len(sys.argv) > 1 else "target/debug/kodade-cli").resolve()
 libc = ctypes.CDLL(None, use_errno=True)
+# shm_open is variadic on Darwin/arm64; declare its fixed arguments so libffi
+# passes mode_t in the variadic area instead of an ordinary argument register.
+libc.shm_open.argtypes = [ctypes.c_char_p, ctypes.c_int]
+libc.shm_open.restype = ctypes.c_int
+libc.shm_unlink.argtypes = [ctypes.c_char_p]
 shm_name = f"/kodade-media-{os.getpid()}".encode()
 with tempfile.TemporaryDirectory(prefix="km-") as directory:
     root = Path(directory)
@@ -37,7 +42,7 @@ with tempfile.TemporaryDirectory(prefix="km-") as directory:
     temporary = root / "tty-graphics-protocol-pixels.rgb"
     source.write_bytes(b"prefix" + pixels + b"suffix")
     temporary.write_bytes(pixels)
-    fd = libc.shm_open(shm_name, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
+    fd = libc.shm_open(shm_name, os.O_CREAT | os.O_EXCL | os.O_RDWR, ctypes.c_uint(0o600))
     assert fd >= 0, os.strerror(ctypes.get_errno())
     os.ftruncate(fd, len(pixels))
     shared = mmap.mmap(fd, len(pixels))

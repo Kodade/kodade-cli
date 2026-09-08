@@ -175,6 +175,9 @@ struct PtyCallbacks {
     title: String,
     graphics: graphics::Store,
     graphics_tracker: graphics::Tracker,
+    graphics_placeholder: Vec<u8>,
+    graphics_unicode: graphics::UnicodeTracker,
+    graphics_virtual_style: graphics::VirtualStyle,
     hyperlinks: hyperlinks::Tracker,
 }
 impl vt100::Callbacks for PtyCallbacks {
@@ -4155,19 +4158,48 @@ fn graphics_text(parser: &mut PtyParser, text: &[u8]) {
     let mut tracker = std::mem::take(&mut parser.callbacks_mut().graphics_tracker);
     let mut store = std::mem::take(&mut parser.callbacks_mut().graphics);
     let mut hyperlinks = std::mem::take(&mut parser.callbacks_mut().hyperlinks);
-    for &byte in text {
-        let before_alt = parser.screen().alternate_screen();
-        tracker.feed(byte, parser.screen(), &mut store);
-        hyperlinks.feed(byte, parser.screen());
-        parser.process(&[byte]);
-        let alternate = parser.screen().alternate_screen();
-        if alternate && !before_alt {
-            store.clear(true);
-            hyperlinks.clear_alternate();
+    let mut style = std::mem::take(&mut parser.callbacks_mut().graphics_virtual_style);
+    let mut placeholder = std::mem::take(&mut parser.callbacks_mut().graphics_placeholder);
+    let mut unicode = std::mem::take(&mut parser.callbacks_mut().graphics_unicode);
+    for &raw in text {
+        style.feed(raw);
+        let chars = unicode.feed(raw);
+        let mut placeholder_cell = None;
+        for c in chars {
+            if c == '\u{10eeee}' {
+                let alternate = parser.screen().alternate_screen();
+                let (row, col) = parser.screen().cursor_position();
+                placeholder_cell = Some((alternate, row, col));
+            } else if let Some(index) = graphics::kitty_diacritic_index(c) {
+                store.add_virtual_diacritic(index);
+            } else {
+                store.end_virtual_sequence();
+            }
+        }
+        for normalized in graphics::normalize_unicode_placeholders(&mut placeholder, &[raw]) {
+            let before_alt = parser.screen().alternate_screen();
+            let (row, col) = parser.screen().cursor_position();
+            let printed = tracker.feed(normalized.byte, parser.screen(), &mut store);
+            if printed {
+                store.clear_virtual_cell(before_alt, row, col);
+            }
+            hyperlinks.feed(normalized.byte, parser.screen());
+            parser.process(&[normalized.byte]);
+            let alternate = parser.screen().alternate_screen();
+            if alternate && !before_alt {
+                store.clear_screen(true);
+                hyperlinks.clear_alternate();
+            }
+        }
+        if let Some((alternate, row, col)) = placeholder_cell {
+            store.record_virtual_cell(alternate, row, col, style.ids());
         }
     }
     parser.callbacks_mut().graphics_tracker = tracker;
     parser.callbacks_mut().graphics = store;
+    parser.callbacks_mut().graphics_virtual_style = style;
+    parser.callbacks_mut().graphics_placeholder = placeholder;
+    parser.callbacks_mut().graphics_unicode = unicode;
     parser.callbacks_mut().hyperlinks = hyperlinks;
 }
 
@@ -4242,10 +4274,11 @@ fn snapshot(parser: &PtyParser) -> Screen {
         rows: (0..rows).map(|row| screen_row(screen, row, cols)).collect(),
         bracketed_paste: screen.bracketed_paste(),
         mouse_reporting: screen.mouse_protocol_mode() != vt100::MouseProtocolMode::None,
-        graphics: parser
-            .callbacks()
-            .graphics
-            .placements(screen.alternate_screen(), screen.scrollback()),
+        graphics: parser.callbacks().graphics.placements_with_screen(
+            screen.alternate_screen(),
+            screen.scrollback(),
+            Some(screen),
+        ),
         links: parser
             .callbacks()
             .hyperlinks
@@ -4737,6 +4770,8 @@ async fn send_notifications(
 
 #[cfg(test)]
 mod tests {
+    use base64::Engine;
+
     #[test]
     fn graphics_follow_bottom_row_autowrap_and_scroll_commands() {
         let mut parser = pty_parser(4, 10, 100, PtyCallbacks::default());
@@ -4753,6 +4788,81 @@ mod tests {
         assert_eq!(parser.callbacks().graphics.placements(false, 0)[0].row, 1);
         graphics_text(&mut parser, b"\x1b[2J");
         assert!(parser.callbacks().graphics.placements(false, 0).is_empty());
+    }
+
+    #[test]
+    fn graphics_follow_escape_index_at_the_bottom_margin() {
+        let mut parser = pty_parser(4, 10, 100, PtyCallbacks::default());
+        parser.callbacks_mut().graphics.command(
+            b"a=T,f=24,s=1,v=1,i=7,c=1,r=1,C=1;AAAA",
+            (2, 0),
+            false,
+        );
+
+        graphics_text(&mut parser, b"\x1b[4;1H\x1bD");
+
+        assert_eq!(parser.callbacks().graphics.placements(false, 0)[0].row, 1);
+    }
+
+    #[test]
+    fn unicode_placeholders_keep_distinct_underline_placement_ids() {
+        let mut parser = pty_parser(1, 3, 0, PtyCallbacks::default());
+        parser.callbacks_mut().graphics.command(
+            b"a=t,f=24,s=3,v=1,i=7;AAAAAAAAAAAA",
+            (0, 0),
+            false,
+        );
+        for placement in [3, 4] {
+            parser.callbacks_mut().graphics.command(
+                format!("a=p,i=7,p={placement},U=1,c=3,r=1").as_bytes(),
+                (0, 0),
+                false,
+            );
+        }
+        graphics_text(
+            &mut parser,
+            b"\x1b[38;2;0;0;7;58;2;0;0;3m\xf4\x8e\xbb\xae\x1b[58;2;0;0;4m\xf4\x8e\xbb\xae",
+        );
+        let placements = snapshot(&parser).graphics;
+        assert_eq!(placements.len(), 2);
+        assert_eq!(placements[0].placement, 3);
+        assert_eq!(placements[1].placement, 4);
+    }
+
+    #[test]
+    fn unicode_placeholder_uses_diacritic_source_coordinates_across_pty_reads() {
+        let mut parser = pty_parser(4, 12, 0, PtyCallbacks::default());
+        let pixels = base64::engine::general_purpose::STANDARD.encode(vec![0; 100 * 80 * 3]);
+        parser.callbacks_mut().graphics.command(
+            format!("a=t,f=24,s=100,v=80,i=16777223;{pixels}").as_bytes(),
+            (0, 0),
+            false,
+        );
+        parser.callbacks_mut().graphics.command(
+            b"a=p,i=16777223,p=3,U=1,c=4,r=2,x=10,y=20,w=80,h=40",
+            (0, 0),
+            false,
+        );
+
+        // The placeholder is on screen row 3/column 9, but its source cell
+        // is row 1/column 2. Feed every UTF-8 byte through the real PTY path.
+        let text = "\x1b[3;9H\x1b[38;2;0;0;7;58;2;0;0;3m\u{10eeee}\u{030d}\u{030e}\u{030d}\x1b[0m";
+        for chunk in text.as_bytes().chunks(1) {
+            graphics_text(&mut parser, chunk);
+        }
+        let placement = snapshot(&parser).graphics.remove(0);
+        assert_eq!(placement.image, 16_777_223);
+        assert_eq!(placement.placement, 3);
+        assert_eq!((placement.col, placement.row), (8, 2));
+        assert_eq!(
+            (
+                placement.source_x,
+                placement.source_y,
+                placement.source_width,
+                placement.source_height,
+            ),
+            (50, 40, 20, 20)
+        );
     }
     use super::*;
 
