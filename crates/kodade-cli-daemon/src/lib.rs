@@ -11,12 +11,16 @@ mod manifest;
 mod persist;
 mod plugins;
 mod proc;
+pub mod transport;
 
+#[cfg(any(unix, windows))]
+use std::fs;
+#[cfg(unix)]
+use std::os::unix::fs::FileTypeExt;
 use std::{
     collections::{HashMap, HashSet},
-    env, fs,
+    env,
     io::{Read, Write},
-    os::unix::fs::FileTypeExt,
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
@@ -25,6 +29,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use crate::transport::{OwnedWriteHalf, Stream};
 use anyhow::{anyhow, bail, Context, Result};
 use kodade_cli_proto::{
     decode, encode, schema_message, AgentInfo, AgentStateKind, CellColor, ClientMessage, Direction,
@@ -36,7 +41,6 @@ use kodade_cli_proto::{
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use tokio::{
     io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader},
-    net::{UnixListener, UnixStream},
     sync::broadcast,
 };
 
@@ -308,7 +312,8 @@ pub fn socket_path(session: &str) -> PathBuf {
     socket_dir().join(format!("{session}.sock"))
 }
 
-fn hook_socket_path() -> PathBuf {
+#[cfg(unix)]
+fn hook_socket_path(_session: &str) -> PathBuf {
     // Keep hook transport out of the public socket directory: `session ls`
     // deliberately scans its direct `*.sock` children. A PID is unique among
     // concurrent daemons and keeps this path comfortably under sockaddr limits.
@@ -317,8 +322,21 @@ fn hook_socket_path() -> PathBuf {
         .join(format!("{}.sock", std::process::id()))
 }
 
+#[cfg(windows)]
+fn hook_socket_path(session: &str) -> PathBuf {
+    socket_path(session)
+}
+
 /// Directory holding one `<session>.sock` per live session. `session ls` scans
 /// it, so it is part of the public surface.
+#[cfg(windows)]
+pub fn socket_dir() -> PathBuf {
+    persist::state_dir()
+        .unwrap_or_else(std::env::temp_dir)
+        .join("sessions")
+}
+
+#[cfg(not(windows))]
 pub fn socket_dir() -> PathBuf {
     let runtime = env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from);
     let home = dirs::home_dir();
@@ -335,6 +353,7 @@ pub fn socket_dir() -> PathBuf {
     .to_path_buf()
 }
 
+#[cfg(not(windows))]
 fn socket_path_for(
     session: &str,
     runtime: Option<&Path>,
@@ -360,40 +379,48 @@ pub async fn run(session_name: String) -> Result<()> {
     if let Some(parent) = socket.parent() {
         fs::create_dir_all(parent).context("create Ködade CLI socket directory")?;
     }
+    #[cfg(unix)]
     if socket.exists() {
         remove_stale_socket(&socket).await?;
     }
-    let listener = UnixListener::bind(&socket).context("bind Ködade CLI socket")?;
-    let hook_socket = hook_socket_path();
-    fs::create_dir_all(hook_socket.parent().expect("hook socket has parent"))
-        .context("create Ködade hook socket directory")?;
-    if let Ok(metadata) = fs::symlink_metadata(&hook_socket) {
-        if !metadata.file_type().is_socket() {
+    let listener = transport::bind(&socket)
+        .await
+        .context("bind Ködade CLI socket")?;
+    #[cfg(unix)]
+    let hook_socket = hook_socket_path(&session_name);
+    #[cfg(unix)]
+    {
+        fs::create_dir_all(hook_socket.parent().expect("hook socket has parent"))
+            .context("create Ködade hook socket directory")?;
+        if let Ok(metadata) = fs::symlink_metadata(&hook_socket) {
+            if !metadata.file_type().is_socket() {
+                drop(listener);
+                let _ = fs::remove_file(&socket);
+                bail!(
+                    "refusing to replace non-socket Ködade hook path {}",
+                    hook_socket.display()
+                );
+            }
+            // A PID-reused stale socket is safe to remove only after this process
+            // has exclusively bound the public session name. A live socket is not.
+            if let Err(error) = remove_stale_socket(&hook_socket).await {
+                drop(listener);
+                let _ = fs::remove_file(&socket);
+                return Err(error).context("remove stale Ködade hook socket");
+            }
+        }
+        if let Err(error) = fs::hard_link(&socket, &hook_socket) {
             drop(listener);
             let _ = fs::remove_file(&socket);
-            bail!(
-                "refusing to replace non-socket Ködade hook path {}",
-                hook_socket.display()
-            );
+            return Err(error).context("link stable Ködade hook socket");
         }
-        // A PID-reused stale socket is safe to remove only after this process
-        // has exclusively bound the public session name. A live socket is not.
-        if let Err(error) = remove_stale_socket(&hook_socket).await {
-            drop(listener);
-            let _ = fs::remove_file(&socket);
-            return Err(error).context("remove stale Ködade hook socket");
-        }
-    }
-    if let Err(error) = fs::hard_link(&socket, &hook_socket) {
-        drop(listener);
-        let _ = fs::remove_file(&socket);
-        return Err(error).context("link stable Ködade hook socket");
     }
     // Binding succeeded, so no live daemon owns this session: safe to restore.
     let session = match load_session(&session_name) {
         Ok(session) => Arc::new(session),
         Err(error) => {
             drop(listener);
+            #[cfg(unix)]
             let _ = fs::remove_file(&hook_socket);
             let _ = fs::remove_file(&socket);
             return Err(error);
@@ -414,9 +441,7 @@ pub async fn run(session_name: String) -> Result<()> {
     }
     // Keeps agent detection running for event subscribers with no TUI attached.
     tokio::spawn(subscriber_tick(Arc::clone(&session)));
-    // Flush state on SIGTERM so a stopped daemon (e.g. logout) can be restored.
-    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-        .context("install SIGTERM handler")?;
+    let mut termination = Box::pin(wait_for_termination());
     loop {
         tokio::select! {
             _ = shutdown.recv() => {
@@ -425,15 +450,20 @@ pub async fn run(session_name: String) -> Result<()> {
                 persist::remove_session_file(&session.session_name());
                 session.images.clear();
                 drop(listener);
+                #[cfg(any(unix, windows))]
                 let _ = fs::remove_file(session.socket_path());
+                #[cfg(any(unix, windows))]
                 let _ = fs::remove_file(session.hook_socket());
                 return Ok(());
             }
-            _ = sigterm.recv() => {
+            result = &mut termination => {
+                result?;
                 session.save();
                 session.images.clear();
                 drop(listener);
+                #[cfg(any(unix, windows))]
                 let _ = fs::remove_file(session.socket_path());
+                #[cfg(any(unix, windows))]
                 let _ = fs::remove_file(session.hook_socket());
                 return Ok(());
             }
@@ -448,6 +478,22 @@ pub async fn run(session_name: String) -> Result<()> {
             }
         }
     }
+}
+
+async fn wait_for_termination() -> Result<()> {
+    #[cfg(unix)]
+    {
+        let mut signal = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .context("install SIGTERM handler")?;
+        signal.recv().await;
+    }
+    #[cfg(windows)]
+    {
+        tokio::signal::ctrl_c()
+            .await
+            .context("install Ctrl-C handler")?;
+    }
+    Ok(())
 }
 
 /// Restore this session from its state file when one is present and valid; a
@@ -517,9 +563,10 @@ async fn history_loop(session: Arc<Session>) {
     }
 }
 
+#[cfg(unix)]
 async fn remove_stale_socket(socket: &Path) -> Result<()> {
     if let Ok(Ok(_)) =
-        tokio::time::timeout(Duration::from_millis(250), UnixStream::connect(socket)).await
+        tokio::time::timeout(Duration::from_millis(250), transport::connect(socket)).await
     {
         bail!("Ködade CLI daemon already running: {}", socket.display());
     }
@@ -570,7 +617,7 @@ impl Session {
             events,
             subscribers: AtomicUsize::new(0),
             socket: Mutex::new(socket_path(&name_for_socket)),
-            hook_socket: hook_socket_path(),
+            hook_socket: hook_socket_path(&name_for_socket),
             view_dispatch: Mutex::new(()),
         };
         let pane = session.new_pane("shell", None, None)?;
@@ -632,7 +679,7 @@ impl Session {
             events,
             subscribers: AtomicUsize::new(0),
             socket: Mutex::new(socket_path(&file.name)),
-            hook_socket: hook_socket_path(),
+            hook_socket: hook_socket_path(&file.name),
             view_dispatch: Mutex::new(()),
         };
         let mut resumed_native_sessions = HashSet::new();
@@ -3004,7 +3051,11 @@ impl Session {
                 return Err(error).context("link the session socket to its new name");
             }
         }
+        #[cfg(unix)]
         fs::remove_file(&old_socket).context("remove the old session socket")?;
+        // On Windows the discovery record is the stable hook alias. Keep its
+        // hard link after publishing the new public name so already-running
+        // panes with KODADE_SOCKET continue to authenticate to this daemon.
         *self.socket.lock().expect("socket lock poisoned") = new_socket.clone();
         *self.name.lock().expect("name lock poisoned") = new_name.to_owned();
         if let Some(path) = persist::session_file_path(&old_name) {
@@ -3460,7 +3511,10 @@ impl Pane {
             pixel_width: 0,
             pixel_height: 0,
         })?;
+        #[cfg(unix)]
         let shell = env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_owned());
+        #[cfg(windows)]
+        let shell = "cmd.exe".to_owned();
         // With a command, the detection fallback name is the command basename;
         // otherwise it's the login shell's.
         let spawn_process = run
@@ -3475,12 +3529,21 @@ impl Pane {
                     .to_owned()
             });
         let mut command = CommandBuilder::new(&shell);
+        #[cfg(unix)]
         command.arg("-l");
         // Commands run through the login shell so agent CLIs keep their env and
         // credentials handling; `exec` replaces the shell with the target.
         if let Some(args) = &run {
-            command.arg("-c");
-            command.arg(format!("exec {}", proc::shell_command(args)));
+            #[cfg(unix)]
+            {
+                command.arg("-c");
+                command.arg(format!("exec {}", proc::shell_command(args)));
+            }
+            #[cfg(windows)]
+            {
+                command.arg("/C");
+                command.arg(proc::shell_command(args));
+            }
         }
         if let Some(dir) = &cwd {
             command.cwd(dir);
@@ -3818,20 +3881,40 @@ impl Pane {
         if !force && now.saturating_duration_since(process.checked_at) < Duration::from_secs(2) {
             return;
         }
-        let pid = self
-            .master
-            .lock()
-            .expect("PTY master lock poisoned")
-            .process_group_leader();
-        if let Some(pid) = pid {
-            process.pid = Some(pid);
-            process.name = proc::command_of(pid)
-                .as_deref()
-                .and_then(proc::process_basename);
-            process.cwd = proc::cwd_of(pid);
-        } else {
-            process.pid = None;
-            process.name = None;
+        #[cfg(unix)]
+        {
+            let pid = self
+                .master
+                .lock()
+                .expect("PTY master lock poisoned")
+                .process_group_leader();
+            if let Some(pid) = pid {
+                process.pid = Some(pid);
+                process.name = proc::command_of(pid)
+                    .as_deref()
+                    .and_then(proc::process_basename);
+                process.cwd = proc::cwd_of(pid);
+            } else {
+                process.pid = None;
+                process.name = None;
+                process.cwd = None;
+            }
+        }
+        #[cfg(windows)]
+        {
+            let pid = self
+                .child
+                .lock()
+                .expect("PTY child lock poisoned")
+                .process_id();
+            if let Some(pid) = pid {
+                let (pid, name) = proc::descendant_process(pid).unwrap_or((pid as i32, None));
+                process.pid = Some(pid);
+                process.name = name;
+            } else {
+                process.pid = None;
+                process.name = None;
+            }
             process.cwd = None;
         }
         process.checked_at = now;
@@ -4495,7 +4578,7 @@ async fn read_client_line<R: AsyncBufRead + Unpin>(
     }
 }
 
-async fn serve_client(stream: UnixStream, session: Arc<Session>) -> Result<()> {
+async fn serve_client(stream: Stream, session: Arc<Session>) -> Result<()> {
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
     let mut line_buffer = Vec::new();
@@ -4743,10 +4826,7 @@ fn tick_subscribers(session: &Session) {
     }
 }
 
-async fn write_server(
-    writer: &mut tokio::net::unix::OwnedWriteHalf,
-    message: &ServerMessage,
-) -> Result<()> {
+async fn write_server(writer: &mut OwnedWriteHalf, message: &ServerMessage) -> Result<()> {
     writer.write_all(&encode(message)?).await?;
     Ok(())
 }
@@ -4754,7 +4834,7 @@ async fn write_server(
 /// Flushes any notifications this client has not seen yet, always after a fresh
 /// snapshot so the client can resolve workspace/tab names from it.
 async fn send_notifications(
-    writer: &mut tokio::net::unix::OwnedWriteHalf,
+    writer: &mut OwnedWriteHalf,
     session: &Arc<Session>,
     last_seq: &mut u64,
     subscribed: bool,
@@ -4769,7 +4849,7 @@ async fn send_notifications(
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     #[test]
     fn graphics_follow_bottom_row_autowrap_and_scroll_commands() {
@@ -4789,6 +4869,7 @@ mod tests {
         assert!(parser.callbacks().graphics.placements(false, 0).is_empty());
     }
     use super::*;
+    use tokio::net::{UnixListener, UnixStream};
 
     #[tokio::test]
     async fn pane_context_is_created_after_acceptance_and_removed_with_the_pane() {
@@ -5175,7 +5256,7 @@ mod tests {
             20,
             2,
             "scroll-test".into(),
-            hook_socket_path(),
+            hook_socket_path("test"),
             updates,
             Arc::new(AtomicU64::new(0)),
             None,
@@ -6261,7 +6342,7 @@ mod tests {
         );
         let renamed = format!("{unique}-new");
         let public = socket_path(&unique);
-        let stable = hook_socket_path();
+        let stable = hook_socket_path("test");
         let new_public = socket_path(&renamed);
         let _ = fs::remove_file(&public);
         let _ = fs::remove_file(&stable);
