@@ -112,6 +112,11 @@ Host kodade-unix-fixture
     $previousHome = $env:USERPROFILE
     $env:USERPROFILE = $clientHome
     try {
+        Write-Host 'checking Windows remote preparation accepts the installed Unix artifact'
+        # This exercises the Windows client's compatibility preflight against
+        # the real Linux binary before the bridge opens a daemon connection.
+        Invoke-Native $WindowsBinary @('machine', 'prepare', 'kodade-unix-fixture') 45 | Out-Null
+
         Write-Host 'running Windows client through the Unix SSH bridge'
         # Both commands create a Windows authenticated loopback bridge, then
         # send daemon protocol through the Windows OpenSSH client into the Unix
@@ -130,6 +135,18 @@ Host kodade-unix-fixture
         }
         if (-not $seen) { throw 'Unix PTY output did not return through the Windows SSH bridge' }
         Invoke-Native $WindowsBinary @('--remote', 'kodade-unix-fixture', '--session', $session, 'kill-session') 45 | Out-Null
+
+        # A remote executable that identifies as another version must be
+        # rejected before the Windows client starts the bridge.
+        Set-Content -LiteralPath $remoteBinary -Value "#!/bin/sh`necho kodade-cli 0.0.0" -NoNewline
+        Invoke-Wsl @('sh', '-lc', 'chmod 700 /root/.local/bin/kodade-cli')
+        try {
+            Invoke-Native $WindowsBinary @('--remote', 'kodade-unix-fixture', 'session', 'ls') 45 | Out-Null
+            throw 'Windows client accepted an incompatible Unix kodade-cli version'
+        } catch {
+            if ($_.Exception.Message -match 'accepted an incompatible') { throw }
+            if ($_.Exception.Message -notmatch 'incompatible kodade-cli') { throw }
+        }
     } finally {
         $env:USERPROFILE = $previousHome
     }
