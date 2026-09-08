@@ -341,7 +341,9 @@ where
     let version = release.tag_name.trim_start_matches('v').to_owned();
     let asset = update::platform_asset_for(&version, os_to_target(os)?, arch_to_target(arch)?)?;
     let sums = String::from_utf8(fetch(update::release_asset_url(&release, "SHA256SUMS")?)?)?;
-    let archive = fetch(update::release_asset_url(&release, &asset)?)?;
+    let archive_url = update::release_asset_url(&release, &asset)
+        .with_context(|| format!("published release is missing {asset}"))?;
+    let archive = fetch(archive_url)?;
     Ok((
         update::verified_binary(&archive, &update::checksum(&sums, &asset)?)?,
         version,
@@ -375,7 +377,7 @@ async fn upload_binary(
         .take()
         .context("remote install stdin unavailable")?;
     stdin
-        .write_all(&binary)
+        .write_all(binary)
         .await
         .context("upload verified remote binary")?;
     drop(stdin);
