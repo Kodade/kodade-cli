@@ -1,8 +1,16 @@
 //! Bounded clipboard writes owned by the attached client.
 
-use anyhow::{Context, Result};
-use std::{process::Stdio, time::Duration};
+#[cfg(not(windows))]
+use anyhow::Context;
+use anyhow::Result;
+#[cfg(not(windows))]
+use std::process::Stdio;
+use std::time::Duration;
+#[cfg(not(windows))]
 use tokio::io::AsyncWriteExt;
+
+#[cfg(windows)]
+mod windows;
 
 use crate::mode::{osc52, OSC52_LIMIT};
 
@@ -91,11 +99,10 @@ fn limit(text: &str) -> (&str, bool) {
     }
 }
 
+#[cfg(not(windows))]
 fn command() -> (&'static str, &'static [&'static str]) {
     if cfg!(target_os = "macos") {
         ("pbcopy", &[])
-    } else if cfg!(windows) {
-        ("clip.exe", &[])
     } else if std::env::var_os("WAYLAND_DISPLAY").is_some() {
         ("wl-copy", &["--type", "text/plain;charset=utf-8"])
     } else {
@@ -104,23 +111,18 @@ fn command() -> (&'static str, &'static [&'static str]) {
 }
 
 async fn native_copy(text: &str) -> Result<()> {
-    let (program, args) = command();
-    run_native(program, args, &native_payload(text), CLIPBOARD_TIMEOUT).await
-}
-
-fn native_payload(text: &str) -> Vec<u8> {
-    if cfg!(windows) {
-        // clip.exe consumes redirected input through the active console code
-        // page. Its documented pipe interface therefore cannot promise that
-        // UTF-8 survives unchanged. A BOM makes the UTF-16LE stream explicit.
-        let mut bytes = vec![0xff, 0xfe];
-        bytes.extend(text.encode_utf16().flat_map(u16::to_le_bytes));
-        bytes
-    } else {
-        text.as_bytes().to_vec()
+    #[cfg(windows)]
+    {
+        windows::copy(text, CLIPBOARD_TIMEOUT).await
+    }
+    #[cfg(not(windows))]
+    {
+        let (program, args) = command();
+        run_native(program, args, text.as_bytes(), CLIPBOARD_TIMEOUT).await
     }
 }
 
+#[cfg(not(windows))]
 async fn run_native(program: &str, args: &[&str], bytes: &[u8], timeout: Duration) -> Result<()> {
     let mut command = tokio::process::Command::new(program);
     command
@@ -298,19 +300,5 @@ mod tests {
             "clipboard backend child {pid} survived timeout"
         );
         let _ = std::fs::remove_file(path);
-    }
-
-    #[test]
-    fn native_payload_preserves_unicode() {
-        let text = "Ködade 日本語 🚀";
-        let payload = native_payload(text);
-        #[cfg(windows)]
-        {
-            let mut expected = vec![0xff, 0xfe];
-            expected.extend(text.encode_utf16().flat_map(u16::to_le_bytes));
-            assert_eq!(payload, expected);
-        }
-        #[cfg(not(windows))]
-        assert_eq!(payload, text.as_bytes());
     }
 }
