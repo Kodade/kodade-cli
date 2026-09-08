@@ -18,8 +18,9 @@ struct Harness {
 
 impl Harness {
     fn new() -> Self {
-        let root = std::env::temp_dir().join(format!(
-            "kodade-cli-agent-automation-{}-{}",
+        // macOS TMPDIR paths alone can consume most of sockaddr_un.
+        let root = PathBuf::from("/tmp").join(format!(
+            "ka-{}-{}",
             std::process::id(),
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -32,6 +33,8 @@ impl Harness {
         fs::create_dir_all(&state).expect("create state directory");
         let session = "automation".to_owned();
         let daemon = Command::new(BIN)
+            .env("HOME", &root)
+            .env("SHELL", "/bin/sh")
             .env("XDG_RUNTIME_DIR", &runtime)
             .env("XDG_STATE_HOME", &state)
             .args(["-s", &session, "daemon"])
@@ -60,6 +63,8 @@ impl Harness {
     {
         let mut command = Command::new(BIN);
         command
+            .env("HOME", &self.root)
+            .env("SHELL", "/bin/sh")
             .env("XDG_RUNTIME_DIR", &self.runtime)
             .env("XDG_STATE_HOME", &self.state)
             .arg("-s")
