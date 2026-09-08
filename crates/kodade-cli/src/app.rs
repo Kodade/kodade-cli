@@ -3497,7 +3497,7 @@ pub fn bytes(k: KeyEvent) -> Option<Vec<u8>> {
     Some(b)
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
