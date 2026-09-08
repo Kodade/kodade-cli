@@ -52,7 +52,7 @@ printf '%s\n' '{"Query":"Layout"}' | nc -U /tmp/kodade-cli-$UID/default.sock
 | `Query(Schema)` | `{"Query":"Schema"}` | `Schema` |
 | `Subscribe` | `"Subscribe"` | `Layout`, then `Event`s |
 | `ApplyLayout` | `{"ApplyLayout":{"version":1,…}}` | `Layout` |
-| `Hello` | `{"Hello":{"cols":120,"rows":40,"version":1}}` | `Welcome` + `Layout` |
+| `Hello` | `{"Hello":{"cols":120,"rows":40,"version":2}}` | `Welcome` + `Layout` |
 | `Input` | `{"Input":{"bytes":[108,115,13]}}` | `Layout` |
 | `Resize` | `{"Resize":{"cols":120,"rows":40}}` | `Layout` |
 | `SplitRight` / `SplitDown` | `"SplitRight"` | `Layout` |
@@ -161,9 +161,9 @@ request; one-shot command clients can still treat the `Error` reply as failure.
 
 ## Server messages
 
-- `Welcome` — `{"Welcome":{"session":"default","version":1}}`. Sent once, in
+- `Welcome` — `{"Welcome":{"session":"default","version":2}}`. Sent once, in
   reply to `Hello`.
-- `Version` — `{"Version":{"version":1}}`. Reply to `Query(Version)`.
+- `Version` — `{"Version":{"version":2}}`. Reply to `Query(Version)`.
 - `Pane` — `{"Pane":{…PaneSnapshot…}}`. Reply to `Query(Pane)`. Unlike `Layout`,
   which only carries the active tab's panes, this reaches any pane in the
   session; an unknown id answers `Error`.
@@ -184,7 +184,7 @@ request; one-shot command clients can still treat the `Error` reply as failure.
 - `Event` — `{"Event":{…}}`. Only sent to subscribed connections (see below).
 - `Session` — `{"Session":{"version":1,…}}`. The persisted-layout view of the
   session; the same JSON `layout export` writes and `ApplyLayout` accepts.
-- `Schema` — `{"Schema":{"version":1,"client_messages":[…],"server_messages":[…]}}`.
+- `Schema` — `{"Schema":{"version":2,"client_messages":[…],"server_messages":[…]}}`.
 - `Manifests` — `{"Manifests":[{"name":"codex","source":"builtin",…}]}`.
 - `Error` — `{"Error":{"message":"pane 9 not found"}}`. The daemon closes the
   connection after an error reply.
@@ -234,10 +234,10 @@ Notes:
 version:
 
 ```json
-{"Schema":{"version":1,"client_messages":["Query","Subscribe",…],"server_messages":["Welcome","Layout",…]}}
+{"Schema":{"version":2,"client_messages":["Query","Subscribe",…],"server_messages":["Welcome","Layout",…]}}
 ```
 
-Version 1 is the current protocol (`PROTOCOL_VERSION` in `kodade-cli-proto`).
+Version 2 is the current protocol (`PROTOCOL_VERSION` in `kodade-cli-proto`).
 Both ends check it at attach time so a stale binary fails fast (#23):
 
 - The client's first message is `Hello { cols, rows, version }`. `version`

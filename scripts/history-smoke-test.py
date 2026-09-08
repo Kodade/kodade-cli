@@ -81,8 +81,10 @@ with tempfile.TemporaryDirectory(prefix="kodade-history-smoke-") as temp:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
             client.settimeout(5)
             client.connect(str(Path(env["XDG_RUNTIME_DIR"]) / "kodade-cli/history-smoke.sock"))
-            client.sendall(json.dumps({"Hello": {"cols": 140, "rows": 45, "version": 1}}).encode() + b"\n")
             reader = client.makefile("rb")
+            client.sendall(json.dumps({"Query": "Version"}).encode() + b"\n")
+            protocol = json.loads(reader.readline())["Version"]["version"]
+            client.sendall(json.dumps({"Hello": {"cols": 140, "rows": 45, "version": protocol}}).encode() + b"\n")
             while "Welcome" not in json.loads(reader.readline()):
                 pass
             reader.close()

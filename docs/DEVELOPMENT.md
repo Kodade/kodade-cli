@@ -185,7 +185,7 @@ IDs, never a directory-wide “last session” lookup.
 
 ## Protocol versioning (#23)
 
-`kodade-cli-proto` exports `PROTOCOL_VERSION: u32` (currently `1`). Both ends
+`kodade-cli-proto` exports `PROTOCOL_VERSION: u32` (currently `2`). Both ends
 check it at attach time so a stale binary fails fast with a clear message
 instead of misbehaving. Bump it whenever a client and daemon can no longer
 understand each other. The handshake, the `Query(Version)` probe, and the
