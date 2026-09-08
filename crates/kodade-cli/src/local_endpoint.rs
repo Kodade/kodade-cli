@@ -23,6 +23,7 @@ pub struct Viewport {
     pub cols: u16,
     pub rows: u16,
     pub compact: bool,
+    pub colors: Option<kodade_cli_proto::TerminalColors>,
 }
 
 pub fn spawn(
@@ -75,6 +76,7 @@ pub fn spawn(
                                 }
                                 connection.writer.write_all(&encode(&ClientMessage::Resize { cols: viewport.cols, rows: viewport.rows })?).await?;
                                 connection.writer.write_all(&encode(&ClientMessage::SetCompactView { enabled: viewport.compact })?).await?;
+                                connection.writer.write_all(&encode(&ClientMessage::SetTerminalColors { colors: viewport.colors.clone() })?).await?;
                                 Update::EndpointConnected { session, socket: socket.clone() }
                             }
                             ServerMessage::Layout(layout) => { view.observe(&layout); Update::Layout(layout) },
@@ -147,6 +149,11 @@ async fn reconnect(
         writer
             .write_all(&encode(&ClientMessage::SetCompactView {
                 enabled: viewport.compact,
+            })?)
+            .await?;
+        writer
+            .write_all(&encode(&ClientMessage::SetTerminalColors {
+                colors: viewport.colors.clone(),
             })?)
             .await?;
         for message in view.restore() {

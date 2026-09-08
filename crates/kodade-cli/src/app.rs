@@ -441,6 +441,7 @@ impl App {
                 self.local_session.clone(),
                 self.pane_cols(size.width),
                 size.height,
+                self.theme_colors(),
                 router.updates(id.clone(), updates.clone()),
                 receiver,
             );
@@ -644,6 +645,13 @@ impl App {
             self.sidebar_mode = SidebarMode::Full;
             self.auto_hidden = false;
         }
+    }
+
+    pub fn theme_colors(&self) -> Option<kodade_cli_proto::TerminalColors> {
+        std::env::var_os("NO_COLOR")
+            .filter(|value| !value.is_empty())
+            .is_none()
+            .then(|| self.theme.terminal_colors())
     }
 
     /// Pane width for the current sidebar state, used by `Hello` and `Resize`.
@@ -1941,7 +1949,16 @@ impl App {
                 }
                 self.send_resize(writer, term).await?;
             }
-            config::Action::ReloadConfig => self.reload_config(term)?,
+            config::Action::ReloadConfig => {
+                self.reload_config(term)?;
+                write(
+                    writer,
+                    &ClientMessage::SetTerminalColors {
+                        colors: self.theme_colors(),
+                    },
+                )
+                .await?;
+            }
             config::Action::Settings => {
                 self.settings = Some(settings::overlay(&self.config, 0));
             }

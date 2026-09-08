@@ -211,7 +211,16 @@ fn plugin_version_gt(required: &str, current: &str) -> Result<bool> {
 /// Wire protocol version. Bumped whenever a client and daemon can no longer
 /// understand each other. Both ends compare it at attach time (see `Hello` /
 /// `Welcome`) so a stale binary fails fast instead of misbehaving (#23).
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
+
+/// Colors the attached client actually uses when rendering a pane. The daemon
+/// retains these only for read-only terminal color queries from that pane.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TerminalColors {
+    pub foreground: [u8; 3],
+    pub background: [u8; 3],
+    pub palette: [[u8; 3]; 16],
+}
 
 // No `Eq`: `ApplyLayout` carries the split ratios, which are floats.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -243,6 +252,11 @@ pub enum ClientMessage {
     /// the shared tab tree and its other PTYs intact.
     SetCompactView {
         enabled: bool,
+    },
+    /// Report the rendering colors for this interactive client. This never
+    /// changes terminal colors; it only enables accurate OSC read queries.
+    SetTerminalColors {
+        colors: Option<TerminalColors>,
     },
     SplitRight,
     SplitDown,
@@ -1014,6 +1028,7 @@ pub const CLIENT_MESSAGE_NAMES: &[&str] = &[
     "Input",
     "Resize",
     "SetCompactView",
+    "SetTerminalColors",
     "SplitRight",
     "SplitDown",
     "ClosePane",
@@ -1091,6 +1106,7 @@ pub fn client_message_name(message: &ClientMessage) -> &'static str {
         ClientMessage::Input { .. } => "Input",
         ClientMessage::Resize { .. } => "Resize",
         ClientMessage::SetCompactView { .. } => "SetCompactView",
+        ClientMessage::SetTerminalColors { .. } => "SetTerminalColors",
         ClientMessage::SplitRight => "SplitRight",
         ClientMessage::SplitDown => "SplitDown",
         ClientMessage::ClosePane => "ClosePane",
@@ -1315,6 +1331,13 @@ mod tests {
             ClientMessage::Input { bytes: vec![1] },
             ClientMessage::Resize { cols: 80, rows: 24 },
             ClientMessage::SetCompactView { enabled: true },
+            ClientMessage::SetTerminalColors {
+                colors: Some(TerminalColors {
+                    foreground: [1, 2, 3],
+                    background: [4, 5, 6],
+                    palette: [[7, 8, 9]; 16],
+                }),
+            },
             ClientMessage::SplitRight,
             ClientMessage::SplitDown,
             ClientMessage::ClosePane,

@@ -15,6 +15,7 @@ mod persist;
 mod plugins;
 mod proc;
 mod pty_io;
+mod terminal_colors;
 mod terminal_modes;
 mod terminal_replay;
 
@@ -281,6 +282,7 @@ struct ClientView {
     cols: u16,
     rows: u16,
     compact: bool,
+    terminal_colors: Option<kodade_cli_proto::TerminalColors>,
 }
 
 impl ClientView {
@@ -305,6 +307,7 @@ impl ClientView {
             cols,
             rows,
             compact: false,
+            terminal_colors: None,
         }
     }
 }
@@ -361,6 +364,7 @@ struct PtyCallbacks {
     sync_tail: Vec<u8>,
     sync_frozen: Option<(Instant, Screen)>,
     terminal_modes: terminal_modes::Modes,
+    terminal_colors: terminal_colors::Tracker,
 }
 impl vt100::Callbacks for PtyCallbacks {
     fn set_window_title(&mut self, _: &mut vt100::Screen, title: &[u8]) {
@@ -2047,6 +2051,10 @@ impl Session {
     /// mutation implementation without allowing that temporary selection to
     /// escape to a different socket or into persisted state.
     fn handle_view(&self, message: ClientMessage, view: &mut ClientView) -> Result<()> {
+        if let ClientMessage::SetTerminalColors { colors } = message {
+            view.terminal_colors = colors;
+            return self.set_view_terminal_colors(view);
+        }
         if let ClientMessage::SetCompactView { enabled } = message {
             view.compact = enabled;
             return self.resize_for_view(view);
@@ -2144,6 +2152,30 @@ impl Session {
             self.save();
         }
         result
+    }
+
+    fn set_view_terminal_colors(&self, view: &ClientView) -> Result<()> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow!("state lock poisoned"))?;
+        let (_, _, pane_id) = Self::view_selection(&state, Some(view));
+        drop(state);
+        if let Some(pane) = self
+            .panes
+            .lock()
+            .map_err(|_| anyhow!("pane lock poisoned"))?
+            .get(&pane_id)
+            .cloned()
+        {
+            pane.parser
+                .lock()
+                .map_err(|_| anyhow!("PTY parser lock poisoned"))?
+                .callbacks_mut()
+                .terminal_colors
+                .set(view.terminal_colors.clone());
+        }
+        Ok(())
     }
     fn notify(&self) {
         // Every mutation funnels through here (directly or via `resize`), so this
@@ -2769,7 +2801,7 @@ impl Session {
                 version: _,
             }
             | ClientMessage::Resize { cols, rows } => self.resize(cols, rows)?,
-            ClientMessage::SetCompactView { .. } => {}
+            ClientMessage::SetCompactView { .. } | ClientMessage::SetTerminalColors { .. } => {}
             ClientMessage::Input { bytes } => {
                 let state = self
                     .state
@@ -4527,6 +4559,7 @@ impl Pane {
                         .callbacks()
                         .graphics_virtual_style
                         .capture_handoff()?,
+                    terminal_colors: parser.callbacks().terminal_colors.snapshot(),
                     clipboard: parser.callbacks().clipboard.clone(),
                     graphics_placeholder: parser.callbacks().graphics_placeholder.clone(),
                     sync_tail: parser.callbacks().sync_tail.clone(),
@@ -4589,6 +4622,8 @@ impl Pane {
             graphics::UnicodeTracker::restore_handoff(runtime.graphics_unicode);
         parser.callbacks_mut().graphics_virtual_style =
             graphics::VirtualStyle::restore_handoff(runtime.graphics_virtual_style);
+        parser.callbacks_mut().terminal_colors =
+            terminal_colors::Tracker::restore(runtime.terminal_colors);
         parser.callbacks_mut().clipboard = runtime.clipboard;
         parser.callbacks_mut().graphics_placeholder = runtime.graphics_placeholder;
         parser.callbacks_mut().sync_tail = runtime.sync_tail;
@@ -5378,6 +5413,7 @@ fn read_pty(
                     }
                 }
                 replies.extend(parser.callbacks_mut().terminal_modes.take_replies());
+                replies.extend(parser.callbacks_mut().terminal_colors.take_replies());
             }
             if !replies.is_empty() {
                 if let Ok(mut writer) = writer.lock() {
@@ -5413,6 +5449,7 @@ fn graphics_text_inner(parser: &mut PtyParser, text: &[u8], feed_modes: bool) {
         if feed_modes {
             parser.callbacks_mut().terminal_modes.feed(raw);
         }
+        parser.callbacks_mut().terminal_colors.feed(raw);
         style.feed(raw);
         let chars = unicode.feed(raw);
         let mut placeholder_cell = None;

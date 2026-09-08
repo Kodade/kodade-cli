@@ -186,6 +186,7 @@ pub fn spawn_machine(
     session: String,
     cols: u16,
     rows: u16,
+    colors: Option<kodade_cli_proto::TerminalColors>,
     updates: Updates,
     commands: mpsc::Receiver<ClientMessage>,
 ) {
@@ -196,6 +197,7 @@ pub fn spawn_machine(
             cols,
             rows,
             compact: false,
+            colors,
         };
         let mut view = crate::reconnect_view::View::default();
         let mut remote_session = profile.session.clone().unwrap_or(session);
@@ -250,6 +252,7 @@ async fn connect_machine(
         cols,
         rows,
         compact,
+        ..
     } = viewport;
     let (socket, _tunnel) = tokio::select! {
         result = tokio::time::timeout(Duration::from_secs(12), remote::connect_endpoint(&profile.target, session)) => {
@@ -302,6 +305,13 @@ async fn connect_machine(
         &ClientMessage::SetCompactView { enabled: *compact },
     )
     .await?;
+    write_endpoint(
+        &mut writer,
+        &ClientMessage::SetTerminalColors {
+            colors: viewport.colors.clone(),
+        },
+    )
+    .await?;
     for message in view.restore() {
         write_endpoint(&mut writer, &message).await?;
     }
@@ -325,6 +335,13 @@ async fn connect_machine(
         &ClientMessage::Resize {
             cols: *cols,
             rows: *rows,
+        },
+    )
+    .await?;
+    write_endpoint(
+        &mut writer,
+        &ClientMessage::SetTerminalColors {
+            colors: viewport.colors.clone(),
         },
     )
     .await?;
