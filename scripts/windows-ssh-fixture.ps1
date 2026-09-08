@@ -154,8 +154,7 @@ Host kodade-unix-fixture
 
         # A remote executable that identifies as another version must be
         # rejected before the Windows client starts the bridge.
-        Set-Content -LiteralPath $remoteBinary -Value "#!/bin/sh`necho kodade-cli 0.0.0" -NoNewline
-        Invoke-Wsl @('sh', '-lc', 'chmod 700 /root/.local/bin/kodade-cli')
+        Invoke-Wsl @('sh', '-lc', "printf '%s\n' '#!/bin/sh' 'echo kodade-cli 0.0.0' > /root/.local/bin/kodade-cli && chmod 700 /root/.local/bin/kodade-cli")
         try {
             Invoke-Native $WindowsBinary @('--remote', 'kodade-unix-fixture', 'session', 'ls') 45 | Out-Null
             throw 'Windows client accepted an incompatible Unix kodade-cli version'
