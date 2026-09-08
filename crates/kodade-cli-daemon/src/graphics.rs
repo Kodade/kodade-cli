@@ -13,6 +13,7 @@ const MAX_IMAGE: usize = 8 * 1024 * 1024;
 const MAX_STORE: usize = 32 * 1024 * 1024;
 const MAX_IMAGES: usize = 16;
 const MAX_PLACEMENTS: usize = 64;
+const MAX_VIRTUAL_CELLS: usize = 65_536;
 const MAX_FRAME: usize = 8192;
 const KITTY_UNICODE_PLACEHOLDER: &[u8] = "\u{10eeee}".as_bytes();
 const PLACEHOLDER_CELL: u8 = b' ';
@@ -255,13 +256,16 @@ struct Transfer {
 #[derive(Default)]
 pub struct Store {
     images: BTreeMap<u32, ImageData>,
+    image_numbers: BTreeMap<u32, u32>,
     placements: Vec<StoredPlacement>,
     transfer: Option<Transfer>,
     revision: u64,
     next_image: u32,
     next_placement: u32,
-    virtual_cells: BTreeMap<(bool, u16, u16), VirtualCell>,
-    last_virtual_cell: Option<(bool, u16, u16)>,
+    /// Placeholder cells use logical rows: zero is the live viewport's top,
+    /// negative rows are retained normal-screen history.
+    virtual_cells: BTreeMap<(bool, i32, u16), VirtualCell>,
+    last_virtual_cell: Option<(bool, i32, u16)>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -312,9 +316,14 @@ enum Control {
     Index,
     ReverseIndex,
     Clear,
+    EraseHistory,
     EraseDisplay(u16),
     EraseLine(u16),
     EraseChars(u16),
+    InsertChars(u16),
+    DeleteChars(u16),
+    InsertLines(u16),
+    DeleteLines(u16),
     Reset,
     Scroll(i32),
     Margins(u16, u16),
@@ -354,9 +363,14 @@ impl vte::Perform for Controls {
         let first = params.next().and_then(|p| p.first()).copied().unwrap_or(0);
         self.0 = match command {
             'J' if first == 2 => Some(Control::Clear),
+            'J' if first == 3 => Some(Control::EraseHistory),
             'J' if first <= 1 => Some(Control::EraseDisplay(first)),
             'K' if first <= 2 => Some(Control::EraseLine(first)),
             'X' => Some(Control::EraseChars(first.max(1))),
+            '@' => Some(Control::InsertChars(first.max(1))),
+            'P' => Some(Control::DeleteChars(first.max(1))),
+            'L' => Some(Control::InsertLines(first.max(1))),
+            'M' => Some(Control::DeleteLines(first.max(1))),
             'S' => Some(Control::Scroll(i32::from(first.max(1)))),
             'T' => Some(Control::Scroll(-i32::from(first.max(1)))),
             'r' => Some(Control::Margins(
@@ -369,13 +383,20 @@ impl vte::Perform for Controls {
 }
 
 impl Tracker {
-    pub fn feed(&mut self, byte: u8, screen: &vt100::Screen, store: &mut Store) -> bool {
+    pub fn reset_resize(&mut self) {
+        self.margins = [None, None];
+    }
+
+    pub fn feed(&mut self, byte: u8, screen: &vt100::Screen, store: &mut Store) -> u16 {
         self.events.0 = None;
         self.parser.advance(&mut self.events, &[byte]);
         let Some(event) = self.events.0.take() else {
-            return false;
+            return 0;
         };
-        let printed = matches!(event, Control::Print(_));
+        let printed = match event {
+            Control::Print(c) => c.width().unwrap_or(0) as u16,
+            _ => 0,
+        };
         let alternate = screen.alternate_screen();
         let (height, width) = screen.size();
         let (height, width) = (height.get(), width.get());
@@ -393,29 +414,68 @@ impl Tracker {
                     (end - 1).min(height - 1)
                 };
                 *margin = (start < end).then_some((start, end));
-                return false;
+                return 0;
             }
             Control::Reset => {
                 self.margins = [None, None];
                 store.clear_screen(false);
                 store.clear_screen(true);
-                return false;
+                return 0;
             }
             Control::Clear => {
-                store.clear_screen(alternate);
-                return false;
+                store.clear_visible(alternate);
+                return 0;
+            }
+            Control::EraseHistory => {
+                store
+                    .virtual_cells
+                    .retain(|&(alt, row, _), _| alt != alternate || row >= 0);
+                store.placements.retain(|entry| {
+                    entry.alternate != alternate
+                        || entry.virtual_placement
+                        || entry.placement.row + i32::from(entry.placement.rows) > 0
+                });
+                return 0;
             }
             Control::EraseDisplay(mode) => {
                 store.erase_display(alternate, row, col, height, width, mode);
-                return false;
+                return 0;
             }
             Control::EraseLine(mode) => {
                 store.erase_line(alternate, row, col, width, mode);
-                return false;
+                return 0;
             }
             Control::EraseChars(count) => {
                 store.erase_range(alternate, row, col, col.saturating_add(count).min(width));
-                return false;
+                return 0;
+            }
+            Control::InsertChars(count) => {
+                store.insert_chars(
+                    alternate,
+                    row,
+                    col,
+                    count.min(width.saturating_sub(col)),
+                    width,
+                );
+                return 0;
+            }
+            Control::DeleteChars(count) => {
+                store.delete_chars(
+                    alternate,
+                    row,
+                    col,
+                    count.min(width.saturating_sub(col)),
+                    width,
+                );
+                return 0;
+            }
+            Control::InsertLines(count) if (top..=bottom).contains(&row) => {
+                store.insert_lines(alternate, row, bottom, count.min(bottom - row + 1));
+                return 0;
+            }
+            Control::DeleteLines(count) if (top..=bottom).contains(&row) => {
+                store.delete_lines(alternate, row, bottom, count.min(bottom - row + 1));
+                return 0;
             }
             Control::Index if row == bottom => 1,
             Control::ReverseIndex if row == top => -1,
@@ -437,7 +497,7 @@ impl Tracker {
         };
         if shift != 0 {
             if top == 0 && bottom == height - 1 && !alternate && shift > 0 {
-                store.scroll(alternate, shift);
+                store.scroll(alternate, shift, height);
             } else {
                 store.scroll_region(alternate, top, bottom, shift);
             }
@@ -447,6 +507,38 @@ impl Tracker {
 }
 
 impl Store {
+    /// Keep virtual cells in the same logical coordinate space as vt100 after
+    /// its active grid moves rows during a resize. The inactive grid has no
+    /// observable cursor delta, so its placeholders are conservatively reset.
+    pub fn resize_virtual_cells(&mut self, active: bool, row_delta: i32, rows: u16, cols: u16) {
+        self.virtual_cells = self
+            .virtual_cells
+            .iter()
+            .filter_map(|(&(alternate, row, col), &cell)| {
+                if alternate != active {
+                    return None;
+                }
+                let row = row.saturating_add(row_delta);
+                let row_valid = if alternate {
+                    (0..i32::from(rows)).contains(&row)
+                } else {
+                    row >= -10_000
+                };
+                (row_valid && col < cols).then_some(((alternate, row, col), cell))
+            })
+            .collect();
+        self.last_virtual_cell = self
+            .last_virtual_cell
+            .filter(|key| self.virtual_cells.contains_key(key));
+    }
+
+    fn image_by_number(&self, number: u32) -> Option<u32> {
+        self.images
+            .values()
+            .filter(|image| self.image_numbers.get(&image.id) == Some(&number))
+            .max_by_key(|image| image.revision)
+            .map(|image| image.id)
+    }
     fn delete_matching(
         &mut self,
         mut matches: impl FnMut(&StoredPlacement) -> bool,
@@ -469,17 +561,20 @@ impl Store {
         deleted.into_iter().map(|(image, _)| image).collect()
     }
 
-    fn remove_unused_images(&mut self) {
+    fn remove_image_data(&mut self, affected: &HashSet<u32>) {
         self.images.retain(|image, _| {
-            self.placements
-                .iter()
-                .any(|entry| entry.placement.image == *image)
+            !affected.contains(image)
+                || self
+                    .placements
+                    .iter()
+                    .any(|entry| entry.placement.image == *image)
         });
     }
 
     pub fn clear_virtual_cell(&mut self, alternate: bool, row: u16, col: u16) {
-        self.virtual_cells.remove(&(alternate, row, col));
-        if self.last_virtual_cell == Some((alternate, row, col)) {
+        let key = (alternate, i32::from(row), col);
+        self.virtual_cells.remove(&key);
+        if self.last_virtual_cell == Some(key) {
             self.last_virtual_cell = None;
         }
     }
@@ -493,7 +588,7 @@ impl Store {
     ) {
         if let Some((image_low, placement)) = ids.filter(|(image, _)| *image != 0) {
             self.virtual_cells.insert(
-                (alternate, row, col),
+                (alternate, i32::from(row), col),
                 VirtualCell {
                     image_low,
                     placement: (placement != 0).then_some(placement),
@@ -502,7 +597,10 @@ impl Store {
                     image_high: None,
                 },
             );
-            self.last_virtual_cell = Some((alternate, row, col));
+            self.last_virtual_cell = Some((alternate, i32::from(row), col));
+            while self.virtual_cells.len() > MAX_VIRTUAL_CELLS {
+                self.virtual_cells.pop_first();
+            }
         }
     }
 
@@ -597,10 +695,23 @@ impl Store {
     ) -> Vec<ImagePlacement> {
         let (rows, cols) = screen.size();
         let mut visible = Vec::new();
+        if self
+            .virtual_cells
+            .range((alternate, i32::MIN, 0)..=(alternate, i32::MAX, u16::MAX))
+            .next()
+            .is_none()
+        {
+            return visible;
+        }
         for row in 0..rows.get() {
+            let logical_row = i32::from(row).saturating_sub(scroll.min(i32::MAX as usize) as i32);
             let mut previous: Option<ResolvedVirtualCell> = None;
             for col in 0..cols.get() {
-                let Some(cell) = self.virtual_cells.get(&(alternate, row, col)).copied() else {
+                let Some(cell) = self
+                    .virtual_cells
+                    .get(&(alternate, logical_row, col))
+                    .copied()
+                else {
                     previous = None;
                     continue;
                 };
@@ -671,7 +782,7 @@ impl Store {
                 p.source_height = (u64::from(p.source_height) * u64::from(resolved.row + 1)
                     / u64::from(grid_rows)) as u32
                     - source_y as u32;
-                p.row = i32::from(row).saturating_add(scroll.min(i32::MAX as usize) as i32);
+                p.row = i32::from(row);
                 p.col = col;
                 p.cols = 1;
                 p.rows = 1;
@@ -695,28 +806,38 @@ impl Store {
                 })
                 .or_insert_with(|| p.clone());
         }
-        for entry in &self.placements {
-            let Some(parent) = entry.parent else { continue };
-            let Some(mut p) = anchors.get(&parent).cloned() else {
-                continue;
-            };
-            p.image = entry.placement.image;
-            p.revision = entry.placement.revision;
-            p.placement = entry.placement.placement;
-            p.cols = entry.placement.cols;
-            p.rows = entry.placement.rows;
-            p.source_x = entry.placement.source_x;
-            p.source_y = entry.placement.source_y;
-            p.source_width = entry.placement.source_width;
-            p.source_height = entry.placement.source_height;
-            p.x_offset = entry.placement.x_offset;
-            p.y_offset = entry.placement.y_offset;
-            p.z = entry.placement.z;
-            p.col = (i32::from(p.col).saturating_add(entry.relative_offset.0))
-                .clamp(0, i32::from(u16::MAX)) as u16;
-            p.row = p.row.saturating_add(entry.relative_offset.1);
-            anchors.insert((p.image, p.placement), p.clone());
-            visible.push(p);
+        for _ in 0..8 {
+            let before = anchors.len();
+            for entry in &self.placements {
+                let key = (entry.placement.image, entry.placement.placement);
+                if anchors.contains_key(&key) {
+                    continue;
+                }
+                let Some(parent) = entry.parent else { continue };
+                let Some(mut p) = anchors.get(&parent).cloned() else {
+                    continue;
+                };
+                p.image = entry.placement.image;
+                p.revision = entry.placement.revision;
+                p.placement = entry.placement.placement;
+                p.cols = entry.placement.cols;
+                p.rows = entry.placement.rows;
+                p.source_x = entry.placement.source_x;
+                p.source_y = entry.placement.source_y;
+                p.source_width = entry.placement.source_width;
+                p.source_height = entry.placement.source_height;
+                p.x_offset = entry.placement.x_offset;
+                p.y_offset = entry.placement.y_offset;
+                p.z = entry.placement.z;
+                p.col = (i32::from(p.col).saturating_add(entry.relative_offset.0))
+                    .clamp(0, i32::from(u16::MAX)) as u16;
+                p.row = p.row.saturating_add(entry.relative_offset.1);
+                anchors.insert((p.image, p.placement), p.clone());
+                visible.push(p);
+            }
+            if anchors.len() == before {
+                break;
+            }
         }
         visible
     }
@@ -736,14 +857,25 @@ impl Store {
         }
     }
 
+    fn clear_visible(&mut self, alternate: bool) {
+        self.placements.retain(|entry| {
+            entry.alternate != alternate
+                || entry.virtual_placement
+                || entry.placement.row + i32::from(entry.placement.rows) <= 0
+        });
+        self.virtual_cells
+            .retain(|&(alt, row, _), _| alt != alternate || row < 0);
+        self.last_virtual_cell = None;
+    }
+
     fn erase_range(&mut self, alternate: bool, row: u16, start: u16, end: u16) {
         self.virtual_cells.retain(|&(alt, cell_row, cell_col), _| {
-            alt != alternate || cell_row != row || cell_col < start || cell_col >= end
+            alt != alternate || cell_row != i32::from(row) || cell_col < start || cell_col >= end
         });
         if self
             .last_virtual_cell
             .is_some_and(|(alt, cell_row, cell_col)| {
-                alt == alternate && cell_row == row && (start..end).contains(&cell_col)
+                alt == alternate && cell_row == i32::from(row) && (start..end).contains(&cell_col)
             })
         {
             self.last_virtual_cell = None;
@@ -770,10 +902,15 @@ impl Store {
     ) {
         match mode {
             0 => self.virtual_cells.retain(|&(alt, cell_row, cell_col), _| {
-                alt != alternate || cell_row < row || (cell_row == row && cell_col < col)
+                alt != alternate
+                    || cell_row < i32::from(row)
+                    || (cell_row == i32::from(row) && cell_col < col)
             }),
             1 => self.virtual_cells.retain(|&(alt, cell_row, cell_col), _| {
-                alt != alternate || cell_row > row || (cell_row == row && cell_col > col)
+                alt != alternate
+                    || cell_row < 0
+                    || cell_row > i32::from(row)
+                    || (cell_row == i32::from(row) && cell_col > col)
             }),
             _ => self.clear_screen(alternate),
         }
@@ -781,12 +918,103 @@ impl Store {
         self.last_virtual_cell = None;
     }
 
-    fn clear_placements(&mut self, alternate: bool) {
-        self.placements
-            .retain(|entry| entry.alternate != alternate || entry.virtual_placement);
+    fn shift_cells(
+        &mut self,
+        alternate: bool,
+        row: u16,
+        width: u16,
+        map_col: impl Fn(u16) -> Option<u16>,
+    ) {
+        let logical_row = i32::from(row);
+        self.virtual_cells = self
+            .virtual_cells
+            .iter()
+            .filter_map(|(&(alt, cell_row, col), &cell)| {
+                if alt != alternate || cell_row != logical_row {
+                    return Some(((alt, cell_row, col), cell));
+                }
+                map_col(col)
+                    .filter(|next| *next < width)
+                    .map(|next| ((alt, cell_row, next), cell))
+            })
+            .collect();
+        self.last_virtual_cell = self
+            .last_virtual_cell
+            .filter(|key| self.virtual_cells.contains_key(key));
     }
 
-    pub fn scroll(&mut self, alternate: bool, rows: i32) {
+    fn insert_chars(&mut self, alternate: bool, row: u16, col: u16, count: u16, width: u16) {
+        if count == 0 {
+            return;
+        }
+        self.shift_cells(alternate, row, width, |cell_col| {
+            if cell_col < col {
+                Some(cell_col)
+            } else {
+                cell_col.checked_add(count)
+            }
+        });
+    }
+
+    fn delete_chars(&mut self, alternate: bool, row: u16, col: u16, count: u16, width: u16) {
+        if count == 0 {
+            return;
+        }
+        self.shift_cells(alternate, row, width, |cell_col| {
+            if cell_col < col {
+                Some(cell_col)
+            } else if cell_col < col.saturating_add(count) {
+                None
+            } else {
+                Some(cell_col - count)
+            }
+        });
+    }
+
+    fn shift_lines(
+        &mut self,
+        alternate: bool,
+        row: u16,
+        bottom: u16,
+        map_row: impl Fn(i32) -> Option<i32>,
+    ) {
+        let row = i32::from(row);
+        let end = i32::from(bottom) + 1;
+        self.virtual_cells = self
+            .virtual_cells
+            .iter()
+            .filter_map(|(&(alt, cell_row, col), &cell)| {
+                if alt != alternate || !(row..end).contains(&cell_row) {
+                    return Some(((alt, cell_row, col), cell));
+                }
+                map_row(cell_row)
+                    .filter(|next| (row..end).contains(next))
+                    .map(|next| ((alt, next, col), cell))
+            })
+            .collect();
+        self.last_virtual_cell = self
+            .last_virtual_cell
+            .filter(|key| self.virtual_cells.contains_key(key));
+    }
+
+    fn insert_lines(&mut self, alternate: bool, row: u16, bottom: u16, count: u16) {
+        if count > 0 {
+            self.shift_lines(alternate, row, bottom, |cell_row| {
+                cell_row.checked_add(i32::from(count))
+            });
+        }
+    }
+
+    fn delete_lines(&mut self, alternate: bool, row: u16, bottom: u16, count: u16) {
+        if count > 0 {
+            let first_retained = i32::from(row) + i32::from(count);
+            self.shift_lines(alternate, row, bottom, |cell_row| {
+                (cell_row >= first_retained).then_some(cell_row - i32::from(count))
+            });
+        }
+    }
+
+    pub fn scroll(&mut self, alternate: bool, rows: i32, height: u16) {
         for entry in &mut self.placements {
             if entry.alternate == alternate && !entry.virtual_placement {
                 entry.placement.row = entry.placement.row.saturating_sub(rows);
@@ -797,14 +1025,28 @@ impl Store {
         self.virtual_cells = self
             .virtual_cells
             .iter()
-            .filter_map(|(&(alt, row, col), &ids)| {
+            .filter_map(|(&(alt, row, col), &cell)| {
                 if alt != alternate {
-                    return Some(((alt, row, col), ids));
+                    return Some(((alt, row, col), cell));
                 }
-                let row = i32::from(row).saturating_sub(rows);
-                (row >= 0 && row <= i32::from(u16::MAX)).then_some(((alt, row as u16, col), ids))
+                let row = row.saturating_sub(rows);
+                let retained = if alternate {
+                    (0..i32::from(height)).contains(&row)
+                } else {
+                    row >= -10_000
+                };
+                retained.then_some(((alt, row, col), cell))
             })
             .collect();
+        self.last_virtual_cell = self.last_virtual_cell.and_then(|(alt, row, col)| {
+            if alt != alternate {
+                return Some((alt, row, col));
+            }
+            let row = row.saturating_sub(rows);
+            self.virtual_cells
+                .contains_key(&(alt, row, col))
+                .then_some((alt, row, col))
+        });
     }
 
     fn scroll_region(&mut self, alternate: bool, top: u16, bottom: u16, shift: i32) {
@@ -836,9 +1078,34 @@ impl Store {
             entry.virtual_placement
                 || (entry.placement.rows > 0 && entry.placement.source_height > 0)
         });
+        self.virtual_cells = self
+            .virtual_cells
+            .iter()
+            .filter_map(|(&(alt, row, col), &cell)| {
+                if alt != alternate || !(top..end).contains(&row) {
+                    return Some(((alt, row, col), cell));
+                }
+                let row = row.saturating_sub(shift);
+                (top..end).contains(&row).then_some(((alt, row, col), cell))
+            })
+            .collect();
+        self.last_virtual_cell = self
+            .last_virtual_cell
+            .filter(|key| self.virtual_cells.contains_key(key));
     }
 
+    #[cfg(test)]
     pub fn command(&mut self, frame: &[u8], cursor: (u16, u16), alternate: bool) -> Outcome {
+        self.command_with_screen(frame, cursor, alternate, None)
+    }
+
+    pub fn command_with_screen(
+        &mut self,
+        frame: &[u8],
+        cursor: (u16, u16),
+        alternate: bool,
+        screen: Option<&vt100::Screen>,
+    ) -> Outcome {
         let (header, payload) = frame
             .iter()
             .position(|byte| *byte == b';')
@@ -852,11 +1119,17 @@ impl Store {
                     .map(|(key, value)| (key.to_string(), value.to_string()))
             })
             .collect::<BTreeMap<_, _>>();
+        if params.get("a").is_some_and(|action| action == "d") {
+            self.transfer = None;
+        }
         let response = self.transfer.as_ref().map(|t| &t.params).unwrap_or(&params);
-        let id = number(response, "i", 0).unwrap_or(0);
+        let mut id = number(response, "i", 0).unwrap_or(0);
+        let image_number = number(response, "I", 0).unwrap_or(0);
         let quiet = number(response, "q", 0).unwrap_or(0);
         let placement = number(response, "p", 0).unwrap_or(0);
-        let result = self.apply(params, payload, cursor, alternate);
+        let result = self.apply(params, payload, cursor, alternate, screen, &mut id);
+        self.image_numbers
+            .retain(|id, _| self.images.contains_key(id));
         let (status, advance) = match result {
             Ok(advance) => ("OK".to_owned(), advance),
             Err(error) => {
@@ -864,17 +1137,25 @@ impl Store {
                 (format!("EINVAL:{error}"), None)
             }
         };
-        let reply =
-            if self.transfer.is_some() || quiet == 2 || (quiet == 1 && status == "OK") || id == 0 {
-                Vec::new()
+        let reply = if self.transfer.is_some()
+            || quiet == 2
+            || (quiet == 1 && status == "OK")
+            || (id == 0 && image_number == 0)
+        {
+            Vec::new()
+        } else {
+            let p = if placement > 0 {
+                format!(",p={placement}")
             } else {
-                let p = if placement > 0 {
-                    format!(",p={placement}")
-                } else {
-                    String::new()
-                };
-                format!("\x1b_Gi={id}{p};{status}\x1b\\").into_bytes()
+                String::new()
             };
+            let n = if image_number > 0 {
+                format!(",I={image_number}")
+            } else {
+                String::new()
+            };
+            format!("\x1b_Gi={id}{n}{p};{status}\x1b\\").into_bytes()
+        };
         Outcome { reply, advance }
     }
 
@@ -884,6 +1165,8 @@ impl Store {
         payload: &[u8],
         cursor: (u16, u16),
         alternate: bool,
+        screen: Option<&vt100::Screen>,
+        response_id: &mut u32,
     ) -> Result<Option<(u16, u16)>> {
         let more = number(&params, "m", 0)? == 1;
         let mut encoded = payload.to_vec();
@@ -907,50 +1190,85 @@ impl Store {
         }
         let action = params.get("a").map(String::as_str).unwrap_or("t");
         let mut id = number(&params, "i", 0)?;
+        let image_number = number(&params, "I", 0)?;
+        if id != 0 && image_number != 0 {
+            bail!("image id and number are mutually exclusive");
+        }
+        if action == "q" && id == 0 {
+            bail!("image id required for query");
+        }
+        if image_number > 0 && matches!(action, "p" | "d") {
+            id = self
+                .image_by_number(image_number)
+                .context("image number not found")?;
+            *response_id = id;
+        }
         if action == "d" {
             let mode = params.get("d").map(String::as_str).unwrap_or("a");
+            let selector = mode.to_ascii_lowercase();
             let placement = number(&params, "p", 0)?;
-            match mode {
-                "a" | "A" => self.clear_placements(alternate),
-                "i" | "I" => {
-                    self.delete_matching(|entry| {
+            let affected = match selector.as_str() {
+                "a" => self.delete_matching(|entry| {
+                    entry.alternate == alternate && !entry.virtual_placement
+                }),
+                "i" | "n" => {
+                    if selector == "n" && image_number == 0 {
+                        bail!("image number required");
+                    }
+                    let mut affected = self.delete_matching(|entry| {
                         entry.placement.image == id
                             && (placement == 0 || entry.placement.placement == placement)
                     });
+                    // A named image can be deleted even before it is placed.
+                    affected.insert(id);
+                    affected
                 }
-                "p" | "P" | "q" | "Q" | "c" | "C" | "x" | "X" | "y" | "Y" | "z" | "Z" => {
+                "p" | "q" | "c" | "x" | "y" | "z" => {
                     let cell_col = number(&params, "x", 0)?;
                     let cell_row = number(&params, "y", 0)?;
                     let z = signed_number(&params, "z", 0)?;
                     let cursor_col = u32::from(cursor.1) + 1;
                     let cursor_row = u32::from(cursor.0) + 1;
-                    self.delete_matching(|entry| match mode.to_ascii_lowercase().as_str() {
-                        _ if entry.virtual_placement => false,
-                        "c" => intersects(&entry.placement, cursor_col, cursor_row),
-                        "p" => intersects(&entry.placement, cell_col, cell_row),
-                        "q" => {
-                            intersects(&entry.placement, cell_col, cell_row)
-                                && entry.placement.z == z
-                        }
-                        "x" => intersects_column(&entry.placement, cell_col),
-                        "y" => intersects_row(&entry.placement, cell_row),
-                        "z" => entry.placement.z == z,
-                        _ => false,
-                    });
+                    let selected: HashSet<_> = self
+                        .placements_with_screen(alternate, 0, screen)
+                        .iter()
+                        .filter(|p| match selector.as_str() {
+                            "c" => intersects(p, cursor_col, cursor_row),
+                            "p" => intersects(p, cell_col, cell_row),
+                            "q" => intersects(p, cell_col, cell_row) && p.z == z,
+                            "x" => intersects_column(p, cell_col),
+                            "y" => intersects_row(p, cell_row),
+                            "z" => p.z == z,
+                            _ => false,
+                        })
+                        .map(|p| (p.image, p.placement))
+                        .collect();
+                    self.delete_matching(|entry| {
+                        !entry.virtual_placement
+                            && selected
+                                .contains(&(entry.placement.image, entry.placement.placement))
+                    })
                 }
-                "r" | "R" => {
+                "r" => {
                     let first = number(&params, "x", 0)?;
                     let last = number(&params, "y", 0)?;
                     if first == 0 || first > last {
                         bail!("invalid image id range");
                     }
-                    self.delete_matching(|entry| (first..=last).contains(&entry.placement.image));
+                    let mut affected = self
+                        .delete_matching(|entry| (first..=last).contains(&entry.placement.image));
+                    affected.extend(
+                        self.images
+                            .keys()
+                            .filter(|id| (first..=last).contains(id))
+                            .copied(),
+                    );
+                    affected
                 }
-                "n" | "N" | "f" | "F" => bail!("unsupported delete selector"),
                 _ => bail!("unsupported delete selector"),
-            }
+            };
             if mode.as_bytes().first().is_some_and(u8::is_ascii_uppercase) {
-                self.remove_unused_images();
+                self.remove_image_data(&affected);
             }
             return Ok(None);
         }
@@ -1018,6 +1336,12 @@ impl Store {
                 *image == id || !deleted_images.contains(image) || used_images.contains(image)
             });
             self.revision += 1;
+            if image_number > 0 {
+                self.image_numbers.insert(id, image_number);
+                *response_id = id;
+            } else {
+                self.image_numbers.remove(&id);
+            }
             self.images.insert(
                 id,
                 ImageData {
@@ -1427,6 +1751,62 @@ mod tests {
     }
 
     #[test]
+    fn image_numbers_allocate_ids_and_target_the_newest_transmission() {
+        let mut store = Store::default();
+        let first = store.command(b"a=t,f=24,s=1,v=1,I=13;/wCA", (0, 0), false);
+        assert_eq!(first.reply, b"\x1b_Gi=1,I=13;OK\x1b\\");
+        assert_eq!(
+            store
+                .command(b"a=t,f=24,s=1,v=1,I=13;AP9A", (0, 0), false)
+                .reply,
+            b"\x1b_Gi=2,I=13;OK\x1b\\"
+        );
+        assert_eq!(
+            store.command(b"a=p,I=13,p=7,C=1", (2, 3), false).reply,
+            b"\x1b_Gi=2,I=13,p=7;OK\x1b\\"
+        );
+        assert_eq!(store.placements(false, 0)[0].image, 2);
+        store.command(b"a=d,d=N,I=13", (0, 0), false);
+        assert!(store.placements(false, 0).is_empty());
+        assert_eq!(store.image(1, 1).unwrap().data, "/wCA");
+        assert!(store.image(2, 2).is_err());
+        assert!(
+            String::from_utf8_lossy(&store.command(b"a=p,i=1,I=13", (0, 0), false).reply)
+                .contains("EINVAL")
+        );
+    }
+
+    #[test]
+    fn uppercase_deletion_preserves_unrelated_assets_and_cancels_partial_uploads() {
+        let mut store = Store::default();
+        store.command(b"a=t,f=24,s=1,v=1,i=8;AP9A", (0, 0), false);
+        store.command(b"a=T,f=24,s=1,v=1,i=7,C=1;/wCA", (0, 0), false);
+        assert!(store
+            .command(b"a=t,f=24,s=1,v=1,I=42,m=1;/w", (0, 0), false)
+            .reply
+            .is_empty());
+        store.command(b"a=d,d=I,i=7", (0, 0), false);
+        assert!(store.placements(false, 0).is_empty());
+        assert!(store.image(7, 2).is_err());
+        assert_eq!(store.image(8, 1).unwrap().data, "AP9A");
+        assert!(
+            String::from_utf8_lossy(&store.command(b"a=p,I=42", (0, 0), false).reply)
+                .contains("EINVAL")
+        );
+        assert_eq!(
+            store
+                .command(b"a=t,f=24,s=1,v=1,I=42,m=1;/w", (0, 0), false)
+                .reply,
+            b""
+        );
+        assert_eq!(
+            store.command(b"m=0;CA", (0, 0), false).reply,
+            b"\x1b_Gi=1,I=42;OK\x1b\\"
+        );
+        assert_eq!(store.image(1, 3).unwrap().data, "/wCA");
+    }
+
+    #[test]
     fn direct_images_are_retained_queried_scrolled_and_deleted() {
         let mut store = Store::default();
         let result = store.command(b"a=T,f=24,s=1,v=1,i=7,c=2,r=3;AAAA", (4, 5), false);
@@ -1435,7 +1815,7 @@ mod tests {
         let placement = store.placements(false, 0).remove(0);
         assert_eq!(placement.row, 4);
         assert_eq!(store.image(7, placement.revision).unwrap().data, "AAAA");
-        store.scroll(false, 2);
+        store.scroll(false, 2, 24);
         assert_eq!(store.placements(false, 1)[0].row, 3);
         store.command(b"a=d,d=I,i=7", (0, 0), false);
         assert!(store.placements(false, 0).is_empty());
@@ -1552,6 +1932,31 @@ mod tests {
     }
 
     #[test]
+    fn deletion_uses_relative_geometry_after_parent_replacement() {
+        let mut store = Store::default();
+        for id in 7..=9 {
+            store.command(
+                format!("a=t,f=24,s=1,v=1,i={id};AAAA").as_bytes(),
+                (0, 0),
+                false,
+            );
+        }
+        store.command(b"a=p,i=7,p=1,c=1,r=1,C=1", (1, 2), false);
+        store.command(b"a=p,i=8,p=1,c=1,r=1,P=7,Q=1,H=2,V=1", (9, 9), false);
+        store.command(b"a=p,i=9,p=1,c=1,r=1,P=8,Q=1,H=1,V=1", (9, 9), false);
+        // Replacing an intermediate placement moves it after its child in storage.
+        store.command(b"a=p,i=8,p=1,c=1,r=1,P=7,Q=1,H=3,V=1", (9, 9), false);
+        let visible = store.placements(false, 0);
+        let grandchild = visible.iter().find(|p| p.image == 9).unwrap();
+        assert_eq!((grandchild.col, grandchild.row), (6, 3));
+        store.command(b"a=d,d=P,x=7,y=4", (0, 0), false);
+        assert!(store.images.contains_key(&7));
+        assert!(store.images.contains_key(&8));
+        assert!(!store.images.contains_key(&9));
+        assert_eq!(store.placements(false, 0).len(), 2);
+    }
+
+    #[test]
     fn retransmitting_a_parent_removes_relative_children() {
         let mut store = Store::default();
         store.command(b"a=t,f=24,s=1,v=1,i=7;AAAA", (0, 0), false);
@@ -1620,7 +2025,7 @@ mod tests {
     fn virtual_cells_scroll_and_clear_when_text_overwrites_them() {
         let mut store = Store::default();
         store.record_virtual_cell(false, 3, 2, Some((7, 4)));
-        store.scroll(false, 2);
+        store.scroll(false, 2, 24);
         assert_eq!(
             store
                 .virtual_cells
@@ -1630,6 +2035,60 @@ mod tests {
         );
         store.clear_virtual_cell(false, 1, 2);
         assert!(store.virtual_cells.is_empty());
+    }
+
+    #[test]
+    fn virtual_cells_follow_character_and_regional_line_edits() {
+        let mut store = Store::default();
+        for (row, col) in [(1, 0), (1, 2), (2, 1), (3, 1)] {
+            store.record_virtual_cell(false, row, col, Some((7, 4)));
+        }
+
+        store.insert_chars(false, 1, 1, 2, 5);
+        assert!(store.virtual_cells.contains_key(&(false, 1, 0)));
+        assert!(store.virtual_cells.contains_key(&(false, 1, 4)));
+        store.delete_chars(false, 1, 0, 1, 5);
+        assert!(!store.virtual_cells.contains_key(&(false, 1, 0)));
+        assert!(store.virtual_cells.contains_key(&(false, 1, 3)));
+
+        store.insert_lines(false, 2, 3, 1);
+        assert!(store.virtual_cells.contains_key(&(false, 3, 1)));
+        assert!(!store.virtual_cells.contains_key(&(false, 2, 1)));
+        store.delete_lines(false, 2, 3, 1);
+        assert!(store.virtual_cells.contains_key(&(false, 2, 1)));
+    }
+
+    #[test]
+    fn virtual_cells_render_source_crops_on_the_alternate_screen() {
+        let mut store = Store::default();
+        store.command(
+            b"a=t,f=24,s=4,v=2,i=7;AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            (0, 0),
+            true,
+        );
+        store.command(b"a=p,i=7,p=3,U=1,c=2,r=2,x=1,y=0,w=2,h=2", (0, 0), true);
+        let mut parser = vt100::Parser::new(
+            std::num::NonZeroU16::new(2).unwrap(),
+            std::num::NonZeroU16::new(2).unwrap(),
+            0,
+        );
+        parser.process(b"\x1b[?1049h");
+        store.record_virtual_cell(true, 1, 1, Some((7, 3)));
+        store.add_virtual_diacritic(1);
+        store.add_virtual_diacritic(1);
+        let placement = store
+            .placements_with_screen(true, 0, Some(parser.screen()))
+            .remove(0);
+        assert_eq!((placement.row, placement.col), (1, 1));
+        assert_eq!(
+            (
+                placement.source_x,
+                placement.source_y,
+                placement.source_width,
+                placement.source_height,
+            ),
+            (2, 1, 1, 1)
+        );
     }
 
     #[test]

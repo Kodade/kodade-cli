@@ -3624,10 +3624,7 @@ impl Pane {
             .parser
             .lock()
             .map_err(|_| anyhow!("PTY parser lock poisoned"))?;
-        parser
-            .screen_mut()
-            .set_size(terminal_size(rows, cols).0, terminal_size(rows, cols).1);
-        parser.callbacks_mut().hyperlinks.resize(rows, cols);
+        resize_parser(&mut parser, rows, cols);
         Ok(())
     }
     fn write(&self, bytes: &[u8]) -> Result<()> {
@@ -4116,10 +4113,14 @@ fn read_pty(
                         graphics::Token::Graphics(frame) => {
                             let cursor = parser.screen().cursor_position();
                             let alternate = parser.screen().alternate_screen();
-                            let result = parser
-                                .callbacks_mut()
-                                .graphics
-                                .command(&frame, cursor, alternate);
+                            let mut graphics = std::mem::take(&mut parser.callbacks_mut().graphics);
+                            let result = graphics.command_with_screen(
+                                &frame,
+                                cursor,
+                                alternate,
+                                Some(parser.screen()),
+                            );
+                            parser.callbacks_mut().graphics = graphics;
                             replies.extend(result.reply);
                             if let Some((rows, cols)) = result.advance {
                                 let (height, width) = parser.screen().size();
@@ -4167,9 +4168,7 @@ fn graphics_text(parser: &mut PtyParser, text: &[u8]) {
         let mut placeholder_cell = None;
         for c in chars {
             if c == '\u{10eeee}' {
-                let alternate = parser.screen().alternate_screen();
-                let (row, col) = parser.screen().cursor_position();
-                placeholder_cell = Some((alternate, row, col));
+                placeholder_cell = Some(());
             } else if let Some(index) = graphics::kitty_diacritic_index(c) {
                 store.add_virtual_diacritic(index);
             } else {
@@ -4178,21 +4177,25 @@ fn graphics_text(parser: &mut PtyParser, text: &[u8]) {
         }
         for normalized in graphics::normalize_unicode_placeholders(&mut placeholder, &[raw]) {
             let before_alt = parser.screen().alternate_screen();
-            let (row, col) = parser.screen().cursor_position();
             let printed = tracker.feed(normalized.byte, parser.screen(), &mut store);
-            if printed {
-                store.clear_virtual_cell(before_alt, row, col);
-            }
             hyperlinks.feed(normalized.byte, parser.screen());
             parser.process(&[normalized.byte]);
             let alternate = parser.screen().alternate_screen();
+            if printed > 0 {
+                let (row, end) = parser.screen().cursor_position();
+                for col in end.saturating_sub(printed)..end {
+                    store.clear_virtual_cell(alternate, row, col);
+                }
+            }
             if alternate && !before_alt {
                 store.clear_screen(true);
                 hyperlinks.clear_alternate();
             }
         }
-        if let Some((alternate, row, col)) = placeholder_cell {
-            store.record_virtual_cell(alternate, row, col, style.ids());
+        if placeholder_cell.is_some() {
+            let alternate = parser.screen().alternate_screen();
+            let (row, col) = parser.screen().cursor_position();
+            store.record_virtual_cell(alternate, row, col.saturating_sub(1), style.ids());
         }
     }
     parser.callbacks_mut().graphics_tracker = tracker;
@@ -4201,6 +4204,26 @@ fn graphics_text(parser: &mut PtyParser, text: &[u8]) {
     parser.callbacks_mut().graphics_placeholder = placeholder;
     parser.callbacks_mut().graphics_unicode = unicode;
     parser.callbacks_mut().hyperlinks = hyperlinks;
+}
+
+fn resize_parser(parser: &mut PtyParser, rows: u16, cols: u16) {
+    let active = parser.screen().alternate_screen();
+    let before_row = parser.screen().cursor_position().0;
+    parser
+        .screen_mut()
+        .set_size(terminal_size(rows, cols).0, terminal_size(rows, cols).1);
+    let after_row = parser.screen().cursor_position().0;
+    let mut graphics = std::mem::take(&mut parser.callbacks_mut().graphics);
+    graphics.resize_virtual_cells(
+        active,
+        i32::from(after_row) - i32::from(before_row),
+        rows.max(1),
+        cols.max(1),
+    );
+    let callbacks = parser.callbacks_mut();
+    callbacks.graphics = graphics;
+    callbacks.graphics_tracker.reset_resize();
+    callbacks.hyperlinks.resize(rows, cols);
 }
 
 /// Collect the pane's full scrollback plus visible screen as plain-text lines,
@@ -4864,6 +4887,124 @@ mod tests {
             (50, 40, 20, 20)
         );
     }
+
+    #[test]
+    fn virtual_image_source_crop_survives_normal_scrollback() {
+        let mut parser = pty_parser(2, 12, 10, PtyCallbacks::default());
+        let pixels = base64::engine::general_purpose::STANDARD.encode(vec![0; 100 * 80 * 3]);
+        parser.callbacks_mut().graphics.command(
+            format!("a=t,f=24,s=100,v=80,i=7;{pixels}").as_bytes(),
+            (0, 0),
+            false,
+        );
+        parser.callbacks_mut().graphics.command(
+            b"a=p,i=7,p=3,U=1,c=4,r=2,x=10,y=20,w=80,h=40",
+            (0, 0),
+            false,
+        );
+
+        graphics_text(
+            &mut parser,
+            "\x1b[1;1H\x1b[38;2;0;0;7;58;2;0;0;3m\u{10eeee}\u{030d}\u{030e}\x1b[0m\x1b[2;1Hlive\n"
+                .as_bytes(),
+        );
+        assert!(snapshot(&parser).graphics.is_empty());
+
+        parser.screen_mut().set_scrollback(1);
+        let placement = snapshot(&parser).graphics.remove(0);
+        assert_eq!((placement.row, placement.col), (0, 0));
+        assert_eq!(
+            (
+                placement.source_x,
+                placement.source_y,
+                placement.source_width,
+                placement.source_height,
+            ),
+            (50, 40, 20, 20)
+        );
+        parser.screen_mut().set_scrollback(0);
+        graphics_text(&mut parser, b"\x1b[2J");
+        parser.screen_mut().set_scrollback(1);
+        assert_eq!(
+            snapshot(&parser).graphics.len(),
+            1,
+            "ED2 preserves history images"
+        );
+        parser.screen_mut().set_scrollback(0);
+        graphics_text(&mut parser, b"\x1b[3J");
+        parser.screen_mut().set_scrollback(1);
+        assert!(
+            snapshot(&parser).graphics.is_empty(),
+            "ED3 clears history images"
+        );
+    }
+
+    #[test]
+    fn shrinking_a_virtual_image_column_cannot_revive_it_on_expand() {
+        let mut parser = pty_parser(2, 4, 10, PtyCallbacks::default());
+        parser
+            .callbacks_mut()
+            .graphics
+            .command(b"a=t,f=24,s=2,v=1,i=7;AAAAAAAA", (0, 0), false);
+        parser
+            .callbacks_mut()
+            .graphics
+            .command(b"a=p,i=7,p=3,U=1,c=2,r=1", (0, 0), false);
+        graphics_text(
+            &mut parser,
+            "\x1b[1;4H\x1b[38;2;0;0;7;58;2;0;0;3m\u{10eeee}\x1b[0m".as_bytes(),
+        );
+        assert_eq!(snapshot(&parser).graphics.len(), 1);
+
+        resize_parser(&mut parser, 2, 2);
+        resize_parser(&mut parser, 2, 4);
+        assert!(snapshot(&parser).graphics.is_empty());
+    }
+
+    #[test]
+    fn growing_normal_history_moves_virtual_cells_with_vt100() {
+        let mut parser = pty_parser(2, 4, 10, PtyCallbacks::default());
+        parser
+            .callbacks_mut()
+            .graphics
+            .command(b"a=t,f=24,s=2,v=1,i=7;AAAAAAAA", (0, 0), false);
+        parser
+            .callbacks_mut()
+            .graphics
+            .command(b"a=p,i=7,p=3,U=1,c=2,r=1", (0, 0), false);
+        graphics_text(
+            &mut parser,
+            "\x1b[1;1H\x1b[38;2;0;0;7;58;2;0;0;3m\u{10eeee}\x1b[0m\x1b[2;1Hx\n".as_bytes(),
+        );
+        assert!(snapshot(&parser).graphics.is_empty());
+
+        resize_parser(&mut parser, 3, 4);
+        let placement = snapshot(&parser).graphics.remove(0);
+        assert_eq!((placement.row, placement.col), (0, 0));
+    }
+
+    #[test]
+    fn virtual_placeholders_follow_wrap_and_wide_overwrite() {
+        let mut parser = pty_parser(2, 2, 10, PtyCallbacks::default());
+        parser
+            .callbacks_mut()
+            .graphics
+            .command(b"a=t,f=24,s=2,v=1,i=7;AAAAAAAA", (0, 0), false);
+        parser
+            .callbacks_mut()
+            .graphics
+            .command(b"a=p,i=7,p=1,U=1,c=2,r=1", (0, 0), false);
+        graphics_text(
+            &mut parser,
+            "ab\x1b[38;2;0;0;7m\u{10eeee}\u{10eeee}".as_bytes(),
+        );
+        let screen = snapshot(&parser);
+        assert_eq!(screen.graphics.len(), 2);
+        assert_eq!((screen.graphics[0].row, screen.graphics[0].col), (1, 0));
+        graphics_text(&mut parser, "\x1b[2;1H\x1b[0m界".as_bytes());
+        assert!(snapshot(&parser).graphics.is_empty());
+    }
+
     use super::*;
 
     #[tokio::test]
@@ -6815,21 +6956,24 @@ mod tests {
                 })
                 .expect("spawn pane");
         }
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        let contents: Vec<_> = session
-            .panes
-            .lock()
-            .expect("panes")
-            .values()
-            .map(|pane| pane.snapshot().0.contents)
-            .collect();
-        assert_eq!(
-            contents
-                .iter()
-                .filter(|text| text.contains("per-workspace"))
-                .count(),
-            2
-        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let ready = session
+                .panes
+                .lock()
+                .expect("panes")
+                .values()
+                .filter(|pane| pane.snapshot().0.contents.contains("per-workspace"))
+                .count();
+            if ready == 2 {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "workspace environment did not reach both panes"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         assert_eq!(
             session
                 .build_file()
@@ -6864,13 +7008,23 @@ mod tests {
                 context: None,
             })
             .expect("spawn restored pane");
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        assert!(restored
-            .panes
-            .lock()
-            .expect("panes")
-            .values()
-            .any(|pane| pane.snapshot().0.contents.contains("per-workspace")));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if restored
+                .panes
+                .lock()
+                .expect("panes")
+                .values()
+                .any(|pane| pane.snapshot().0.contents.contains("per-workspace"))
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "restored pane did not receive workspace environment"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
     }
 
     #[tokio::test]
