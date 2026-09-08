@@ -59,6 +59,7 @@ pub struct SidebarMachine {
 pub struct Router {
     selected: EndpointId,
     senders: BTreeMap<EndpointId, mpsc::Sender<ClientMessage>>,
+    online: std::collections::BTreeSet<EndpointId>,
 }
 
 impl Router {
@@ -66,6 +67,7 @@ impl Router {
         Self {
             selected,
             senders: BTreeMap::new(),
+            online: std::collections::BTreeSet::new(),
         }
     }
 
@@ -77,9 +79,18 @@ impl Router {
     /// input is discarded so disabling a machine cannot replay stale keystrokes.
     pub fn unregister(&mut self, id: &EndpointId) {
         self.senders.remove(id);
+        self.online.remove(id);
         if &self.selected == id {
             self.selected = EndpointId::Local;
         }
+    }
+
+    pub fn mark_online(&mut self, id: EndpointId) {
+        self.online.insert(id);
+    }
+
+    pub fn mark_offline(&mut self, id: &EndpointId) {
+        self.online.remove(id);
     }
 
     pub fn select(&mut self, id: EndpointId) {
@@ -94,14 +105,22 @@ impl Router {
     }
 
     pub fn send(&self, message: ClientMessage) -> Result<()> {
-        self.senders
+        if !self.online.contains(&self.selected) {
+            return Ok(());
+        }
+        match self
+            .senders
             .get(&self.selected)
             .ok_or_else(|| anyhow!("selected endpoint is offline"))?
             .try_send(message)
-            .map_err(|error| match error {
-                mpsc::error::TrySendError::Full(_) => anyhow!("selected endpoint is busy"),
-                mpsc::error::TrySendError::Closed(_) => anyhow!("selected endpoint disconnected"),
-            })
+        {
+            Ok(()) => Ok(()),
+            // Input is deliberately lossy at this boundary. It is safer to
+            // show endpoint state than replay a key into a later SSH session.
+            Err(mpsc::error::TrySendError::Full(_) | mpsc::error::TrySendError::Closed(_)) => {
+                Ok(())
+            }
+        }
     }
 }
 
@@ -147,9 +166,13 @@ pub fn spawn_machine(
                 .await;
             let delay = Duration::from_secs(1u64 << retry.min(6));
             retry = retry.saturating_add(1).min(6);
-            tokio::select! {
-                _ = tokio::time::sleep(delay) => {}
-                message = commands.recv() => if message.is_none() { return; },
+            let sleep = tokio::time::sleep(delay);
+            tokio::pin!(sleep);
+            loop {
+                tokio::select! {
+                    _ = &mut sleep => break,
+                    message = commands.recv() => if message.is_none() { return; },
+                }
             }
         }
     });
@@ -182,22 +205,26 @@ async fn connect_machine(
         })?)
         .await?;
     let mut lines = BufReader::new(reader).lines();
-    let connected_session = loop {
-        let line = tokio::time::timeout(Duration::from_secs(10), lines.next_line())
-            .await
-            .context("endpoint handshake timed out")??
-            .ok_or_else(|| anyhow!("endpoint closed during handshake"))?;
-        match decode::<ServerMessage>(line.as_bytes())? {
-            ServerMessage::Welcome { session, version } if version == PROTOCOL_VERSION => {
-                break session
+    let connected_session = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let line = lines
+                .next_line()
+                .await?
+                .ok_or_else(|| anyhow!("endpoint closed during handshake"))?;
+            match decode::<ServerMessage>(line.as_bytes())? {
+                ServerMessage::Welcome { session, version } if version == PROTOCOL_VERSION => {
+                    break Ok(session)
+                }
+                ServerMessage::Welcome { version, .. } => {
+                    return Err(anyhow!("protocol version mismatch: {version}"))
+                }
+                ServerMessage::Error { message } => return Err(anyhow!(message)),
+                _ => {}
             }
-            ServerMessage::Welcome { version, .. } => {
-                return Err(anyhow!("protocol version mismatch: {version}"))
-            }
-            ServerMessage::Error { message } => return Err(anyhow!(message)),
-            _ => {}
         }
-    };
+    })
+    .await
+    .context("endpoint handshake timed out")??;
     updates
         .send((
             id.clone(),
@@ -359,6 +386,8 @@ mod tests {
         let mut router = Router::new(EndpointId::Local);
         router.register(EndpointId::Local, local_tx);
         router.register(machine.clone(), machine_tx);
+        router.mark_online(EndpointId::Local);
+        router.mark_online(machine.clone());
         router
             .send(ClientMessage::Input {
                 bytes: b"local".to_vec(),

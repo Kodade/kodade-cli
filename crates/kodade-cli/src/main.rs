@@ -1066,6 +1066,7 @@ async fn tui(
     let (command_tx, mut command_rx) = mpsc::channel(64);
     let mut router = endpoints::Router::new(endpoints::EndpointId::Local);
     router.register(endpoints::EndpointId::Local, command_tx);
+    router.mark_online(endpoints::EndpointId::Local);
     state.configure_machines(&profiles);
     for profile in profiles.into_iter().filter(|profile| profile.enabled) {
         let (machine_tx, machine_rx) = mpsc::channel(64);

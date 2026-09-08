@@ -177,6 +177,10 @@ def main() -> None:
             catalog = json.loads(run("machine", "list", "--json").stdout)
             if not any(item["id"] == machine and item["target"] == "kodade-smoke" and item["session"] == SESSION for item in catalog):
                 raise RuntimeError("saved machine catalog did not preserve target/session")
+            # This unreachable profile starts alongside the real one. The
+            # local marker below proves its bounded connection attempts never
+            # freeze normal attach or queue input for later replay.
+            run("machine", "add", "missing-kodade-smoke-host", "--label", "Offline host")
 
             # A real controlling PTY exercises the ordinary local attach with
             # the saved profile loaded. Both daemons start pane id 1, so the

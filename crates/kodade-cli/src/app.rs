@@ -787,10 +787,12 @@ impl App {
                     self.endpoints.update(&endpoint, layout.clone());
                 }
                 if let Update::EndpointFailed { reason } = &update {
+                    writer.mark_offline(&endpoint);
                     self.endpoints
                         .failed(&endpoint, Instant::now(), reason.clone());
                 }
                 if let Update::EndpointConnected { session, socket } = &update {
+                    writer.mark_online(endpoint.clone());
                     self.endpoint_contexts
                         .insert(endpoint.clone(), (session.clone(), socket.clone()));
                 }
