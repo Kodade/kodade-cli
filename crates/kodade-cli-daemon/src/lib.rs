@@ -4183,6 +4183,7 @@ fn sidebar_tab_info(
                     }),
                     state: detection.state,
                     state_age_secs: ages.get(&pane).copied().unwrap_or(0),
+                    detected: detection.agent.is_some(),
                 })
             })
             .collect(),
@@ -4324,6 +4325,10 @@ impl Pane {
         if let Some(dir) = &cwd {
             command.cwd(dir);
         }
+        // Panes render through Ködade's terminal, independently of the host's
+        // terminfo installation. Explicit workspace overrides remain available.
+        command.env("TERM", "xterm-256color");
+        command.env("COLORTERM", "truecolor");
         for (key, value) in environment {
             command.env(key, value);
         }
@@ -9008,6 +9013,55 @@ mod tests {
 
         git::worktree_remove(&repo, &worktree, true).expect("forced cleanup");
         fs::remove_dir_all(base).ok();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pane_reports_its_terminal_environment_and_allows_workspace_override() {
+        let session = Session::spawn(80, 24, "terminal-env".into()).expect("session");
+        for (term, env) in [
+            ("xterm-256color", HashMap::new()),
+            ("vt100", HashMap::from([("TERM".into(), "vt100".into())])),
+        ] {
+            session
+                .handle(ClientMessage::NewWorkspace {
+                    name: term.into(),
+                    root: None,
+                    env,
+                })
+                .unwrap();
+            session
+                .handle(ClientMessage::NewPane {
+                    workspace: None,
+                    tab: None,
+                    split: None,
+                    command: Some(vec![
+                        "sh".into(),
+                        "-c".into(),
+                        "printf 'terminal=%s colors=%s' \"$TERM\" \"$COLORTERM\"; sleep 10".into(),
+                    ]),
+                    name: None,
+                    context: None,
+                })
+                .unwrap();
+            let expected = format!("terminal={term} colors=truecolor");
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if session
+                        .snapshot()
+                        .unwrap()
+                        .panes
+                        .iter()
+                        .any(|pane| pane.screen.contents.contains(&expected))
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("actual PTY terminal environment");
+        }
     }
 
     #[tokio::test]

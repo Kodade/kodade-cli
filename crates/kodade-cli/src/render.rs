@@ -1028,6 +1028,28 @@ pub fn sidebar_rows_for_endpoints(
     agents_panel: bool,
     machines: &[(EndpointId, String, String, bool)],
 ) -> SidebarModel {
+    if entries.len() == 1
+        && entries[0].0 == EndpointId::Local
+        && entries[0].1 == "Local"
+        && entries[0].2 == "online"
+        && machines
+            .iter()
+            .all(|(id, _, _, _)| *id == EndpointId::Local)
+    {
+        let (endpoint, _label, _status, layout) = &entries[0];
+        let empty = HashSet::new();
+        let mut model = sidebar_rows(
+            layout,
+            collapsed.get(endpoint).unwrap_or(&empty),
+            agents_panel,
+        );
+        for row in model.workspaces.iter_mut().chain(model.agents.iter_mut()) {
+            if let Some(target) = row.target.take() {
+                row.target = Some(SidebarTarget::Scoped(endpoint.clone(), Box::new(target)));
+            }
+        }
+        return model;
+    }
     let mut model = SidebarModel {
         workspaces: vec![heading_row("machines")],
         agents: Vec::new(),
@@ -1111,10 +1133,12 @@ fn agents_panel_rows(layout: &LayoutSnapshot) -> Vec<SidebarRow> {
         .workspaces
         .iter()
         .flat_map(|workspace| {
-            workspace
-                .tabs
-                .iter()
-                .flat_map(move |tab| tab.agents.iter().map(move |agent| (workspace, tab, agent)))
+            workspace.tabs.iter().flat_map(move |tab| {
+                tab.agents
+                    .iter()
+                    .filter(|agent| agent.detected)
+                    .map(move |agent| (workspace, tab, agent))
+            })
         })
         .collect();
     if agents.is_empty() {
@@ -1631,6 +1655,7 @@ mod tests {
                             name: "Codex".into(),
                             state: AgentStateKind::Blocked,
                             state_age_secs: 245,
+                            detected: true,
                         }],
                     }],
                 },
@@ -1723,6 +1748,30 @@ mod tests {
             .into_flat()
             .iter()
             .any(|row| matches!(row.target, Some(SidebarTarget::Pane(_)))));
+    }
+
+    #[test]
+    fn simple_local_sidebar_keeps_offline_machine_discovery() {
+        let endpoints = vec![(
+            EndpointId::Local,
+            "Local".into(),
+            "online".into(),
+            snapshot(),
+        )];
+        let mut machines = vec![(EndpointId::Local, "Local".into(), "online".into(), true)];
+        let simple = sidebar_rows_for_endpoints(&endpoints, &BTreeMap::new(), true, &machines);
+        assert_eq!(simple.workspaces[0].label, "workspaces");
+        assert!(!simple
+            .workspaces
+            .iter()
+            .any(|row| matches!(row.target, Some(SidebarTarget::Endpoint(_)))));
+        let remote = EndpointId::Machine("offline".into());
+        machines.push((remote.clone(), "Build".into(), "offline".into(), false));
+        let connected = sidebar_rows_for_endpoints(&endpoints, &BTreeMap::new(), true, &machines);
+        assert!(connected
+            .workspaces
+            .iter()
+            .any(|row| row.target == Some(SidebarTarget::Endpoint(remote.clone()))));
     }
 
     #[test]
@@ -1862,12 +1911,25 @@ mod tests {
             name: "Claude".into(),
             state: AgentStateKind::Working,
             state_age_secs: 30,
+            detected: true,
         }];
         let model = sidebar_rows(&layout, &no_collapse(), true);
         assert_eq!(model.agents[0].kind, SidebarKind::Heading);
         // Blocked outranks working.
         assert_eq!(model.agents[1].target, Some(SidebarTarget::Pane(PaneId(3))));
         assert_eq!(model.agents[2].target, Some(SidebarTarget::Pane(PaneId(9))));
+    }
+
+    #[test]
+    fn plain_shells_stay_in_the_tree_but_not_the_agents_panel() {
+        let mut layout = snapshot();
+        layout.workspaces[0].tabs[0].agents[0].detected = false;
+        let model = sidebar_rows(&layout, &no_collapse(), true);
+        assert!(model
+            .workspaces
+            .iter()
+            .any(|row| row.target == Some(SidebarTarget::Pane(PaneId(3)))));
+        assert!(model.agents.is_empty());
     }
 
     #[test]
@@ -1888,6 +1950,7 @@ mod tests {
                 name: format!("a{i}"),
                 state: AgentStateKind::Working,
                 state_age_secs: i,
+                detected: true,
             })
             .collect();
         let model = sidebar_rows(&layout, &no_collapse(), true);
@@ -1911,6 +1974,7 @@ mod tests {
                 name: format!("a{i}"),
                 state: AgentStateKind::Working,
                 state_age_secs: i,
+                detected: true,
             })
             .collect();
         let model = sidebar_rows(&layout, &no_collapse(), true);
