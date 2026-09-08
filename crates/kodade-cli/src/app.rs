@@ -230,6 +230,7 @@ pub struct App {
     config: config::Config,
     theme: config::Theme,
     plugin_results: mpsc::UnboundedReceiver<String>,
+    clipboard: crate::clipboard::Clipboard,
     plugin_result_tx: mpsc::UnboundedSender<String>,
     remote_endpoint: bool,
     primary_remote: bool,
@@ -351,6 +352,7 @@ impl App {
             theme: config.resolve_theme(),
             config: config.clone(),
             plugin_results,
+            clipboard: crate::clipboard::Clipboard::default(),
             plugin_result_tx,
             remote_endpoint: false,
             primary_remote: false,
@@ -959,6 +961,19 @@ impl App {
         updates: &mpsc::Sender<crate::endpoints::UpdatePacket>,
     ) -> Result<()> {
         loop {
+            while let Some(copy) = self.clipboard.completed() {
+                if let Some(sequence) = copy.sequence {
+                    term.backend_mut().write_all(sequence.as_bytes())?;
+                    term.backend_mut().flush()?;
+                }
+                if copy.notify {
+                    self.set_note(if copy.truncated {
+                        " copied (truncated to 100KB)"
+                    } else {
+                        " copied"
+                    });
+                }
+            }
             while let Ok(note) = self.plugin_results.try_recv() {
                 self.set_note(note);
             }
@@ -1042,11 +1057,8 @@ impl App {
                 match update {
                     Update::Clipboard { pane, text } => {
                         let _ = pane;
-                        if let Err(error) =
-                            crate::clipboard::copy(text, endpoint != EndpointId::Local).await
-                        {
-                            self.set_note(format!(" clipboard: {error:#}"));
-                        }
+                        self.clipboard
+                            .request(text, endpoint != EndpointId::Local, false);
                     }
                     Update::Layout(layout) => {
                         self.handle_layout(layout);
@@ -1434,8 +1446,9 @@ impl App {
             KeyCode::Char('y') => {
                 let text = cm.yank_text();
                 self.paste_buffer = text.clone();
-                crate::clipboard::copy(text, self.selected_endpoint != EndpointId::Local).await?;
-                self.set_note(" copied");
+                self.clipboard
+                    .request(text, self.selected_endpoint != EndpointId::Local, true);
+                self.set_note(" copying");
                 keep = false;
             }
 

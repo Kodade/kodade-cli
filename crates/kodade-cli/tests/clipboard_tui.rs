@@ -10,6 +10,18 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+struct Tui(Child);
+impl Drop for Tui {
+    fn drop(&mut self) {
+        // `script` owns a child TUI; clean the fixture's entire process group.
+        unsafe {
+            libc::kill(-(self.0.id() as i32), libc::SIGKILL);
+        }
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
 const BIN: &str = env!("CARGO_BIN_EXE_kodade-cli");
 
 struct Harness {
@@ -86,14 +98,18 @@ impl Harness {
     }
 
     fn backend(&self, body: &str) {
-        let backend = self.fake_bin.join("wl-copy");
+        let backend = self.fake_bin.join(if cfg!(target_os = "macos") {
+            "pbcopy"
+        } else {
+            "wl-copy"
+        });
         fs::write(&backend, format!("#!/bin/sh\n{body}\n")).expect("write fake backend");
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(&backend, fs::Permissions::from_mode(0o755))
             .expect("make fake backend executable");
     }
 
-    fn start_tui(&self) -> (Child, Arc<Mutex<Vec<u8>>>) {
+    fn start_tui(&self) -> (Tui, Arc<Mutex<Vec<u8>>>) {
         let mut command = Command::new("script");
         base_env(
             &mut command,
@@ -105,8 +121,14 @@ impl Harness {
         // `script` supplies the controlling PTY that crossterm requires; a
         // pipe would make the TUI reject raw mode before it can receive copies.
         let line = format!("stty cols 100 rows 30; exec {BIN} -s {}", self.session);
+        if cfg!(target_os = "macos") {
+            command.args(["-q", "/dev/null", "/bin/sh", "-c", &line]);
+        } else {
+            command.args(["-qfec", &line, "/dev/null"]);
+        }
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
         let mut tui = command
-            .args(["-qfec", &line, "/dev/null"])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -127,7 +149,7 @@ impl Harness {
                     .extend_from_slice(&buffer[..count]);
             }
         });
-        (tui, output)
+        (Tui(tui), output)
     }
 
     fn focused_pane(&self) -> String {
@@ -163,6 +185,8 @@ fn base_env(command: &mut Command, root: &Path, runtime: &Path, state: &Path, fa
         std::env::var("PATH").unwrap_or_default()
     );
     command
+        .env_remove("SSH_CONNECTION")
+        .env_remove("SSH_TTY")
         .env("HOME", root)
         .env("SHELL", "/bin/sh")
         .env("XDG_RUNTIME_DIR", runtime)
@@ -171,6 +195,7 @@ fn base_env(command: &mut Command, root: &Path, runtime: &Path, state: &Path, fa
         .env("PATH", path);
 }
 
+#[track_caller]
 fn wait_for(timeout: Duration, mut ready: impl FnMut() -> bool) {
     let deadline = Instant::now() + timeout;
     while !ready() {
@@ -191,7 +216,9 @@ fn host_tui_uses_native_clipboard_then_emits_osc52_on_backend_timeout() {
     let harness = Harness::new();
     harness.backend(&format!("cat > {}", harness.copied.display()));
     let (mut tui, output) = harness.start_tui();
-    thread::sleep(Duration::from_millis(300));
+    wait_for(Duration::from_secs(5), || {
+        contains(&output.lock().unwrap(), b"\x1b[?1049h")
+    });
     let pane = harness.focused_pane();
 
     let native = harness
@@ -217,7 +244,8 @@ fn host_tui_uses_native_clipboard_then_emits_osc52_on_backend_timeout() {
 
     // A stalled host backend must not freeze the terminal forever. The TUI
     // falls back to OSC 52 on its own controlling PTY after the two-second cap.
-    harness.backend("sleep 10");
+    let started = harness.root.join("backend-started");
+    harness.backend(&format!("echo ready > {}; sleep 10", started.display()));
     let fallback = harness
         .command(["send", &pane, "printf '\\033]52;c;ZmFsbGJhY2s=\\007'"])
         .output()
@@ -227,9 +255,28 @@ fn host_tui_uses_native_clipboard_then_emits_osc52_on_backend_timeout() {
         "{}",
         String::from_utf8_lossy(&fallback.stderr)
     );
+    wait_for(Duration::from_secs(5), || started.exists());
+    assert!(harness
+        .command(["send", &pane, "printf 'RESPONSIVE_CANVAS\\n'"])
+        .status()
+        .unwrap()
+        .success());
+    wait_for(Duration::from_secs(1), || {
+        let transcript = output.lock().unwrap();
+        contains(&transcript, b"RESPONSIVE_CANVAS")
+    });
     wait_for(Duration::from_secs(4), || {
         contains(&output.lock().unwrap(), b"\x1b]52;c;ZmFsbGJhY2s=")
     });
-    let _ = tui.kill();
-    let _ = tui.wait();
+    assert!(harness
+        .command(["kill-session"])
+        .status()
+        .unwrap()
+        .success());
+    wait_for(Duration::from_secs(5), || {
+        tui.0.try_wait().unwrap().is_some()
+    });
+    wait_for(Duration::from_secs(1), || {
+        contains(&output.lock().unwrap(), b"\x1b[?1049l")
+    });
 }

@@ -1785,18 +1785,19 @@ impl Session {
         let panes = self.panes.lock().ok()?;
         // Advance this connection's cursor for every pane now. A hidden-pane
         // request is intentionally dropped, never delivered after a later focus.
+        seen.retain(|id, _| panes.contains_key(id));
         let mut current = None;
         for (id, pane) in panes.iter() {
-            let clipboard = pane.parser.lock().ok()?.callbacks().clipboard.clone();
-            let Some((seq, selection, encoded)) = clipboard else {
+            let parser = pane.parser.lock().ok()?;
+            let Some((seq, selection, encoded)) = &parser.callbacks().clipboard else {
                 continue;
             };
-            if seq <= seen.get(id).copied().unwrap_or(0) {
+            if *seq <= seen.get(id).copied().unwrap_or(0) {
                 continue;
             }
-            seen.insert(*id, seq);
+            seen.insert(*id, *seq);
             if *id == focused {
-                current = Some((selection, encoded));
+                current = Some((selection.clone(), encoded.clone()));
             }
         }
         let (selection, encoded) = current?;
@@ -4646,6 +4647,14 @@ async fn serve_client(stream: UnixStream, session: Arc<Session>) -> Result<()> {
                         subscribed = true;
                     }
                     _ => {}
+                }
+                // Observe pending copies under the old focus before applying a
+                // client focus change. Hidden writes must not become visible
+                // just because the input message wins the tick race.
+                if initialized {
+                    if let Some(clipboard) = session.view_clipboard(&view, &mut clipboard_seen) {
+                        write_server(&mut writer, &clipboard).await?;
+                    }
                 }
                 let hello = matches!(message, ClientMessage::Hello { .. });
                 let kill = matches!(message, ClientMessage::KillSession);
