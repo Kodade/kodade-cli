@@ -27,7 +27,8 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo build
-      - run: cargo test
+      - run: cargo test -- --nocapture
+        timeout-minutes: 5
       - name: Exercise live client handoff
         if: runner.os != 'Windows'
         run: python3 scripts/handoff-tui-smoke.py target/debug/kodade-cli
