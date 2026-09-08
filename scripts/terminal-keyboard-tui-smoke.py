@@ -8,6 +8,7 @@ from pathlib import Path
 import pty
 import select
 import shlex
+import shutil
 import struct
 import subprocess
 import sys
@@ -36,9 +37,13 @@ def controlling_terminal():
 
 with tempfile.TemporaryDirectory(prefix="kodade-keyboard-") as directory:
     root = Path(directory)
+    # macOS limits Unix-domain socket paths to 104 bytes; its default temporary
+    # directory is already long enough to exceed that once the session socket
+    # suffix is added.
+    runtime = Path(tempfile.mkdtemp(prefix="kodade-kb-", dir="/tmp"))
     env = {key: value for key, value in os.environ.items() if not key.startswith("KODADE_")}
     env.update(HOME=directory, XDG_CONFIG_HOME=str(root / ".config"),
-               XDG_RUNTIME_DIR=str(root / "run"), XDG_STATE_HOME=str(root / "state"),
+               XDG_RUNTIME_DIR=str(runtime), XDG_STATE_HOME=str(root / "state"),
                SHELL="/bin/sh", TERM="xterm-256color")
     config = root / ".config" / "kodade-cli"
     config.mkdir(parents=True)
@@ -230,5 +235,6 @@ finally:
             os.close(slave)
         subprocess.run([str(BINARY), "--session", SESSION, "kill-session"], env=env,
                        capture_output=True)
+        shutil.rmtree(runtime, ignore_errors=True)
 
 print("Terminal keyboard TUI smoke passed: detection, real PTY forwarding, focus ownership, modal consumption, legacy releases, and detach restoration")
