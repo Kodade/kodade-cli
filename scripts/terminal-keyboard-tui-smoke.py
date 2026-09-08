@@ -259,7 +259,15 @@ finally:
         wait_for("TUI detach", lambda: (drain() is None) and tui.poll() is not None)
         assert tui.wait(timeout=5) == 0
         drain()
-        assert termios.tcgetattr(slave) == original, "detach left host terminal raw"
+        try:
+            restored_modes = termios.tcgetattr(slave)
+        except termios.error as error:
+            # macOS detaches the slave from the ended controlling session.
+            # The master remains the same PTY and still exposes its termios.
+            if error.args[0] != errno.ENOTTY:
+                raise
+            restored_modes = termios.tcgetattr(master)
+        assert restored_modes == original, "detach left host terminal raw"
         assert b"\x1b[<1u" in transcript, "detach did not pop keyboard enhancement"
     finally:
         (root / "stop").touch()
