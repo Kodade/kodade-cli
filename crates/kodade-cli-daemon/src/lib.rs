@@ -391,6 +391,9 @@ impl vt100::Callbacks for PtyCallbacks {
             c,
         );
     }
+    fn unhandled_osc(&mut self, _: &mut vt100::Screen, params: &[&[u8]]) {
+        self.terminal_colors.osc(params);
+    }
     fn unhandled_escape(&mut self, _: &mut vt100::Screen, i1: Option<u8>, _: Option<u8>, c: u8) {
         if i1.is_none() && c == b'c' {
             self.terminal_modes = terminal_modes::Modes::default();
@@ -2052,18 +2055,38 @@ impl Session {
     fn handle_view(&self, message: ClientMessage, view: &mut ClientView) -> Result<()> {
         if let ClientMessage::SetTerminalColors { colors } = message {
             view.terminal_colors = colors;
+            let _dispatch = self
+                .view_dispatch
+                .lock()
+                .map_err(|_| anyhow!("view dispatch lock poisoned"))?;
+            self.ensure_mutation_open()?;
             return self.set_view_terminal_colors(view);
         }
         if let ClientMessage::SetCompactView { enabled } = message {
             view.compact = enabled;
-            return self.resize_for_view(view);
+            let _dispatch = self
+                .view_dispatch
+                .lock()
+                .map_err(|_| anyhow!("view dispatch lock poisoned"))?;
+            self.ensure_mutation_open()?;
+            self.resize_view_locked(view)?;
+            return self.set_view_terminal_colors(view);
         }
         if let ClientMessage::Hello { cols, rows, .. } | ClientMessage::Resize { cols, rows } =
             message
         {
             view.cols = cols;
             view.rows = rows;
-            return self.resize_for_view(view);
+            let _dispatch = self
+                .view_dispatch
+                .lock()
+                .map_err(|_| anyhow!("view dispatch lock poisoned"))?;
+            self.ensure_mutation_open()?;
+            self.resize_view_locked(view)?;
+            if !matches!(message, ClientMessage::Hello { .. }) {
+                self.set_view_terminal_colors(view)?;
+            }
+            return Ok(());
         }
         if let ClientMessage::ScrollPane { id, delta } = message {
             let _dispatch = self
@@ -2118,6 +2141,9 @@ impl Session {
             Self::install_view(&mut state, view);
             saved
         };
+        if Self::message_updates_terminal_colors(&message) {
+            self.set_view_terminal_colors(view)?;
+        }
         let result = self.handle(message.clone());
         let mut state = self
             .state
@@ -2134,6 +2160,11 @@ impl Session {
             }
         }
         drop(state);
+        if result.is_ok() && Self::message_updates_terminal_colors(&message) {
+            // Focus and pane-creation commands select their destination during
+            // dispatch, so publish the view's colors to that final pane too.
+            self.set_view_terminal_colors(view)?;
+        }
         if result.is_ok()
             && !matches!(
                 message,
@@ -2158,23 +2189,39 @@ impl Session {
             .state
             .lock()
             .map_err(|_| anyhow!("state lock poisoned"))?;
-        let (_, _, pane_id) = Self::view_selection(&state, Some(view));
+        let (_, tab, focused) = Self::view_selection(&state, Some(view));
+        let mut pane_ids = Vec::new();
+        if tab.zoomed || view.compact {
+            pane_ids.push(focused);
+        } else {
+            layout::leaves(&tab.tree, &mut pane_ids);
+        }
         drop(state);
-        if let Some(pane) = self
+        let panes = self
             .panes
             .lock()
-            .map_err(|_| anyhow!("pane lock poisoned"))?
-            .get(&pane_id)
-            .cloned()
-        {
-            pane.parser
-                .lock()
-                .map_err(|_| anyhow!("PTY parser lock poisoned"))?
-                .callbacks_mut()
-                .terminal_colors
-                .set(view.terminal_colors.clone());
+            .map_err(|_| anyhow!("pane lock poisoned"))?;
+        for pane_id in pane_ids {
+            if let Some(pane) = panes.get(&pane_id) {
+                pane.parser
+                    .lock()
+                    .map_err(|_| anyhow!("PTY parser lock poisoned"))?
+                    .callbacks_mut()
+                    .terminal_colors
+                    .set(view.terminal_colors.clone());
+            }
         }
         Ok(())
+    }
+
+    fn message_updates_terminal_colors(message: &ClientMessage) -> bool {
+        !matches!(
+            message,
+            ClientMessage::Query(_)
+                | ClientMessage::Subscribe
+                | ClientMessage::ReadPane { .. }
+                | ClientMessage::Hello { .. }
+        )
     }
     fn notify(&self) {
         // Every mutation funnels through here (directly or via `resize`), so this
@@ -2695,19 +2742,6 @@ impl Session {
         }
         self.notify();
         Ok(())
-    }
-
-    /// The most recently interacting client owns the physical PTY geometry.
-    /// Other views retain their requested dimensions for reconnect/inspection,
-    /// while terminal applications see one coherent size instead of a resize
-    /// race on every output frame.
-    fn resize_for_view(&self, view: &ClientView) -> Result<()> {
-        let _dispatch = self
-            .view_dispatch
-            .lock()
-            .map_err(|_| anyhow!("view dispatch lock poisoned"))?;
-        self.ensure_mutation_open()?;
-        self.resize_view_locked(view)
     }
 
     fn resize_view_locked(&self, view: &ClientView) -> Result<()> {
@@ -5407,7 +5441,6 @@ fn graphics_text(parser: &mut PtyParser, text: &[u8]) {
     let mut unicode = std::mem::take(&mut parser.callbacks_mut().graphics_unicode);
     for &raw in text {
         parser.callbacks_mut().terminal_modes.feed(raw);
-        parser.callbacks_mut().terminal_colors.feed(raw);
         style.feed(raw);
         let chars = unicode.feed(raw);
         let mut placeholder_cell = None;
@@ -6237,6 +6270,105 @@ mod tests {
         assert_eq!(clipboard, "hi");
         drop(writer);
         server_task.await.unwrap().unwrap();
+    }
+
+    fn test_terminal_colors(foreground: [u8; 3]) -> kodade_cli_proto::TerminalColors {
+        kodade_cli_proto::TerminalColors {
+            foreground,
+            background: [4, 5, 6],
+            palette: [[7, 8, 9]; 16],
+        }
+    }
+
+    fn color_reply(session: &Session, pane_id: PaneId) -> Vec<u8> {
+        let pane = session.panes.lock().unwrap()[&pane_id].clone();
+        let mut parser = pane.parser.lock().unwrap();
+        parser.callbacks_mut().terminal_colors.osc(&[b"10", b"?"]);
+        parser.callbacks_mut().terminal_colors.take_replies()
+    }
+
+    #[tokio::test]
+    async fn viewed_panes_follow_interacting_client_colors_without_read_only_takeover() {
+        let session = Session::spawn(80, 24, "terminal-colors-views".into()).unwrap();
+        session.handle(ClientMessage::SplitRight).unwrap();
+        let mut dark = session.new_client_view().unwrap();
+        let mut light = session.new_client_view().unwrap();
+        let dark_colors = test_terminal_colors([1, 2, 3]);
+        let light_colors = test_terminal_colors([10, 11, 12]);
+        session
+            .handle_view(
+                ClientMessage::SetTerminalColors {
+                    colors: Some(dark_colors),
+                },
+                &mut dark,
+            )
+            .unwrap();
+        let panes = session.snapshot_for_client(&dark).unwrap().panes;
+        assert!(panes
+            .iter()
+            .all(|pane| { color_reply(&session, pane.id) == b"\x1b]10;rgb:0101/0202/0303\x1b\\" }));
+        session
+            .handle_view(
+                ClientMessage::SetTerminalColors {
+                    colors: Some(light_colors),
+                },
+                &mut light,
+            )
+            .unwrap();
+        // A snapshot query does not publish the detached client's old palette.
+        session
+            .handle_view(ClientMessage::Query(QueryKind::Layout), &mut dark)
+            .unwrap();
+        assert!(panes
+            .iter()
+            .all(|pane| { color_reply(&session, pane.id) == b"\x1b]10;rgb:0a0a/0b0b/0c0c\x1b\\" }));
+        session
+            .handle_view(ClientMessage::Input { bytes: Vec::new() }, &mut dark)
+            .unwrap();
+        assert!(panes
+            .iter()
+            .all(|pane| { color_reply(&session, pane.id) == b"\x1b]10;rgb:0101/0202/0303\x1b\\" }));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn real_pty_answers_split_osc_color_query_for_active_view() {
+        let session = Session::spawn(80, 24, "terminal-colors-pty".into()).unwrap();
+        let mut view = session.new_client_view().unwrap();
+        session
+            .handle_view(
+                ClientMessage::SetTerminalColors {
+                    colors: Some(test_terminal_colors([1, 2, 3])),
+                },
+                &mut view,
+            )
+            .unwrap();
+        session
+            .handle_view(
+                ClientMessage::Input {
+                    bytes: br#"exec python3 -c 'import os,termios,tty;fd=os.open("/dev/tty",os.O_RDWR);old=termios.tcgetattr(fd);tty.setraw(fd);os.write(fd,b"\x1b]10;");os.write(fd,b"?\x1b\\");value=os.read(fd,128);termios.tcsetattr(fd,termios.TCSADRAIN,old);print("color:"+value.hex())'
+"#.to_vec(),
+                },
+                &mut view,
+            )
+            .unwrap();
+        let screen = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let screen = session.snapshot().unwrap().panes[0].screen.clone();
+                if screen
+                    .contents
+                    .contains("color:1b5d31303b7267623a303130312f303230322f303330331b5c")
+                {
+                    break screen;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("PTY color reply");
+        assert!(screen
+            .contents
+            .contains("color:1b5d31303b7267623a303130312f303230322f303330331b5c"));
     }
 
     #[cfg(unix)]
@@ -8236,7 +8368,15 @@ mod tests {
         assert_eq!(pane.master.lock().unwrap().get_size().unwrap().cols, 38);
         let mut wide = session.new_client_view().unwrap();
         wide.cols = 120;
-        session.resize_for_view(&wide).unwrap();
+        session
+            .handle_view(
+                ClientMessage::Resize {
+                    cols: 120,
+                    rows: wide.rows,
+                },
+                &mut wide,
+            )
+            .unwrap();
         session
             .handle_view(ClientMessage::Input { bytes: Vec::new() }, &mut narrow)
             .unwrap();
