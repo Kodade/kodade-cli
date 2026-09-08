@@ -3486,6 +3486,10 @@ impl Pane {
         if let Some(dir) = &cwd {
             command.cwd(dir);
         }
+        // Panes render through Ködade's terminal, independently of the host's
+        // terminfo installation. Explicit workspace overrides remain available.
+        command.env("TERM", "xterm-256color");
+        command.env("COLORTERM", "truecolor");
         for (key, value) in environment {
             command.env(key, value);
         }
@@ -6725,6 +6729,55 @@ mod tests {
         fs::remove_dir_all(base).ok();
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pane_reports_its_terminal_environment_and_allows_workspace_override() {
+        let session = Session::spawn(80, 24, "terminal-env".into()).expect("session");
+        for (term, env) in [
+            ("xterm-256color", HashMap::new()),
+            ("vt100", HashMap::from([("TERM".into(), "vt100".into())])),
+        ] {
+            session
+                .handle(ClientMessage::NewWorkspace {
+                    name: term.into(),
+                    root: None,
+                    env,
+                })
+                .unwrap();
+            session
+                .handle(ClientMessage::NewPane {
+                    workspace: None,
+                    tab: None,
+                    split: None,
+                    command: Some(vec![
+                        "sh".into(),
+                        "-c".into(),
+                        "printf 'terminal=%s colors=%s' \"$TERM\" \"$COLORTERM\"; sleep 10".into(),
+                    ]),
+                    name: None,
+                    context: None,
+                })
+                .unwrap();
+            let expected = format!("terminal={term} colors=truecolor");
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if session
+                        .snapshot()
+                        .unwrap()
+                        .panes
+                        .iter()
+                        .any(|pane| pane.screen.contents.contains(&expected))
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("actual PTY terminal environment");
+        }
+    }
+
     #[tokio::test]
     async fn workspace_environment_reaches_future_pty_panes_and_persists() {
         let session = Session::spawn(80, 24, "workspace-env".into()).expect("spawn session");
@@ -6753,21 +6806,23 @@ mod tests {
                 })
                 .expect("spawn pane");
         }
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        let contents: Vec<_> = session
-            .panes
-            .lock()
-            .expect("panes")
-            .values()
-            .map(|pane| pane.snapshot().0.contents)
-            .collect();
-        assert_eq!(
-            contents
-                .iter()
-                .filter(|text| text.contains("per-workspace"))
-                .count(),
-            2
-        );
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let count = session
+                    .panes
+                    .lock()
+                    .expect("panes")
+                    .values()
+                    .filter(|pane| pane.snapshot().0.contents.contains("per-workspace"))
+                    .count();
+                if count == 2 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("both actual PTYs receive workspace variables");
         assert_eq!(
             session
                 .build_file()
@@ -6802,13 +6857,22 @@ mod tests {
                 context: None,
             })
             .expect("spawn restored pane");
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        assert!(restored
-            .panes
-            .lock()
-            .expect("panes")
-            .values()
-            .any(|pane| pane.snapshot().0.contents.contains("per-workspace")));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let ready = restored
+                    .panes
+                    .lock()
+                    .expect("panes")
+                    .values()
+                    .any(|pane| pane.snapshot().0.contents.contains("per-workspace"));
+                if ready {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("restored PTY receives workspace variables");
     }
 
     #[tokio::test]

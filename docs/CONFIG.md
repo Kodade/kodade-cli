@@ -565,3 +565,9 @@ bright_magenta = "#e5a67d"
 bright_cyan = "#9dd4e2"
 bright_white = "#f0ece3"
 ```
+
+### Terminal environment inside panes
+
+Panes default to `TERM=xterm-256color` and `COLORTERM=truecolor`, so programs
+use Ködade's terminal capabilities even when the outer terminal has a custom
+terminfo name. An explicit workspace environment can override these defaults.

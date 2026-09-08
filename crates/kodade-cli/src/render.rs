@@ -1029,10 +1029,12 @@ pub fn sidebar_rows_for_endpoints(
     machines: &[(EndpointId, String, String, bool)],
 ) -> SidebarModel {
     if entries.len() == 1
-        && (machines.is_empty()
-            || machines
-                .first()
-                .is_some_and(|(_, label, status, _)| label == "Local" && status == "online"))
+        && entries[0].0 == EndpointId::Local
+        && entries[0].1 == "Local"
+        && entries[0].2 == "online"
+        && machines
+            .iter()
+            .all(|(id, _, _, _)| *id == EndpointId::Local)
     {
         let (endpoint, _label, _status, layout) = &entries[0];
         let empty = HashSet::new();
@@ -1746,6 +1748,30 @@ mod tests {
             .into_flat()
             .iter()
             .any(|row| matches!(row.target, Some(SidebarTarget::Pane(_)))));
+    }
+
+    #[test]
+    fn simple_local_sidebar_keeps_offline_machine_discovery() {
+        let endpoints = vec![(
+            EndpointId::Local,
+            "Local".into(),
+            "online".into(),
+            snapshot(),
+        )];
+        let mut machines = vec![(EndpointId::Local, "Local".into(), "online".into(), true)];
+        let simple = sidebar_rows_for_endpoints(&endpoints, &BTreeMap::new(), true, &machines);
+        assert_eq!(simple.workspaces[0].label, "workspaces");
+        assert!(!simple
+            .workspaces
+            .iter()
+            .any(|row| matches!(row.target, Some(SidebarTarget::Endpoint(_)))));
+        let remote = EndpointId::Machine("offline".into());
+        machines.push((remote.clone(), "Build".into(), "offline".into(), false));
+        let connected = sidebar_rows_for_endpoints(&endpoints, &BTreeMap::new(), true, &machines);
+        assert!(connected
+            .workspaces
+            .iter()
+            .any(|row| row.target == Some(SidebarTarget::Endpoint(remote.clone()))));
     }
 
     #[test]

@@ -1,8 +1,21 @@
 # Ködade CLI
 
-Ködade CLI is a terminal workspace for running agent CLIs such as Claude Code,
-Codex, and other programs that run in a terminal. Workspaces contain tabs, and
-tabs contain panes. It is the terminal-native companion to the
+Keep your coding agents, shells, and remote projects in one terminal workspace.
+Ködade CLI remembers your panes, shows which agents need attention, and gives
+you the same controls at the keyboard or from a script.
+
+- **Find the next action.** Press `ctrl+b`, then `space` to search commands,
+  launch an agent, switch projects, or open settings.
+- **Work across machines.** Keep local and saved SSH workspaces together, with
+  independent focus and reconnects for each attached client.
+- **Automate with a clear target.** Start, read, prompt, and wait for a specific
+  agent. Exact conversation references prevent an accidental resume into the
+  wrong conversation.
+- **Make it yours.** Add local extensions, selected-text actions, command
+  shortcuts, workspace variables, and Git worktrees.
+
+A Rust binary with a persistent local daemon. No account or hosted service.
+Ködade CLI also works independently of the
 [Ködade desktop app](https://github.com/Kodade/kodade).
 
 ## Status
@@ -20,7 +33,7 @@ After upgrading, start a new session to use the updated daemon. Existing
 sessions keep their running daemon until stopped; save work in those panes
 before stopping them.
 
-Current development also includes:
+The next release also includes:
 
 - Local and saved SSH machines in one workspace, with independent reconnects.
 - A command center (`prefix space`) and attention history (`prefix A`).
@@ -95,6 +108,7 @@ The default prefix is `ctrl+b`. After the prefix, the default actions are:
 
 | Key | Action |
 |---|---|
+| `space` / `A` | Command center / attention history |
 | `%` / `"` | Split right / down |
 | `x` / `c` | Close pane / new tab |
 | `n` | Navigate mode |

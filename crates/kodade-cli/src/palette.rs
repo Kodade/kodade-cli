@@ -139,6 +139,7 @@ impl Palette {
         let rows = visible.iter().map(row).collect();
         let mut overlay = Overlay::new("command center · type to filter · esc closes", rows);
         overlay.filter = Some(String::new());
+        overlay.max_visible_rows = 16;
         Self {
             all,
             visible,
