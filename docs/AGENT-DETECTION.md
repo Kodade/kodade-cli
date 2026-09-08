@@ -25,7 +25,11 @@ then `working`, `done`, `idle`, and `unknown`.
 
 Detection uses the highest available authority in this order:
 
-1. **Lifecycle hook.** A hook report wins when it is still current. For
+1. **Lifecycle hook.** A hook report wins when it is still current. Recognized
+   Ködade adapters also identify their agent when a JavaScript/Python wrapper
+   is the foreground process. That identity is bound to current process
+   evidence and is retired when the pane returns to a shell. Arbitrary hook
+   source text never becomes an identity. For
    `blocked`, `working`, and `idle` reports that means no more than 30 seconds
    old — the daemon constant is `HOOK_TTL = Duration::from_secs(30)`, and a
    report exactly 30 seconds old is still valid. A `done` report has **no
@@ -97,6 +101,8 @@ match is specific to an attention prompt.
 
 ## Built-in manifests and overrides
 
+Ködade bundles 24 manifests and ships lifecycle adapters for 17 agents.
+
 Built-ins are source files in
 `crates/kodade-cli-daemon/manifests/` and are embedded into the binary by
 `crates/kodade-cli-daemon/src/manifest.rs`. "Verified" means the process,
@@ -114,7 +120,7 @@ Verified:
 - Gemini CLI (`gemini-cli.toml`) — blocked rule, `resume = "gemini --resume latest"`
 - Aider (`aider.toml`) — blocked rule
 
-Unverified (identification only, no screen rules):
+Identification-only (no screen rules):
 
 - Cursor CLI (`cursor-agent.toml`)
 - GitHub Copilot CLI (`copilot.toml`)
@@ -125,6 +131,15 @@ Unverified (identification only, no screen rules):
 - Qwen Code (`qwen-code.toml`)
 - Pi (`pi.toml`)
 - Hermes (`hermes.toml`)
+- Antigravity (`antigravity.toml`)
+- Devin (`devin.toml`)
+- Kilo Code (`kilo.toml`)
+- Kiro CLI (`kiro.toml`)
+- Maki (`maki.toml`)
+- Mastra Code (`mastra.toml`)
+- Muse Code (`muse.toml`)
+- OMP (`omp.toml`)
+- Qoder CLI (`qodercli.toml`)
 
 None of the built-ins define a `done` screen rule: the interactive agents
 return to their prompt on completion with no distinctive, stable footer, so
@@ -160,9 +175,9 @@ Only files ending in `.toml` are read. A user manifest whose `name` equals a
 built-in `name` replaces that built-in. A different `name` adds another
 manifest. The replacement is complete: fields are not merged with the
 built-in, so copy any built-in rules you want to retain. Invalid TOML or an
-invalid manifest prevents the manifest load from succeeding. The current
-implementation loads manifests when the daemon session is created; changing
-a file does not yet hot-reload an already running session.
+invalid manifest prevents the manifest load from succeeding. The daemon loads
+manifests when its session is created; run `kodade-cli agent manifests --reload`
+to atomically validate and reload built-ins plus overrides while it is running.
 
 ## Contributing a manifest
 
@@ -273,10 +288,12 @@ state, so detection does not depend on screen strings alone.
   events → working, permission requests → blocked, and agent end/stop → done.
   The vendor documents a `session_id` hook field, but no CLI thread-resume
   argument; Ködade therefore keeps it out of native restore metadata.
-- `integrate grok [--write]` — writes Ködade's self-contained `SessionStart`
+- `integrate grok [--write]` — writes Ködade's self-contained lifecycle
   configuration to `~/.grok/hooks/kodade-cli.json` (or
   `$GROK_HOME/hooks/kodade-cli.json`). Grok merges hook files in that
-  directory, so it does not modify any user hook file. The documented
+  directory, so it does not modify any user hook file. It maps start/prompt,
+  tool, subagent, and compact events to working; permissions, failures, and
+  notifications to blocked; and stop/session-end to done. The documented
   `sessionId` restores exactly with `grok --resume ID`.
 
 Merges are idempotent and never remove unrelated keys or hooks. A previously

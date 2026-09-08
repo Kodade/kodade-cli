@@ -261,6 +261,7 @@ impl Drop for Pane {
 struct ReportedHook {
     state: AgentStateKind,
     source: String,
+    agent: Option<String>,
     reported_at: Instant,
 }
 
@@ -1382,10 +1383,11 @@ impl Session {
     fn track_pane_agent(
         &self,
         pane: &Pane,
-        agent: &Option<String>,
+        detection: &agent::Detection,
         process: &ProcessEvidence,
     ) -> u64 {
-        let (generation, cleared_native) = pane.track_agent_identity(agent, process);
+        let (generation, cleared_native) =
+            pane.track_agent_identity(&detection.agent, process, detection.identity_from_hook);
         if cleared_native {
             // Retiring a conversation is a persistence mutation even when its
             // pane is hidden and terminal-output persistence is disabled.
@@ -1546,7 +1548,7 @@ impl Session {
         let mut ages = HashMap::new();
         for (id, pane) in panes.iter() {
             let detection = &detections[id];
-            self.track_pane_agent(pane, &detection.agent, &pane.process_evidence(now, false));
+            self.track_pane_agent(pane, detection, &pane.process_evidence(now, false));
             let (previous, age) = pane.transition_state(detection.state, now);
             ages.insert(*id, age);
             // The `track_state` write above makes this fire once per real
@@ -1693,7 +1695,7 @@ impl Session {
             agent: detection.agent.clone(),
             agent_generation: self.track_pane_agent(
                 &pane,
-                &detection.agent,
+                &detection,
                 &pane.process_evidence(now, false),
             ),
             activity_revision: pane.activity_revision.load(Ordering::Relaxed),
@@ -1733,7 +1735,7 @@ impl Session {
             .lock()
             .map_err(|_| anyhow!("manifest lock poisoned"))?;
         let (detection, process) = pane.detect_fresh(&manifests, now);
-        let generation = self.track_pane_agent(&pane, &detection.agent, &process);
+        let generation = self.track_pane_agent(&pane, &detection, &process);
         if detection.agent.as_deref() != Some(expected_agent) || generation != expected_generation {
             bail!("agent pane {} was replaced; resolve the target again", id.0);
         }
@@ -2440,11 +2442,13 @@ impl Session {
                 let pane = panes
                     .get(&pane)
                     .ok_or_else(|| anyhow!("pane {} not found", pane.0))?;
+                let hook_agent = trusted_hook_agent(&source, native_session.as_ref());
                 let mut hook = pane.hook.lock().expect("hook lock poisoned");
                 let changed = hook.as_ref().is_none_or(|previous| previous.state != state);
                 *hook = Some(ReportedHook {
                     state,
                     source,
+                    agent: hook_agent,
                     reported_at: Instant::now(),
                 });
                 drop(hook);
@@ -2455,7 +2459,11 @@ impl Session {
                     // this report, so its next detection cannot erase a new ID.
                     let manifests = self.manifests.lock().expect("manifest lock poisoned");
                     let (detection, process) = pane.detect_fresh(&manifests, Instant::now());
-                    pane.track_agent_identity(&detection.agent, &process);
+                    pane.track_agent_identity(
+                        &detection.agent,
+                        &process,
+                        detection.identity_from_hook,
+                    );
                     *pane
                         .native_session
                         .lock()
@@ -3678,12 +3686,13 @@ impl Pane {
             .map(|hook| agent::HookState {
                 state: hook.state,
                 source: hook.source,
+                agent: hook.agent,
                 age: now.saturating_duration_since(hook.reported_at),
                 // A `done` report is released once the pane prints anything new.
                 output_since_report: last_output > hook.reported_at,
             });
         let output_age = now.saturating_duration_since(last_output);
-        let detection = agent::detect(
+        let mut detection = agent::detect(
             manifests,
             process.name.as_deref().or(Some(&self.spawn_process)),
             &title,
@@ -3691,6 +3700,22 @@ impl Pane {
             output_age,
             hook,
         );
+        // A hook-backed adapter can run under Node/Python. Once that process
+        // exits to a shell, ignore any stale title and sticky hook state.
+        if process.name.as_deref().is_some_and(agent::is_shell)
+            && self
+                .agent_identity
+                .lock()
+                .expect("agent identity lock poisoned")
+                .as_deref()
+                .is_some_and(|identity| identity.ends_with("|hook=true"))
+        {
+            detection.agent = None;
+            detection.state = AgentStateKind::Idle;
+            detection.reason = "foreground shell after agent exit".into();
+            detection.from_hook = false;
+            detection.identity_from_hook = false;
+        }
         (detection, process)
     }
 
@@ -3701,6 +3726,7 @@ impl Pane {
         &self,
         agent: &Option<String>,
         process: &ProcessEvidence,
+        from_hook: bool,
     ) -> (u64, bool) {
         let mut identity = self
             .agent_identity
@@ -3711,7 +3737,7 @@ impl Pane {
         // foreground PID/process when the platform can expose it.
         let next = agent.as_ref().map(|agent| {
             format!(
-                "{agent}|pid={}|process={}",
+                "{agent}|pid={}|process={}|hook={from_hook}",
                 process
                     .pid
                     .map_or_else(|| "unknown".into(), |pid| pid.to_string()),
@@ -3907,6 +3933,37 @@ fn valid_native_session(native: &NativeSession) -> bool {
             | ("kodade:devin", "devin", true, false)
             | ("kodade:grok", "grok", true, false)
     )
+}
+
+/// Accept identity only from one of our fixed adapter/source pairs. Hook
+/// `source` is user-supplied protocol text, so it must never become a pane
+/// identity by itself.
+fn trusted_hook_agent(source: &str, native: Option<&NativeSession>) -> Option<String> {
+    let native = native?;
+    let (agent, display) = match (source, native.source.as_str(), native.agent.as_str()) {
+        ("kodade:claude-code", "kodade:claude-code", "claude") => ("claude", "Claude Code"),
+        ("kodade:codex", "kodade:codex", "codex") => ("codex", "Codex"),
+        ("kodade:gemini-cli", "kodade:gemini-cli", "gemini") => ("gemini", "Gemini CLI"),
+        ("kodade:copilot", "kodade:copilot", "copilot") => ("copilot", "GitHub Copilot CLI"),
+        ("kodade:cursor", "kodade:cursor", "cursor") => ("cursor", "Cursor CLI"),
+        ("kodade:droid", "kodade:droid", "droid") => ("droid", "Droid"),
+        ("kodade:kimi", "kodade:kimi", "kimi") => ("kimi", "Kimi CLI"),
+        ("kodade:qwen", "kodade:qwen", "qwen") => ("qwen", "Qwen Code"),
+        ("kodade:omp", "kodade:omp", "omp") => ("omp", "OMP"),
+        ("kodade:kilo", "kodade:kilo", "kilo") => ("kilo", "Kilo Code"),
+        ("kodade:hermes", "kodade:hermes", "hermes") => ("hermes", "Hermes"),
+        ("kodade:antigravity", "kodade:antigravity", "antigravity") => {
+            ("antigravity", "Antigravity")
+        }
+        ("kodade:devin", "kodade:devin", "devin") => ("devin", "Devin"),
+        ("kodade:mastra", "kodade:mastra", "mastra") => ("mastra", "Mastra Code"),
+        ("kodade:grok", "kodade:grok", "grok") => ("grok", "Grok Build"),
+        ("kodade:opencode", "kodade:opencode", "opencode") => ("opencode", "OpenCode"),
+        ("kodade:pi", "kodade:pi", "pi") => ("pi", "Pi"),
+        _ => return None,
+    };
+    debug_assert!(!agent.is_empty());
+    Some(display.into())
 }
 
 fn native_resume_argv(native: &NativeSession) -> Option<Vec<String>> {
@@ -6136,6 +6193,7 @@ mod tests {
         *pane.hook.lock().unwrap() = Some(ReportedHook {
             state: AgentStateKind::Blocked,
             source: "test".into(),
+            agent: None,
             reported_at: Instant::now(),
         });
         assert!(session
@@ -6146,6 +6204,38 @@ mod tests {
                 b"must-not-write",
             )
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn recognized_hook_identity_survives_a_node_wrapper_but_not_a_shell() {
+        let session = Session::spawn(80, 24, "hook-wrapper-identity".into()).unwrap();
+        let pane_id = session.snapshot().unwrap().panes[0].id;
+        let pane = Arc::clone(&session.panes.lock().unwrap()[&pane_id]);
+        {
+            let mut process = pane.process.lock().unwrap();
+            process.name = Some("node".into());
+            process.checked_at = Instant::now();
+        }
+        session
+            .handle(ClientMessage::AgentState {
+                pane: pane_id,
+                state: AgentStateKind::Working,
+                source: "kodade:pi".into(),
+                native_session: Some(NativeSession {
+                    source: "kodade:pi".into(),
+                    agent: "pi".into(),
+                    id: None,
+                    path: None,
+                }),
+            })
+            .unwrap();
+        assert_eq!(
+            session.pane_snapshot(pane_id).unwrap().agent.as_deref(),
+            Some("Pi")
+        );
+
+        pane.process.lock().unwrap().name = Some("sh".into());
+        assert_eq!(session.pane_snapshot(pane_id).unwrap().agent, None);
     }
 
     #[tokio::test]

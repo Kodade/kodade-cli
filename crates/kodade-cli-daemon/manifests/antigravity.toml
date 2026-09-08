@@ -1,0 +1,4 @@
+# Identification uses the documented `antigravity` CLI entrypoint only.
+name = "antigravity"
+display = "Antigravity"
+process = ["antigravity"]

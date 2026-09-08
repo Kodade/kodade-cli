@@ -1,0 +1,4 @@
+# Identification uses the documented Maki CLI entrypoint only.
+name = "maki"
+display = "Maki"
+process = ["maki"]

@@ -1,0 +1,4 @@
+# Identification uses the documented Kilo Code CLI entrypoint only.
+name = "kilo"
+display = "Kilo Code"
+process = ["kilo"]

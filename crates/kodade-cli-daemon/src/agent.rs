@@ -14,6 +14,8 @@ pub const SCREEN_LINES: usize = 8;
 pub struct HookState {
     pub state: AgentStateKind,
     pub source: String,
+    /// Display identity from a recognized Ködade lifecycle adapter.
+    pub agent: Option<String>,
     pub age: Duration,
     /// True when the pane emitted PTY output after this hook was reported.
     /// A `done` report sticks until output appears (or the next report), rather
@@ -39,6 +41,8 @@ pub struct Detection {
     /// True when a live hook report drove the state. Notifications (#10) treat a
     /// hook as proof an agent is present even without a manifest match.
     pub from_hook: bool,
+    /// True only when the hook, rather than a manifest, supplied the identity.
+    pub identity_from_hook: bool,
 }
 
 pub fn detect(
@@ -54,6 +58,13 @@ pub fn detect(
         .find(|manifest| manifest.identifies(process, title));
     let agent = manifest.map(|manifest| manifest.display.clone());
     if let Some(hook) = hook.filter(hook_is_current) {
+        // Adapter callbacks commonly run under Node/Python instead of the
+        // agent executable. A shell is conclusive evidence that it exited.
+        let hook_agent = (!process.is_some_and(is_shell) && agent.is_none())
+            .then(|| hook.agent.clone())
+            .flatten();
+        let identity_from_hook = hook_agent.is_some();
+        let agent = agent.or(hook_agent);
         let sticky = if hook.state == AgentStateKind::Done {
             " sticky until output"
         } else {
@@ -68,6 +79,7 @@ pub fn detect(
                 hook.source
             ),
             from_hook: true,
+            identity_from_hook,
         };
     }
     let Some(manifest) = manifest else {
@@ -84,6 +96,7 @@ pub fn detect(
                 process.unwrap_or("shell")
             ),
             from_hook: false,
+            identity_from_hook: false,
         };
     };
     if let Some(rule) = matching_rule(manifest, screen, SCREEN_LINES) {
@@ -97,6 +110,7 @@ pub fn detect(
             state: rule.state.into(),
             reason: format!("manifest rule '{needle}' matched"),
             from_hook: false,
+            identity_from_hook: false,
         };
     }
     let (state, reason) = if output_age < OUTPUT_WORKING_WINDOW {
@@ -113,10 +127,11 @@ pub fn detect(
             output_age.as_secs()
         ),
         from_hook: false,
+        identity_from_hook: false,
     }
 }
 
-fn is_shell(process: &str) -> bool {
+pub(crate) fn is_shell(process: &str) -> bool {
     matches!(process, "sh" | "bash" | "zsh" | "fish" | "nu")
 }
 
@@ -168,6 +183,7 @@ mod tests {
             Some(HookState {
                 state: AgentStateKind::Working,
                 source: "claude".into(),
+                agent: None,
                 age: Duration::from_secs(4),
                 output_since_report: false,
             }),
@@ -183,6 +199,7 @@ mod tests {
             Some(HookState {
                 state: AgentStateKind::Working,
                 source: "claude".into(),
+                agent: None,
                 age: Duration::from_secs(31),
                 output_since_report: false,
             }),
@@ -202,6 +219,7 @@ mod tests {
             Some(HookState {
                 state: AgentStateKind::Done,
                 source: "claude".into(),
+                agent: None,
                 age: Duration::from_secs(600),
                 output_since_report: false,
             }),
@@ -218,11 +236,50 @@ mod tests {
             Some(HookState {
                 state: AgentStateKind::Done,
                 source: "claude".into(),
+                agent: None,
                 age: Duration::from_secs(2),
                 output_since_report: true,
             }),
         );
         assert_eq!(released.state, AgentStateKind::Blocked);
+    }
+
+    #[test]
+    fn recognized_hook_identifies_a_wrapper_but_not_its_exit_shell() {
+        let hook = HookState {
+            state: AgentStateKind::Working,
+            source: "kodade:pi".into(),
+            agent: Some("Pi".into()),
+            age: Duration::ZERO,
+            output_since_report: false,
+        };
+        assert_eq!(
+            detect(
+                &[],
+                Some("node"),
+                "",
+                "",
+                Duration::ZERO,
+                Some(hook.clone())
+            )
+            .agent
+            .as_deref(),
+            Some("Pi")
+        );
+        assert_eq!(
+            detect(&[], Some("sh"), "", "", Duration::ZERO, Some(hook)).agent,
+            None
+        );
+    }
+
+    #[test]
+    fn title_identifies_an_agent_started_through_a_shell() {
+        let mut titled = manifest();
+        titled.title = vec!["Codex".into()];
+        assert_eq!(
+            detect(&[titled], Some("sh"), "Codex", "", Duration::ZERO, None,).agent,
+            Some("Codex".into())
+        );
     }
 
     #[test]
