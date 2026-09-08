@@ -216,15 +216,9 @@ pub fn remove_session_file(name: &str) {
 #[derive(Debug, Default, Deserialize)]
 struct DaemonConfig {
     #[serde(default)]
-    session: SessionConfig,
+    session: kodade_cli_proto::SessionSettings,
     #[serde(default)]
     worktrees: WorktreesConfig,
-}
-
-#[derive(Debug, Default, Deserialize)]
-struct SessionConfig {
-    #[serde(flatten)]
-    settings: kodade_cli_proto::SessionSettings,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -274,7 +268,7 @@ pub fn resume_agents_setting() -> bool {
         return false;
     };
     toml::from_str::<DaemonConfig>(&text)
-        .map(|config| config.session.settings.resume_agents)
+        .map(|config| config.session.resume_agents)
         .unwrap_or(false)
 }
 
@@ -285,7 +279,7 @@ pub fn session_settings() -> kodade_cli_proto::SessionSettings {
     fs::read_to_string(home.join(".config/kodade-cli/config.toml"))
         .ok()
         .and_then(|text| toml::from_str::<DaemonConfig>(&text).ok())
-        .map(|config| config.session.settings)
+        .map(|config| config.session)
         .unwrap_or_default()
 }
 
