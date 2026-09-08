@@ -602,7 +602,7 @@ pub async fn run_action_with_context(
         let mut command = tokio::process::Command::new(
             std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".into()),
         );
-        command.args(["/D", "/S", "/C", &action.command]);
+        command.args(["/D", "/C", &action.command]);
         command
     };
     command
