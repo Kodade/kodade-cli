@@ -5999,6 +5999,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn daemon_rejects_invalid_and_reserved_workspace_environment() {
+        let session = Session::spawn(80, 24, "workspace-env-invalid".into()).expect("spawn");
+        for env in [
+            HashMap::from([("KODADE_SOCKET".into(), "forged".into())]),
+            HashMap::from([("1INVALID".into(), "value".into())]),
+        ] {
+            assert!(session
+                .handle(ClientMessage::NewWorkspace {
+                    name: "invalid".into(),
+                    root: None,
+                    env,
+                })
+                .is_err());
+        }
+    }
+
+    #[tokio::test]
     async fn pane_query_reaches_panes_outside_the_active_tab() {
         let directory =
             std::env::temp_dir().join(format!("kodade-cli-panequery-{}", std::process::id()));
