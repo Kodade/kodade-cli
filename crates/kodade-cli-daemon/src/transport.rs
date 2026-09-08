@@ -66,23 +66,25 @@ pub async fn bind(path: &Path) -> Result<Listener> {
 impl Listener {
     /// Reject unauthenticated peers before handing a byte of JSON to the daemon.
     pub async fn accept(&self) -> Result<(Stream, std::net::SocketAddr)> {
-        let (mut stream, address) = self
-            .listener
-            .accept()
+        loop {
+            let (mut stream, address) = self
+                .listener
+                .accept()
+                .await
+                .context("accept loopback connection")?;
+            let mut presented = [0; 32];
+            let authenticated = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                stream.read_exact(&mut presented),
+            )
             .await
-            .context("accept loopback connection")?;
-        let mut presented = [0; 32];
-        tokio::time::timeout(
-            std::time::Duration::from_secs(1),
-            stream.read_exact(&mut presented),
-        )
-        .await
-        .context("loopback authentication timed out")?
-        .context("read loopback authentication")?;
-        if !constant_time_eq(&presented, &self.secret) {
-            anyhow::bail!("unauthenticated loopback connection");
+            .ok()
+            .and_then(Result::ok)
+            .is_some_and(|_| constant_time_eq(&presented, &self.secret));
+            if authenticated {
+                return Ok((stream, address));
+            }
         }
-        Ok((stream, address))
     }
 }
 
@@ -210,6 +212,30 @@ fn restrict_to_owner(path: &Path) -> Result<()> {
 #[cfg(all(test, windows))]
 mod windows_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn rejected_authentication_does_not_stop_the_listener() {
+        use tokio::io::AsyncWriteExt;
+        let path = std::env::temp_dir().join(format!(
+            "kodade-transport-test-{}-{}.record",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let listener = bind(&path).await.unwrap();
+        let record = read_record(&path).unwrap();
+        let (endpoint, _) = parse_record(&record).unwrap();
+        let mut intruder = TcpStream::connect(endpoint).await.unwrap();
+        intruder.write_all(&[0; 32]).await.unwrap();
+        drop(intruder);
+        let (accepted, connected) = tokio::join!(listener.accept(), connect(&path));
+        assert!(accepted.is_ok());
+        assert!(connected.is_ok());
+        drop(connected);
+        let _ = std::fs::remove_file(path);
+    }
 
     #[test]
     fn discovery_record_accepts_only_ascii_loopback_secrets() {
