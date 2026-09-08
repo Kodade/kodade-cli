@@ -190,7 +190,25 @@ pub fn unintegrate_mastra() -> Result<()> {
 /// Grok merges each JSON file in its hooks directory. Keep Ködade's entry in
 /// a dedicated file so installation never rewrites a user's hook document.
 fn grok_hooks() -> Value {
-    json!({ "hooks": { "SessionStart": [{ "hooks": [{ "type": "command", "command": report_command("working", "kodade:grok", "grok"), "timeout": 10 }] }] } })
+    let hook = |state| json!([{ "hooks": [{ "type": "command", "command": report_command(state, "kodade:grok", "grok"), "timeout": 10 }] }]);
+    // Grok's documented event table distinguishes lifecycle, active work, and
+    // attention/failure events. Keep the complete mapping in our owned file.
+    json!({ "hooks": {
+        "SessionStart": hook("idle"),
+        "UserPromptSubmit": hook("working"),
+        "PreToolUse": hook("working"),
+        "PostToolUse": hook("working"),
+        "PostToolUseFailure": hook("blocked"),
+        "PermissionDenied": hook("blocked"),
+        "Notification": hook("blocked"),
+        "SubagentStart": hook("working"),
+        "SubagentStop": hook("working"),
+        "PreCompact": hook("working"),
+        "PostCompact": hook("working"),
+        "Stop": hook("done"),
+        "StopFailure": hook("blocked"),
+        "SessionEnd": hook("done")
+    } })
 }
 
 fn grok_config_dir(home: &Path) -> std::path::PathBuf {
@@ -235,7 +253,7 @@ pub fn unintegrate_grok() -> Result<()> {
 /// reports state only and deliberately does not persist `conversationId`.
 fn antigravity_report_command(state: &str) -> String {
     format!(
-        "{REPORT_PREFIX} if [ -n \"${{KODADE_PANE:-}}\" ] && [ -n \"${{KODADE_SOCKET:-}}\" ]; then \"${{KODADE_BIN:-kodade-cli}}\" agent report \"$KODADE_PANE\" {state} --source kodade:antigravity >/dev/null 2>&1 || true; fi; printf '{{}}\\n'"
+        "{REPORT_PREFIX} if [ -n \"${{KODADE_PANE:-}}\" ] && [ -n \"${{KODADE_SOCKET:-}}\" ]; then \"${{KODADE_BIN:-kodade-cli}}\" agent report \"$KODADE_PANE\" {state} --source kodade:antigravity --native-agent antigravity >/dev/null 2>&1 || true; fi; printf '{{}}\\n'"
     )
 }
 
@@ -1341,11 +1359,29 @@ mod tests {
         }
 
         let grok = grok_hooks();
-        let command = grok["hooks"]["SessionStart"][0]["hooks"][0]["command"]
-            .as_str()
-            .unwrap();
-        assert!(command.contains("kodade:grok"));
-        assert!(command.contains("--hook-json"));
+        for (event, state) in [
+            ("SessionStart", " idle "),
+            ("UserPromptSubmit", " working "),
+            ("PreToolUse", " working "),
+            ("PostToolUse", " working "),
+            ("PostToolUseFailure", " blocked "),
+            ("PermissionDenied", " blocked "),
+            ("Notification", " blocked "),
+            ("SubagentStart", " working "),
+            ("SubagentStop", " working "),
+            ("PreCompact", " working "),
+            ("PostCompact", " working "),
+            ("Stop", " done "),
+            ("StopFailure", " blocked "),
+            ("SessionEnd", " done "),
+        ] {
+            let command = grok["hooks"][event][0]["hooks"][0]["command"]
+                .as_str()
+                .unwrap();
+            assert!(command.contains("kodade:grok"), "{event}");
+            assert!(command.contains("--hook-json"), "{event}");
+            assert!(command.contains(state), "{event}");
+        }
     }
 
     #[test]
@@ -1414,7 +1450,7 @@ mod tests {
                 .as_str()
                 .unwrap(),
             mastra_hooks()["Stop"][0]["command"].as_str().unwrap(),
-            grok_hooks()["hooks"]["SessionStart"][0]["hooks"][0]["command"]
+            grok_hooks()["hooks"]["SessionEnd"][0]["hooks"][0]["command"]
                 .as_str()
                 .unwrap(),
         ] {

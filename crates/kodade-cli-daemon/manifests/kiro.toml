@@ -1,0 +1,4 @@
+# Identification uses the documented Kiro CLI entrypoint only.
+name = "kiro"
+display = "Kiro CLI"
+process = ["kiro-cli"]
