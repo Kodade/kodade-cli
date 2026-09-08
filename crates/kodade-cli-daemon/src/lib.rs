@@ -81,11 +81,12 @@ struct Workspace {
     root: Option<PathBuf>,
     /// Sidebar swatch color as `#rrggbb`, when the user set one (#19).
     color: Option<String>,
-    /// Cached git branch of `root`, refreshed on the 2 s process tick so the
-    /// sidebar can label it without a subprocess per frame (#22).
+    /// Git metadata is refreshed together every two seconds, keeping snapshot
+    /// rendering free of filesystem reads.
     branch: Option<String>,
-    /// When `branch` was last read, so the refresh only re-reads HEAD every 2 s.
-    branch_checked_at: Option<Instant>,
+    main_worktree_root: Option<PathBuf>,
+    parent: Option<WorkspaceId>,
+    metadata_checked_at: Option<Instant>,
 }
 struct Tab {
     id: TabId,
@@ -122,9 +123,9 @@ struct Pane {
     /// thread never sees EOF (the daemon and the test runtime would wait forever).
     child: Mutex<Box<dyn portable_pty::Child + Send>>,
     process: Mutex<ProcessEvidence>,
-    // Tracks how long the current detected state has held, for sidebar age labels.
-    last_state: Mutex<Option<AgentStateKind>>,
-    state_since: Mutex<Instant>,
+    // Tracks the current detected state and its start as one atomic transition,
+    // so concurrent snapshots cannot publish the same change twice.
+    state: Mutex<PaneState>,
 }
 
 /// Closing a pane terminates its process so the PTY reader thread exits.
@@ -148,6 +149,26 @@ struct ProcessEvidence {
     name: Option<String>,
     cwd: Option<PathBuf>,
     checked_at: Instant,
+}
+
+struct PaneState {
+    last: Option<AgentStateKind>,
+    since: Instant,
+}
+
+impl PaneState {
+    /// Record one observation and return the previous state plus this state's
+    /// age. Holding both values together makes the returned transition real
+    /// even when multiple clients snapshot at the same time.
+    fn transition(&mut self, next: AgentStateKind, now: Instant) -> (Option<AgentStateKind>, u64) {
+        let previous = self.last;
+        self.since = state_since_after(previous, next, self.since, now);
+        self.last = Some(next);
+        (
+            previous,
+            now.saturating_duration_since(self.since).as_secs(),
+        )
+    }
 }
 
 pub fn socket_path(session: &str) -> PathBuf {
@@ -296,8 +317,16 @@ async fn remove_stale_socket(socket: &Path) -> Result<()> {
     Ok(())
 }
 
-fn validate_session_name(session: &str) -> Result<()> {
-    if session.is_empty() || session.contains('/') || session == "." || session == ".." {
+/// Validate the single path component used for a session's socket and state
+/// file. Clients should call this before deriving either path.
+pub fn validate_session_name(session: &str) -> Result<()> {
+    if session.is_empty()
+        || session.len() > 64
+        || session.contains(['/', '\\'])
+        || session.chars().any(char::is_control)
+        || session == "."
+        || session == ".."
+    {
         bail!("session names must be non-empty path components");
     }
     Ok(())
@@ -350,7 +379,9 @@ impl Session {
                 root: None,
                 color: None,
                 branch: None,
-                branch_checked_at: None,
+                main_worktree_root: None,
+                parent: None,
+                metadata_checked_at: None,
             });
         Ok(session)
     }
@@ -429,7 +460,9 @@ impl Session {
                 root: saved.root.clone(),
                 color: saved.color.clone(),
                 branch: None,
-                branch_checked_at: None,
+                main_worktree_root: None,
+                parent: None,
+                metadata_checked_at: None,
             });
         }
         let active_workspace = workspace_ids
@@ -717,8 +750,9 @@ impl Session {
             .state
             .lock()
             .map_err(|_| anyhow!("state lock poisoned"))?;
-        // Refresh each workspace's cached branch at most every 2 s (cheap HEAD read).
-        refresh_branches(&mut state, Instant::now());
+        // Refresh git-derived sidebar metadata at most every 2 s. Snapshot
+        // rendering itself must not canonicalize worktree paths per frame.
+        refresh_workspace_metadata(&mut state, Instant::now());
         let workspace = state
             .workspaces
             .iter()
@@ -748,8 +782,7 @@ impl Session {
         let mut ages = HashMap::new();
         for (id, pane) in panes.iter() {
             let detection = &detections[id];
-            let previous = pane.last_state();
-            let age = pane.track_state(detection.state, now);
+            let (previous, age) = pane.transition_state(detection.state, now);
             ages.insert(*id, age);
             // The `track_state` write above makes this fire once per real
             // transition even when several clients snapshot concurrently.
@@ -817,7 +850,7 @@ impl Session {
                         root: item.root.clone(),
                         color: item.color.clone(),
                         branch: item.branch.clone(),
-                        parent: workspace_parent(&state, item),
+                        parent: item.parent,
                         tabs,
                     }
                 })
@@ -867,8 +900,7 @@ impl Session {
         }
         let now = Instant::now();
         let detection = pane.detect(&self.manifests, now);
-        let previous = pane.last_state();
-        let age = pane.track_state(detection.state, now);
+        let (previous, age) = pane.transition_state(detection.state, now);
         if let Some(from) = previous.filter(|from| *from != detection.state) {
             self.emit(Event::AgentStateChanged {
                 pane: id,
@@ -1363,7 +1395,9 @@ impl Session {
                     root,
                     color: None,
                     branch: None,
-                    branch_checked_at: None,
+                    main_worktree_root: None,
+                    parent: None,
+                    metadata_checked_at: None,
                 });
                 state.active_workspace = id;
                 drop(state);
@@ -1686,7 +1720,9 @@ impl Session {
             root: Some(dest),
             color: None,
             branch: Some(branch),
-            branch_checked_at: Some(Instant::now()),
+            main_worktree_root: None,
+            parent: None,
+            metadata_checked_at: None,
         });
         state.active_workspace = id;
         drop(state);
@@ -1712,14 +1748,16 @@ impl Session {
         let removal = root
             .as_deref()
             .and_then(|root| git::main_worktree_root(root).map(|main| (main, root.to_path_buf())));
-        // Drop the workspace (and its panes) first so no shell holds the cwd.
+        // Refuse a dirty or otherwise unremovable checkout before changing the
+        // session. A failed removal must leave the user's workspace and panes
+        // available to fix the problem. Git can remove a registered worktree
+        // even while a pane has it as its cwd on supported Unix platforms.
+        if !keep {
+            if let Some((main, dest)) = removal {
+                git::worktree_remove(&main, &dest, false)?;
+            }
+        }
         self.close_workspace(id)?;
-        if keep {
-            return Ok(());
-        }
-        if let Some((main, dest)) = removal {
-            git::worktree_remove(&main, &dest, true)?;
-        }
         Ok(())
     }
 
@@ -1750,7 +1788,7 @@ impl Session {
                 Some(index) => index,
                 None => return Ok(()),
             };
-            if state.workspaces.len() == 1 {
+            let pane_ids = if state.workspaces.len() == 1 {
                 // The last workspace is reset, not removed: its tabs go away and
                 // a fresh one takes their place, so no `WorkspaceClosed` here.
                 let workspace = &mut state.workspaces[index];
@@ -1782,7 +1820,14 @@ impl Session {
                 events.push(Event::WorkspaceClosed { workspace: id });
                 state.active_workspace = state.workspaces[index.saturating_sub(1)].id;
                 ids
+            };
+            // A cached child may have pointed at the workspace just removed.
+            // Refresh all relationships on the next snapshot rather than
+            // presenting a dangling parent for the cache interval.
+            for workspace in &mut state.workspaces {
+                workspace.metadata_checked_at = None;
             }
+            pane_ids
         };
         let mut panes = self
             .panes
@@ -2113,7 +2158,9 @@ impl Session {
                 root: saved.root.clone(),
                 color: saved.color.clone(),
                 branch: None,
-                branch_checked_at: None,
+                main_worktree_root: None,
+                parent: None,
+                metadata_checked_at: None,
             });
         }
         Ok((workspaces, used, highest))
@@ -2149,40 +2196,45 @@ fn locate_tab(state: &SessionState, tab: TabId) -> Option<(usize, usize)> {
         })
 }
 
-/// Refresh each workspace's cached git branch, re-reading HEAD at most once
-/// every 2 s so the sidebar can label branches without a subprocess per frame.
-fn refresh_branches(state: &mut SessionState, now: Instant) {
+/// Refresh git-derived sidebar metadata at most every two seconds. Parent
+/// relationships are calculated from this cache, so hot screen snapshots do no
+/// filesystem work beyond the timed refresh.
+fn refresh_workspace_metadata(state: &mut SessionState, now: Instant) {
+    let mut refreshed = false;
     for workspace in &mut state.workspaces {
         let Some(root) = workspace.root.clone() else {
             workspace.branch = None;
+            workspace.main_worktree_root = None;
+            workspace.parent = None;
             continue;
         };
         let stale = workspace
-            .branch_checked_at
+            .metadata_checked_at
             .map(|at| now.saturating_duration_since(at) >= Duration::from_secs(2))
             .unwrap_or(true);
         if stale {
             workspace.branch = git::branch_of(&root);
-            workspace.branch_checked_at = Some(now);
+            workspace.main_worktree_root = git::main_worktree_root(&root);
+            workspace.metadata_checked_at = Some(now);
+            refreshed = true;
         }
     }
-}
-
-/// The workspace `item` nests under: the one whose root is the main repo of
-/// `item`'s worktree, if such a workspace is open. `None` for a normal workspace.
-fn workspace_parent(state: &SessionState, item: &Workspace) -> Option<WorkspaceId> {
-    let main = item.root.as_deref().and_then(git::main_worktree_root)?;
-    state
+    if !refreshed {
+        return;
+    }
+    let roots: Vec<_> = state
         .workspaces
         .iter()
-        .filter(|other| other.id != item.id)
-        .find(|other| {
-            other
-                .root
-                .as_deref()
-                .is_some_and(|root| same_dir(root, &main))
-        })
-        .map(|other| other.id)
+        .filter_map(|workspace| workspace.root.clone().map(|root| (workspace.id, root)))
+        .collect();
+    for workspace in &mut state.workspaces {
+        workspace.parent = workspace.main_worktree_root.as_deref().and_then(|main| {
+            roots
+                .iter()
+                .find(|(id, root)| *id != workspace.id && same_dir(root, main))
+                .map(|(id, _)| *id)
+        });
+    }
 }
 
 /// Whether two paths point at the same directory, comparing canonical forms so
@@ -2396,8 +2448,10 @@ impl Pane {
                 cwd: None,
                 checked_at: Instant::now() - Duration::from_secs(2),
             }),
-            last_state: Mutex::new(None),
-            state_since: Mutex::new(Instant::now()),
+            state: Mutex::new(PaneState {
+                last: None,
+                since: Instant::now(),
+            }),
         })
     }
     fn snapshot(&self) -> (Screen, usize) {
@@ -2509,20 +2563,16 @@ impl Pane {
         )
     }
 
-    /// The last state `track_state` recorded, or `None` before the first
-    /// detection. Read before `track_state` so a transition can be spotted.
-    fn last_state(&self) -> Option<AgentStateKind> {
-        *self.last_state.lock().expect("state lock poisoned")
-    }
-
-    /// Records a state transition and returns how many seconds the current state
-    /// has held. `state_since` only resets when the detected state actually changes.
-    fn track_state(&self, state: AgentStateKind, now: Instant) -> u64 {
-        let mut last = self.last_state.lock().expect("state lock poisoned");
-        let mut since = self.state_since.lock().expect("state_since lock poisoned");
-        *since = state_since_after(*last, state, *since, now);
-        *last = Some(state);
-        now.saturating_duration_since(*since).as_secs()
+    /// Record one detection atomically and return the preceding state plus age.
+    fn transition_state(
+        &self,
+        state: AgentStateKind,
+        now: Instant,
+    ) -> (Option<AgentStateKind>, u64) {
+        self.state
+            .lock()
+            .expect("pane state lock poisoned")
+            .transition(state, now)
     }
 
     fn process_name(&self, now: Instant) -> Option<String> {
@@ -3122,6 +3172,16 @@ mod tests {
         );
     }
     #[test]
+    fn session_names_are_safe_single_path_components() {
+        for invalid in ["", ".", "..", "a/b", "a\\b", "line\nbreak", &"x".repeat(65)] {
+            assert!(
+                validate_session_name(invalid).is_err(),
+                "{invalid:?} should fail"
+            );
+        }
+        assert!(validate_session_name("agent-session_01").is_ok());
+    }
+    #[test]
     fn vt100_snapshot_retains_terminal_contents() {
         let mut parser = PtyParser::new_with_callbacks(3, 10, 100, PtyCallbacks::default());
         parser.process(b"hello\r\nworld");
@@ -3284,6 +3344,65 @@ mod tests {
     }
 
     #[test]
+    fn agent_state_transition_reports_a_change_once() {
+        let start = Instant::now();
+        let mut state = PaneState {
+            last: Some(AgentStateKind::Working),
+            since: start,
+        };
+
+        let first = state.transition(AgentStateKind::Blocked, start + Duration::from_secs(1));
+        let second = state.transition(AgentStateKind::Blocked, start + Duration::from_secs(2));
+
+        assert_eq!(first.0, Some(AgentStateKind::Working));
+        assert_eq!(second.0, Some(AgentStateKind::Blocked));
+        assert_eq!(second.1, 1);
+    }
+
+    #[tokio::test]
+    async fn concurrent_snapshots_publish_one_agent_transition() {
+        let session = Arc::new(Session::spawn(80, 24, "transition-race".into()).expect("session"));
+        let pane = session.snapshot().expect("initial snapshot").panes[0].id;
+        session
+            .handle(ClientMessage::AgentState {
+                pane,
+                state: AgentStateKind::Working,
+                source: "test".into(),
+            })
+            .expect("report working");
+        session.snapshot().expect("settle working state");
+        let mut events = session.events.subscribe();
+        session
+            .handle(ClientMessage::AgentState {
+                pane,
+                state: AgentStateKind::Blocked,
+                source: "test".into(),
+            })
+            .expect("report blocked");
+
+        let first = Arc::clone(&session);
+        let second = Arc::clone(&session);
+        let first = std::thread::spawn(move || first.snapshot().expect("first snapshot"));
+        let second = std::thread::spawn(move || second.snapshot().expect("second snapshot"));
+        first.join().expect("first thread");
+        second.join().expect("second thread");
+
+        let transitions = std::iter::from_fn(|| events.try_recv().ok())
+            .filter(|event| {
+                matches!(
+                    event,
+                    Event::AgentStateChanged {
+                        pane: changed,
+                        from: AgentStateKind::Working,
+                        to: AgentStateKind::Blocked,
+                    } if *changed == pane
+                )
+            })
+            .count();
+        assert_eq!(transitions, 1);
+    }
+
+    #[test]
     fn scroll_offset_clamps_to_available_history() {
         assert_eq!(scroll_offset_after_delta(1, 99, 2), 2);
         assert_eq!(scroll_offset_after_delta(1, -99, 2), 0);
@@ -3373,7 +3492,9 @@ mod tests {
                     root: None,
                     color: None,
                     branch: None,
-                    branch_checked_at: None,
+                    main_worktree_root: None,
+                    parent: None,
+                    metadata_checked_at: None,
                     tabs: vec![Tab {
                         id: TabId(2),
                         name: "shell".into(),
@@ -3389,7 +3510,9 @@ mod tests {
                     root: None,
                     color: None,
                     branch: None,
-                    branch_checked_at: None,
+                    main_worktree_root: None,
+                    parent: None,
+                    metadata_checked_at: None,
                     tabs: vec![Tab {
                         id: TabId(5),
                         name: "agents".into(),
@@ -3418,7 +3541,9 @@ mod tests {
                 root: None,
                 color: None,
                 branch: None,
-                branch_checked_at: None,
+                main_worktree_root: None,
+                parent: None,
+                metadata_checked_at: None,
                 tabs: vec![Tab {
                     id: TabId(2),
                     name: "agents".into(),
@@ -4057,6 +4182,81 @@ mod tests {
             })
             .expect("select the source workspace");
         session.snapshot().expect("snapshot after the move");
+    }
+
+    #[tokio::test]
+    async fn failed_worktree_removal_keeps_its_workspace_open() {
+        let base = std::env::temp_dir().join(format!(
+            "kodade-cli-worktree-remove-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let repo = base.join("repo");
+        let worktree = base.join("worktree");
+        fs::create_dir_all(&repo).expect("create repo");
+        for args in [
+            vec!["init", "-q", "-b", "main"],
+            vec!["config", "user.email", "test@example.com"],
+            vec!["config", "user.name", "Test"],
+        ] {
+            assert!(std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(args)
+                .status()
+                .expect("run git")
+                .success());
+        }
+        fs::write(repo.join("README.md"), "base\n").expect("seed repo");
+        assert!(std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["add", "."])
+            .status()
+            .expect("stage")
+            .success());
+        assert!(std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["commit", "-q", "-m", "base"])
+            .status()
+            .expect("commit")
+            .success());
+        git::worktree_add(&repo, "feature", None, &worktree).expect("add worktree");
+        fs::write(worktree.join("dirty.txt"), "preserve me\n").expect("dirty worktree");
+
+        let session = Session::spawn(80, 24, "dirty-worktree".into()).expect("spawn session");
+        session
+            .handle(ClientMessage::NewWorkspace {
+                name: "feature".into(),
+                root: Some(worktree.clone()),
+            })
+            .expect("open worktree workspace");
+        let workspace = session
+            .state
+            .lock()
+            .expect("state")
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.root.as_deref() == Some(worktree.as_path()))
+            .expect("worktree workspace")
+            .id;
+
+        assert!(session.remove_worktree_workspace(workspace, false).is_err());
+        assert!(worktree.join("dirty.txt").exists());
+        assert!(session
+            .state
+            .lock()
+            .expect("state")
+            .workspaces
+            .iter()
+            .any(|item| item.id == workspace));
+
+        git::worktree_remove(&repo, &worktree, true).expect("forced cleanup");
+        fs::remove_dir_all(base).ok();
     }
 
     #[tokio::test]

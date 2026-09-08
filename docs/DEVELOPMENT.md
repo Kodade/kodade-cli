@@ -42,17 +42,19 @@ identifies it.
 `repo_root` walks up to a `.git` entry, `current_branch` reads `.git/HEAD` (or,
 for a linked worktree, follows the `gitdir:` file to the real HEAD), and
 `main_worktree_root` follows `commondir` to find a worktree's main repo. These
-run on the daemon's 2-second process tick — each `Workspace` caches its `branch`
-so no subprocess runs per frame — and the cached branch plus the derived
-`parent` (the open workspace whose root is the worktree's main repo) travel on
+run on the daemon's 2-second metadata tick — each `Workspace` caches its branch
+and derived `parent` (the open workspace whose root is the worktree's main repo),
+so no filesystem work runs per frame — and those cached values travel on
 `WorkspaceInfo` so the sidebar can nest worktrees and dim their branch.
 
 Mutations shell out: `NewWorktreeWorkspace` runs `git worktree add` under
 `[worktrees] directory` (default `~/.kodade/worktrees`, read with the same tiny
 loader as `[session]`) and opens a `repo:branch` workspace rooted there;
-`RemoveWorktreeWorkspace` closes the workspace and, unless `keep`, runs
-`git worktree remove`. Removal is only attempted when `main_worktree_root`
-resolves, so nothing outside a registered worktree is ever deleted.
+`RemoveWorktreeWorkspace` first runs a non-forced `git worktree remove` unless
+`keep` is set, then closes the workspace only after removal succeeds. A dirty
+or otherwise unremovable checkout therefore stays open with its panes intact.
+Removal is only attempted when `main_worktree_root` resolves, so nothing
+outside a registered worktree is ever deleted.
 
 ## Session persistence and restore
 
@@ -71,7 +73,8 @@ risk); only layout and metadata are.
 
 Writes are debounced ~500 ms and driven by a `layout_generation` counter that
 only layout-changing mutations advance — PTY output never triggers a write. The
-file is written atomically (temp file + rename). SIGTERM flushes a final save;
+file is written atomically and durably (a unique same-directory temp file,
+file sync, rename, and directory sync). SIGTERM flushes a final save;
 an explicit `kill-session` deletes the file so a stopped session is not revived.
 
 On a cold start (no live daemon owns the socket) the daemon rebuilds the layout

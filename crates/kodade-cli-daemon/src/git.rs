@@ -224,4 +224,19 @@ mod tests {
         worktree_remove(&repo, &dest, true).ok();
         std::fs::remove_dir_all(&repo).ok();
     }
+
+    #[test]
+    fn refuses_to_remove_a_dirty_worktree_without_force() {
+        let repo = temp_dir("wt-dirty");
+        init_repo(&repo);
+        let dest = temp_dir("wt-dirty-dest").join("feature");
+        worktree_add(&repo, "feature", None, &dest).expect("worktree add");
+        std::fs::write(dest.join("uncommitted.txt"), "keep this work\n").unwrap();
+
+        assert!(worktree_remove(&repo, &dest, false).is_err());
+        assert!(dest.join("uncommitted.txt").exists());
+
+        worktree_remove(&repo, &dest, true).expect("forced cleanup");
+        std::fs::remove_dir_all(&repo).ok();
+    }
 }

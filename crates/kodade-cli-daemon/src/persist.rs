@@ -10,7 +10,10 @@
 use std::time::Instant;
 use std::{
     env, fs,
+    fs::OpenOptions,
+    io::Write,
     path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
     time::Duration,
 };
 
@@ -19,6 +22,10 @@ use serde::Deserialize;
 
 /// Debounce window: layout changes within this span collapse into one write.
 pub const DEBOUNCE: Duration = Duration::from_millis(500);
+
+/// Makes same-process state-file temps distinct. `create_new` below is still
+/// the authority when another process happens to choose the same path.
+static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// The session-file types now live in the proto crate so `layout export` /
 /// `layout apply` can carry them on the wire (#16); persistence keeps using
@@ -84,18 +91,87 @@ pub fn quarantine(path: &Path) {
     }
 }
 
-/// Atomically write a session file: serialize to `<path>.tmp`, then rename over
-/// the target so a reader never sees a half-written file.
+/// Atomically and durably publish a session file. Every writer claims a unique
+/// same-directory temp file, syncs its content, then renames it over the old
+/// state and syncs the directory. A concurrent writer's temp is never reused.
 pub fn write_session_file(path: &Path, file: &SessionFile) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).context("create session state directory")?;
     }
-    let temp = path.with_extension("json.tmp");
     let mut bytes = serde_json::to_vec_pretty(file).context("serialize session state")?;
     bytes.push(b'\n');
-    fs::write(&temp, &bytes).context("write session state temp file")?;
+    let (temp, mut temp_file) = create_unique_temp(path)?;
+    let mut cleanup = TempGuard::new(temp.clone());
+    temp_file
+        .write_all(&bytes)
+        .context("write session state temp file")?;
+    temp_file
+        .sync_all()
+        .context("sync session state temp file")?;
+    drop(temp_file);
     fs::rename(&temp, path).context("commit session state file")?;
+    // The rename consumed our pathname. Do not race a future writer that could
+    // create a new file at the same temp path before this scope ends.
+    cleanup.disarm();
+    sync_parent(path)?;
     Ok(())
+}
+
+/// Removes a temp file only while this writer still owns that pathname.
+struct TempGuard(Option<PathBuf>);
+
+impl TempGuard {
+    fn new(path: PathBuf) -> Self {
+        Self(Some(path))
+    }
+
+    fn disarm(&mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for TempGuard {
+    fn drop(&mut self) {
+        if let Some(path) = self.0.take() {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
+fn create_unique_temp(path: &Path) -> Result<(PathBuf, fs::File)> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("session state path has no parent"))?;
+    let name = path
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("session state path has no file name"))?
+        .to_string_lossy();
+    // `create_new` is the authority: a check followed by opening would race
+    // another process choosing the same candidate.
+    for _ in 0..32 {
+        let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let candidate = parent.join(format!(".{name}.{}.{}.tmp", std::process::id(), sequence));
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(file) => return Ok((candidate, file)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error).context("create session state temp file"),
+        }
+    }
+    anyhow::bail!("could not allocate a unique session state temp file")
+}
+
+fn sync_parent(path: &Path) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("session state path has no parent"))?;
+    fs::File::open(parent)
+        .context("open session state directory")?
+        .sync_all()
+        .context("sync session state directory")
 }
 
 /// Remove a session's state file (and any leftover temp), e.g. on an explicit
@@ -359,6 +435,44 @@ mod tests {
         write_session_file(&path, &sample_file()).expect("write");
         let read = read_session_file(&path).expect("read").expect("present");
         assert_eq!(read, sample_file());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn atomic_write_never_reuses_another_writers_temp_path() {
+        let dir = std::env::temp_dir().join(format!(
+            "kodade-persist-independent-temp-{}",
+            std::process::id()
+        ));
+        let path = dir.join("sessions").join("demo.json");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        // A concurrent writer may have already claimed the old fixed temp name.
+        // Publishing our state must not overwrite or remove its in-progress file.
+        let other_temp = path.with_extension("json.tmp");
+        fs::write(&other_temp, "other writer").unwrap();
+
+        write_session_file(&path, &sample_file()).expect("write");
+
+        assert_eq!(fs::read_to_string(&other_temp).unwrap(), "other writer");
+        assert_eq!(read_session_file(&path).unwrap(), Some(sample_file()));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn failed_publish_removes_only_its_own_temp_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "kodade-persist-failed-publish-{}",
+            std::process::id()
+        ));
+        let path = dir.join("target-directory");
+        fs::create_dir_all(&path).unwrap();
+
+        assert!(write_session_file(&path, &sample_file()).is_err());
+        assert!(fs::read_dir(&dir).unwrap().all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".target-directory.")));
         fs::remove_dir_all(&dir).unwrap();
     }
 
