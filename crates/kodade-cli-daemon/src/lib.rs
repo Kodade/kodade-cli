@@ -570,6 +570,20 @@ impl Session {
                     let command =
                         resume_command(saved_pane, resume_agents, &mut resumed_native_sessions);
                     let new_id = session.new_pane(&saved_pane.title, cwd, command)?;
+                    if let Some(native) = saved_pane.native_session.clone() {
+                        if valid_native_session(&native) {
+                            session
+                                .panes
+                                .lock()
+                                .expect("panes lock poisoned")
+                                .get(&new_id)
+                                .expect("new pane exists")
+                                .native_session
+                                .lock()
+                                .expect("native session lock poisoned")
+                                .replace(native);
+                        }
+                    }
                     pane_ids.insert(PaneId(saved_pane.id), new_id);
                 }
                 let tree = remap_tree(&saved_tab.tree, &pane_ids);
@@ -3317,6 +3331,14 @@ impl Pane {
             )
         });
         if *identity != next {
+            // A native session belongs to the foreground agent process. Once it
+            // exits or is replaced, do not let its old conversation resurrect.
+            if identity.is_some() {
+                *self
+                    .native_session
+                    .lock()
+                    .expect("native session lock poisoned") = None;
+            }
             *identity = next;
             self.agent_generation.fetch_add(1, Ordering::Relaxed);
         }
@@ -3411,17 +3433,14 @@ fn resume_command(
         .native_session
         .as_ref()
         .filter(|native| valid_native_session(native))?;
+    let argv = native_resume_argv(native)?;
     let key = native_session_key(native);
-    if !resumed.insert(key) {
-        return None;
-    }
-    native_resume_argv(native)
+    resumed.insert(key).then_some(argv)
 }
 
 fn native_session_key(native: &NativeSession) -> String {
     format!(
-        "{}\0{}\0{}\0{}",
-        native.source,
+        "{}\0{}\0{}",
         native.agent,
         native.id.as_deref().unwrap_or_default(),
         native
@@ -3435,11 +3454,17 @@ fn native_session_key(native: &NativeSession) -> String {
 fn valid_native_session(native: &NativeSession) -> bool {
     const MAX_VALUE: usize = 4096;
     let valid_text = |value: &str| {
-        !value.is_empty() && value.len() <= MAX_VALUE && !value.chars().any(char::is_control)
+        !value.is_empty()
+            && value.len() <= MAX_VALUE
+            && !value.starts_with('-')
+            && !value
+                .chars()
+                .any(|ch| ch.is_whitespace() || ch.is_control())
     };
     let valid_id = native.id.as_deref().is_some_and(valid_text);
     let valid_path = native.path.as_ref().is_some_and(|path| {
         path.is_absolute()
+            && path.is_file()
             && path.as_os_str().len() <= MAX_VALUE
             && !path.to_string_lossy().chars().any(char::is_control)
     });

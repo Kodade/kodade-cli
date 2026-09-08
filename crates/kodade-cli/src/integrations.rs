@@ -13,9 +13,9 @@ const REPORT_PREFIX: &str = "KODADE_INTEGRATION=kodade-cli;";
 const LEGACY_REPORT_PREFIX: &str = "kodade-cli agent report $KODADE_PANE ";
 
 /// Command each hook/notify entry runs; `state` is the state it reports.
-fn report_command(state: &str, source: &str, agent: &str, payload_key: &str) -> String {
+fn report_command(state: &str, source: &str, agent: &str, _payload_key: &str) -> String {
     format!(
-        "{REPORT_PREFIX} payload=$(cat); native_id=$(printf '%s' \"$payload\" | sed -n 's/.*\"{payload_key}\"[[:space:]]*:[[:space:]]*\"\\([^\"]*\\)\".*/\\1/p' | head -n 1); if [ -n \"${{KODADE_PANE:-}}\" ] && [ -n \"${{KODADE_SOCKET:-}}\" ]; then if [ -n \"$native_id\" ]; then \"${{KODADE_BIN:-kodade-cli}}\" agent report \"$KODADE_PANE\" {state} --source {source} --native-agent {agent} --native-session-id \"$native_id\"; else \"${{KODADE_BIN:-kodade-cli}}\" agent report \"$KODADE_PANE\" {state} --source {source}; fi >/dev/null 2>&1 || true; fi"
+        "{REPORT_PREFIX} if [ -n \"${{KODADE_PANE:-}}\" ] && [ -n \"${{KODADE_SOCKET:-}}\" ]; then \"${{KODADE_BIN:-kodade-cli}}\" agent report \"$KODADE_PANE\" {state} --source {source} --native-agent {agent} --hook-json >/dev/null 2>&1 || true; fi"
     )
 }
 
@@ -513,9 +513,9 @@ mod tests {
         let codex = codex_hooks["Stop"][0]["hooks"][0]["command"]
             .as_str()
             .unwrap();
-        assert!(claude.contains("--native-session-id \"$native_id\""));
+        assert!(claude.contains("--hook-json"));
         assert!(claude.contains("kodade:claude-code"));
-        assert!(codex.contains("\"thread_id\""));
+        assert!(codex.contains("--hook-json"));
         assert!(codex.contains("--native-agent codex"));
         assert!(pi_extension().contains("getSessionFile"));
         assert!(opencode_plugin().contains("sessionID || event.properties?.sessionId"));

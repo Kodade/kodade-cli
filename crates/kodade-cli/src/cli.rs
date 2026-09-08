@@ -605,6 +605,10 @@ pub enum AgentCommand {
         /// Agent-native session path reported by an integration hook.
         #[arg(long, value_name = "PATH", conflicts_with = "native_session_id")]
         native_session_path: Option<PathBuf>,
+        /// Read one bounded JSON hook payload from a pipe and extract this
+        /// integration's documented native session field.
+        #[arg(long)]
+        hook_json: bool,
     },
 }
 
@@ -847,6 +851,7 @@ mod tests {
                     native_agent: None,
                     native_session_id: None,
                     native_session_path: None,
+                    hook_json: false,
                 }
             })
         );
@@ -867,6 +872,7 @@ mod tests {
                     native_agent: None,
                     native_session_id: None,
                     native_session_path: None,
+                    hook_json: false,
                 }
             })
         );
@@ -897,6 +903,7 @@ mod tests {
                     native_agent: Some("codex".into()),
                     native_session_id: Some("thread-7".into()),
                     native_session_path: None,
+                    hook_json: false,
                 }
             })
         );

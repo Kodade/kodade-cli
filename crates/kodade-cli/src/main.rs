@@ -1045,7 +1045,13 @@ async fn agent(
             native_agent,
             native_session_id,
             native_session_path,
+            hook_json,
         } => {
+            let native_session_id = if hook_json {
+                hook_session_id(&source, native_agent.as_deref())?
+            } else {
+                native_session_id
+            };
             commands::layout(
                 commands::request(
                     socket,
@@ -1066,6 +1072,34 @@ async fn agent(
             Ok(())
         }
     }
+}
+
+fn hook_session_id(source: &str, agent: Option<&str>) -> Result<Option<String>> {
+    use std::io::{IsTerminal, Read};
+    if std::io::stdin().is_terminal() {
+        return Ok(None);
+    }
+    let mut payload = Vec::with_capacity(4096);
+    std::io::stdin()
+        .take(65_537)
+        .read_to_end(&mut payload)
+        .context("read hook payload")?;
+    if payload.len() > 65_536 {
+        bail!("hook payload exceeds 64 KiB");
+    }
+    let value: serde_json::Value =
+        serde_json::from_slice(&payload).context("parse hook payload")?;
+    let key = match (source, agent) {
+        ("kodade:codex", Some("codex")) => "session_id",
+        ("kodade:claude-code", Some("claude")) | ("kodade:gemini-cli", Some("gemini")) => {
+            "session_id"
+        }
+        _ => return Ok(None),
+    };
+    Ok(value
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned))
 }
 
 fn print_manifests(message: ServerMessage, json: bool) -> Result<()> {
