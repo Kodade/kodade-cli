@@ -1722,15 +1722,14 @@ impl App {
         if command.pane {
             let workspace = context.workspace.clone().unwrap_or_default();
             let pane = context.pane.clone().unwrap_or_default();
-            let args = crate::plugins::pane_command_with_context(
+            let args = crate::plugins::pane_command(
                 "configured-command",
                 &cwd,
                 &command.command,
                 Some(&command.label),
                 &workspace,
                 &pane,
-                &context,
-            )?;
+            );
             write(
                 writer,
                 &ClientMessage::NewPane {
@@ -1739,6 +1738,7 @@ impl App {
                     split: None,
                     command: Some(args),
                     name: Some(command.label),
+                    context: Some(Box::new(context)),
                 },
             )
             .await?;
