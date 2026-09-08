@@ -18,10 +18,6 @@ pub type OwnedReadHalf = tokio::net::tcp::OwnedReadHalf;
 #[cfg(windows)]
 pub type OwnedWriteHalf = tokio::net::tcp::OwnedWriteHalf;
 #[cfg(windows)]
-pub type OwnedReadHalf = tokio::net::tcp::OwnedReadHalf;
-#[cfg(windows)]
-pub type OwnedWriteHalf = tokio::net::tcp::OwnedWriteHalf;
-#[cfg(windows)]
 pub async fn connect(path: &Path) -> Result<Stream> {
     use tokio::io::AsyncWriteExt;
     let record = std::fs::read_to_string(path).context("read private daemon discovery record")?;
