@@ -986,12 +986,12 @@ mod tests {
             std::env::temp_dir().join(format!("kodade-context-timeout-{}", std::process::id()));
         #[cfg(unix)]
         let command = format!(
-            "printf '%s' \"$KODADE_PLUGIN_CONTEXT\" > {}; sleep 2",
+            "printf '%s' \"$KODADE_PLUGIN_CONTEXT\" > {}; sleep 5",
             marker.display()
         );
         #[cfg(windows)]
         let command = format!(
-            "echo %KODADE_PLUGIN_CONTEXT%> \"{}\" & ping 127.0.0.1 -n 3 > NUL",
+            "echo %KODADE_PLUGIN_CONTEXT%> \"{}\" & ping 127.0.0.1 -n 6 > NUL",
             marker.display()
         );
         let action = PluginAction {
@@ -1009,7 +1009,7 @@ mod tests {
             &InvocationContext::default(),
             "session",
             Path::new("/tmp/socket"),
-            Duration::from_millis(500)
+            Duration::from_secs(1)
         )
         .await
         .is_err());

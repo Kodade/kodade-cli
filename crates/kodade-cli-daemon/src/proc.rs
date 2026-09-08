@@ -129,18 +129,12 @@ fn windows_process_name(name: &str) -> String {
 
 /// Wrap the pieces of a command so the login shell runs them verbatim. Each
 /// argument is single-quoted (no external `shell-escape` dependency).
+#[cfg(unix)]
 pub fn shell_command(args: &[String]) -> String {
-    #[cfg(unix)]
-    {
-        args.iter()
-            .map(|arg| shell_quote(arg))
-            .collect::<Vec<_>>()
-            .join(" ")
-    }
-    #[cfg(windows)]
-    {
-        args.join(" ")
-    }
+    args.iter()
+        .map(|arg| shell_quote(arg))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Single-quote one argument for POSIX shells, escaping embedded quotes.

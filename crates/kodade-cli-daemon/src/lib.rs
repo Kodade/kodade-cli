@@ -3544,8 +3544,8 @@ impl Pane {
         command.arg("-l");
         // Commands run through the login shell so agent CLIs keep their env and
         // credentials handling; `exec` replaces the shell with the target.
+        #[cfg(unix)]
         if let Some(args) = &run {
-            #[cfg(unix)]
             {
                 command.arg("-c");
                 command.arg(format!("exec {}", proc::shell_command(args)));
