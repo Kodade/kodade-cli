@@ -228,6 +228,7 @@ mod tests {
                         name: "codex".into(),
                         state: AgentStateKind::Blocked,
                         state_age_secs: 0,
+                        detected: true,
                     }],
                 }],
             }],

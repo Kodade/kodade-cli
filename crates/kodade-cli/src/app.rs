@@ -3800,6 +3800,7 @@ mod tests {
                     name: "agent".into(),
                     state: AgentStateKind::Blocked,
                     state_age_secs: 0,
+                    detected: true,
                 }],
             });
         app.endpoint_layouts.insert(remote.clone(), live);
@@ -4024,6 +4025,7 @@ mod tests {
             name: "claude".into(),
             state,
             state_age_secs: 0,
+            detected: true,
         }
     }
 

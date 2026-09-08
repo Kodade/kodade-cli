@@ -264,6 +264,7 @@ mod tests {
             name: name.into(),
             state,
             state_age_secs: 0,
+            detected: true,
         }
     }
 

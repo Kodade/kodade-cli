@@ -3344,6 +3344,7 @@ fn sidebar_tab_info(
                     }),
                     state: detection.state,
                     state_age_secs: ages.get(&pane).copied().unwrap_or(0),
+                    detected: detection.agent.is_some(),
                 })
             })
             .collect(),

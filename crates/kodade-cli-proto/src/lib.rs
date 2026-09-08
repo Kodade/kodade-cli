@@ -677,6 +677,13 @@ pub struct AgentInfo {
     /// Seconds the current state has held, for sidebar age labels.
     #[serde(default)]
     pub state_age_secs: u64,
+    /// False for ordinary shells; omitted by older servers means detected.
+    #[serde(default = "default_agent_info_detected")]
+    pub detected: bool,
+}
+
+fn default_agent_info_detected() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
