@@ -90,8 +90,10 @@ move receives a fresh shell tab, because a workspace always has at least one.
 `NewWorktreeWorkspace` runs `git worktree add` for `branch` (created from `from`,
 or checked out when it already exists) under the `[worktrees] directory` config
 (default `~/.kodade/worktrees`), then opens a `repo:branch` workspace rooted in
-the new worktree. `RemoveWorktreeWorkspace` closes the workspace and, unless
-`keep`, runs `git worktree remove`; the directory is only ever removed when git
+the new worktree. `RemoveWorktreeWorkspace` runs a non-forced `git worktree
+remove` before closing the workspace unless `keep` is set. If Git refuses a
+dirty or otherwise unremovable checkout, the daemon replies `Error` and leaves
+the workspace and its panes intact. The directory is only ever removed when Git
 reports it as a registered worktree. Each `WorkspaceInfo` in a `Layout` carries a
 `branch` (the workspace root's current git branch, refreshed on the daemon's 2 s
 tick, `null` outside a repo) and a `parent` (the workspace id whose root is a
