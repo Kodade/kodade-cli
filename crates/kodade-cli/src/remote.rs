@@ -282,6 +282,16 @@ fn upload_args(
 /// Explicitly prepare a remote Unix host. No reconnect path calls this: it
 /// only runs from `machine add --install` or `machine prepare --install`.
 pub async fn prepare_machine(host: &str, install: bool) -> Result<()> {
+    prepare_machine_with_fetch(host, install, update::fetch).await
+}
+
+/// Keeps release retrieval replaceable only inside this module's tests. Every
+/// caller still flows through release metadata selection, SHA256 validation,
+/// archive extraction, and remote staged verification.
+async fn prepare_machine_with_fetch<F>(host: &str, install: bool, fetch: F) -> Result<()>
+where
+    F: Fn(&str) -> Result<Vec<u8>>,
+{
     validate_host(host)?;
     ensure_runtime_dir()?;
     let control = control_path().to_string_lossy().into_owned();
@@ -307,29 +317,11 @@ pub async fn prepare_machine(host: &str, install: bool) -> Result<()> {
     if !install {
         bail!("{host} has no compatible kodade-cli; run `kodade-cli machine prepare {host} --install` (or add with --install)");
     }
-    let metadata = String::from_utf8(update::fetch(update::metadata_url("stable"))?)?;
-    let release = update::select_release("stable", &metadata)?;
-    let asset = update::platform_asset_for(
-        release.tag_name.trim_start_matches('v'),
-        os_to_target(os)?,
-        arch_to_target(arch)?,
-    )?;
-    let sums = String::from_utf8(update::fetch(update::release_asset_url(
-        &release,
-        "SHA256SUMS",
-    )?)?)?;
-    let archive = update::fetch(update::release_asset_url(&release, &asset)?)?;
-    let binary = update::verified_binary(&archive, &update::checksum(&sums, &asset)?)?;
+    let (binary, release_version) = verified_release_binary(os, arch, fetch)?;
     let expected_sha256 = format!("{:x}", sha2::Sha256::digest(&binary));
     tokio::time::timeout(
         Duration::from_secs(45),
-        upload_binary(
-            &control,
-            host,
-            &binary,
-            &expected_sha256,
-            release.tag_name.trim_start_matches('v'),
-        ),
+        upload_binary(&control, host, &binary, &expected_sha256, &release_version),
     )
     .await
     .context("remote install timed out")??;
@@ -338,6 +330,22 @@ pub async fn prepare_machine(host: &str, install: bool) -> Result<()> {
         bail!("remote install on {host} did not produce a compatible kodade-cli");
     }
     Ok(())
+}
+
+fn verified_release_binary<F>(os: &str, arch: &str, fetch: F) -> Result<(Vec<u8>, String)>
+where
+    F: Fn(&str) -> Result<Vec<u8>>,
+{
+    let metadata = String::from_utf8(fetch(update::metadata_url("stable"))?)?;
+    let release = update::select_release("stable", &metadata)?;
+    let version = release.tag_name.trim_start_matches('v').to_owned();
+    let asset = update::platform_asset_for(&version, os_to_target(os)?, arch_to_target(arch)?)?;
+    let sums = String::from_utf8(fetch(update::release_asset_url(&release, "SHA256SUMS")?)?)?;
+    let archive = fetch(update::release_asset_url(&release, &asset)?)?;
+    Ok((
+        update::verified_binary(&archive, &update::checksum(&sums, &asset)?)?,
+        version,
+    ))
 }
 
 async fn upload_binary(
@@ -666,6 +674,25 @@ mod tests {
         assert!(!remote_version_is_compatible(b"kodade-cli 0.2.9\n"));
         assert!(!remote_version_is_compatible(b"kodade-cli 1.0.0\n"));
         assert!(!remote_version_is_compatible(b"unparseable\n"));
+    }
+
+    #[test]
+    fn fixture_download_rejects_a_bad_checksum_before_remote_upload() {
+        let metadata = br#"{"tag_name":"v0.2.1","assets":[{"name":"SHA256SUMS","browser_download_url":"sums"},{"name":"kodade-cli-0.2.1-x86_64-unknown-linux-gnu.tar.gz","browser_download_url":"archive"}]}"#;
+        let error = verified_release_binary("Linux", "x86_64", |url| match url {
+            "https://api.github.com/repos/Kodade/kodade-cli/releases/latest" => {
+                Ok(metadata.to_vec())
+            }
+            "sums" => Ok(format!(
+                "{}  kodade-cli-0.2.1-x86_64-unknown-linux-gnu.tar.gz\n",
+                "0".repeat(64)
+            )
+            .into_bytes()),
+            "archive" => Ok(b"fixture archive".to_vec()),
+            _ => bail!("unexpected fixture URL {url}"),
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("checksum mismatch"));
     }
 
     #[test]
