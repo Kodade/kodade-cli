@@ -31,6 +31,7 @@ try {
     $sumsPath = Join-Path $temp 'SHA256SUMS'
     Invoke-WebRequest -UseBasicParsing -TimeoutSec $TimeoutSec -Uri $zipAsset.browser_download_url -OutFile $zipPath
     Invoke-WebRequest -UseBasicParsing -TimeoutSec $TimeoutSec -Uri $sumsAsset.browser_download_url -OutFile $sumsPath
+    if ((Get-Item -LiteralPath $zipPath).Length -gt 100MB -or (Get-Item -LiteralPath $sumsPath).Length -gt 1MB) { throw 'Downloaded release archive or checksum file exceeds its size limit.' }
     $sum = @(Get-Content -LiteralPath $sumsPath | Where-Object { $_ -match ('^([A-Fa-f0-9]{64})\s+\*?' + [regex]::Escape($assetName) + '$') })
     if ($sum.Count -ne 1) { throw "SHA256SUMS must contain exactly one entry for $assetName." }
     $expected = ([regex]::Match($sum, '^[A-Fa-f0-9]{64}')).Value.ToLowerInvariant()
@@ -48,8 +49,8 @@ try {
             if ($entryName -match '(^|/)\.\.($|/)' -or $entryName.StartsWith('/') -or $entryName -match '^[A-Za-z]:' -or $entryName -notmatch ('^' + [regex]::Escape($rootName) + '/(kodade-cli\.exe|LICENSE|NOTICE|README\.md)$')) { throw 'Release archive contains an unexpected or unsafe path.' }
         }
         $candidate = Join-Path $temp 'kodade-cli.exe'
-        $input = $exe[0].Open(); $output = [IO.File]::Create($candidate); $copied = 0; $buffer = New-Object byte[] 65536
-        try { while (($read = $input.Read($buffer, 0, $buffer.Length)) -gt 0) { $copied += $read; if ($copied -gt 100MB) { throw 'Release executable exceeds extraction limit.' }; $output.Write($buffer, 0, $read) } } finally { $output.Dispose(); $input.Dispose() }
+        $zipInput = $exe[0].Open(); $zipOutput = [IO.File]::Create($candidate); $copied = 0; $buffer = New-Object byte[] 65536
+        try { while (($read = $zipInput.Read($buffer, 0, $buffer.Length)) -gt 0) { $copied += $read; if ($copied -gt 100MB) { throw 'Release executable exceeds extraction limit.' }; $zipOutput.Write($buffer, 0, $read) } } finally { $zipOutput.Dispose(); $zipInput.Dispose() }
     } finally { $archive.Dispose() }
     $probe = New-Object Diagnostics.Process; $probe.StartInfo.FileName = $candidate; $probe.StartInfo.Arguments = '--version'; $probe.StartInfo.UseShellExecute = $false; $probe.StartInfo.RedirectStandardOutput = $true
     [void]$probe.Start(); if (-not $probe.WaitForExit($TimeoutSec * 1000)) { $probe.Kill(); throw 'Downloaded executable version probe timed out.' }; $reported = $probe.StandardOutput.ReadToEnd().Trim()
@@ -59,7 +60,6 @@ try {
     Move-Item -LiteralPath $candidate -Destination $staged
     $backup = Join-Path $InstallDir (".kodade-cli-backup-" + [Guid]::NewGuid() + '.exe')
     try {
-        if (Test-Path -LiteralPath $backup) { Remove-Item -LiteralPath $backup -Force }
         if (Test-Path -LiteralPath $target) { Move-Item -LiteralPath $target -Destination $backup }
         Move-Item -LiteralPath $staged -Destination $target
         if (Test-Path -LiteralPath $backup) { Remove-Item -LiteralPath $backup -Force }
