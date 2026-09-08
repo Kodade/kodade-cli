@@ -282,7 +282,9 @@ struct ClientView {
     cols: u16,
     rows: u16,
     compact: bool,
+    /// Set only after an interactive renderer explicitly reports its palette.
     terminal_colors: Option<kodade_cli_proto::TerminalColors>,
+    terminal_colors_reported: bool,
 }
 
 impl ClientView {
@@ -308,6 +310,7 @@ impl ClientView {
             rows,
             compact: false,
             terminal_colors: None,
+            terminal_colors_reported: false,
         }
     }
 }
@@ -2056,6 +2059,7 @@ impl Session {
     fn handle_view(&self, message: ClientMessage, view: &mut ClientView) -> Result<()> {
         if let ClientMessage::SetTerminalColors { colors } = message {
             view.terminal_colors = colors;
+            view.terminal_colors_reported = true;
             let _dispatch = self
                 .view_dispatch
                 .lock()
@@ -2186,6 +2190,11 @@ impl Session {
     }
 
     fn set_view_terminal_colors(&self, view: &ClientView) -> Result<()> {
+        // CLI/script connections never render a palette, so their absent
+        // report must not clear the palette supplied by an interactive view.
+        if !view.terminal_colors_reported {
+            return Ok(());
+        }
         let state = self
             .state
             .lock()
@@ -4756,7 +4765,11 @@ impl Pane {
             .parser
             .lock()
             .ok()
-            .map(|mut parser| parser.callbacks_mut().terminal_modes.take_replies())
+            .map(|mut parser| {
+                let mut replies = parser.callbacks_mut().terminal_modes.take_replies();
+                replies.extend(parser.callbacks_mut().terminal_colors.take_replies());
+                replies
+            })
             .unwrap_or_default();
         if !replies.is_empty() {
             if let Ok(mut writer) = self.writer.lock() {
@@ -6370,6 +6383,15 @@ mod tests {
         assert!(panes
             .iter()
             .all(|pane| { color_reply(&session, pane.id) == b"\x1b]10;rgb:0101/0202/0303\x1b\\" }));
+        // A scripting connection has no renderer report; its pane mutation
+        // must leave the interactive view's known palette intact.
+        let mut script = session.new_client_view().unwrap();
+        session
+            .handle_view(ClientMessage::NewTab, &mut script)
+            .unwrap();
+        assert!(panes
+            .iter()
+            .all(|pane| { color_reply(&session, pane.id) == b"\x1b]10;rgb:0101/0202/0303\x1b\\" }));
     }
 
     #[cfg(unix)]
@@ -7668,6 +7690,14 @@ mod tests {
                 b"\x1b[>3u\x1b[?1049h\x1b[>1u\x1b[?1049l\x1b[>4\x11;2",
             );
         }
+        {
+            let mut parser = source.parser.lock().unwrap();
+            parser
+                .callbacks_mut()
+                .terminal_colors
+                .set(Some(test_terminal_colors([1, 2, 3])));
+            parser.process(b"\x1b]10;?\x1b\\");
+        }
         let (runtime, fd) = source.capture_handoff().expect("pause and capture source");
         let (sender, receiver) = std::os::unix::net::UnixStream::pair().expect("socket pair");
         let transfer =
@@ -7681,6 +7711,17 @@ mod tests {
         assert!(imported.snapshot().0.contents.contains("before-handoff"));
         assert_eq!(imported.agent_generation.load(Ordering::Relaxed), 9);
         assert_eq!(imported.activity_revision.load(Ordering::Relaxed), 4);
+        // The query was parsed before transfer. The target sends that queued
+        // reply once before it starts consuming post-handoff PTY output.
+        imported.flush_terminal_replies();
+        assert!(imported
+            .parser
+            .lock()
+            .unwrap()
+            .callbacks_mut()
+            .terminal_colors
+            .take_replies()
+            .is_empty());
         assert_eq!(
             imported.parser.lock().unwrap().callbacks().title,
             "editor status"
