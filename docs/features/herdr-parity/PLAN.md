@@ -87,8 +87,8 @@ Merged to main through PRs #39 and #44: reliability and independent views
 live manifest reload (#34), and terminal cleanup (#38). Linux and macOS CI
 passed. This does not establish native Windows or universal agent compatibility.
 
-The next integration branch combines machines (#32), images (#35), narrow
-views (#40), and Unix standalone updates (#41). Its full workspace gates pass:
+PR #48 merged machines (#32), images (#35), narrow views (#40), and Unix
+standalone updates (#41) after Linux and macOS CI passed. Its workspace gates passed:
 214 client tests, 93 daemon tests, 7 protocol tests, and the agent automation
 integration test. Additional behavioral proof:
 
@@ -113,8 +113,7 @@ integration test. Additional behavioral proof:
   integration work.
 
 Still in progress: native Windows runner evidence (#36), complete live daemon
-upgrade and client reconnect (#42), real remote bootstrap failure fixtures
-(#45), exact native conversation restore (#46), optional cold screen replay
+upgrade and client reconnect (#42), exact native conversation restore (#46), optional cold screen replay
 (#47), and the final fresh competitive/UX/release review (#37). The graphics
 implementation has a documented supported protocol subset in docs/GRAPHICS.md;
 this ledger does not claim complete Kitty protocol coverage.
@@ -133,3 +132,15 @@ this ledger does not claim complete Kitty protocol coverage.
   no hosted marketplace or account system is needed for their capabilities.
 - Remove the stale README implementation-milestone table. Put current behavior
   and shortcuts in front of users, with detailed engineering status here.
+
+Remote bootstrap (#45) is integrated for review with 220 client, 93 daemon,
+7 protocol tests and the agent automation integration test passing. A real
+isolated SSH fixture installs a checksum-verified binary into a home path with
+spaces and proves checksum refusal, incompatible-release refusal and truncated
+upload all preserve the prior executable. The combined SSH/image/machine smoke
+also passes with the integrated release binary.
+
+A fresh code comparison additionally tracks verified lifecycle adapter coverage
+(#49), structured extension context and URL handlers (#50), configured commands
+(#51), workspace environment and existing-worktree open (#52), and a discoverable
+local agent guide (#53). These are required follow-up work, not completed parity.

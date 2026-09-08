@@ -416,6 +416,16 @@ pub enum MachineCommand {
         label: String,
         #[arg(long = "remote-session")]
         session: Option<String>,
+        /// Download and install a verified standalone binary when the host needs one.
+        #[arg(long)]
+        install: bool,
+    },
+    /// Check a saved host and optionally install a verified standalone binary.
+    Prepare {
+        #[arg(value_name = "PROFILE")]
+        id: String,
+        #[arg(long)]
+        install: bool,
     },
     Rename {
         id: String,
@@ -1448,7 +1458,8 @@ mod tests {
                 command: MachineCommand::Add {
                     target: "buildbox".into(),
                     label: "Build".into(),
-                    session: Some("agents".into())
+                    session: Some("agents".into()),
+                    install: false,
                 }
             })
         );
