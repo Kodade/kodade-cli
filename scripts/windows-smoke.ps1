@@ -98,7 +98,10 @@ try {
 @'
 const { spawn, spawnSync } = require("child_process");
 const report = state => spawnSync(process.env.KODADE_BIN, ["agent", "report", process.env.KODADE_PANE, state, "--source", "kodade:pi", "--native-agent", "pi"]);
-report("working");
+// ConPTY can expose cmd.exe for the first scheduler tick after node starts.
+// Report after Node is demonstrably the foreground wrapper, so the daemon can
+// bind this hook identity to the real process instead of a transient shell.
+setTimeout(() => report("working"), 1000);
 process.stdin.once("data", () => {
   spawn("cmd.exe", ["/C", "ping 127.0.0.1 -n 10 > NUL"], { stdio: "inherit" });
   process.exit(0);
