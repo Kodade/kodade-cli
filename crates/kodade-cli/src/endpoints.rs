@@ -595,6 +595,7 @@ mod tests {
         let colors = kodade_cli_proto::TerminalColors {
             foreground: [0x3f, 0x3b, 0x34],
             background: [0xfa, 0xf9, 0xf5],
+            cursor: [0x9d, 0x57, 0x29],
             palette: [[0x9d, 0x57, 0x29]; 16],
         };
 
