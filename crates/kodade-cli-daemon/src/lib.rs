@@ -66,6 +66,49 @@ struct Session {
     /// Path of the bound socket file. `session rename` renames the file in
     /// place, so teardown reads it from here rather than from the start value.
     socket: Mutex<PathBuf>,
+    /// Serializes the short compatibility staging used by [`ClientView`].  The
+    /// stored session selection remains the scripting/persistence default; an
+    /// attached client temporarily installs only its own selection while one
+    /// legacy mutation is dispatched.
+    view_dispatch: Mutex<()>,
+}
+
+/// Selection and viewport state owned by one socket connection.  It is never
+/// persisted and is dropped with the connection, so detached clients cannot
+/// change a later client's view.
+#[derive(Clone, Debug)]
+struct ClientView {
+    workspace: WorkspaceId,
+    tabs: HashMap<WorkspaceId, TabId>,
+    focused: HashMap<TabId, PaneId>,
+    scroll: HashMap<PaneId, usize>,
+    cols: u16,
+    rows: u16,
+}
+
+impl ClientView {
+    fn from_state(state: &SessionState, cols: u16, rows: u16) -> Self {
+        let workspace = state.active_workspace;
+        let tabs = state
+            .workspaces
+            .iter()
+            .map(|workspace| (workspace.id, workspace.active_tab))
+            .collect::<HashMap<_, _>>();
+        let focused = state
+            .workspaces
+            .iter()
+            .flat_map(|workspace| workspace.tabs.iter())
+            .map(|tab| (tab.id, tab.focused))
+            .collect();
+        Self {
+            workspace,
+            tabs,
+            focused,
+            scroll: HashMap::new(),
+            cols,
+            rows,
+        }
+    }
 }
 struct SessionState {
     workspaces: Vec<Workspace>,
@@ -94,6 +137,13 @@ struct Tab {
     tree: LayoutTree,
     focused: PaneId,
     zoomed: bool,
+}
+
+#[derive(Clone)]
+struct StoredSelection {
+    workspace: WorkspaceId,
+    tabs: Vec<(WorkspaceId, TabId)>,
+    focused: Vec<(TabId, PaneId)>,
 }
 /// vt100 0.16 reports the OSC window title through callbacks instead of `Screen::title`.
 #[derive(Default)]
@@ -357,6 +407,7 @@ impl Session {
             events,
             subscribers: AtomicUsize::new(0),
             socket: Mutex::new(socket_path(&name_for_socket)),
+            view_dispatch: Mutex::new(()),
         };
         let pane = session.new_pane("shell", None, None)?;
         let tab = Tab {
@@ -413,6 +464,7 @@ impl Session {
             events,
             subscribers: AtomicUsize::new(0),
             socket: Mutex::new(socket_path(&file.name)),
+            view_dispatch: Mutex::new(()),
         };
         let mut workspaces = Vec::new();
         let mut workspace_ids: HashMap<u64, WorkspaceId> = HashMap::new();
@@ -528,6 +580,16 @@ impl Session {
         }
     }
 
+    /// Read the persisted/script projection without observing another
+    /// connection's brief compatibility staging.
+    fn build_file_stable(&self) -> Result<persist::SessionFile> {
+        let _dispatch = self
+            .view_dispatch
+            .lock()
+            .map_err(|_| anyhow!("view dispatch lock poisoned"))?;
+        Ok(self.build_file())
+    }
+
     /// Persist the current layout to this session's state file. Best-effort:
     /// errors are logged, never propagated to the client-facing loop.
     fn save(&self) {
@@ -535,7 +597,13 @@ impl Session {
         let Some(path) = persist::session_file_path(&name) else {
             return;
         };
-        let file = self.build_file();
+        let file = match self.build_file_stable() {
+            Ok(file) => file,
+            Err(error) => {
+                eprintln!("Ködade CLI could not read session '{name}' for persistence: {error:#}");
+                return;
+            }
+        };
         if let Err(error) = persist::write_session_file(&path, &file) {
             eprintln!("Ködade CLI could not persist session '{name}': {error:#}");
         }
@@ -732,6 +800,166 @@ impl Session {
             .find(|item| item.id == workspace.active_tab)
             .expect("active tab exists")
     }
+
+    fn save_selection(state: &SessionState) -> StoredSelection {
+        StoredSelection {
+            workspace: state.active_workspace,
+            tabs: state
+                .workspaces
+                .iter()
+                .map(|item| (item.id, item.active_tab))
+                .collect(),
+            focused: state
+                .workspaces
+                .iter()
+                .flat_map(|item| item.tabs.iter())
+                .map(|tab| (tab.id, tab.focused))
+                .collect(),
+        }
+    }
+
+    fn install_view(state: &mut SessionState, view: &ClientView) {
+        if state
+            .workspaces
+            .iter()
+            .any(|item| item.id == view.workspace)
+        {
+            state.active_workspace = view.workspace;
+        }
+        for workspace in &mut state.workspaces {
+            if let Some(tab) = view
+                .tabs
+                .get(&workspace.id)
+                .filter(|tab| workspace.tabs.iter().any(|item| item.id == **tab))
+            {
+                workspace.active_tab = *tab;
+            }
+            for tab in &mut workspace.tabs {
+                if let Some(pane) = view
+                    .focused
+                    .get(&tab.id)
+                    .filter(|pane| layout::contains(&tab.tree, **pane))
+                {
+                    tab.focused = *pane;
+                }
+            }
+        }
+    }
+
+    fn capture_view(state: &SessionState, view: &mut ClientView) {
+        view.workspace = state.active_workspace;
+        view.tabs = state
+            .workspaces
+            .iter()
+            .map(|item| (item.id, item.active_tab))
+            .collect();
+        view.focused = state
+            .workspaces
+            .iter()
+            .flat_map(|item| item.tabs.iter())
+            .map(|tab| (tab.id, tab.focused))
+            .collect();
+    }
+
+    fn restore_selection(state: &mut SessionState, saved: StoredSelection) {
+        if state
+            .workspaces
+            .iter()
+            .any(|workspace| workspace.id == saved.workspace)
+        {
+            state.active_workspace = saved.workspace;
+        }
+        for workspace in &mut state.workspaces {
+            if let Some(tab) = saved
+                .tabs
+                .iter()
+                .find(|(id, _)| *id == workspace.id)
+                .map(|(_, tab)| *tab)
+                .filter(|tab| workspace.tabs.iter().any(|item| item.id == *tab))
+            {
+                workspace.active_tab = tab;
+            }
+            for tab in &mut workspace.tabs {
+                if let Some(pane) = saved
+                    .focused
+                    .iter()
+                    .find(|(id, _)| *id == tab.id)
+                    .map(|(_, pane)| *pane)
+                    .filter(|pane| layout::contains(&tab.tree, *pane))
+                {
+                    tab.focused = pane;
+                }
+            }
+        }
+    }
+
+    /// Dispatch one connection-scoped request through the legacy global
+    /// mutation implementation without allowing that temporary selection to
+    /// escape to a different socket or into persisted state.
+    fn handle_view(&self, message: ClientMessage, view: &mut ClientView) -> Result<()> {
+        if let ClientMessage::Hello { cols, rows, .. } | ClientMessage::Resize { cols, rows } =
+            message
+        {
+            view.cols = cols;
+            view.rows = rows;
+            return self.resize_for_view(view);
+        }
+        if let ClientMessage::ScrollPane { id, delta } = message {
+            let pane = self
+                .panes
+                .lock()
+                .map_err(|_| anyhow!("pane lock poisoned"))?
+                .get(&id)
+                .cloned();
+            if let Some(pane) = pane {
+                let current = view.scroll.get(&id).copied().unwrap_or(0);
+                view.scroll
+                    .insert(id, pane.scroll_offset_after(delta, current));
+            }
+            self.notify();
+            return Ok(());
+        }
+        // A view-changing operation becomes the PTY size arbiter. Read-only
+        // queries deliberately do not resize a session another client is using.
+        if !matches!(
+            message,
+            ClientMessage::Query(_) | ClientMessage::Subscribe | ClientMessage::ReadPane { .. }
+        ) {
+            *self
+                .size
+                .lock()
+                .map_err(|_| anyhow!("size lock poisoned"))? = (view.cols, view.rows);
+        }
+        let _dispatch = self
+            .view_dispatch
+            .lock()
+            .map_err(|_| anyhow!("view dispatch lock poisoned"))?;
+        let saved = {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| anyhow!("state lock poisoned"))?;
+            let saved = Self::save_selection(&state);
+            Self::install_view(&mut state, view);
+            saved
+        };
+        let result = self.handle(message.clone());
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow!("state lock poisoned"))?;
+        Self::capture_view(&state, view);
+        Self::restore_selection(&mut state, saved);
+        if matches!(message, ClientMessage::Input { .. }) {
+            if let Some(pane) = view
+                .focused
+                .get(view.tabs.get(&view.workspace).unwrap_or(&TabId(0)))
+            {
+                view.scroll.remove(pane);
+            }
+        }
+        result
+    }
     fn notify(&self) {
         // Every mutation funnels through here (directly or via `resize`), so this
         // is the one place the persist generation needs to advance. PTY output
@@ -746,6 +974,45 @@ impl Session {
     }
 
     fn snapshot(&self) -> Result<LayoutSnapshot> {
+        self.snapshot_for(None)
+    }
+
+    fn snapshot_stable(&self) -> Result<LayoutSnapshot> {
+        let _dispatch = self
+            .view_dispatch
+            .lock()
+            .map_err(|_| anyhow!("view dispatch lock poisoned"))?;
+        self.snapshot()
+    }
+
+    fn snapshot_for_client(&self, view: &ClientView) -> Result<LayoutSnapshot> {
+        let _dispatch = self
+            .view_dispatch
+            .lock()
+            .map_err(|_| anyhow!("view dispatch lock poisoned"))?;
+        self.snapshot_for(Some(view))
+    }
+
+    fn new_client_view(&self) -> Result<ClientView> {
+        let _dispatch = self
+            .view_dispatch
+            .lock()
+            .map_err(|_| anyhow!("view dispatch lock poisoned"))?;
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow!("state lock poisoned"))?;
+        let (cols, rows) = *self
+            .size
+            .lock()
+            .map_err(|_| anyhow!("size lock poisoned"))?;
+        Ok(ClientView::from_state(&state, cols, rows))
+    }
+
+    /// Project shared panes through either the persisted/script selection or a
+    /// connection's independent view.  Detection remains session-wide; only
+    /// selection and scrollback are viewer state.
+    fn snapshot_for(&self, view: Option<&ClientView>) -> Result<LayoutSnapshot> {
         let mut state = self
             .state
             .lock()
@@ -753,14 +1020,30 @@ impl Session {
         // Refresh git-derived sidebar metadata at most every 2 s. Snapshot
         // rendering itself must not canonicalize worktree paths per frame.
         refresh_workspace_metadata(&mut state, Instant::now());
+        let workspace_id = view
+            .map(|view| view.workspace)
+            .filter(|id| state.workspaces.iter().any(|item| item.id == *id))
+            .unwrap_or(state.active_workspace);
         let workspace = state
             .workspaces
             .iter()
-            .find(|item| item.id == state.active_workspace)
+            .find(|item| item.id == workspace_id)
             .expect("active workspace exists");
-        let tab = Self::active_tab(&state);
+        let tab_id = view
+            .and_then(|view| view.tabs.get(&workspace.id).copied())
+            .filter(|id| workspace.tabs.iter().any(|item| item.id == *id))
+            .unwrap_or(workspace.active_tab);
+        let tab = workspace
+            .tabs
+            .iter()
+            .find(|item| item.id == tab_id)
+            .expect("active tab exists");
+        let focused = view
+            .and_then(|view| view.focused.get(&tab.id).copied())
+            .filter(|id| layout::contains(&tab.tree, *id))
+            .unwrap_or(tab.focused);
         let tree = if tab.zoomed {
-            LayoutTree::Leaf { pane: tab.focused }
+            LayoutTree::Leaf { pane: focused }
         } else {
             tab.tree.clone()
         };
@@ -810,14 +1093,17 @@ impl Session {
             .into_iter()
             .filter_map(|id| {
                 panes.get(&id).map(|pane| {
-                    // vt100 advances its own offset as output arrives while a
-                    // user reads history. Keep that one source of truth and
-                    // snapshot it atomically with the visible cells.
-                    let (screen, scroll_offset) = pane.snapshot();
+                    // The parser stays at its live screen between snapshots;
+                    // this view's offset is installed only long enough to
+                    // render its own historical viewport.
+                    let offset = view
+                        .and_then(|view| view.scroll.get(&id).copied())
+                        .unwrap_or(0);
+                    let (screen, scroll_offset) = pane.snapshot_at(offset);
                     PaneSnapshot {
                         id,
                         title: pane.title.lock().expect("title lock poisoned").clone(),
-                        focused: id == tab.focused,
+                        focused: id == focused,
                         scroll_offset,
                         screen,
                         agent: detections[&id].agent.clone(),
@@ -924,6 +1210,14 @@ impl Session {
         })
     }
 
+    fn pane_snapshot_stable(&self, id: PaneId) -> Result<PaneSnapshot> {
+        let _dispatch = self
+            .view_dispatch
+            .lock()
+            .map_err(|_| anyhow!("view dispatch lock poisoned"))?;
+        self.pane_snapshot(id)
+    }
+
     /// Queues a notification with the next sequence number, capping the ring at
     /// 64 so a long-lived session never grows the queue without bound.
     fn push_notification(
@@ -983,6 +1277,36 @@ impl Session {
             &snapshot.tree,
             cols.max(1),
             rows.saturating_sub(2).max(1),
+            &mut sizes,
+        );
+        let panes = self
+            .panes
+            .lock()
+            .map_err(|_| anyhow!("pane lock poisoned"))?;
+        for (id, width, height) in sizes {
+            if let Some(pane) = panes.get(&id) {
+                pane.resize(width.max(1), height.max(1))?;
+            }
+        }
+        self.notify();
+        Ok(())
+    }
+
+    /// The most recently interacting client owns the physical PTY geometry.
+    /// Other views retain their requested dimensions for reconnect/inspection,
+    /// while terminal applications see one coherent size instead of a resize
+    /// race on every output frame.
+    fn resize_for_view(&self, view: &ClientView) -> Result<()> {
+        *self
+            .size
+            .lock()
+            .map_err(|_| anyhow!("size lock poisoned"))? = (view.cols, view.rows);
+        let snapshot = self.snapshot_for(Some(view))?;
+        let mut sizes = Vec::new();
+        pane_sizes(
+            &snapshot.tree,
+            view.cols.max(1),
+            view.rows.saturating_sub(2).max(1),
             &mut sizes,
         );
         let panes = self
@@ -2458,6 +2782,16 @@ impl Pane {
         let parser = self.parser.lock().expect("PTY parser lock poisoned");
         (snapshot(&parser), parser.screen().scrollback())
     }
+    /// Render a requested historical offset without leaving the shared parser
+    /// scrolled for another client. `set_scrollback` clamps to available history.
+    fn snapshot_at(&self, offset: usize) -> (Screen, usize) {
+        let mut parser = self.parser.lock().expect("PTY parser lock poisoned");
+        parser.screen_mut().set_scrollback(offset);
+        let actual = parser.screen().scrollback();
+        let screen = snapshot(&parser);
+        parser.screen_mut().set_scrollback(0);
+        (screen, actual)
+    }
     /// Full pane text for copy mode / `pane read`. With `scrollback`, walks the
     /// vt100 history and appends the visible screen; otherwise just the visible
     /// screen. `lines` keeps the last N lines. Returns the text and its line
@@ -2521,6 +2855,15 @@ impl Pane {
         let mut parser = self.parser.lock().expect("PTY parser lock poisoned");
         let offset = scroll_offset_after_delta(parser.screen().scrollback(), delta, usize::MAX);
         parser.screen_mut().set_scrollback(offset);
+    }
+    fn scroll_offset_after(&self, delta: i16, current: usize) -> usize {
+        let mut parser = self.parser.lock().expect("PTY parser lock poisoned");
+        parser.screen_mut().set_scrollback(current);
+        let offset = scroll_offset_after_delta(parser.screen().scrollback(), delta, usize::MAX);
+        parser.screen_mut().set_scrollback(offset);
+        let actual = parser.screen().scrollback();
+        parser.screen_mut().set_scrollback(0);
+        actual
     }
     fn reset_scrollback(&self) {
         self.parser
@@ -2957,6 +3300,7 @@ async fn serve_client(stream: UnixStream, session: Arc<Session>) -> Result<()> {
     process_timer.tick().await;
     let mut last_snapshot = Instant::now() - Duration::from_millis(16);
     let mut initialized = false;
+    let mut view = session.new_client_view()?;
     // A fresh client only hears about transitions raised after it attached, so
     // the spawn-time backlog never replays.
     let mut last_notify_seq = session.notify_high_water();
@@ -2998,7 +3342,7 @@ async fn serve_client(stream: UnixStream, session: Arc<Session>) -> Result<()> {
                         continue;
                     }
                     ClientMessage::Query(QueryKind::Pane(id)) => {
-                        match session.pane_snapshot(id) {
+                        match session.pane_snapshot_stable(id) {
                             Ok(pane) => write_server(&mut writer, &ServerMessage::Pane(pane)).await?,
                             Err(error) => {
                                 write_server(&mut writer, &ServerMessage::Error { message: error.to_string() }).await?;
@@ -3008,7 +3352,7 @@ async fn serve_client(stream: UnixStream, session: Arc<Session>) -> Result<()> {
                         continue;
                     }
                     ClientMessage::Query(QueryKind::Session) => {
-                        write_server(&mut writer, &ServerMessage::Session(session.build_file())).await?;
+                        write_server(&mut writer, &ServerMessage::Session(session.build_file_stable()?)).await?;
                         continue;
                     }
                     ClientMessage::Query(QueryKind::Schema) => {
@@ -3028,13 +3372,13 @@ async fn serve_client(stream: UnixStream, session: Arc<Session>) -> Result<()> {
                 }
                 let hello = matches!(message, ClientMessage::Hello { .. });
                 let kill = matches!(message, ClientMessage::KillSession);
-                match session.handle(message) {
+                match session.handle_view(message, &mut view) {
                     Ok(()) if hello => {
                         initialized = true;
                         write_server(&mut writer, &ServerMessage::Welcome { session: session.session_name(), version: PROTOCOL_VERSION }).await?;
                         // The first client attach sees `restored: true`; clear it
                         // afterward so later snapshots (and `ls`) report normally.
-                        write_server(&mut writer, &ServerMessage::Layout(session.snapshot()?)).await?;
+                        write_server(&mut writer, &ServerMessage::Layout(session.snapshot_for_client(&view)?)).await?;
                         send_notifications(&mut writer, &session, &mut last_notify_seq, subscribed).await?;
                         session.clear_restored();
                     }
@@ -3043,12 +3387,16 @@ async fn serve_client(stream: UnixStream, session: Arc<Session>) -> Result<()> {
                         return Ok(());
                     }
                     Ok(()) => {
-                        write_server(&mut writer, &ServerMessage::Layout(session.snapshot()?)).await?;
+                        write_server(&mut writer, &ServerMessage::Layout(session.snapshot_for_client(&view)?)).await?;
                         send_notifications(&mut writer, &session, &mut last_notify_seq, subscribed).await?;
                     }
                     Err(error) => {
                         write_server(&mut writer, &ServerMessage::Error { message: error.to_string() }).await?;
-                        return Ok(());
+                        // A rejected interactive action (for example a dirty
+                        // worktree removal) must not strand the attached TUI.
+                        // One-shot callers still receive this Error as their
+                        // reply and terminate on their own.
+                        continue;
                     }
                 }
             }
@@ -3059,7 +3407,7 @@ async fn serve_client(stream: UnixStream, session: Arc<Session>) -> Result<()> {
                     while updates.try_recv().is_ok() {}
                     let remaining = Duration::from_millis(16).saturating_sub(last_snapshot.elapsed());
                     if !remaining.is_zero() { tokio::time::sleep(remaining).await; }
-                    write_server(&mut writer, &ServerMessage::Layout(session.snapshot()?)).await?;
+                    write_server(&mut writer, &ServerMessage::Layout(session.snapshot_for_client(&view)?)).await?;
                     send_notifications(&mut writer, &session, &mut last_notify_seq, subscribed).await?;
                     last_snapshot = Instant::now();
                 }
@@ -3067,7 +3415,7 @@ async fn serve_client(stream: UnixStream, session: Arc<Session>) -> Result<()> {
             },
             _ = process_timer.tick() => {
                 if initialized {
-                    write_server(&mut writer, &ServerMessage::Layout(session.snapshot()?)).await?;
+                    write_server(&mut writer, &ServerMessage::Layout(session.snapshot_for_client(&view)?)).await?;
                     send_notifications(&mut writer, &session, &mut last_notify_seq, subscribed).await?;
                     last_snapshot = Instant::now();
                 }
@@ -3118,7 +3466,7 @@ async fn subscriber_tick(session: Arc<Session>) {
 /// One tick of [`subscriber_tick`], split out so tests can drive it directly.
 fn tick_subscribers(session: &Session) {
     if session.subscribers.load(Ordering::Relaxed) > 0 {
-        let _ = session.snapshot();
+        let _ = session.snapshot_stable();
     }
 }
 
@@ -3805,6 +4153,63 @@ mod tests {
         assert!(!should_notify(Some(Done), Working, true));
     }
 
+    #[tokio::test]
+    async fn stable_readers_wait_out_a_staged_client_view() {
+        use std::sync::mpsc;
+
+        let session = Arc::new(Session::spawn(80, 24, "stable-view".into()).expect("spawn"));
+        let first = session.snapshot().expect("first snapshot");
+        let workspace = first.active_workspace;
+        let first_tab = first.active_tab;
+        session.handle(ClientMessage::NewTab).expect("new tab");
+        let second_tab = session.snapshot().expect("second snapshot").active_tab;
+        {
+            let mut state = session.state.lock().expect("state");
+            state.workspaces[0].active_tab = first_tab;
+        }
+        let mut view = session.new_client_view().expect("client view");
+        view.workspace = workspace;
+        view.tabs.insert(workspace, second_tab);
+        let (staged_tx, staged_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let staging_session = Arc::clone(&session);
+        let staging = std::thread::spawn(move || {
+            let _dispatch = staging_session.view_dispatch.lock().expect("dispatch");
+            let saved = {
+                let mut state = staging_session.state.lock().expect("state");
+                let saved = Session::save_selection(&state);
+                Session::install_view(&mut state, &view);
+                saved
+            };
+            staged_tx.send(()).expect("staged");
+            release_rx.recv().expect("release staging");
+            let mut state = staging_session.state.lock().expect("state");
+            Session::restore_selection(&mut state, saved);
+            ready_tx.send(()).expect("restored");
+        });
+        staged_rx.recv().expect("view installed");
+        let reader_session = Arc::clone(&session);
+        let reader = std::thread::spawn(move || {
+            let file = reader_session.build_file_stable().expect("stable export");
+            let view = reader_session
+                .new_client_view()
+                .expect("stable client view");
+            (file, view)
+        });
+        // The reader cannot complete while the alternate selection is staged.
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(!reader.is_finished());
+        release_tx.send(()).expect("release");
+        ready_rx.recv().expect("restored");
+        staging.join().expect("staging thread");
+        let (file, new_view) = reader.join().expect("reader thread");
+        assert_eq!(file.active_workspace, workspace.0);
+        assert_eq!(file.workspaces[0].active_tab, first_tab.0);
+        assert_eq!(new_view.workspace, workspace);
+        assert_eq!(new_view.tabs[&workspace], first_tab);
+    }
+
     async fn next_server_message(
         lines: &mut tokio::io::Lines<BufReader<tokio::net::unix::OwnedReadHalf>>,
     ) -> ServerMessage {
@@ -3814,6 +4219,253 @@ mod tests {
             .expect("read line")
             .expect("stream open");
         decode::<ServerMessage>(line.as_bytes()).expect("decode server message")
+    }
+
+    async fn next_layout_matching(
+        lines: &mut tokio::io::Lines<BufReader<tokio::net::unix::OwnedReadHalf>>,
+        predicate: impl Fn(&LayoutSnapshot) -> bool,
+    ) -> LayoutSnapshot {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let ServerMessage::Layout(layout) = next_server_message(lines).await {
+                    if predicate(&layout) {
+                        break layout;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("matching layout")
+    }
+
+    async fn next_error(
+        lines: &mut tokio::io::Lines<BufReader<tokio::net::unix::OwnedReadHalf>>,
+    ) -> String {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let ServerMessage::Error { message } = next_server_message(lines).await {
+                    break message;
+                }
+            }
+        })
+        .await
+        .expect("error reply")
+    }
+
+    #[tokio::test]
+    async fn two_socket_clients_keep_selection_scroll_and_size_independent() {
+        let session = Arc::new(Session::spawn(80, 24, "views".into()).expect("spawn session"));
+        let (a_server, a_client) = UnixStream::pair().expect("first socket pair");
+        let (b_server, b_client) = UnixStream::pair().expect("second socket pair");
+        let a_task = tokio::spawn(serve_client(a_server, Arc::clone(&session)));
+        let b_task = tokio::spawn(serve_client(b_server, Arc::clone(&session)));
+        let (a_reader, mut a_writer) = a_client.into_split();
+        let (b_reader, mut b_writer) = b_client.into_split();
+        let mut a = BufReader::new(a_reader).lines();
+        let mut b = BufReader::new(b_reader).lines();
+        for (writer, cols, rows) in [(&mut a_writer, 100, 30), (&mut b_writer, 60, 20)] {
+            writer
+                .write_all(
+                    &encode(&ClientMessage::Hello {
+                        cols,
+                        rows,
+                        version: PROTOCOL_VERSION,
+                    })
+                    .unwrap(),
+                )
+                .await
+                .expect("hello");
+        }
+        assert!(matches!(
+            next_server_message(&mut a).await,
+            ServerMessage::Welcome { .. }
+        ));
+        let first = match next_server_message(&mut a).await {
+            ServerMessage::Layout(layout) => layout,
+            other => panic!("expected layout, got {other:?}"),
+        };
+        assert!(matches!(
+            next_server_message(&mut b).await,
+            ServerMessage::Welcome { .. }
+        ));
+        let b_first = match next_server_message(&mut b).await {
+            ServerMessage::Layout(layout) => layout,
+            other => panic!("expected layout, got {other:?}"),
+        };
+        let first_tab = first.active_tab;
+        let first_pane = first.panes[0].id;
+        assert_eq!(b_first.active_tab, first_tab);
+
+        // Client A creates and selects a tab. Client B keeps the original tab.
+        a_writer
+            .write_all(&encode(&ClientMessage::NewTab).unwrap())
+            .await
+            .expect("new tab");
+        let a_second = next_layout_matching(&mut a, |layout| layout.tabs.len() == 2).await;
+        let second_tab = a_second.active_tab;
+        assert_ne!(second_tab, first_tab);
+        b_writer
+            .write_all(&encode(&ClientMessage::Query(QueryKind::Layout)).unwrap())
+            .await
+            .expect("query b");
+        let b_still_first =
+            next_layout_matching(&mut b, |layout| layout.active_tab == first_tab).await;
+        assert_eq!(b_still_first.active_tab, first_tab);
+
+        // `Input` follows each connection's focused pane, rather than the
+        // session's persisted/script focus. Use the live shells so this is a
+        // real PTY routing assertion instead of inspecting implementation state.
+        let second_pane = a_second.panes[0].id;
+        a_writer
+            .write_all(
+                &encode(&ClientMessage::Input {
+                    bytes: b"printf VIEW_A\\n\r".to_vec(),
+                })
+                .unwrap(),
+            )
+            .await
+            .expect("input a");
+        b_writer
+            .write_all(
+                &encode(&ClientMessage::Input {
+                    bytes: b"printf VIEW_B\\n\r".to_vec(),
+                })
+                .unwrap(),
+            )
+            .await
+            .expect("input b");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let (first_text, _) = session
+                    .read_pane_text(first_pane, true, None)
+                    .expect("read first");
+                let (second_text, _) = session
+                    .read_pane_text(second_pane, true, None)
+                    .expect("read second");
+                if first_text.contains("VIEW_B") && second_text.contains("VIEW_A") {
+                    assert!(!first_text.contains("VIEW_A"));
+                    assert!(!second_text.contains("VIEW_B"));
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("inputs reach their own panes");
+
+        // Scrollback belongs to B's view. Seed real terminal history directly,
+        // then verify B sees it while A remains on its own tab.
+        let pane = session
+            .panes
+            .lock()
+            .expect("panes")
+            .get(&first_pane)
+            .cloned()
+            .expect("first pane");
+        let history = (0..40)
+            .map(|line| format!("line {line}\r\n"))
+            .collect::<String>();
+        pane.parser
+            .lock()
+            .expect("parser")
+            .process(history.as_bytes());
+        b_writer
+            .write_all(
+                &encode(&ClientMessage::ScrollPane {
+                    id: first_pane,
+                    delta: 3,
+                })
+                .unwrap(),
+            )
+            .await
+            .expect("scroll b");
+        let b_scrolled = next_layout_matching(&mut b, |layout| {
+            layout
+                .panes
+                .iter()
+                .any(|pane| pane.id == first_pane && pane.scroll_offset > 0)
+        })
+        .await;
+        assert!(b_scrolled.panes[0].scroll_offset > 0);
+        a_writer
+            .write_all(&encode(&ClientMessage::Query(QueryKind::Layout)).unwrap())
+            .await
+            .expect("query a");
+        let a_still_second =
+            next_layout_matching(&mut a, |layout| layout.active_tab == second_tab).await;
+        assert_eq!(a_still_second.active_tab, second_tab);
+
+        // A's selection mutation takes physical size ownership; B's read-only
+        // query did not resize it back to 60x20.
+        a_writer
+            .write_all(
+                &encode(&ClientMessage::FocusPaneId {
+                    id: a_second.panes[0].id,
+                })
+                .unwrap(),
+            )
+            .await
+            .expect("focus a");
+        let _ = next_layout_matching(&mut a, |layout| layout.active_tab == second_tab).await;
+        assert_eq!(*session.size.lock().expect("size"), (100, 30));
+        drop(a_writer);
+        // Disconnecting A leaves B and the panes alive.
+        b_writer
+            .write_all(&encode(&ClientMessage::Query(QueryKind::Layout)).unwrap())
+            .await
+            .expect("query after detach");
+        let alive = next_layout_matching(&mut b, |layout| layout.active_tab == first_tab).await;
+        assert_eq!(alive.panes[0].id, first_pane);
+        drop(b_writer);
+        a_task.abort();
+        b_task.abort();
+    }
+
+    #[tokio::test]
+    async fn rejected_interactive_command_keeps_attached_socket_usable() {
+        let session = Arc::new(Session::spawn(80, 24, "error-view".into()).expect("spawn session"));
+        let (server, client) = UnixStream::pair().expect("socket pair");
+        let task = tokio::spawn(serve_client(server, session));
+        let (reader, mut writer) = client.into_split();
+        let mut lines = BufReader::new(reader).lines();
+        writer
+            .write_all(
+                &encode(&ClientMessage::Hello {
+                    cols: 80,
+                    rows: 24,
+                    version: PROTOCOL_VERSION,
+                })
+                .unwrap(),
+            )
+            .await
+            .expect("hello");
+        assert!(matches!(
+            next_server_message(&mut lines).await,
+            ServerMessage::Welcome { .. }
+        ));
+        let layout = match next_server_message(&mut lines).await {
+            ServerMessage::Layout(layout) => layout,
+            other => panic!("expected layout, got {other:?}"),
+        };
+        writer
+            .write_all(
+                &encode(&ClientMessage::SetWorkspaceColor {
+                    id: layout.active_workspace,
+                    color: Some("not-a-color".into()),
+                })
+                .unwrap(),
+            )
+            .await
+            .expect("bad command");
+        assert!(next_error(&mut lines).await.contains("workspace color"));
+        writer
+            .write_all(&encode(&ClientMessage::Query(QueryKind::Layout)).unwrap())
+            .await
+            .expect("follow-up query");
+        let recovered = next_layout_matching(&mut lines, |_| true).await;
+        assert_eq!(recovered.active_workspace, layout.active_workspace);
+        drop(writer);
+        task.abort();
     }
 
     #[test]

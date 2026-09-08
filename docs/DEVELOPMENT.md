@@ -97,6 +97,15 @@ socket per session. Each message is one UTF-8 JSON value followed by a newline;
 PTY input bytes are represented by serde JSON byte arrays. The shared protocol
 types live in `kodade-cli-proto`.
 
+Each connection owns a transient view: selected workspace/tab, focused pane,
+and scrollback offsets are independent and disappear on disconnect. The
+persisted session selection remains the scripting default, so scripts cannot
+redirect an attached client's view. Shared panes have one physical PTY size.
+`Hello`, `Resize`, and later view-changing input use last-interacting
+arbitration: the most recently interacting client sets that size, while a
+read-only query never resizes it. Recoverable request errors reply with
+`Error` but leave an attached client connected for its next request.
+
 Pane contents travel in a `Screen`: a plain `contents` string (used by copy
 mode and `pane read`) plus `rows`, one styled run list per visible terminal
 row. A `Run` is a stretch of adjacent cells sharing foreground color,
