@@ -8,6 +8,7 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  RUST_TEST_THREADS: 4
 
 jobs:
   check:
@@ -27,3 +28,5 @@ jobs:
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo build
       - run: cargo test
+      - name: Exercise graphics media through a real PTY
+        run: python3 scripts/graphics-media-smoke.py target/debug/kodade-cli
