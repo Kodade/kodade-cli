@@ -92,15 +92,24 @@ finally:
     def raw(path):
         return path.read_bytes() if path.exists() else b""
 
-    def expect_bytes(label, path, expected, context=None):
+    def expect_bytes(label, path, expected, context=None, progress=None):
+        hex_path = path.with_suffix(".hex")
+
+        def received():
+            if progress is not None:
+                progress()
+            # The recorder publishes the raw and hex views in separate writes.
+            # Wait until both report the same complete capture instead of
+            # accepting raw bytes while its matching hex write is still racing.
+            return raw(path) == expected and hex_path.exists() and hex_path.read_text() == expected.hex()
+
         try:
-            wait_for(label, lambda: raw(path) == expected)
+            wait_for(label, received)
         except RuntimeError as error:
             details = f"{error}: got {raw(path).hex()}, expected {expected.hex()}"
             if context is not None:
                 details += f"; {context()}"
             raise RuntimeError(details) from error
-        assert path.with_suffix(".hex").read_text() == expected.hex()
 
     master = slave = None
     tui = None
@@ -175,7 +184,7 @@ finally:
         host_key(b"\x1b[99;5:2u")
         host_key(b"\x1b[99;5:3u")
         expect_bytes("Ctrl-c press/repeat/release", first_raw,
-                     b"\x1b[99;5u\x1b[99;5:2u\x1b[99;5:3u", keyboard_context)
+                     b"\x1b[99;5u\x1b[99;5:2u\x1b[99;5:3u", keyboard_context, drain)
 
         # Unmodified text and Shift+Enter retain their documented flag-3 behavior:
         # text is plain, neither text nor Enter gets a release without flag 8.
@@ -184,7 +193,7 @@ finally:
         host_key(b"\x1b[13;2u")
         host_key(b"\x1b[13;2:3u")
         expect_bytes("plain text and Shift-Enter", first_raw,
-                     b"\x1b[99;5u\x1b[99;5:2u\x1b[99;5:3ux\x1b[13;2u")
+                     b"\x1b[99;5u\x1b[99;5:2u\x1b[99;5:3ux\x1b[13;2u", progress=drain)
 
         # A press belongs to its original pane even when an actual mouse click
         # switches focus before the release arrives.
@@ -199,13 +208,14 @@ finally:
             # cannot observe it.  The following child-byte assertion does.
         host_key(b"\x1b[1;5:3A")
         expect_bytes("arrow release stays with original pane", first_raw,
-                     b"\x1b[99;5u\x1b[99;5:2u\x1b[99;5:3ux\x1b[13;2u\x1b[1;5A\x1b[1;5:2A\x1b[1;5:3A")
+                     b"\x1b[99;5u\x1b[99;5:2u\x1b[99;5:3ux\x1b[13;2u\x1b[1;5A\x1b[1;5:2A\x1b[1;5:3A",
+                     progress=drain)
         assert raw(second_raw) == b"", "focus switch leaked the prior key release into the new pane"
 
         host_key(b"\x1b[113;5u")
         host_key(b"\x1b[113;5:3u")
         expect_bytes("actual mouse focus routes new key to second pane", second_raw,
-                     b"\x1b[113;5u\x1b[113;5:3u")
+                     b"\x1b[113;5u\x1b[113;5:3u", progress=drain)
 
         # Prefix commands and their modal keys are consumed. Their releases must
         # not become late PTY input after the mode changes.
@@ -241,7 +251,7 @@ finally:
             )
         host_key(b"\x1b[13;2u")
         expect_bytes("Shift-Enter after two live upgrades", second_raw,
-                     b"\x1b[113;5u\x1b[113;5:3u\x1b[13;2u", keyboard_context)
+                     b"\x1b[113;5u\x1b[113;5:3u\x1b[13;2u", keyboard_context, drain)
 
         # A non-negotiating child still gets legacy bytes but never host releases.
         legacy_cmd, legacy_raw, legacy_hex, legacy_ready = recorder("legacy", negotiate=False)
@@ -265,7 +275,10 @@ finally:
         assert raw(legacy_raw), "actual mouse clicks could not reach the legacy pane"
         legacy_bytes = raw(legacy_raw)
         assert legacy_bytes == b"z" * len(legacy_bytes), "legacy pane received a host release"
-        assert legacy_hex.read_text() == legacy_bytes.hex()
+        wait_for(
+            "legacy recorder hex capture",
+            lambda: (drain() is None) and legacy_hex.exists() and legacy_hex.read_text() == legacy_bytes.hex(),
+        )
 
         os.write(master, b"\x02d")
         wait_for("TUI detach", lambda: (drain() is None) and tui.poll() is not None)
