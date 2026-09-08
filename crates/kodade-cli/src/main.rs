@@ -1205,7 +1205,8 @@ fn hook_session_id_from_value(
         ("kodade:cursor", Some("cursor"))
         | ("kodade:droid", Some("droid"))
         | ("kodade:kimi", Some("kimi"))
-        | ("kodade:qwen", Some("qwen")) => "session_id",
+        | ("kodade:qwen", Some("qwen"))
+        | ("kodade:devin", Some("devin")) => "session_id",
         ("kodade:grok", Some("grok")) => "sessionId",
         _ => return None,
     };
@@ -1521,6 +1522,18 @@ mod hook_payload_tests {
         assert_eq!(
             hook_session_id_from_value(&payload, "kodade:grok", Some("grok")),
             Some("grok-root".into())
+        );
+    }
+
+    #[test]
+    fn devin_uses_the_documented_top_level_snake_case_session_id() {
+        let payload = serde_json::json!({
+            "session_id": "devin-root",
+            "tool_input": { "session_id": "nested-decoy" },
+        });
+        assert_eq!(
+            hook_session_id_from_value(&payload, "kodade:devin", Some("devin")),
+            Some("devin-root".into())
         );
     }
 }

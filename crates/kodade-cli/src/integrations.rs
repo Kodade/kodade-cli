@@ -109,9 +109,9 @@ pub fn integrate_list() -> Result<()> {
     Ok(())
 }
 
-/// Devin's documented hook configuration is Claude-compatible. Its published
-/// payload does not provide a stable native session id, so these hooks report
-/// lifecycle state only.
+/// Devin's documented hook configuration is Claude-compatible. Every payload
+/// includes a stable root `session_id`, which `report_command` records from
+/// stdin through `--hook-json`.
 fn devin_hooks() -> Value {
     json!({
         "SessionStart": [{ "hooks": [{ "type": "command", "command": report_command("idle", "kodade:devin", "devin") }] }],
@@ -1324,7 +1324,7 @@ mod tests {
         ] {
             let command = devin[event][0]["hooks"][0]["command"].as_str().unwrap();
             assert!(command.contains("kodade:devin"));
-            assert!(!command.contains("--native-session-id"));
+            assert!(command.contains("--hook-json"));
         }
         assert!(devin["PermissionRequest"][0]["hooks"][0]["command"]
             .as_str()

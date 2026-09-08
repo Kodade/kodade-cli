@@ -265,8 +265,9 @@ state, so detection does not depend on screen strings alone.
   lifecycle events into `$XDG_CONFIG_HOME/devin/config.json` (or
   `~/.config/devin/config.json`). It reports `SessionStart` → idle,
   prompt/tool events → working, permission requests → blocked, and
-  `Stop`/`SessionEnd` → done. Devin's published hook payload has no verified
-  native session ID, so this adapter deliberately does not claim an ID resume.
+  `Stop`/`SessionEnd` → done. The [Devin hook payload](https://docs.devin.ai/cli/extensibility/hooks/overview)
+  supplies stable root `session_id` values, which Ködade stores and restores
+  with [`devin --resume SESSION_ID`](https://docs.devin.ai/cli/reference/commands).
 - `integrate mastra [--write]` — merges Mastra Code's flat command entries
   into `~/.mastracode/hooks.json`: session start → idle, prompt/agent/tool
   events → working, permission requests → blocked, and agent end/stop → done.
