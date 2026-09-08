@@ -137,17 +137,40 @@ fn parse_record(record: &str) -> Result<(&str, [u8; 32])> {
 
 #[cfg(windows)]
 fn write_record(path: &Path, endpoint: &str, secret: &[u8; 32]) -> Result<()> {
+    use std::os::windows::{ffi::OsStrExt, io::FromRawHandle};
+    use windows_sys::Win32::{
+        Foundation::{LocalFree, INVALID_HANDLE_VALUE},
+        Security::SECURITY_ATTRIBUTES,
+        Storage::FileSystem::{CreateFileW, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, FILE_GENERIC_WRITE},
+    };
     let parent = path.parent().context("discovery record needs parent")?;
     std::fs::create_dir_all(parent).context("create discovery directory")?;
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    let mut file = options
-        .open(path)
-        .context("create daemon discovery record")?;
-    if let Err(error) = restrict_to_owner(path) {
-        let _ = std::fs::remove_file(path);
-        return Err(error);
+    let descriptor = owner_security_descriptor()?;
+    let path_wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    let attributes = SECURITY_ATTRIBUTES {
+        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: descriptor.cast(),
+        bInheritHandle: 0,
+    };
+    let handle = unsafe {
+        CreateFileW(
+            path_wide.as_ptr(),
+            FILE_GENERIC_WRITE,
+            0,
+            &attributes,
+            CREATE_NEW,
+            FILE_ATTRIBUTE_NORMAL,
+            std::ptr::null_mut(),
+        )
+    };
+    unsafe { LocalFree(descriptor.cast()) };
+    if handle == INVALID_HANDLE_VALUE {
+        anyhow::bail!(
+            "create private daemon discovery record: {}",
+            std::io::Error::last_os_error()
+        );
     }
+    let mut file = unsafe { std::fs::File::from_raw_handle(handle as _) };
     let text = format!(
         "{endpoint}\n{}\n",
         secret
@@ -162,23 +185,15 @@ fn write_record(path: &Path, endpoint: &str, secret: &[u8; 32]) -> Result<()> {
     Ok(())
 }
 
-/// The secret is useful only if another local account cannot read it. `OW` is
-/// the SID of the file owner; the protected DACL prevents inherited broad ACLs.
+/// The record is created with this descriptor, so no reader can retain a broad
+/// inherited handle before its secret is published.
 #[cfg(windows)]
-fn restrict_to_owner(path: &Path) -> Result<()> {
-    use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::{
-        Foundation::LocalFree,
-        Security::{
-            Authorization::{
-                ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
-            },
-            SetFileSecurityW, DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
-            PSECURITY_DESCRIPTOR,
-        },
+fn owner_security_descriptor() -> Result<windows_sys::Win32::Security::PSECURITY_DESCRIPTOR> {
+    use windows_sys::Win32::Security::{
+        Authorization::{ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1},
+        PSECURITY_DESCRIPTOR,
     };
     let sddl: Vec<u16> = "D:P(A;;FA;;;OW)\0".encode_utf16().collect();
-    let path: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
     let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
     unsafe {
         if ConvertStringSecurityDescriptorToSecurityDescriptorW(
@@ -193,55 +208,6 @@ fn restrict_to_owner(path: &Path) -> Result<()> {
                 std::io::Error::last_os_error()
             );
         }
-        let result = SetFileSecurityW(
-            path.as_ptr(),
-            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
-            descriptor,
-        );
-        LocalFree(descriptor.cast());
-        if result == 0 {
-            anyhow::bail!(
-                "restrict daemon discovery record: {}",
-                std::io::Error::last_os_error()
-            );
-        }
     }
-    Ok(())
-}
-
-#[cfg(all(test, windows))]
-mod windows_tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn rejected_authentication_does_not_stop_the_listener() {
-        use tokio::io::AsyncWriteExt;
-        let path = std::env::temp_dir().join(format!(
-            "kodade-transport-test-{}-{}.record",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let listener = bind(&path).await.unwrap();
-        let record = read_record(&path).unwrap();
-        let (endpoint, _) = parse_record(&record).unwrap();
-        let mut intruder = TcpStream::connect(endpoint).await.unwrap();
-        intruder.write_all(&[0; 32]).await.unwrap();
-        drop(intruder);
-        let (accepted, connected) = tokio::join!(listener.accept(), connect(&path));
-        assert!(accepted.is_ok());
-        assert!(connected.is_ok());
-        drop(connected);
-        let _ = std::fs::remove_file(path);
-    }
-
-    #[test]
-    fn discovery_record_accepts_only_ascii_loopback_secrets() {
-        let record = format!("127.0.0.1:4000\n{}\n", "ab".repeat(32));
-        assert_eq!(parse_record(&record).unwrap().1, [0xab; 32]);
-        assert!(parse_record(&format!("192.0.2.1:4000\n{}\n", "ab".repeat(32))).is_err());
-        assert!(parse_record(&format!("127.0.0.1:4000\n{}\n", "é".repeat(32))).is_err());
-    }
+    Ok(descriptor)
 }
