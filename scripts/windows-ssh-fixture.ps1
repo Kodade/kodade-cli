@@ -158,10 +158,14 @@ setTimeout(() => report("working"), 1000);
 setTimeout(() => report("idle"), 5000);
 setInterval(() => {}, 1000);
 '@
+    # Remote command serialization is shell-oriented. Send the JavaScript as
+    # base64 so the Windows client, OpenSSH, and the Unix login shell cannot
+    # reinterpret quotes, semicolons, or newlines before Node receives it.
+    $nodeHookBase64 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($nodeHook))
     # `agent wait` polls through several bridge connections until the adapter
     # transitions to idle. First observe the live adapter rather than guessing
     # when the WSL process group has made Node its foreground process.
-    $waitPane = (Invoke-Native $WindowsBinary @('--remote', $sshAlias, '--session', $session, 'run', '--', 'node', '-e', $nodeHook) 45).Trim()
+    $waitPane = (Invoke-Native $WindowsBinary @('--remote', $sshAlias, '--session', $session, 'run', '--', 'sh', '-c', "echo $nodeHookBase64 | base64 -d | node") 45).Trim()
     if ($waitPane -notmatch '^\d+$') { throw "remote wait fixture did not return a pane id: $waitPane" }
     $recognized = $false
     $lastProbeError = ''
