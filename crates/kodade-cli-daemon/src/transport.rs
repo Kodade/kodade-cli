@@ -1,6 +1,6 @@
 //! Local daemon transport: Unix sockets on Unix, authenticated loopback on Windows.
 use anyhow::{Context, Result};
-use std::path::Path;
+use std::{io::Read, path::Path};
 #[cfg(unix)]
 pub use tokio::net::{UnixListener as Listener, UnixStream as Stream};
 #[cfg(unix)]
@@ -31,7 +31,7 @@ pub struct Listener {
 #[cfg(windows)]
 #[allow(dead_code)] // The CLI crate connects in production; daemon tests use this seam.
 pub async fn connect(path: &Path) -> Result<Stream> {
-    let record = std::fs::read_to_string(path).context("read private daemon discovery record")?;
+    let record = read_record(path)?;
     let (endpoint, secret) = parse_record(&record)?;
     let mut stream = Stream::connect(endpoint)
         .await
@@ -93,18 +93,39 @@ fn constant_time_eq(left: &[u8; 32], right: &[u8; 32]) -> bool {
 }
 
 #[cfg(windows)]
+fn read_record(path: &Path) -> Result<String> {
+    let mut record = String::new();
+    std::fs::File::open(path)
+        .context("open private daemon discovery record")?
+        .take(512)
+        .read_to_string(&mut record)
+        .context("read private daemon discovery record")?;
+    Ok(record)
+}
+
+#[cfg(windows)]
 #[allow(dead_code)] // Used by the test-only daemon transport client above.
 fn parse_record(record: &str) -> Result<(&str, [u8; 32])> {
+    let record = record
+        .strip_suffix('\n')
+        .context("invalid daemon discovery record")?;
     let (endpoint, encoded) = record
-        .trim_end()
         .split_once('\n')
         .context("invalid daemon discovery record")?;
-    if endpoint.parse::<std::net::SocketAddr>().is_err() || encoded.len() != 64 {
+    let address = endpoint
+        .parse::<std::net::SocketAddr>()
+        .context("invalid daemon discovery record")?;
+    if !address.ip().is_loopback()
+        || encoded.len() != 64
+        || !encoded.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
         anyhow::bail!("invalid daemon discovery record");
     }
     let mut secret = [0; 32];
-    for (index, byte) in secret.iter_mut().enumerate() {
-        *byte = u8::from_str_radix(&encoded[index * 2..index * 2 + 2], 16)
+    let (pairs, remainder) = encoded.as_bytes().as_chunks::<2>();
+    debug_assert!(remainder.is_empty());
+    for (byte, hex) in secret.iter_mut().zip(pairs) {
+        *byte = u8::from_str_radix(std::str::from_utf8(hex).expect("ASCII hex"), 16)
             .context("invalid daemon discovery record")?;
     }
     Ok((endpoint, secret))
@@ -114,6 +135,15 @@ fn parse_record(record: &str) -> Result<(&str, [u8; 32])> {
 fn write_record(path: &Path, endpoint: &str, secret: &[u8; 32]) -> Result<()> {
     let parent = path.parent().context("discovery record needs parent")?;
     std::fs::create_dir_all(parent).context("create discovery directory")?;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    let mut file = options
+        .open(path)
+        .context("create daemon discovery record")?;
+    if let Err(error) = restrict_to_owner(path) {
+        let _ = std::fs::remove_file(path);
+        return Err(error);
+    }
     let text = format!(
         "{endpoint}\n{}\n",
         secret
@@ -121,8 +151,10 @@ fn write_record(path: &Path, endpoint: &str, secret: &[u8; 32]) -> Result<()> {
             .map(|byte| format!("{byte:02x}"))
             .collect::<String>()
     );
-    std::fs::write(path, text).context("write daemon discovery record")?;
-    restrict_to_owner(path)?;
+    use std::io::Write;
+    file.write_all(text.as_bytes())
+        .context("write daemon discovery record")?;
+    file.sync_all().context("sync daemon discovery record")?;
     Ok(())
 }
 
@@ -171,4 +203,17 @@ fn restrict_to_owner(path: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+
+    #[test]
+    fn discovery_record_accepts_only_ascii_loopback_secrets() {
+        let record = format!("127.0.0.1:4000\n{}\n", "ab".repeat(32));
+        assert_eq!(parse_record(&record).unwrap().1, [0xab; 32]);
+        assert!(parse_record(&format!("192.0.2.1:4000\n{}\n", "ab".repeat(32))).is_err());
+        assert!(parse_record(&format!("127.0.0.1:4000\n{}\n", "é".repeat(32))).is_err());
+    }
 }
