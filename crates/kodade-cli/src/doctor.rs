@@ -49,7 +49,7 @@ pub async fn run(socket: &Path, session: &str, json: bool) -> Result<()> {
         status,
         detail,
     });
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
+    let shell = platform_shell();
     checks.push(tool_check("login shell", &shell, true));
     for (label, command) in [
         ("git worktrees", "git"),
@@ -153,7 +153,7 @@ fn executable(command: &str) -> Option<PathBuf> {
         vec![PathBuf::from(command)]
     } else {
         std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
-            .map(|directory| directory.join(command))
+            .flat_map(|directory| platform_executable_candidates(&directory, command))
             .collect()
     };
     candidates.into_iter().find(|path| {
@@ -172,4 +172,33 @@ fn executable(command: &str) -> Option<PathBuf> {
             }
         })
     })
+}
+
+fn platform_shell() -> String {
+    #[cfg(windows)]
+    {
+        std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".into())
+    }
+    #[cfg(not(windows))]
+    {
+        std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into())
+    }
+}
+
+fn platform_executable_candidates(directory: &Path, command: &str) -> Vec<PathBuf> {
+    #[cfg(windows)]
+    {
+        let extensions = std::env::var_os("PATHEXT")
+            .map(|value| std::env::split_paths(&value).collect::<Vec<_>>())
+            .unwrap_or_default();
+        let mut candidates = vec![directory.join(command)];
+        for extension in extensions {
+            candidates.push(directory.join(format!("{command}{}", extension.to_string_lossy())));
+        }
+        candidates
+    }
+    #[cfg(not(windows))]
+    {
+        vec![directory.join(command)]
+    }
 }

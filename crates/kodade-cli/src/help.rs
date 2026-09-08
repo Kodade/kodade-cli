@@ -537,7 +537,7 @@ help = ["F1"]
 
     #[test]
     fn docs_table_matches_the_embedded_table() {
-        let docs = include_str!("../../../docs/CONFIG.md");
+        let docs = include_str!("../../../docs/CONFIG.md").replace("\r\n", "\n");
         let start = docs
             .find("<!-- keys:start -->")
             .expect("keys:start marker present");

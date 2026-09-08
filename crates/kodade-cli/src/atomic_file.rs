@@ -53,15 +53,52 @@ pub fn write(path: &Path, contents: &[u8]) -> Result<()> {
     file.write_all(contents)?;
     file.sync_all()?;
     drop(file);
-    fs::rename(&temp.0, &path).with_context(|| format!("replace {}", path.display()))?;
+    replace(&temp.0, &path).with_context(|| format!("replace {}", path.display()))?;
+    // Windows does not permit opening a directory as a normal file. Its
+    // replacement call uses MOVEFILE_WRITE_THROUGH above instead.
+    #[cfg(unix)]
     fs::File::open(parent)?.sync_all()?;
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(not(windows))]
+fn replace(source: &Path, destination: &Path) -> std::io::Result<()> {
+    fs::rename(source, destination)
+}
+
+/// Windows `rename` cannot replace an existing open file. `MoveFileExW` asks
+/// the filesystem to replace the target as one operation, preserving the old
+/// file until the staged contents are durable.
+#[cfg(windows)]
+fn replace(source: &Path, destination: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
+    let source: Vec<u16> = source.as_os_str().encode_wide().chain(Some(0)).collect();
+    let destination: Vec<u16> = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+    if unsafe {
+        MoveFileExW(
+            source.as_ptr(),
+            destination.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    } == 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
     #[test]
     fn updates_symlink_target_without_replacing_link() {
         use std::os::unix::fs::symlink;

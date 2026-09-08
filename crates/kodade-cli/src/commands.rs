@@ -5,15 +5,8 @@ use kodade_cli_proto::{
     WorkspaceInfo,
 };
 use regex::Regex;
-use std::{
-    fs,
-    path::{Path, PathBuf},
-    time::Duration,
-};
-use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
-    net::UnixStream,
-};
+use std::{fs, path::Path, time::Duration};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 /// Poll interval for `agent wait` / `pane wait-output`.
 const POLL: Duration = Duration::from_millis(250);
@@ -41,7 +34,7 @@ pub fn parse_state(value: &str) -> Result<AgentStateKind> {
 /// redirects every scripting command through the forwarded local socket (#23).
 pub async fn request(socket: &Path, message: ClientMessage) -> Result<ServerMessage> {
     let exchange = async {
-        let stream = UnixStream::connect(socket)
+        let stream = crate::transport::connect(socket)
             .await
             .with_context(|| format!("no Ködade CLI daemon at {}", socket.display()))?;
         let (reader, mut writer) = stream.into_split();
@@ -274,6 +267,7 @@ pub struct SessionEntry {
 }
 
 /// Enumerate `*.sock` in the runtime directory and probe each one.
+#[cfg(not(windows))]
 pub async fn session_entries() -> Result<Vec<SessionEntry>> {
     let dir = kodade_cli_daemon::socket_dir();
     let read = session_socket_paths(&dir)?;
@@ -298,9 +292,10 @@ pub async fn session_entries() -> Result<Vec<SessionEntry>> {
     Ok(entries)
 }
 
-fn session_socket_paths(dir: &Path) -> Result<Vec<PathBuf>> {
+#[cfg(not(windows))]
+fn session_socket_paths(dir: &Path) -> Result<Vec<std::path::PathBuf>> {
     let entries = Vec::new();
-    let mut read = match fs::read_dir(dir) {
+    let mut paths = match fs::read_dir(dir) {
         Ok(read) => read,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(entries),
         Err(error) => return Err(error).context("read the Ködade CLI runtime directory"),
@@ -309,14 +304,53 @@ fn session_socket_paths(dir: &Path) -> Result<Vec<PathBuf>> {
     .map(|entry| entry.path())
     .filter(|path| path.extension().is_some_and(|ext| ext == "sock"))
     .collect::<Vec<_>>();
-    read.sort();
-    Ok(read)
+    paths.sort();
+    Ok(paths)
+}
+
+#[cfg(windows)]
+pub async fn session_entries() -> Result<Vec<SessionEntry>> {
+    let dir = kodade_cli_daemon::socket_dir();
+    let mut names = match fs::read_dir(&dir) {
+        Ok(read) => read
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter_map(|path| {
+                (path
+                    .extension()
+                    .is_some_and(|extension| extension == "json"))
+                .then(|| path.file_stem()?.to_str().map(str::to_owned))
+                .flatten()
+            })
+            .collect::<Vec<_>>(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error).context("read Ködade CLI session state directory"),
+    };
+    names.sort();
+    let mut entries = Vec::with_capacity(names.len());
+    for name in names {
+        let path = kodade_cli_daemon::socket_path(&name);
+        let probe = probe_session(&path).await;
+        entries.push(SessionEntry {
+            name,
+            path: path.display().to_string(),
+            alive: probe.is_some(),
+            restored: probe.as_ref().is_some_and(|layout| layout.restored),
+            workspaces: probe
+                .as_ref()
+                .map(|layout| layout.workspaces.len())
+                .unwrap_or(0),
+            tabs: probe.as_ref().map(|layout| layout.tabs.len()).unwrap_or(0),
+            panes: probe.as_ref().map(|layout| layout.panes.len()).unwrap_or(0),
+        });
+    }
+    Ok(entries)
 }
 
 /// Connect to a socket and ask for its layout, giving up after [`PROBE_TIMEOUT`].
 async fn probe_session(path: &Path) -> Option<LayoutSnapshot> {
     let probe = async {
-        let stream = UnixStream::connect(path).await.ok()?;
+        let stream = crate::transport::connect(path).await.ok()?;
         let (reader, mut writer) = stream.into_split();
         writer
             .write_all(&encode(&layout_query()).ok()?)
@@ -392,7 +426,7 @@ pub fn format_event(event: &Event) -> String {
 
 /// Subscribe to a session and print every event until the daemon goes away.
 pub async fn stream_events(socket: &Path, json: bool) -> Result<()> {
-    let stream = UnixStream::connect(socket)
+    let stream = crate::transport::connect(socket)
         .await
         .with_context(|| format!("no Ködade CLI daemon at {}", socket.display()))?;
     let (reader, mut writer) = stream.into_split();
@@ -840,6 +874,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn session_listing_ignores_private_hook_socket_subdirectory() {
         let directory =

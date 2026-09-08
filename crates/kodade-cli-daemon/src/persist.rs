@@ -6,12 +6,14 @@
 //! cold start the daemon rebuilds that layout with fresh panes. Scrollback is
 //! never persisted (secrets risk); only structure and metadata are.
 
+#[cfg(not(windows))]
+use std::env;
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 #[cfg(test)]
 use std::time::Instant;
 use std::{
-    env, fs,
+    fs,
     fs::OpenOptions,
     io::Write,
     path::{Path, PathBuf},
@@ -36,15 +38,23 @@ pub use kodade_cli_proto::{PaneFile, SessionFile, TabFile, WorkspaceFile};
 
 /// State directory for the current platform, honoring `XDG_STATE_HOME`.
 pub fn state_dir() -> Option<PathBuf> {
-    let xdg = env::var_os("XDG_STATE_HOME").map(PathBuf::from);
-    state_dir_for(
-        xdg.as_deref(),
-        dirs::home_dir().as_deref(),
-        cfg!(target_os = "macos"),
-    )
+    #[cfg(windows)]
+    {
+        dirs::data_local_dir().map(|path| path.join("kodade-cli"))
+    }
+    #[cfg(not(windows))]
+    {
+        let xdg = env::var_os("XDG_STATE_HOME").map(PathBuf::from);
+        state_dir_for(
+            xdg.as_deref(),
+            dirs::home_dir().as_deref(),
+            cfg!(target_os = "macos"),
+        )
+    }
 }
 
 /// Pure resolver behind [`state_dir`] so the platform rules can be unit-tested.
+#[cfg(not(windows))]
 fn state_dir_for(xdg: Option<&Path>, home: Option<&Path>, is_macos: bool) -> Option<PathBuf> {
     if let Some(xdg) = xdg {
         return Some(xdg.join("kodade-cli"));
@@ -173,13 +183,23 @@ fn create_unique_temp(path: &Path) -> Result<(PathBuf, fs::File)> {
 }
 
 fn sync_parent(path: &Path) -> Result<()> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("session state path has no parent"))?;
-    fs::File::open(parent)
-        .context("open session state directory")?
-        .sync_all()
-        .context("sync session state directory")
+    #[cfg(windows)]
+    {
+        // Windows cannot open a directory as a regular file. `rename` already
+        // replaces the state file atomically on this volume.
+        let _ = path;
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        let parent = path
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("session state path has no parent"))?;
+        fs::File::open(parent)
+            .context("open session state directory")?
+            .sync_all()
+            .context("sync session state directory")
+    }
 }
 
 /// Remove a session's state file (and any leftover temp), e.g. on an explicit
@@ -508,6 +528,7 @@ mod tests {
         fs::remove_dir_all(&dir).unwrap();
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn state_dir_follows_platform_rules() {
         assert_eq!(
