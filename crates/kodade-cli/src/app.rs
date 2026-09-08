@@ -2592,7 +2592,7 @@ impl App {
             }
             MouseEventKind::Up(MouseButton::Left) => {
                 self.drag = None;
-                self.finish_selection(term)?;
+                self.finish_selection(Some(term))?;
             }
             MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
                 let area = self.content_area(term)?;
@@ -2830,7 +2830,7 @@ impl App {
 
     // Mouse up: a plain click clears, a real drag copies when
     // `mouse.copy_on_select` is on and always fills the paste buffer.
-    fn finish_selection(&mut self, term: &mut Term) -> Result<()> {
+    fn finish_selection(&mut self, term: Option<&mut Term>) -> Result<()> {
         self.selecting = false;
         let Some(selection) = self.selection.clone() else {
             return Ok(());
@@ -2851,6 +2851,7 @@ impl App {
         self.paste_buffer = text.clone();
         self.selected_text = Some((self.selected_endpoint.clone(), selection.pane, text.clone()));
         if self.config.copy_on_select {
+            let term = term.ok_or_else(|| anyhow!("terminal unavailable for selection copy"))?;
             let (payload, truncated) = mode::osc52(&text);
             execute!(term.backend_mut(), crossterm::style::Print(payload))?;
             term.backend_mut().flush()?;
@@ -3929,7 +3930,6 @@ mod tests {
 
     #[test]
     fn mouse_selection_reaches_command_context_only_for_its_endpoint_and_pane() {
-        use ratatui::{backend::CrosstermBackend, Terminal};
         let mut config = config::Config::default();
         config.copy_on_select = false;
         let mut app = App::new(
@@ -3973,8 +3973,7 @@ mod tests {
         selection.set_head((0, 7), &screen);
         app.selection = Some(selection);
         app.selecting = true;
-        let mut terminal = Terminal::new(CrosstermBackend::new(std::io::stdout())).unwrap();
-        app.finish_selection(&mut terminal).unwrap();
+        app.finish_selection(None).unwrap();
         assert_eq!(
             app.plugin_context(None).selected_text.as_deref(),
             Some("selected")
