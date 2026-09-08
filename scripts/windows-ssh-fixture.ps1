@@ -72,7 +72,8 @@ try {
     Invoke-Wsl @('sh', '-lc', 'apk add --no-cache openssh')
     # WSL imports keep their filesystem opaque to Windows. Copy through the
     # distro's mounted Windows path so the running Unix instance sees the binary.
-    $linuxSource = (Invoke-Native 'wsl.exe' @('-d', $distro, '--', 'wslpath', '-a', $LinuxBinary) 30).Trim()
+    if ($LinuxBinary -notmatch '^([A-Za-z]):\\(.*)$') { throw "cannot map Windows fixture path into WSL: $LinuxBinary" }
+    $linuxSource = "/mnt/$($matches[1].ToLowerInvariant())/$($matches[2].Replace('\', '/'))"
     $quotedSource = $linuxSource.Replace("'", "'\''")
     Invoke-Wsl @('sh', '-lc', "mkdir -p /root/.local/bin /root/.ssh && cp '$quotedSource' /root/.local/bin/kodade-cli && chmod 700 /root/.local/bin/kodade-cli /root/.ssh")
 
