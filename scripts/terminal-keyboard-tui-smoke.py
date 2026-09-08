@@ -9,7 +9,6 @@ import pty
 import select
 import shlex
 import shutil
-import signal
 import struct
 import subprocess
 import sys
@@ -67,6 +66,7 @@ with tempfile.TemporaryDirectory(prefix="kodade-keyboard-") as directory:
         source = f"""
 import os, select, termios, tty
 raw = {str(raw)!r}; hexed = {str(hexed)!r}; ready = {str(ready)!r}; stop = {str(stop)!r}
+frame = {str(root / f"{name}.frame")!r}
 fd = os.open('/dev/tty', os.O_RDWR)
 old = termios.tcgetattr(fd)
 tty.setraw(fd)
@@ -75,6 +75,10 @@ try:
     open(ready, 'w').close()
     captured = bytearray()
     while not os.path.exists(stop):
+        if os.path.exists(frame):
+            with open(frame, 'rb') as marker:
+                os.write(fd, b'\\r\\n' + marker.read() + b'\\r\\n')
+            os.unlink(frame)
         readable, _, _ = select.select([fd], [], [], .05)
         if readable:
             captured.extend(os.read(fd, 4096))
@@ -226,10 +230,18 @@ finally:
                 f"Kitty mode after upgrade {generation}",
                 lambda: next(p for p in panes() if p["id"] == second_id)["screen"]["keyboard"]["kitty_flags"] == 3,
             )
-            drain()
+            # Daemon readiness does not prove this attached client has
+            # reconnected. A new child-output row must reach the actual TUI
+            # before sending input, which is intentionally dropped offline.
+            marker = f"UPGRADE-READY-{generation}".encode()
+            (root / "second.frame").write_bytes(marker)
+            wait_for(
+                f"attached frame after upgrade {generation}",
+                lambda: (drain() is None) and marker in transcript,
+            )
         host_key(b"\x1b[13;2u")
         expect_bytes("Shift-Enter after two live upgrades", second_raw,
-                     b"\x1b[113;5u\x1b[113;5:3u\x1b[13;2u")
+                     b"\x1b[113;5u\x1b[113;5:3u\x1b[13;2u", keyboard_context)
 
         # A non-negotiating child still gets legacy bytes but never host releases.
         legacy_cmd, legacy_raw, legacy_hex, legacy_ready = recorder("legacy", negotiate=False)
@@ -270,28 +282,27 @@ finally:
         assert restored_modes == original, "detach left host terminal raw"
         assert b"\x1b[<1u" in transcript, "detach did not pop keyboard enhancement"
     finally:
+        failed = sys.exc_info()[0] is not None
+        cleanup_error = None
         (root / "stop").touch()
         if tui is not None and tui.poll() is None:
-            # The controlling-terminal process owns its own session. End that
-            # process group so a failed smoke never leaves the CI job's PTY
-            # owner behind; escalate instead of extending an arbitrary wait.
+            # Target only the child we own. macOS can retain a defunct process
+            # group that rejects killpg even after its leader has exited.
             try:
-                os.killpg(tui.pid, signal.SIGTERM)
-            except ProcessLookupError:
+                tui.terminate()
+            except (ProcessLookupError, PermissionError):
                 pass
             try:
                 tui.wait(timeout=1)
             except subprocess.TimeoutExpired:
                 try:
-                    os.killpg(tui.pid, signal.SIGKILL)
-                except ProcessLookupError:
+                    tui.kill()
+                except (ProcessLookupError, PermissionError):
                     pass
                 try:
                     tui.wait(timeout=3)
                 except subprocess.TimeoutExpired as error:
-                    if sys.exc_info()[0] is None:
-                        raise RuntimeError("could not terminate keyboard TUI process group") from error
-                    print("keyboard TUI cleanup timed out after TERM/KILL", file=sys.stderr)
+                    cleanup_error = error
         if master is not None:
             os.close(master)
         if slave is not None:
@@ -299,5 +310,9 @@ finally:
         subprocess.run([str(BINARY), "--session", SESSION, "kill-session"], env=env,
                        capture_output=True)
         shutil.rmtree(runtime, ignore_errors=True)
+        if cleanup_error is not None:
+            if not failed:
+                raise RuntimeError("could not terminate keyboard TUI") from cleanup_error
+            print("keyboard TUI cleanup timed out after TERM/KILL", file=sys.stderr)
 
 print("Terminal keyboard TUI smoke passed: detection, real PTY forwarding, two live upgrades, focus ownership, modal consumption, legacy releases, and detach restoration")
