@@ -554,9 +554,7 @@ impl App {
                     endpoint
                         .map(|item| item.label.clone())
                         .unwrap_or_else(|| "endpoint".into()),
-                    endpoint
-                        .map(|item| format!("{:?}", item.status))
-                        .unwrap_or_default(),
+                    endpoint.map(|item| item.status.label()).unwrap_or_default(),
                     layout.clone(),
                 )
             })
@@ -3966,6 +3964,24 @@ mod tests {
             PathBuf::from("/tmp/kodade-test.sock"),
         );
         assert!(!app.compact_enabled(1));
+    }
+
+    #[test]
+    fn local_app_sidebar_has_one_workspace_heading() {
+        let config = config::Config::default();
+        let mut app = App::new(&config, "work", PathBuf::from("/tmp/kodade-test.sock"));
+        app.endpoints.update(&EndpointId::Local);
+        app.endpoint_layouts
+            .insert(EndpointId::Local, layout_named(&["project"]));
+        let rows = app.sidebar_flat();
+        assert_eq!(
+            rows.iter().filter(|row| row.label == "workspaces").count(),
+            1
+        );
+        assert!(!rows
+            .iter()
+            .any(|row| row.label == "machines" || row.label == "Local workspaces"));
+        assert!(rows.iter().any(|row| row.label.contains("project")));
     }
 
     #[test]

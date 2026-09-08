@@ -31,6 +31,18 @@ pub enum Status {
     Disabled,
 }
 
+impl Status {
+    pub fn label(&self) -> String {
+        match self {
+            Self::Connecting => "connecting".into(),
+            Self::Online => "online".into(),
+            Self::Offline { retry } => format!("offline · retry {}", retry + 1),
+            Self::Attention(reason) => format!("attention · {reason}"),
+            Self::Disabled => "disabled".into(),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Endpoint {
     pub label: String,
@@ -444,13 +456,7 @@ impl Manager {
             .map(|(id, endpoint)| SidebarMachine {
                 id: id.clone(),
                 label: endpoint.label.clone(),
-                status: match &endpoint.status {
-                    Status::Connecting => "connecting".into(),
-                    Status::Online => "online".into(),
-                    Status::Offline { retry } => format!("offline · retry {}", retry + 1),
-                    Status::Attention(reason) => format!("attention · {reason}"),
-                    Status::Disabled => "disabled".into(),
-                },
+                status: endpoint.status.label(),
             })
             .collect()
     }
