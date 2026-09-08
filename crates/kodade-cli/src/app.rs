@@ -3589,16 +3589,22 @@ pub fn bytes(k: KeyEvent) -> Option<Vec<u8>> {
 /// Encode only modes a pane explicitly negotiated; legacy terminals retain the
 /// historical bytes above.
 pub fn bytes_for_mode(k: KeyEvent, modes: KeyboardModes) -> Option<Vec<u8>> {
-    // Event types alone do not change legacy encodings; only emit releases for
-    // keys that the negotiated disambiguation mode represents as CSI sequences.
+    let functional = kitty_functional_key(k.code).is_some();
+    let disambiguated = modes.kitty_flags & 1 != 0
+        && match k.code {
+            KeyCode::Esc => true,
+            KeyCode::Char(_) => k
+                .modifiers
+                .intersects(KeyModifiers::ALT | KeyModifiers::CONTROL),
+            _ => false,
+        };
+    // Text and the legacy Enter/Tab/Backspace escape hatches have no releases.
+    // Event reporting alone must not duplicate a legacy control character.
     if k.kind == KeyEventKind::Release
-        && (modes.kitty_flags & 2 == 0
-            || matches!(k.code, KeyCode::Char(_)) && k.modifiers.is_empty()
-            || matches!(k.code, KeyCode::Enter | KeyCode::Tab | KeyCode::Backspace))
+        && (modes.kitty_flags & 2 == 0 || !(functional || disambiguated))
     {
         return None;
     }
-    let functional = kitty_functional_key(k.code).is_some();
     if modes.kitty_flags & 1 != 0 || (modes.kitty_flags & 2 != 0 && functional) {
         let code = match k.code {
             KeyCode::Char(c) => c as u32,
@@ -3611,13 +3617,14 @@ pub fn bytes_for_mode(k: KeyEvent, modes: KeyboardModes) -> Option<Vec<u8>> {
             _ if k.kind == KeyEventKind::Release => return None,
             _ => return bytes(k),
         };
-        let encoded = match k.code {
-            KeyCode::Char(_) => k
-                .modifiers
-                .intersects(KeyModifiers::ALT | KeyModifiers::CONTROL),
-            KeyCode::Esc => true,
-            _ => !k.modifiers.is_empty(),
-        };
+        let encoded = functional
+            || match k.code {
+                KeyCode::Char(_) => k
+                    .modifiers
+                    .intersects(KeyModifiers::ALT | KeyModifiers::CONTROL),
+                KeyCode::Esc => true,
+                _ => !k.modifiers.is_empty(),
+            };
         if !encoded && k.kind != KeyEventKind::Release {
             return bytes(k);
         }
@@ -3797,6 +3804,68 @@ mod tests {
             bytes_for_mode(KeyEvent::new(KeyCode::F(5), KeyModifiers::SHIFT), modes),
             Some(b"\x1b[15;2~".to_vec())
         );
+    }
+
+    #[test]
+    fn kitty_unmodified_functional_keys_preserve_repeat_events() {
+        for flags in [2, 3] {
+            let modes = KeyboardModes {
+                kitty_flags: flags,
+                modify_other_keys: 0,
+            };
+            for (code, expected) in [
+                (KeyCode::Up, "\x1b[1;1:2A"),
+                (KeyCode::Home, "\x1b[1;1:2H"),
+                (KeyCode::F(1), "\x1b[1;1:2P"),
+                (KeyCode::Delete, "\x1b[3;1:2~"),
+            ] {
+                assert_eq!(
+                    bytes_for_mode(
+                        KeyEvent::new_with_kind(code, KeyModifiers::NONE, KeyEventKind::Repeat),
+                        modes,
+                    ),
+                    Some(expected.as_bytes().to_vec()),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn kitty_text_and_legacy_control_releases_do_not_type_twice() {
+        for flags in [0, 1, 2, 3] {
+            let modes = KeyboardModes {
+                kitty_flags: flags,
+                modify_other_keys: 0,
+            };
+            for (code, modifiers) in [
+                (KeyCode::Char('A'), KeyModifiers::SHIFT),
+                (KeyCode::Char('x'), KeyModifiers::NONE),
+                (KeyCode::Enter, KeyModifiers::SHIFT),
+                (KeyCode::Tab, KeyModifiers::CONTROL),
+                (KeyCode::Backspace, KeyModifiers::ALT),
+            ] {
+                assert_eq!(
+                    bytes_for_mode(
+                        KeyEvent::new_with_kind(code, modifiers, KeyEventKind::Release),
+                        modes,
+                    ),
+                    None,
+                );
+            }
+            if flags != 3 {
+                assert_eq!(
+                    bytes_for_mode(
+                        KeyEvent::new_with_kind(
+                            KeyCode::Char('c'),
+                            KeyModifiers::CONTROL,
+                            KeyEventKind::Release,
+                        ),
+                        modes,
+                    ),
+                    None,
+                );
+            }
+        }
     }
 
     #[test]
