@@ -1,13 +1,20 @@
 mod app;
+mod atomic_file;
+mod attention;
+mod automation;
 mod cli;
 mod commands;
 mod config;
+mod connection;
+mod doctor;
 mod help;
 mod input;
+mod integrations;
 mod keys;
 mod mode;
 mod notify;
 mod overlay;
+mod palette;
 mod paste;
 mod picker;
 mod remote;
@@ -15,20 +22,16 @@ mod render;
 mod selection;
 mod settings;
 mod state;
+mod terminal;
 
-use anyhow::{anyhow, Context, Result};
-use clap::Parser;
-use crossterm::{
-    event::{DisableBracketedPaste, EnableBracketedPaste},
-    execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
-};
+use anyhow::{anyhow, bail, Context, Result};
+use clap::{CommandFactory, FromArgMatches};
 use kodade_cli_proto::{
     decode, encode, ClientMessage, Direction, Event, QueryKind, ServerMessage, SplitAxis,
     PROTOCOL_VERSION,
 };
 use ratatui::{backend::CrosstermBackend, Terminal};
-use std::{env, path::Path, process::Stdio, time::Duration};
+use std::{path::Path, time::Duration};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::UnixStream,
@@ -37,7 +40,16 @@ use tokio::{
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let args = cli::Cli::parse();
+    let matches = cli::Cli::command().get_matches();
+    let explicit_session =
+        matches.value_source("session") == Some(clap::parser::ValueSource::CommandLine);
+    let mut args = cli::Cli::from_arg_matches(&matches)?;
+    connection::inherited_context(
+        &mut args,
+        explicit_session,
+        std::env::var("KODADE_SESSION").ok(),
+        std::env::var_os("KODADE_SOCKET").map(Into::into),
+    )?;
     let session = args.session.clone();
     let remote = args.remote.clone();
 
@@ -67,8 +79,34 @@ async fn main() -> Result<()> {
     let (socket, _tunnel) = if needs_socket {
         remote::resolve_socket(&args).await?
     } else {
-        (kodade_cli_daemon::socket_path(&session), None)
+        (
+            args.socket
+                .clone()
+                .unwrap_or_else(|| kodade_cli_daemon::socket_path(&session)),
+            None,
+        )
     };
+    // Only creation operations start a missing local session. Read-only and
+    // destructive commands never create a new session as a side effect.
+    let creates = matches!(
+        args.command,
+        Some(
+            cli::Command::Agent {
+                command: cli::AgentCommand::Start { .. }
+            } | cli::Command::New { .. }
+                | cli::Command::Run { .. }
+                | cli::Command::NewTab { .. }
+                | cli::Command::Workspace {
+                    command: cli::WorkspaceCommand::New { .. }
+                }
+                | cli::Command::Tab {
+                    command: cli::TabCommand::New { .. }
+                }
+        )
+    );
+    if creates && args.remote.is_none() && args.socket.is_none() {
+        drop(connection::connect(&socket, &session, true).await?);
+    }
     let command = args.command;
 
     // The config is only loaded where it is used, so `config validate` does not
@@ -76,11 +114,18 @@ async fn main() -> Result<()> {
     match command {
         // No subcommand attaches the TUI to the session.
         None => attach(&socket, &session, &config::Config::load()).await,
+        Some(cli::Command::Doctor { json }) => {
+            if let Some(host) = remote.as_deref() {
+                remote::run_doctor(host, &session, json).await
+            } else {
+                doctor::run(&socket, &session, json).await
+            }
+        }
         Some(cli::Command::Daemon { session: name }) => {
             kodade_cli_daemon::run(name.unwrap_or(session)).await
         }
         Some(cli::Command::Session { command }) => {
-            session_command(remote.as_deref(), &session, command).await
+            session_command(remote.as_deref(), &socket, &session, command).await
         }
         Some(cli::Command::Worktree { command }) => worktree(&socket, command).await,
         Some(cli::Command::Ls { json }) => {
@@ -98,7 +143,14 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Some(cli::Command::Agent { command }) => {
-            agent(&socket, &session, &config::Config::load(), command).await
+            agent(
+                &socket,
+                &session,
+                remote.as_deref(),
+                &config::Config::load(),
+                command,
+            )
+            .await
         }
         Some(cli::Command::Pane { command }) => pane(&socket, command).await,
         Some(cli::Command::Send {
@@ -210,11 +262,15 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Some(cli::Command::Integrate { target }) => match target {
-            cli::IntegrateCommand::List => commands::integrate_list(),
-            cli::IntegrateCommand::ClaudeCode { write } => commands::integrate_claude_code(write),
-            cli::IntegrateCommand::GeminiCli { write } => commands::integrate_gemini(write, false),
+            cli::IntegrateCommand::List => integrations::integrate_list(),
+            cli::IntegrateCommand::ClaudeCode { write } => {
+                integrations::integrate_claude_code(write)
+            }
+            cli::IntegrateCommand::GeminiCli { write } => {
+                integrations::integrate_gemini(write, false)
+            }
             cli::IntegrateCommand::Codex { write, force } => {
-                commands::integrate_codex(write, force)
+                integrations::integrate_codex(write, force)
             }
         },
         Some(cli::Command::Tab { command }) => tab(&socket, command).await,
@@ -331,17 +387,41 @@ async fn pane(socket: &Path, command: cli::PaneCommand) -> Result<()> {
         cli::PaneCommand::WaitOutput {
             pane,
             text,
+            regex,
+            scrollback,
             timeout,
         } => {
-            let reached = commands::poll_pane(socket, pane, timeout, |snapshot| {
-                snapshot.screen.contents.contains(&text)
-            })
-            .await?;
+            let matcher = commands::output_matcher(&text, regex)?;
+            // `poll_pane` only exposes screen snapshots. Output waits need the
+            // daemon's durable history when requested, so read through the
+            // same pane-id seam instead.
+            let reached = wait_output(socket, pane, &matcher, scrollback, timeout).await?;
             if !reached {
                 std::process::exit(2);
             }
             Ok(())
         }
+    }
+}
+
+/// Wait for a literal or regex match in a pane's visible screen or durable
+/// scrollback. The pane id is never re-resolved, so replacement fails safely.
+async fn wait_output(
+    socket: &Path,
+    pane: kodade_cli_proto::PaneId,
+    matcher: &commands::OutputMatcher,
+    scrollback: bool,
+    timeout: Option<u64>,
+) -> Result<bool> {
+    let deadline = timeout.map(|secs| std::time::Instant::now() + Duration::from_secs(secs));
+    loop {
+        if matcher.matches(&commands::read_pane(socket, pane, scrollback, None).await?) {
+            return Ok(true);
+        }
+        if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+            return Ok(false);
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
     }
 }
 
@@ -459,6 +539,7 @@ async fn workspace(socket: &Path, command: cli::WorkspaceCommand) -> Result<()> 
 /// directory; with `--remote` every verb runs on the host over SSH (#23).
 async fn session_command(
     remote: Option<&str>,
+    socket: &Path,
     session: &str,
     command: cli::SessionCommand,
 ) -> Result<()> {
@@ -467,7 +548,7 @@ async fn session_command(
     }
     match command {
         cli::SessionCommand::Path => {
-            println!("{}", kodade_cli_daemon::socket_path(session).display());
+            println!("{}", socket.display());
             Ok(())
         }
         cli::SessionCommand::Ls { json } => {
@@ -480,17 +561,17 @@ async fn session_command(
             Ok(())
         }
         cli::SessionCommand::Kill { name } => {
-            let target =
-                kodade_cli_daemon::socket_path(&name.unwrap_or_else(|| session.to_owned()));
+            let target = name
+                .map(|name| kodade_cli_daemon::socket_path(&name))
+                .unwrap_or_else(|| socket.to_path_buf());
             match commands::request(&target, ClientMessage::KillSession).await? {
                 ServerMessage::Shutdown => Ok(()),
                 message => commands::layout(message).map(|_| ()),
             }
         }
         cli::SessionCommand::Rename { name } => {
-            let socket = kodade_cli_daemon::socket_path(session);
             commands::layout(
-                commands::request(&socket, ClientMessage::RenameSession { name }).await?,
+                commands::request(socket, ClientMessage::RenameSession { name }).await?,
             )?;
             Ok(())
         }
@@ -584,6 +665,12 @@ async fn resolve_target(
 /// `config` subcommands: locate, print, or check the config file.
 fn config_command(command: cli::ConfigCommand) {
     match command {
+        cli::ConfigCommand::Init => {
+            if let Err(error) = init_config() {
+                eprintln!("kodade-cli: {error:#}");
+                std::process::exit(1);
+            }
+        }
         cli::ConfigCommand::Path => println!("{}", config::config_path().display()),
         cli::ConfigCommand::Show => match config::Config::load_checked() {
             Ok(config) => print!("{}", config.to_toml()),
@@ -620,6 +707,7 @@ fn config_command(command: cli::ConfigCommand) {
 async fn agent(
     socket: &Path,
     session: &str,
+    remote: Option<&str>,
     config: &config::Config,
     command: cli::AgentCommand,
 ) -> Result<()> {
@@ -637,43 +725,121 @@ async fn agent(
             }
             Ok(())
         }
-        cli::AgentCommand::Attach { pane } => {
-            commands::layout(
-                commands::request(socket, ClientMessage::FocusPaneId { id: pane }).await?,
-            )?;
+        cli::AgentCommand::Start {
+            workspace,
+            tab,
+            name,
+            json,
+            command,
+        } => {
+            let (workspace, tab) = resolve_target(socket, workspace, tab).await?;
+            let pane = automation::start(socket, workspace, tab, name, command).await?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&pane)?);
+            } else {
+                println!("{}", pane.id.0);
+            }
+            Ok(())
+        }
+        cli::AgentCommand::Read {
+            target,
+            lines,
+            scrollback,
+            json,
+        } => {
+            let target = contextual_agent_target(&target, socket, session, remote)?;
+            let (pane, text) = automation::read(socket, &target, scrollback, lines).await?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(
+                        &serde_json::json!({ "pane": pane, "text": text })
+                    )?
+                );
+            } else {
+                println!("{text}");
+            }
+            Ok(())
+        }
+        cli::AgentCommand::SendKeys {
+            target,
+            keys,
+            literal,
+        } => {
+            let target = contextual_agent_target(&target, socket, session, remote)?;
+            automation::send_keys(socket, &target, &keys, literal).await?;
+            Ok(())
+        }
+        cli::AgentCommand::Prompt {
+            target,
+            text,
+            wait,
+            until,
+            timeout,
+            json,
+        } => {
+            let target = contextual_agent_target(&target, socket, session, remote)?;
+            match automation::prompt(socket, &target, &text, wait, until, timeout).await? {
+                automation::PromptOutcome::Sent(pane)
+                | automation::PromptOutcome::Settled(pane) => {
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&pane)?);
+                    }
+                    Ok(())
+                }
+                automation::PromptOutcome::TimedOut => {
+                    std::process::exit(2);
+                }
+            }
+        }
+        cli::AgentCommand::Focus { target, json } => {
+            let target = contextual_agent_target(&target, socket, session, remote)?;
+            let pane = automation::focus(socket, &target).await?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&pane)?);
+            }
+            Ok(())
+        }
+        cli::AgentCommand::Attach { target } => {
+            let target = contextual_agent_target(&target, socket, session, remote)?;
+            automation::focus(socket, &target).await?;
             attach(socket, session, config).await
         }
-        cli::AgentCommand::Rename { pane, name } => {
+        cli::AgentCommand::Rename { target, name } => {
+            let target = contextual_agent_target(&target, socket, session, remote)?;
+            let pane = automation::agent_target(socket, &target).await?;
             commands::layout(
-                commands::request(socket, ClientMessage::RenamePaneId { id: pane, name }).await?,
+                commands::request(socket, ClientMessage::RenamePaneId { id: pane.id, name })
+                    .await?,
             )?;
             Ok(())
         }
-        cli::AgentCommand::Explain { pane, json } => {
-            let layout =
-                commands::layout(commands::request(socket, commands::layout_query()).await?)?;
-            let pane = commands::find_pane(&layout, pane)?;
+        cli::AgentCommand::Explain { target, json } => {
+            let target = contextual_agent_target(&target, socket, session, remote)?;
+            let pane = automation::agent_target(socket, &target).await?;
             if json {
-                println!("{}", serde_json::to_string_pretty(pane)?);
+                println!("{}", serde_json::to_string_pretty(&pane)?);
             } else {
-                println!("{}", commands::format_explain(pane));
+                println!("{}", commands::format_explain(&pane));
             }
             Ok(())
         }
         cli::AgentCommand::Wait {
-            pane,
+            target,
             state,
             timeout,
         } => {
+            let target = contextual_agent_target(&target, socket, session, remote)?;
+            let pane = automation::agent_target(socket, &target).await?;
             let reached =
-                commands::poll_pane(socket, pane, timeout, |snapshot| snapshot.state == state)
+                commands::poll_pane(socket, pane.id, timeout, |snapshot| snapshot.state == state)
                     .await?;
             if !reached {
                 std::process::exit(2);
             }
             Ok(())
         }
-        cli::AgentCommand::UpdateManifests => commands::update_manifests(),
+        cli::AgentCommand::UpdateManifests => integrations::update_manifests(),
         cli::AgentCommand::Report {
             pane,
             state,
@@ -693,6 +859,39 @@ async fn agent(
             Ok(())
         }
     }
+}
+
+/// `current` is only meaningful inside a pane Ködade spawned. Reading its
+/// inherited identity prevents a shell command from accidentally targeting the
+/// TUI's globally focused pane, and rejects a different session or remote.
+fn contextual_agent_target(
+    target: &str,
+    socket: &Path,
+    session: &str,
+    remote: Option<&str>,
+) -> Result<String> {
+    if target != "current" {
+        return Ok(target.into());
+    }
+    if remote.is_some() {
+        bail!("`current` cannot be used with --remote; pass an explicit pane target")
+    }
+    let inherited_session = std::env::var("KODADE_SESSION")
+        .map_err(|_| anyhow!("`current` requires KODADE_PANE inside a Ködade pane"))?;
+    if inherited_session != session {
+        bail!("`current` belongs to session '{inherited_session}', not '{session}'")
+    }
+    let inherited_socket = std::env::var_os("KODADE_SOCKET")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| kodade_cli_daemon::socket_path(&inherited_session));
+    if inherited_socket != socket {
+        bail!("`current` cannot target a different socket; pass an explicit pane target")
+    }
+    let pane = std::env::var("KODADE_PANE")
+        .map_err(|_| anyhow!("`current` requires KODADE_PANE inside a Ködade pane"))?;
+    pane.parse::<u64>()
+        .map_err(|_| anyhow!("KODADE_PANE is not a valid pane id"))?;
+    Ok(pane)
 }
 
 /// `worktree` subcommands: add, remove, and list git-worktree workspaces (#22).
@@ -762,31 +961,7 @@ async fn attach(socket: &Path, session: &str, config: &config::Config) -> Result
     // Only spawn a daemon for this host's own socket; a `--remote` tunnel socket
     // differs from the local path and must not trigger a local daemon.
     let can_spawn = socket == kodade_cli_daemon::socket_path(session).as_path();
-    let stream = match UnixStream::connect(socket).await {
-        Ok(s) => s,
-        Err(e)
-            if can_spawn
-                && matches!(
-                    e.kind(),
-                    std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
-                ) =>
-        {
-            std::process::Command::new(env::current_exe().context("locate binary")?)
-                .arg("daemon")
-                .arg(session)
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()?;
-            loop {
-                if let Ok(s) = UnixStream::connect(socket).await {
-                    break s;
-                }
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        }
-        Err(e) => return Err(e.into()),
-    };
+    let stream = connection::connect(socket, session, can_spawn).await?;
     tui(stream, config, session, socket).await
 }
 
@@ -813,7 +988,9 @@ async fn tui(
             version: PROTOCOL_VERSION,
         })?)
         .await?;
-    handshake(&mut lines, &mut state).await?;
+    tokio::time::timeout(Duration::from_secs(10), handshake(&mut lines, &mut state))
+        .await
+        .context("daemon handshake timed out after 10s")??;
     // Subscribe so the TUI learns about session-level changes (a rename moves
     // the socket under it). Subscribed connections receive notifications as
     // `Event::Notification` instead of `ServerMessage::Notification`.
@@ -842,24 +1019,9 @@ async fn tui(
             }
         }
     });
-    enable_raw_mode()?;
-    let mut stdout = std::io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
-    // Bracketed paste lets the client tell a paste from typing (#21).
-    execute!(stdout, EnableBracketedPaste)?;
-    if config.mouse {
-        execute!(stdout, crossterm::event::EnableMouseCapture)?;
-    }
-    let mut term = Terminal::new(CrosstermBackend::new(stdout))?;
-    let result = state.run(&mut term, &mut writer, &mut rx).await;
-    disable_raw_mode()?;
-    execute!(term.backend_mut(), DisableBracketedPaste)?;
-    execute!(term.backend_mut(), LeaveAlternateScreen)?;
-    if config.mouse {
-        execute!(term.backend_mut(), crossterm::event::DisableMouseCapture)?;
-    }
-    term.show_cursor()?;
-    result
+    let _modes = terminal::TerminalModes::enter(config.mouse)?;
+    let mut term = Terminal::new(CrosstermBackend::new(std::io::stdout()))?;
+    state.run(&mut term, &mut writer, &mut rx).await
 }
 
 /// Read the daemon's opening `Welcome` and verify its protocol version before
@@ -878,20 +1040,38 @@ async fn handshake(
         match decode::<ServerMessage>(line.as_bytes()) {
             Ok(ServerMessage::Welcome { session, version }) => {
                 if version != PROTOCOL_VERSION {
-                    eprintln!(
-                        "protocol version mismatch: client {PROTOCOL_VERSION}, daemon {version} — upgrade kodade-cli on both ends"
-                    );
-                    std::process::exit(1);
+                    bail!("protocol version mismatch: client {PROTOCOL_VERSION}, daemon {version} — upgrade kodade-cli on both ends");
                 }
                 state.handle_session(session);
                 return Ok(());
             }
             Ok(ServerMessage::Error { message }) => {
-                eprintln!("{message}");
-                std::process::exit(1);
+                bail!("{message}");
             }
             // Ignore anything before the Welcome (there should be nothing).
             _ => continue,
         }
     }
+}
+
+/// Create an editable starter without overwriting an existing configuration.
+fn init_config() -> Result<()> {
+    use std::io::Write;
+    let path = config::config_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .with_context(|| {
+            format!(
+                "create {}; existing configuration is preserved",
+                path.display()
+            )
+        })?;
+    file.write_all(b"# K\xc3\xb6dade CLI configuration. Unspecified settings keep their defaults.\n# Run kodade-cli keys to inspect live bindings; prefix space opens the command center.\ntheme = \"auto\"\n\n[sidebar]\nwidth = 24\n\n[notify]\nonly_when_unfocused = true\n")?;
+    println!("created {}", path.display());
+    Ok(())
 }

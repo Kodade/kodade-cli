@@ -58,6 +58,15 @@ pub enum ClientMessage {
         id: PaneId,
         bytes: Vec<u8>,
     },
+    /// Atomically verify a recognized agent identity then write to its pane.
+    /// Scripts use this for prompts so a query/write gap cannot send input to
+    /// a replacement shell or another agent in the same pane.
+    PromptAgent {
+        pane: PaneId,
+        expected_agent: String,
+        expected_generation: u64,
+        bytes: Vec<u8>,
+    },
     RenamePaneId {
         id: PaneId,
         name: String,
@@ -410,6 +419,14 @@ pub struct PaneSnapshot {
     pub scroll_offset: usize,
     pub screen: Screen,
     pub agent: Option<String>,
+    /// Changes whenever the recognized foreground-agent identity changes.
+    /// A prompt carries this value back to the daemon as an identity guard.
+    #[serde(default)]
+    pub agent_generation: u64,
+    /// Increments when this pane enters Working or Blocked. Prompt waiters use
+    /// it to observe a fast lifecycle that completes between polling ticks.
+    #[serde(default)]
+    pub activity_revision: u64,
     pub state: AgentStateKind,
     pub state_reason: String,
     /// Seconds the current state has held (see daemon state_since tracking).
@@ -640,6 +657,7 @@ pub const CLIENT_MESSAGE_NAMES: &[&str] = &[
     "FocusPane",
     "FocusPaneId",
     "SendToPane",
+    "PromptAgent",
     "RenamePaneId",
     "KillSession",
     "RenameSession",
@@ -706,6 +724,7 @@ pub fn client_message_name(message: &ClientMessage) -> &'static str {
         ClientMessage::FocusPane { .. } => "FocusPane",
         ClientMessage::FocusPaneId { .. } => "FocusPaneId",
         ClientMessage::SendToPane { .. } => "SendToPane",
+        ClientMessage::PromptAgent { .. } => "PromptAgent",
         ClientMessage::RenamePaneId { .. } => "RenamePaneId",
         ClientMessage::KillSession => "KillSession",
         ClientMessage::RenameSession { .. } => "RenameSession",
@@ -833,6 +852,8 @@ mod tests {
                     mouse_reporting: false,
                 },
                 agent: None,
+                agent_generation: 0,
+                activity_revision: 0,
                 state: AgentStateKind::Idle,
                 state_reason: "no agent process".into(),
                 state_age_secs: 12,
@@ -916,6 +937,12 @@ mod tests {
             ClientMessage::FocusPaneId { id: pane },
             ClientMessage::SendToPane {
                 id: pane,
+                bytes: vec![1],
+            },
+            ClientMessage::PromptAgent {
+                pane,
+                expected_agent: "Codex".into(),
+                expected_generation: 1,
                 bytes: vec![1],
             },
             ClientMessage::RenamePaneId {
@@ -1033,6 +1060,8 @@ mod tests {
                 scroll_offset: 0,
                 screen: Screen::default(),
                 agent: None,
+                agent_generation: 0,
+                activity_revision: 0,
                 state: AgentStateKind::Idle,
                 state_reason: "no agent process".into(),
                 state_age_secs: 0,

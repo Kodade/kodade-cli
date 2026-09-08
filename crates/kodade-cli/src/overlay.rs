@@ -249,7 +249,9 @@ pub fn render_overlay(frame: &mut Frame, area: Rect, overlay: &Overlay, theme: &
             Style::default().fg(theme.menu_fg).bg(theme.menu_bg)
         };
         // Widths are display cells, so wide (CJK) labels cannot overflow the border.
-        let (hint, hint_width) = clip(&row.hint, list.width as usize);
+        // Preserve a recognisable action label on narrow terminals; a long
+        // secondary hint must not consume the entire interactive row.
+        let (hint, hint_width) = clip(&row.hint, (list.width as usize) / 2);
         let (label, label_width) = clip(&row.label, list.width as usize - hint_width);
         let pad = list.width as usize - hint_width - label_width;
         frame.render_widget(

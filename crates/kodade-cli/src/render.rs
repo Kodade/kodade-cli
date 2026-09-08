@@ -150,6 +150,8 @@ pub struct Ui<'a> {
     pub help: Option<&'a Overlay>,
     /// Workspace / goto picker (`prefix w` / `prefix g`), drawn like help (#17).
     pub picker: Option<&'a crate::picker::Picker>,
+    /// Mutually-exclusive command center, attention inbox, or welcome overlay.
+    pub center: Option<&'a Overlay>,
 }
 
 pub fn render(frame: &mut Frame, layout: &LayoutSnapshot, ui: &Ui, theme: &Theme) {
@@ -179,6 +181,7 @@ pub fn render(frame: &mut Frame, layout: &LayoutSnapshot, ui: &Ui, theme: &Theme
         first_attach_hint,
         help,
         picker,
+        center,
     } = *ui;
     let areas = Layout::default()
         .direction(LayoutDirection::Horizontal)
@@ -336,6 +339,9 @@ pub fn render(frame: &mut Frame, layout: &LayoutSnapshot, ui: &Ui, theme: &Theme
             let state = picker.state_at(index);
             (picker_dot(state), state_color(theme, state))
         });
+    }
+    if let Some(center) = center {
+        render_overlay(frame, frame.area(), center, theme);
     }
 }
 
@@ -1859,6 +1865,8 @@ mod tests {
                 mouse_reporting: false,
             },
             agent: None,
+            agent_generation: 0,
+            activity_revision: 0,
             state: AgentStateKind::Idle,
             state_reason: String::new(),
             state_age_secs: 0,
@@ -1891,6 +1899,7 @@ mod tests {
             first_attach_hint: None,
             help: None,
             picker: None,
+            center: None,
         };
         let mut terminal = Terminal::new(TestBackend::new(40, 10)).expect("test terminal");
         terminal
@@ -1999,6 +2008,8 @@ mod tests {
             scroll_offset: 0,
             screen: Screen::default(),
             agent: Some("Codex".into()),
+            agent_generation: 1,
+            activity_revision: 0,
             state: AgentStateKind::Blocked,
             state_reason: String::new(),
             state_age_secs: 0,
@@ -2033,6 +2044,7 @@ mod tests {
             first_attach_hint: None,
             help: None,
             picker: None,
+            center: None,
         };
         let mut terminal = Terminal::new(TestBackend::new(80, 12)).expect("test terminal");
         terminal

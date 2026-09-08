@@ -24,6 +24,10 @@ the second.
 - The daemon answers every request on the same connection, in order. Most
   messages are answered with a `Layout` snapshot; the exceptions are listed
   below.
+- Each connection that sends `Hello` owns its selected workspace, selected tab, focused pane, and
+  scrollback offsets. These are transient client-view state: closing a socket
+  drops them and never changes another connection's view or the persisted
+  session default.
 - Unknown fields are ignored on read, so a newer daemon can add fields without
   breaking an older client. An unknown *variant* is a decode error and closes
   the connection.
@@ -56,6 +60,7 @@ printf '%s\n' '{"Query":"Layout"}' | nc -U /tmp/kodade-cli-$UID/default.sock
 | `FocusPaneId` | `{"FocusPaneId":{"id":3}}` | `Layout` |
 | `FocusPaneCycle` | `{"FocusPaneCycle":{"forward":true}}` | `Layout` |
 | `SendToPane` | `{"SendToPane":{"id":3,"bytes":[121,13]}}` | `Layout` |
+| `PromptAgent` | `{"PromptAgent":{"pane":3,"expected_agent":"Codex","expected_generation":1,"bytes":[121]}}` | `Pane` |
 | `RenamePane` / `RenameTab` / `RenameWorkspace` | `{"RenameTab":{"name":"agents"}}` | `Layout` |
 | `RenamePaneId` / `RenameTabId` / `RenameWorkspaceId` | `{"RenameTabId":{"id":2,"name":"agents"}}` | `Layout` |
 | `RenameSession` | `{"RenameSession":{"name":"work"}}` | `Layout` |
@@ -90,8 +95,10 @@ move receives a fresh shell tab, because a workspace always has at least one.
 `NewWorktreeWorkspace` runs `git worktree add` for `branch` (created from `from`,
 or checked out when it already exists) under the `[worktrees] directory` config
 (default `~/.kodade/worktrees`), then opens a `repo:branch` workspace rooted in
-the new worktree. `RemoveWorktreeWorkspace` closes the workspace and, unless
-`keep`, runs `git worktree remove`; the directory is only ever removed when git
+the new worktree. `RemoveWorktreeWorkspace` runs a non-forced `git worktree
+remove` before closing the workspace unless `keep` is set. If Git refuses a
+dirty or otherwise unremovable checkout, the daemon replies `Error` and leaves
+the workspace and its panes intact. The directory is only ever removed when Git
 reports it as a registered worktree. Each `WorkspaceInfo` in a `Layout` carries a
 `branch` (the workspace root's current git branch, refreshed on the daemon's 2 s
 tick, `null` outside a repo) and a `parent` (the workspace id whose root is a
@@ -107,6 +114,30 @@ answers `Error` and changes nothing.
 Messages that act on "the focused pane" (`ClosePane`, `ZoomPane`, `SwapPane`,
 `ResizePane`, `BreakPane`, …) have no id argument: send `FocusPaneId` first.
 That is exactly what `kodade-cli pane kill|zoom|swap|resize` does.
+
+`PromptAgent` is the guarded automation write used by `agent prompt`. The
+daemon re-detects the pane immediately before writing and requires both the
+recognized agent label and `PaneSnapshot.agent_generation` to match; it rejects
+blocked, exited, or replaced agents without writing any bytes. Its `bytes`
+payload is one ordered PTY submission and is capped at 64 KiB.
+The check uses a fresh foreground-process probe; a process may still exit in
+the kernel interval between that probe and the PTY write, so automation should
+surface the command's result and retry only after resolving the target again.
+
+Only `Hello` establishes an independent interactive view. Connections that
+have not sent `Hello` use the persisted script selection, so a CLI `FocusPaneId`
+followed by an action on a fresh socket preserves its targeting behavior.
+
+`Hello` and `Resize` record the connection's requested dimensions. A shared
+PTY has one physical size, so the client that most recently sends a
+view-changing request owns that PTY geometry until another client interacts.
+Read-only queries never resize PTYs. This is intentional last-interacting
+arbitration: clients retain independent selections and scrollback while an
+interactive terminal application sees one stable size at a time.
+
+An `Error` rejects that request without changing the session. Attached clients
+remain connected after recoverable command errors and may issue another
+request; one-shot command clients can still treat the `Error` reply as failure.
 
 ## Server messages
 
@@ -250,3 +281,14 @@ state without hard-coding anything:
 ```bash
 "$KODADE_BIN" agent report "$KODADE_PANE" blocked -s "$KODADE_SESSION"
 ```
+
+### CLI endpoint selection
+
+Without an explicit endpoint flag, the CLI uses its inherited `KODADE_SESSION`
+and `KODADE_SOCKET`. `--session NAME` overrides both, `--socket PATH` selects a
+socket directly, and `--remote HOST` selects an SSH host. `session path` prints
+the resolved socket. Session names are validated before deriving paths: 1–64
+bytes, no path separators or control characters, and neither `.` nor `..`.
+
+`doctor --json` probes `Query(Version)` without starting the daemon. Its JSON
+contains `version`, `session`, `socket`, and `checks` (`name`, `status`, `detail`).

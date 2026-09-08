@@ -26,15 +26,31 @@ use std::{
 use tokio::{io::AsyncWriteExt, net::unix::OwnedWriteHalf, sync::mpsc};
 
 use crate::{
-    config, help, input, mode, notify,
-    overlay::{self, Overlay, OverlayEvent, OverlayTarget},
-    paste,
+    attention, config, help, input, mode, notify,
+    overlay::{self, Overlay, OverlayEvent, OverlayRow, OverlayTarget},
+    palette, paste,
     picker::{self, PickTarget},
     render,
     render::SidebarMode,
     selection::{self, Selection, SelectionMode},
     settings, state,
 };
+
+enum CenterOverlay {
+    Palette(palette::Palette),
+    Attention(attention::Attention),
+    Welcome(Overlay),
+}
+
+impl CenterOverlay {
+    fn overlay(&self) -> &Overlay {
+        match self {
+            Self::Palette(palette) => &palette.overlay,
+            Self::Attention(attention) => &attention.overlay,
+            Self::Welcome(overlay) => overlay,
+        }
+    }
+}
 
 /// Two left clicks on the same cell inside this window are a double click (#12).
 const MULTI_CLICK: Duration = Duration::from_millis(400);
@@ -112,6 +128,9 @@ pub struct App {
     collapsed: HashSet<WorkspaceId>,
     /// Persisted UI state (collapsed workspaces, help_seen); loaded once (#19).
     ui_state: state::State,
+    /// The first layout made the onboarding decision for this client lifetime.
+    /// An eligible welcome stays unpersisted until the user actually dismisses it.
+    onboarding_decided: bool,
     /// Workspace ids already reconciled against the persisted collapse set, so a
     /// newly appearing workspace is seeded but existing ones are left alone (#19).
     seeded_ids: HashSet<WorkspaceId>,
@@ -134,6 +153,9 @@ pub struct App {
     /// Help overlay (`prefix ?`); holds the full row set so its filter can
     /// rebuild without re-reading the config (#6).
     help: Option<help::HelpOverlay>,
+    /// Command center, attention inbox, or first-run welcome. These are one
+    /// mutually-exclusive route so presentation modes cannot overlap.
+    center: Option<CenterOverlay>,
     /// Whether the help overlay has ever been opened; drives the first-attach
     /// hint and is persisted to the state file (#6).
     help_seen: bool,
@@ -172,6 +194,40 @@ const FLASH: Duration = Duration::from_secs(1);
 /// How long the `prefix b · sidebar` hint lingers after hiding the sidebar.
 const SIDEBAR_HINT: Duration = Duration::from_secs(3);
 
+fn welcome_overlay() -> Overlay {
+    Overlay::new(
+        "welcome to Ködade · any key opens command center · ? for help",
+        vec![
+            OverlayRow::new(
+                " start an agent",
+                "Codex · Claude · Gemini · OpenCode · Pi",
+                OverlayTarget::None,
+            ),
+            OverlayRow::new(
+                " organize work",
+                "split panes · tabs · workspaces",
+                OverlayTarget::None,
+            ),
+            OverlayRow::new(
+                " stay in flow",
+                "blocked work appears in prefix A",
+                OverlayTarget::None,
+            ),
+        ],
+    )
+}
+
+/// The welcome is only useful for a brand-new, plain-shell session. Decide on
+/// its first snapshot, then persist that decision so later state changes never
+/// interrupt an established session.
+fn should_offer_onboarding(layout: &LayoutSnapshot) -> bool {
+    !layout.restored
+        && layout.workspaces.len() == 1
+        && layout.tabs.len() == 1
+        && layout.panes.len() == 1
+        && layout.panes[0].agent.is_none()
+}
+
 impl App {
     pub fn new(config: &config::Config, session: &str, socket: PathBuf) -> Self {
         // The toast tells the user which chord jumps to the pane, so read the
@@ -181,6 +237,8 @@ impl App {
             .into_iter()
             .next()
             .unwrap_or_else(|| "N".to_string());
+        let ui_state = state::State::load();
+        let onboarding_decided = ui_state.onboarding_seen;
         Self {
             layout: None,
             prefix: false,
@@ -197,7 +255,8 @@ impl App {
                 config_collapsed_mode(config)
             },
             collapsed: HashSet::new(),
-            ui_state: state::State::load(),
+            ui_state,
+            onboarding_decided,
             seeded_ids: HashSet::new(),
             auto_hidden: false,
             navigate: None,
@@ -210,6 +269,7 @@ impl App {
             settings: None,
             picker: None,
             help: None,
+            center: None,
             help_seen: help::state_seen(),
             note: None,
             paste_buffer: String::new(),
@@ -280,6 +340,17 @@ impl App {
     /// Stores a new snapshot. Copy mode refreshes its full-history buffer
     /// separately (throttled) in the event loop, not from the visible screen.
     pub fn handle_layout(&mut self, layout: LayoutSnapshot) {
+        if self.layout.is_none() && !self.onboarding_decided {
+            let offer_onboarding = should_offer_onboarding(&layout);
+            // A first snapshot settles the first-run decision, including a
+            // resumed or already-active session that must never be interrupted.
+            self.onboarding_decided = true;
+            if offer_onboarding && self.center.is_none() {
+                self.center = Some(CenterOverlay::Welcome(welcome_overlay()));
+            } else {
+                self.dismiss_onboarding();
+            }
+        }
         // A selection belongs to one pane's current output: drop it when focus
         // moves, when its pane goes away, or (opt-in) when the pane redraws.
         if let Some(selection) = &self.selection {
@@ -303,6 +374,16 @@ impl App {
         }
         self.layout = Some(layout);
         self.seed_collapsed();
+        if let Some(layout) = &self.layout {
+            self.notifier.reconcile(layout);
+        }
+        if matches!(self.center, Some(CenterOverlay::Attention(_))) {
+            if let Some(layout) = &self.layout {
+                if let Some(CenterOverlay::Attention(attention)) = &mut self.center {
+                    attention.refresh(self.notifier.unread(), layout);
+                }
+            }
+        }
     }
 
     /// Map persisted collapsed workspace names to ids so the sidebar reopens
@@ -468,6 +549,7 @@ impl App {
                 first_attach_hint,
                 help: self.help.as_ref().map(|state| &state.overlay),
                 picker: self.picker.as_ref(),
+                center: self.center.as_ref().map(CenterOverlay::overlay),
             },
             &self.theme,
         )
@@ -479,6 +561,14 @@ impl App {
         if !self.help_seen {
             self.help_seen = true;
             help::mark_seen();
+        }
+    }
+
+    /// Persist the welcome only after it was shown and the user has moved on.
+    fn dismiss_onboarding(&mut self) {
+        if !self.ui_state.onboarding_seen {
+            self.ui_state.onboarding_seen = true;
+            self.ui_state.save();
         }
     }
 
@@ -574,9 +664,11 @@ impl App {
                     }
                 }
                 Event::Mouse(mouse) => {
-                    self.handle_mouse(mouse, writer, term).await?;
+                    if self.handle_mouse(mouse, writer, term).await? == Flow::Detach {
+                        return Ok(());
+                    }
                 }
-                Event::Paste(text) => self.handle_paste(text, writer).await?,
+                Event::Paste(text) => self.handle_paste_event(text, writer).await?,
                 _ => {}
             }
         }
@@ -607,6 +699,8 @@ impl App {
             self.handle_menu_key(key, writer).await?;
         } else if self.help.is_some() {
             self.handle_help_key(key);
+        } else if self.center.is_some() {
+            return self.handle_center_key(key, writer, term).await;
         } else if self.settings.is_some() {
             self.handle_settings_key(key, writer, term).await?;
         } else if self.picker.is_some() {
@@ -1228,6 +1322,17 @@ impl App {
                     ));
                 }
             }
+            config::Action::CommandCenter => {
+                self.center = Some(CenterOverlay::Palette(palette::Palette::new(&self.config)));
+            }
+            config::Action::Attention => {
+                if let Some(layout) = &self.layout {
+                    self.center = Some(CenterOverlay::Attention(attention::Attention::new(
+                        self.notifier.unread(),
+                        layout,
+                    )));
+                }
+            }
             config::Action::Navigate => {
                 // Opening navigate forces the full sidebar; tell the daemon the
                 // new pane width when that actually widened the sidebar.
@@ -1436,6 +1541,118 @@ impl App {
         Ok(())
     }
 
+    async fn handle_center_key(
+        &mut self,
+        key: KeyEvent,
+        writer: &mut OwnedWriteHalf,
+        term: &mut Term,
+    ) -> Result<Flow> {
+        let Some(mut center) = self.center.take() else {
+            return Ok(Flow::Continue);
+        };
+        if matches!(center, CenterOverlay::Welcome(_)) {
+            match key.code {
+                KeyCode::Esc => {
+                    self.dismiss_onboarding();
+                    return Ok(Flow::Continue);
+                }
+                KeyCode::Char('?') => {
+                    self.dismiss_onboarding();
+                    self.open_help();
+                    return Ok(Flow::Continue);
+                }
+                _ => {
+                    self.dismiss_onboarding();
+                    self.center = Some(CenterOverlay::Palette(palette::Palette::new(&self.config)));
+                    return Ok(Flow::Continue);
+                }
+            }
+        }
+        if matches!(center, CenterOverlay::Attention(_))
+            && matches!(key.code, KeyCode::Char('a') | KeyCode::Char('A'))
+        {
+            self.notifier.acknowledge_all();
+            self.set_note(" attention acknowledged");
+            return Ok(Flow::Continue);
+        }
+        let event = overlay::overlay_key(
+            match &mut center {
+                CenterOverlay::Palette(palette) => &mut palette.overlay,
+                CenterOverlay::Attention(attention) => &mut attention.overlay,
+                CenterOverlay::Welcome(_) => unreachable!(),
+            },
+            key,
+        );
+        match event {
+            OverlayEvent::Cancel => {}
+            OverlayEvent::Filtered => {
+                if let CenterOverlay::Palette(palette) = &mut center {
+                    palette.apply_filter();
+                }
+                self.center = Some(center);
+            }
+            OverlayEvent::Select => match center {
+                CenterOverlay::Palette(palette) => {
+                    if let Some(target) = palette.current_target() {
+                        return self.activate_palette(target, writer, term).await;
+                    }
+                }
+                CenterOverlay::Attention(attention) => {
+                    if let Some(pane) = attention.current_pane() {
+                        write(writer, &ClientMessage::FocusPaneId { id: pane }).await?;
+                        self.notifier.acknowledge(pane);
+                    }
+                }
+                CenterOverlay::Welcome(_) => unreachable!(),
+            },
+            _ => self.center = Some(center),
+        }
+        Ok(Flow::Continue)
+    }
+
+    async fn activate_palette(
+        &mut self,
+        target: palette::PaletteTarget,
+        writer: &mut OwnedWriteHalf,
+        term: &mut Term,
+    ) -> Result<Flow> {
+        match target {
+            palette::PaletteTarget::Action(action) => {
+                // A command-center invocation must never recurse into itself.
+                if !matches!(action, config::Action::CommandCenter) {
+                    return self.run_action(action, writer, term).await;
+                }
+            }
+            palette::PaletteTarget::Agent { name, command } => {
+                write(
+                    writer,
+                    &ClientMessage::NewPane {
+                        workspace: None,
+                        tab: None,
+                        split: None,
+                        command: Some(command),
+                        name: Some(name),
+                    },
+                )
+                .await?;
+            }
+            palette::PaletteTarget::Shell => {
+                write(
+                    writer,
+                    &ClientMessage::NewPane {
+                        workspace: None,
+                        tab: None,
+                        split: None,
+                        command: None,
+                        name: None,
+                    },
+                )
+                .await?;
+            }
+        }
+        Ok(Flow::Continue)
+    }
+
     // Focuses the workspace, tab, or pane behind a picker row. A tab first
     // activates its owning workspace, since it may live in an inactive one.
     async fn activate_pick(
@@ -1566,6 +1783,26 @@ impl App {
         self.send_paste(&text, writer).await
     }
 
+    /// A modal owns paste just as it owns keys. Only the command-center uses
+    /// text input; every other center route deliberately consumes it.
+    async fn handle_paste_event(
+        &mut self,
+        text: String,
+        writer: &mut OwnedWriteHalf,
+    ) -> Result<()> {
+        if let Some(CenterOverlay::Palette(palette)) = &mut self.center {
+            if let Some(filter) = &mut palette.overlay.filter {
+                filter.push_str(&text);
+            }
+            palette.apply_filter();
+            return Ok(());
+        }
+        if self.center.is_some() {
+            return Ok(());
+        }
+        self.handle_paste(text, writer).await
+    }
+
     // Frames text for the focused pane and sends it, pacing multi-chunk pastes.
     // Bracketed panes get the paste markers; the daemon writes the bytes as-is.
     async fn send_paste(&self, text: &str, writer: &mut OwnedWriteHalf) -> Result<()> {
@@ -1593,18 +1830,23 @@ impl App {
         mouse: MouseEvent,
         writer: &mut OwnedWriteHalf,
         term: &mut Term,
-    ) -> Result<()> {
+    ) -> Result<Flow> {
         if !self.mouse_capture || self.layout.is_none() {
-            return Ok(());
+            return Ok(Flow::Continue);
+        }
+        if self.center.is_some() {
+            return self.center_mouse(mouse, writer, term).await;
         }
         // The settings overlay owns the mouse while it is up.
         if self.settings.is_some() {
-            return self.settings_mouse(mouse, writer, term).await;
+            self.settings_mouse(mouse, writer, term).await?;
+            return Ok(Flow::Continue);
         }
         // The picker owns the mouse the same way: a click selects a row, a
         // click outside closes it.
         if self.picker.is_some() {
-            return self.picker_mouse(mouse, writer, term).await;
+            self.picker_mouse(mouse, writer, term).await?;
+            return Ok(Flow::Continue);
         }
         // The help overlay swallows mouse input: a click outside it closes it,
         // and clicks inside do nothing (its rows are not actionable).
@@ -1618,12 +1860,12 @@ impl App {
                     self.help = None;
                 }
             }
-            return Ok(());
+            return Ok(Flow::Continue);
         }
         // Context menus own the wheel while open; do not scroll a pane behind
         // an actionable menu.
         if self.menu.is_some() && is_wheel(mouse.kind) {
-            return Ok(());
+            return Ok(Flow::Continue);
         }
         // Over the copied pane, wheel input moves copy mode's viewport instead
         // of that pane's daemon-backed viewport. Other panes keep normal wheel
@@ -1638,12 +1880,12 @@ impl App {
                 if let Some(copy) = &mut self.copy {
                     copy.scroll_viewport(delta);
                 }
-                return Ok(());
+                return Ok(Flow::Continue);
             }
         }
         // A pane app that turned mouse reporting on gets the event verbatim.
         if self.passthrough(mouse, writer, term).await? {
-            return Ok(());
+            return Ok(Flow::Continue);
         }
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
@@ -1684,7 +1926,62 @@ impl App {
             }
             _ => {}
         }
-        Ok(())
+        Ok(Flow::Continue)
+    }
+
+    async fn center_mouse(
+        &mut self,
+        mouse: MouseEvent,
+        writer: &mut OwnedWriteHalf,
+        term: &mut Term,
+    ) -> Result<Flow> {
+        if matches!(
+            mouse.kind,
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+        ) {
+            let key = if matches!(mouse.kind, MouseEventKind::ScrollUp) {
+                KeyCode::Up
+            } else {
+                KeyCode::Down
+            };
+            return self
+                .handle_center_key(KeyEvent::from(key), writer, term)
+                .await;
+        }
+        if !matches!(
+            mouse.kind,
+            MouseEventKind::Down(MouseButton::Left) | MouseEventKind::Down(MouseButton::Right)
+        ) {
+            return Ok(Flow::Continue);
+        }
+        let size = term.size()?;
+        let area = Rect::new(0, 0, size.width, size.height);
+        let overlay = self.center.as_ref().expect("center open").overlay();
+        let row = matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+            .then(|| overlay::row_at(area, overlay, mouse.column, mouse.row))
+            .flatten();
+        match row {
+            Some(index) => {
+                if let Some(center) = &mut self.center {
+                    match center {
+                        CenterOverlay::Palette(palette) => palette.overlay.selected = index,
+                        CenterOverlay::Attention(attention) => attention.overlay.selected = index,
+                        CenterOverlay::Welcome(_) => {}
+                    }
+                }
+                return self
+                    .handle_center_key(KeyEvent::from(KeyCode::Enter), writer, term)
+                    .await;
+            }
+            None => {
+                let was_welcome = matches!(self.center, Some(CenterOverlay::Welcome(_)));
+                self.center = None;
+                if was_welcome {
+                    self.dismiss_onboarding();
+                }
+            }
+        }
+        Ok(Flow::Continue)
     }
 
     // Left click: menu selection, sidebar rows, pane borders, tabs, then panes.
@@ -2400,6 +2697,7 @@ pub fn bytes(k: KeyEvent) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::AsyncReadExt;
 
     #[test]
     fn auto_hide_collapses_at_80_columns_and_restores_when_widened() {
@@ -2426,6 +2724,196 @@ mod tests {
         assert_eq!(app.sidebar_mode, SidebarMode::Hidden);
         app.sidebar_mode = app.sidebar_mode.next();
         assert_eq!(app.sidebar_mode, SidebarMode::Full);
+    }
+
+    #[test]
+    fn onboarding_only_offers_on_the_first_plain_shell_snapshot() {
+        let mut plain = layout_named(&["work"]);
+        plain.tabs = vec![kodade_cli_proto::TabInfo {
+            id: kodade_cli_proto::TabId(1),
+            name: "shell".into(),
+            active: true,
+            state: AgentStateKind::Idle,
+        }];
+        plain.panes = vec![kodade_cli_proto::PaneSnapshot {
+            id: PaneId(1),
+            title: "zsh".into(),
+            focused: true,
+            scroll_offset: 0,
+            screen: Screen::default(),
+            agent: None,
+            agent_generation: 0,
+            activity_revision: 0,
+            state: AgentStateKind::Idle,
+            state_reason: String::new(),
+            state_age_secs: 0,
+            cwd: None,
+        }];
+        assert!(should_offer_onboarding(&plain));
+        plain.panes[0].agent = Some("Codex".into());
+        assert!(!should_offer_onboarding(&plain));
+        plain.panes[0].agent = None;
+        plain.restored = true;
+        assert!(!should_offer_onboarding(&plain));
+    }
+
+    #[test]
+    fn eligible_welcome_is_not_persisted_until_dismissed() {
+        let config = config::Config::default();
+        let mut app = App::new(
+            &config,
+            "welcome-test",
+            PathBuf::from("/tmp/kodade-test.sock"),
+        );
+        app.ui_state.onboarding_seen = false;
+        app.onboarding_decided = false;
+        let mut plain = layout_named(&["work"]);
+        plain.tabs = vec![kodade_cli_proto::TabInfo {
+            id: kodade_cli_proto::TabId(1),
+            name: "shell".into(),
+            active: true,
+            state: AgentStateKind::Idle,
+        }];
+        plain.panes = vec![kodade_cli_proto::PaneSnapshot {
+            id: PaneId(1),
+            title: "zsh".into(),
+            focused: true,
+            scroll_offset: 0,
+            screen: Screen::default(),
+            agent: None,
+            agent_generation: 0,
+            activity_revision: 0,
+            state: AgentStateKind::Idle,
+            state_reason: String::new(),
+            state_age_secs: 0,
+            cwd: None,
+        }];
+        app.handle_layout(plain);
+        assert!(matches!(app.center, Some(CenterOverlay::Welcome(_))));
+        assert!(app.onboarding_decided);
+        assert!(!app.ui_state.onboarding_seen);
+    }
+
+    #[tokio::test]
+    async fn palette_activation_sends_agent_and_shell_and_propagates_detach() {
+        let config = config::Config::default();
+        let mut app = App::new(
+            &config,
+            "palette-test",
+            PathBuf::from("/tmp/kodade-test.sock"),
+        );
+        let mut term = Terminal::with_options(
+            CrosstermBackend::new(std::io::stdout()),
+            ratatui::TerminalOptions {
+                viewport: ratatui::Viewport::Fixed(Rect::new(0, 0, 120, 30)),
+            },
+        )
+        .unwrap();
+
+        let (client, mut daemon) = tokio::net::UnixStream::pair().unwrap();
+        let (_, mut writer) = client.into_split();
+        assert_eq!(
+            app.activate_palette(
+                palette::PaletteTarget::Agent {
+                    name: "Codex".into(),
+                    command: vec!["codex".into()],
+                },
+                &mut writer,
+                &mut term,
+            )
+            .await
+            .unwrap(),
+            Flow::Continue
+        );
+        let mut message = vec![0; 1024];
+        let count = daemon.read(&mut message).await.unwrap();
+        assert!(matches!(
+            kodade_cli_proto::decode::<ClientMessage>(&message[..count - 1]).unwrap(),
+            ClientMessage::NewPane { command: Some(command), name: Some(name), .. }
+                if command == vec!["codex"] && name == "Codex"
+        ));
+
+        let (client, mut daemon) = tokio::net::UnixStream::pair().unwrap();
+        let (_, mut writer) = client.into_split();
+        app.activate_palette(palette::PaletteTarget::Shell, &mut writer, &mut term)
+            .await
+            .unwrap();
+        let count = daemon.read(&mut message).await.unwrap();
+        assert!(matches!(
+            kodade_cli_proto::decode::<ClientMessage>(&message[..count - 1]).unwrap(),
+            ClientMessage::NewPane {
+                command: None,
+                name: None,
+                ..
+            }
+        ));
+
+        assert_eq!(
+            app.activate_palette(
+                palette::PaletteTarget::Action(config::Action::Detach),
+                &mut writer,
+                &mut term,
+            )
+            .await
+            .unwrap(),
+            Flow::Detach
+        );
+    }
+
+    #[tokio::test]
+    async fn modal_paste_filters_the_palette_without_writing_to_the_daemon() {
+        let config = config::Config::default();
+        let mut app = App::new(
+            &config,
+            "paste-test",
+            PathBuf::from("/tmp/kodade-test.sock"),
+        );
+        app.center = Some(CenterOverlay::Palette(palette::Palette::new(&config)));
+        let (client, daemon) = tokio::net::UnixStream::pair().unwrap();
+        let (_, mut writer) = client.into_split();
+
+        app.handle_paste_event("codex".into(), &mut writer)
+            .await
+            .unwrap();
+        let CenterOverlay::Palette(palette) = app.center.as_ref().unwrap() else {
+            panic!("palette remains open")
+        };
+        assert_eq!(palette.overlay.filter.as_deref(), Some("codex"));
+        assert!(matches!(
+            palette.current_target(),
+            Some(palette::PaletteTarget::Agent { .. })
+        ));
+        let mut bytes = [0; 1];
+        assert!(matches!(
+            daemon.try_read(&mut bytes),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+        ));
+    }
+
+    #[tokio::test]
+    async fn keyboard_palette_selection_propagates_detach() {
+        let config = config::Config::default();
+        let mut app = App::new(&config, "key-test", PathBuf::from("/tmp/kodade-test.sock"));
+        let mut palette = palette::Palette::new(&config);
+        palette.overlay.filter = Some("detach".into());
+        palette.apply_filter();
+        app.center = Some(CenterOverlay::Palette(palette));
+        let (client, _daemon) = tokio::net::UnixStream::pair().unwrap();
+        let (_, mut writer) = client.into_split();
+        let mut term = Terminal::with_options(
+            CrosstermBackend::new(std::io::stdout()),
+            ratatui::TerminalOptions {
+                viewport: ratatui::Viewport::Fixed(Rect::new(0, 0, 120, 30)),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            app.handle_center_key(KeyEvent::from(KeyCode::Enter), &mut writer, &mut term)
+                .await
+                .unwrap(),
+            Flow::Detach
+        );
     }
 
     // A layout with the named workspaces; workspace i gets `WorkspaceId(i+1)`.

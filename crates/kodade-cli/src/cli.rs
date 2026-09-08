@@ -25,7 +25,8 @@ pub struct Cli {
         long = "session",
         global = true,
         value_name = "NAME",
-        default_value = DEFAULT_SESSION
+        default_value = DEFAULT_SESSION,
+        value_parser = session_name
     )]
     pub session: String,
 
@@ -33,6 +34,10 @@ pub struct Cli {
     /// instead of the local one (#23). Requires `kodade-cli` on the remote host.
     #[arg(long = "remote", global = true, value_name = "USER@HOST")]
     pub remote: Option<String>,
+
+    /// Use this daemon socket directly (overrides inherited pane context).
+    #[arg(long, global = true, value_name = "PATH", conflicts_with = "remote")]
+    pub socket: Option<PathBuf>,
 
     #[command(subcommand)]
     pub command: Option<Command>,
@@ -43,7 +48,14 @@ pub enum Command {
     /// Run the session daemon (started automatically when attaching).
     Daemon {
         /// Session name; defaults to the global --session value.
+        #[arg(value_parser = session_name)]
         session: Option<String>,
+    },
+    /// Diagnose configuration, tools, and daemon health without starting a session.
+    #[command(visible_alias = "status")]
+    Doctor {
+        #[arg(long)]
+        json: bool,
     },
     /// List workspaces, tabs, panes, and their states.
     Ls {
@@ -246,13 +258,18 @@ pub enum PaneCommand {
     },
     /// Wait until a pane's visible screen contains TEXT.
     ///
-    /// The match is a plain substring, not a regular expression: Ködade CLI
-    /// ships without a regex dependency.
+    /// The match is a plain substring unless `--regex` is set.
     WaitOutput {
         #[arg(value_name = "PANE", value_parser = pane_id)]
         pane: PaneId,
         #[arg(long = "match", value_name = "TEXT", allow_hyphen_values = true)]
         text: String,
+        /// Match TEXT as a regular expression instead of a literal substring.
+        #[arg(long)]
+        regex: bool,
+        /// Search the full scrollback instead of only the visible screen.
+        #[arg(long)]
+        scrollback: bool,
         /// Give up after S seconds and exit 2.
         #[arg(long, value_name = "S")]
         timeout: Option<u64>,
@@ -347,12 +364,12 @@ pub enum SessionCommand {
     },
     /// Stop a session (defaults to the current one).
     Kill {
-        #[arg(value_name = "NAME")]
+        #[arg(value_name = "NAME", value_parser = session_name)]
         name: Option<String>,
     },
     /// Rename the current session; its socket and state file move with it.
     Rename {
-        #[arg(value_name = "NAME")]
+        #[arg(value_name = "NAME", value_parser = session_name)]
         name: String,
     },
 }
@@ -399,22 +416,86 @@ pub enum AgentCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Start a command in a new pane. Never types into an existing shell.
+    Start {
+        /// Workspace name or id (defaults to the active workspace).
+        #[arg(short = 'w', long = "workspace", value_name = "NAME")]
+        workspace: Option<String>,
+        /// Open in this tab (or a new tab when omitted).
+        #[arg(short = 't', long = "tab", value_name = "TAB")]
+        tab: Option<String>,
+        /// Pane title (defaults to the command's basename).
+        #[arg(long, value_name = "NAME")]
+        name: Option<String>,
+        /// Print the new pane snapshot as JSON.
+        #[arg(long)]
+        json: bool,
+        /// Command and arguments, after `--`.
+        #[arg(last = true, required = true, value_name = "CMD")]
+        command: Vec<String>,
+    },
+    /// Read an agent pane by numeric id, unique agent name, pane title, or `current`.
+    Read {
+        #[arg(value_name = "TARGET")]
+        target: String,
+        #[arg(long, value_name = "N")]
+        lines: Option<usize>,
+        #[arg(long)]
+        scrollback: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Send terminal key names or literal text to an agent target.
+    SendKeys {
+        #[arg(value_name = "TARGET")]
+        target: String,
+        #[arg(short = 'l', long)]
+        literal: bool,
+        #[arg(value_name = "KEYS", required = true, allow_hyphen_values = true)]
+        keys: Vec<String>,
+    },
+    /// Submit a sanitized, bracketed prompt to an unblocked recognized agent.
+    Prompt {
+        #[arg(value_name = "TARGET")]
+        target: String,
+        #[arg(value_name = "TEXT", allow_hyphen_values = true)]
+        text: String,
+        /// Wait for fresh output or a working state, then a settled state.
+        #[arg(long, conflicts_with = "until")]
+        wait: bool,
+        /// Wait for fresh activity, then this exact state.
+        #[arg(long, value_name = "STATE", value_parser = agent_state, conflicts_with = "wait")]
+        until: Option<AgentStateKind>,
+        /// Give up after S seconds and exit 2 (only valid with --wait/--until).
+        #[arg(long, value_name = "S")]
+        timeout: Option<u64>,
+        /// Print the final pane snapshot as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Focus an agent target without attaching the TUI.
+    Focus {
+        #[arg(value_name = "TARGET")]
+        target: String,
+        #[arg(long)]
+        json: bool,
+    },
     /// Focus a pane and attach the TUI to its session.
     Attach {
-        #[arg(value_name = "PANE", value_parser = pane_id)]
-        pane: PaneId,
+        #[arg(value_name = "TARGET")]
+        target: String,
     },
     /// Rename a pane.
     Rename {
-        #[arg(value_name = "PANE", value_parser = pane_id)]
-        pane: PaneId,
+        #[arg(value_name = "TARGET")]
+        target: String,
         #[arg(value_name = "NAME", allow_hyphen_values = true)]
         name: String,
     },
     /// Print a pane's agent state and the reason for it.
     Explain {
-        #[arg(value_name = "PANE", value_parser = pane_id)]
-        pane: PaneId,
+        #[arg(value_name = "TARGET")]
+        target: String,
         /// Print the pane snapshot as JSON.
         #[arg(long)]
         json: bool,
@@ -423,8 +504,8 @@ pub enum AgentCommand {
     UpdateManifests,
     /// Wait until a pane reaches an agent state; exits 2 on timeout.
     Wait {
-        #[arg(value_name = "PANE", value_parser = pane_id)]
-        pane: PaneId,
+        #[arg(value_name = "TARGET")]
+        target: String,
         /// One of: blocked, working, done, idle, unknown.
         #[arg(long, value_name = "STATE", value_parser = agent_state)]
         state: AgentStateKind,
@@ -478,6 +559,8 @@ pub enum WorktreeCommand {
 
 #[derive(Debug, Subcommand, PartialEq, Eq)]
 pub enum ConfigCommand {
+    /// Write a documented starter configuration when no file exists.
+    Init,
     /// Print the path of the config file.
     Path,
     /// Print the effective configuration as TOML.
@@ -514,6 +597,11 @@ pub enum IntegrateCommand {
 }
 
 // Pane ids are plain integers on the wire; keep the error message script-friendly.
+pub fn session_name(value: &str) -> Result<String, String> {
+    kodade_cli_daemon::validate_session_name(value).map_err(|error| error.to_string())?;
+    Ok(value.to_owned())
+}
+
 fn pane_id(value: &str) -> Result<PaneId, String> {
     value
         .parse()
@@ -530,6 +618,33 @@ fn agent_state(value: &str) -> Result<AgentStateKind, String> {
 mod tests {
     use super::*;
     use clap::CommandFactory;
+
+    #[test]
+    fn rejects_invalid_session_names_before_any_socket_access() {
+        for name in [
+            "../outside",
+            "a/b",
+            "a\\b",
+            "line\nbreak",
+            ".",
+            "..",
+            "",
+            &"x".repeat(65),
+        ] {
+            assert!(
+                Cli::try_parse_from(["kodade-cli", "-s", name, "session", "path"]).is_err(),
+                "{name:?}"
+            );
+            assert!(
+                Cli::try_parse_from(["kodade-cli", "session", "rename", name]).is_err(),
+                "{name:?}"
+            );
+            assert!(
+                Cli::try_parse_from(["kodade-cli", "daemon", name]).is_err(),
+                "{name:?}"
+            );
+        }
+    }
 
     fn parse(args: &[&str]) -> Cli {
         Cli::try_parse_from(args).expect("arguments parse")
@@ -642,7 +757,7 @@ mod tests {
             parse(&["kodade-cli", "agent", "rename", "1", "--foo"]).command,
             Some(Command::Agent {
                 command: AgentCommand::Rename {
-                    pane: PaneId(1),
+                    target: "1".into(),
                     name: "--foo".into(),
                 }
             })
@@ -756,9 +871,8 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unknown_states_and_pane_ids() {
+    fn rejects_unknown_report_states_and_integrations() {
         assert!(Cli::try_parse_from(["kodade-cli", "agent", "report", "7", "busy"]).is_err());
-        assert!(Cli::try_parse_from(["kodade-cli", "agent", "explain", "x"]).is_err());
         assert!(Cli::try_parse_from(["kodade-cli", "integrate", "nope"]).is_err());
     }
 
@@ -890,12 +1004,84 @@ mod tests {
                 command: PaneCommand::WaitOutput {
                     pane: PaneId(3),
                     text: "done".into(),
+                    regex: false,
+                    scrollback: false,
                     timeout: Some(5),
                 }
             })
         );
         // `--match` is a substring, so a regex-looking value is still literal.
         assert!(Cli::try_parse_from(["kodade-cli", "pane", "swap", "3", "sideways"]).is_err());
+    }
+
+    #[test]
+    fn parses_agent_automation_commands() {
+        assert_eq!(
+            parse(&[
+                "kodade-cli",
+                "agent",
+                "start",
+                "--name",
+                "reviewer",
+                "--",
+                "codex",
+                "--full-auto"
+            ])
+            .command,
+            Some(Command::Agent {
+                command: AgentCommand::Start {
+                    workspace: None,
+                    tab: None,
+                    name: Some("reviewer".into()),
+                    json: false,
+                    command: vec!["codex".into(), "--full-auto".into()],
+                }
+            })
+        );
+        assert_eq!(
+            parse(&[
+                "kodade-cli",
+                "agent",
+                "prompt",
+                "reviewer",
+                "review this",
+                "--until",
+                "done",
+                "--timeout",
+                "10",
+                "--json"
+            ])
+            .command,
+            Some(Command::Agent {
+                command: AgentCommand::Prompt {
+                    target: "reviewer".into(),
+                    text: "review this".into(),
+                    wait: false,
+                    until: Some(AgentStateKind::Done),
+                    timeout: Some(10),
+                    json: true,
+                }
+            })
+        );
+        assert_eq!(
+            parse(&[
+                "kodade-cli",
+                "agent",
+                "read",
+                "current",
+                "--scrollback",
+                "--json"
+            ])
+            .command,
+            Some(Command::Agent {
+                command: AgentCommand::Read {
+                    target: "current".into(),
+                    lines: None,
+                    scrollback: true,
+                    json: true,
+                }
+            })
+        );
     }
 
     #[test]
@@ -1067,7 +1253,7 @@ mod tests {
             .command,
             Some(Command::Agent {
                 command: AgentCommand::Wait {
-                    pane: PaneId(3),
+                    target: "3".into(),
                     state: AgentStateKind::Blocked,
                     timeout: Some(10),
                 }

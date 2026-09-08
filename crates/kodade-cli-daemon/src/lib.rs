@@ -66,6 +66,49 @@ struct Session {
     /// Path of the bound socket file. `session rename` renames the file in
     /// place, so teardown reads it from here rather than from the start value.
     socket: Mutex<PathBuf>,
+    /// Serializes the short compatibility staging used by [`ClientView`].  The
+    /// stored session selection remains the scripting/persistence default; an
+    /// attached client temporarily installs only its own selection while one
+    /// legacy mutation is dispatched.
+    view_dispatch: Mutex<()>,
+}
+
+/// Selection and viewport state owned by one socket connection.  It is never
+/// persisted and is dropped with the connection, so detached clients cannot
+/// change a later client's view.
+#[derive(Clone, Debug)]
+struct ClientView {
+    workspace: WorkspaceId,
+    tabs: HashMap<WorkspaceId, TabId>,
+    focused: HashMap<TabId, PaneId>,
+    scroll: HashMap<PaneId, usize>,
+    cols: u16,
+    rows: u16,
+}
+
+impl ClientView {
+    fn from_state(state: &SessionState, cols: u16, rows: u16) -> Self {
+        let workspace = state.active_workspace;
+        let tabs = state
+            .workspaces
+            .iter()
+            .map(|workspace| (workspace.id, workspace.active_tab))
+            .collect::<HashMap<_, _>>();
+        let focused = state
+            .workspaces
+            .iter()
+            .flat_map(|workspace| workspace.tabs.iter())
+            .map(|tab| (tab.id, tab.focused))
+            .collect();
+        Self {
+            workspace,
+            tabs,
+            focused,
+            scroll: HashMap::new(),
+            cols,
+            rows,
+        }
+    }
 }
 struct SessionState {
     workspaces: Vec<Workspace>,
@@ -81,11 +124,12 @@ struct Workspace {
     root: Option<PathBuf>,
     /// Sidebar swatch color as `#rrggbb`, when the user set one (#19).
     color: Option<String>,
-    /// Cached git branch of `root`, refreshed on the 2 s process tick so the
-    /// sidebar can label it without a subprocess per frame (#22).
+    /// Git metadata is refreshed together every two seconds, keeping snapshot
+    /// rendering free of filesystem reads.
     branch: Option<String>,
-    /// When `branch` was last read, so the refresh only re-reads HEAD every 2 s.
-    branch_checked_at: Option<Instant>,
+    main_worktree_root: Option<PathBuf>,
+    parent: Option<WorkspaceId>,
+    metadata_checked_at: Option<Instant>,
 }
 struct Tab {
     id: TabId,
@@ -93,6 +137,13 @@ struct Tab {
     tree: LayoutTree,
     focused: PaneId,
     zoomed: bool,
+}
+
+#[derive(Clone)]
+struct StoredSelection {
+    workspace: WorkspaceId,
+    tabs: Vec<(WorkspaceId, TabId)>,
+    focused: Vec<(TabId, PaneId)>,
 }
 /// vt100 0.16 reports the OSC window title through callbacks instead of `Screen::title`.
 #[derive(Default)]
@@ -122,9 +173,14 @@ struct Pane {
     /// thread never sees EOF (the daemon and the test runtime would wait forever).
     child: Mutex<Box<dyn portable_pty::Child + Send>>,
     process: Mutex<ProcessEvidence>,
-    // Tracks how long the current detected state has held, for sidebar age labels.
-    last_state: Mutex<Option<AgentStateKind>>,
-    state_since: Mutex<Instant>,
+    // Tracks the current detected state and its start as one atomic transition,
+    // so concurrent snapshots cannot publish the same change twice.
+    state: Mutex<PaneState>,
+    /// Generation of the recognized foreground agent. This changes if the
+    /// process/title evidence identifies a different agent (including none).
+    agent_generation: AtomicU64,
+    agent_identity: Mutex<Option<String>>,
+    activity_revision: AtomicU64,
 }
 
 /// Closing a pane terminates its process so the PTY reader thread exits.
@@ -144,11 +200,51 @@ struct ReportedHook {
     reported_at: Instant,
 }
 
+#[derive(Clone)]
 struct ProcessEvidence {
+    pid: Option<i32>,
     name: Option<String>,
     cwd: Option<PathBuf>,
     checked_at: Instant,
 }
+
+struct PaneState {
+    last: Option<AgentStateKind>,
+    since: Instant,
+}
+
+impl PaneState {
+    /// Record one observation and return the previous state plus this state's
+    /// age. Holding both values together makes the returned transition real
+    /// even when multiple clients snapshot at the same time.
+    fn transition(&mut self, next: AgentStateKind, now: Instant) -> (Option<AgentStateKind>, u64) {
+        let previous = self.last;
+        self.since = state_since_after(previous, next, self.since, now);
+        self.last = Some(next);
+        (
+            previous,
+            now.saturating_duration_since(self.since).as_secs(),
+        )
+    }
+}
+
+/// Validate downloaded detection rules against the same schema used at startup.
+pub fn validate_agent_manifest(source: &str) -> Result<String> {
+    let manifest: manifest::Manifest = toml::from_str(source).context("parse agent manifest")?;
+    if manifest.name.trim().is_empty() || manifest.display.trim().is_empty() {
+        bail!("agent manifest needs a name and display label");
+    }
+    if manifest
+        .rules
+        .iter()
+        .any(|rule| rule.any.is_empty() || rule.any.iter().any(|needle| needle.trim().is_empty()))
+    {
+        bail!("agent manifest rules need nonempty match text");
+    }
+    Ok(manifest.name)
+}
+/// Kept in step with the CLI: a prompt is one atomic PTY writer submission.
+const MAX_PROMPT_BYTES: usize = 64 * 1024;
 
 pub fn socket_path(session: &str) -> PathBuf {
     socket_dir().join(format!("{session}.sock"))
@@ -296,8 +392,16 @@ async fn remove_stale_socket(socket: &Path) -> Result<()> {
     Ok(())
 }
 
-fn validate_session_name(session: &str) -> Result<()> {
-    if session.is_empty() || session.contains('/') || session == "." || session == ".." {
+/// Validate the single path component used for a session's socket and state
+/// file. Clients should call this before deriving either path.
+pub fn validate_session_name(session: &str) -> Result<()> {
+    if session.is_empty()
+        || session.len() > 64
+        || session.contains(['/', '\\'])
+        || session.chars().any(char::is_control)
+        || session == "."
+        || session == ".."
+    {
         bail!("session names must be non-empty path components");
     }
     Ok(())
@@ -328,6 +432,7 @@ impl Session {
             events,
             subscribers: AtomicUsize::new(0),
             socket: Mutex::new(socket_path(&name_for_socket)),
+            view_dispatch: Mutex::new(()),
         };
         let pane = session.new_pane("shell", None, None)?;
         let tab = Tab {
@@ -350,7 +455,9 @@ impl Session {
                 root: None,
                 color: None,
                 branch: None,
-                branch_checked_at: None,
+                main_worktree_root: None,
+                parent: None,
+                metadata_checked_at: None,
             });
         Ok(session)
     }
@@ -382,6 +489,7 @@ impl Session {
             events,
             subscribers: AtomicUsize::new(0),
             socket: Mutex::new(socket_path(&file.name)),
+            view_dispatch: Mutex::new(()),
         };
         let mut workspaces = Vec::new();
         let mut workspace_ids: HashMap<u64, WorkspaceId> = HashMap::new();
@@ -429,7 +537,9 @@ impl Session {
                 root: saved.root.clone(),
                 color: saved.color.clone(),
                 branch: None,
-                branch_checked_at: None,
+                main_worktree_root: None,
+                parent: None,
+                metadata_checked_at: None,
             });
         }
         let active_workspace = workspace_ids
@@ -495,16 +605,34 @@ impl Session {
         }
     }
 
+    /// Read the persisted/script projection without observing another
+    /// connection's brief compatibility staging.
+    fn build_file_stable(&self) -> Result<persist::SessionFile> {
+        let _dispatch = self
+            .view_dispatch
+            .lock()
+            .map_err(|_| anyhow!("view dispatch lock poisoned"))?;
+        Ok(self.build_file())
+    }
+
     /// Persist the current layout to this session's state file. Best-effort:
     /// errors are logged, never propagated to the client-facing loop.
     fn save(&self) {
-        let name = self.session_name();
-        let Some(path) = persist::session_file_path(&name) else {
+        // Keep publication inside dispatch so rename cannot delete the old
+        // state file while an earlier save is still about to publish it.
+        let Ok(_dispatch) = self.view_dispatch.lock() else {
+            eprintln!("Ködade CLI could not persist: view dispatch lock poisoned");
             return;
         };
         let file = self.build_file();
+        let Some(path) = persist::session_file_path(&file.name) else {
+            return;
+        };
         if let Err(error) = persist::write_session_file(&path, &file) {
-            eprintln!("Ködade CLI could not persist session '{name}': {error:#}");
+            eprintln!(
+                "Ködade CLI could not persist session '{}': {error:#}",
+                file.name
+            );
         }
     }
 
@@ -699,6 +827,190 @@ impl Session {
             .find(|item| item.id == workspace.active_tab)
             .expect("active tab exists")
     }
+
+    fn save_selection(state: &SessionState) -> StoredSelection {
+        StoredSelection {
+            workspace: state.active_workspace,
+            tabs: state
+                .workspaces
+                .iter()
+                .map(|item| (item.id, item.active_tab))
+                .collect(),
+            focused: state
+                .workspaces
+                .iter()
+                .flat_map(|item| item.tabs.iter())
+                .map(|tab| (tab.id, tab.focused))
+                .collect(),
+        }
+    }
+
+    fn install_view(state: &mut SessionState, view: &ClientView) {
+        if state
+            .workspaces
+            .iter()
+            .any(|item| item.id == view.workspace)
+        {
+            state.active_workspace = view.workspace;
+        }
+        for workspace in &mut state.workspaces {
+            if let Some(tab) = view
+                .tabs
+                .get(&workspace.id)
+                .filter(|tab| workspace.tabs.iter().any(|item| item.id == **tab))
+            {
+                workspace.active_tab = *tab;
+            }
+            for tab in &mut workspace.tabs {
+                if let Some(pane) = view
+                    .focused
+                    .get(&tab.id)
+                    .filter(|pane| layout::contains(&tab.tree, **pane))
+                {
+                    tab.focused = *pane;
+                }
+            }
+        }
+    }
+
+    fn capture_view(state: &SessionState, view: &mut ClientView) {
+        view.workspace = state.active_workspace;
+        view.tabs = state
+            .workspaces
+            .iter()
+            .map(|item| (item.id, item.active_tab))
+            .collect();
+        view.focused = state
+            .workspaces
+            .iter()
+            .flat_map(|item| item.tabs.iter())
+            .map(|tab| (tab.id, tab.focused))
+            .collect();
+    }
+
+    fn restore_selection(state: &mut SessionState, saved: StoredSelection) {
+        if state
+            .workspaces
+            .iter()
+            .any(|workspace| workspace.id == saved.workspace)
+        {
+            state.active_workspace = saved.workspace;
+        }
+        for workspace in &mut state.workspaces {
+            if let Some(tab) = saved
+                .tabs
+                .iter()
+                .find(|(id, _)| *id == workspace.id)
+                .map(|(_, tab)| *tab)
+                .filter(|tab| workspace.tabs.iter().any(|item| item.id == *tab))
+            {
+                workspace.active_tab = tab;
+            }
+            for tab in &mut workspace.tabs {
+                if let Some(pane) = saved
+                    .focused
+                    .iter()
+                    .find(|(id, _)| *id == tab.id)
+                    .map(|(_, pane)| *pane)
+                    .filter(|pane| layout::contains(&tab.tree, *pane))
+                {
+                    tab.focused = pane;
+                }
+            }
+        }
+    }
+
+    /// One-shot CLI requests share the persisted selection until a Hello
+    /// establishes an interactive view. Preserve focus-then-act script flows.
+    fn handle_script(&self, message: ClientMessage) -> Result<()> {
+        let _dispatch = self
+            .view_dispatch
+            .lock()
+            .map_err(|_| anyhow!("view dispatch lock poisoned"))?;
+        let renamed = matches!(message, ClientMessage::RenameSession { .. });
+        let result = self.handle(message);
+        drop(_dispatch);
+        if renamed && result.is_ok() {
+            self.save();
+        }
+        result
+    }
+
+    /// Dispatch one connection-scoped request through the legacy global
+    /// mutation implementation without allowing that temporary selection to
+    /// escape to a different socket or into persisted state.
+    fn handle_view(&self, message: ClientMessage, view: &mut ClientView) -> Result<()> {
+        if let ClientMessage::Hello { cols, rows, .. } | ClientMessage::Resize { cols, rows } =
+            message
+        {
+            view.cols = cols;
+            view.rows = rows;
+            return self.resize_for_view(view);
+        }
+        if let ClientMessage::ScrollPane { id, delta } = message {
+            let pane = self
+                .panes
+                .lock()
+                .map_err(|_| anyhow!("pane lock poisoned"))?
+                .get(&id)
+                .cloned();
+            if let Some(pane) = pane {
+                let current = view.scroll.get(&id).copied().unwrap_or(0);
+                view.scroll
+                    .insert(id, pane.scroll_offset_after(delta, current));
+            }
+            self.notify();
+            return Ok(());
+        }
+        let _dispatch = self
+            .view_dispatch
+            .lock()
+            .map_err(|_| anyhow!("view dispatch lock poisoned"))?;
+        // A view-changing operation becomes the PTY size arbiter. This is
+        // under the same dispatch lock as selection staging, so another client
+        // cannot publish its dimensions between the arbitration and dispatch.
+        // Read-only queries deliberately do not resize a session another client
+        // is using.
+        if !matches!(
+            message,
+            ClientMessage::Query(_) | ClientMessage::Subscribe | ClientMessage::ReadPane { .. }
+        ) {
+            *self
+                .size
+                .lock()
+                .map_err(|_| anyhow!("size lock poisoned"))? = (view.cols, view.rows);
+        }
+        let saved = {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| anyhow!("state lock poisoned"))?;
+            let saved = Self::save_selection(&state);
+            Self::install_view(&mut state, view);
+            saved
+        };
+        let result = self.handle(message.clone());
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow!("state lock poisoned"))?;
+        Self::capture_view(&state, view);
+        Self::restore_selection(&mut state, saved);
+        if matches!(message, ClientMessage::Input { .. }) {
+            if let Some(pane) = view
+                .focused
+                .get(view.tabs.get(&view.workspace).unwrap_or(&TabId(0)))
+            {
+                view.scroll.remove(pane);
+            }
+        }
+        drop(state);
+        drop(_dispatch);
+        if matches!(message, ClientMessage::RenameSession { .. }) && result.is_ok() {
+            self.save();
+        }
+        result
+    }
     fn notify(&self) {
         // Every mutation funnels through here (directly or via `resize`), so this
         // is the one place the persist generation needs to advance. PTY output
@@ -713,20 +1025,76 @@ impl Session {
     }
 
     fn snapshot(&self) -> Result<LayoutSnapshot> {
+        self.snapshot_for(None)
+    }
+
+    fn snapshot_stable(&self) -> Result<LayoutSnapshot> {
+        let _dispatch = self
+            .view_dispatch
+            .lock()
+            .map_err(|_| anyhow!("view dispatch lock poisoned"))?;
+        self.snapshot()
+    }
+
+    fn snapshot_for_client(&self, view: &ClientView) -> Result<LayoutSnapshot> {
+        let _dispatch = self
+            .view_dispatch
+            .lock()
+            .map_err(|_| anyhow!("view dispatch lock poisoned"))?;
+        self.snapshot_for(Some(view))
+    }
+
+    fn new_client_view(&self) -> Result<ClientView> {
+        let _dispatch = self
+            .view_dispatch
+            .lock()
+            .map_err(|_| anyhow!("view dispatch lock poisoned"))?;
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow!("state lock poisoned"))?;
+        let (cols, rows) = *self
+            .size
+            .lock()
+            .map_err(|_| anyhow!("size lock poisoned"))?;
+        Ok(ClientView::from_state(&state, cols, rows))
+    }
+
+    /// Project shared panes through either the persisted/script selection or a
+    /// connection's independent view.  Detection remains session-wide; only
+    /// selection and scrollback are viewer state.
+    fn snapshot_for(&self, view: Option<&ClientView>) -> Result<LayoutSnapshot> {
         let mut state = self
             .state
             .lock()
             .map_err(|_| anyhow!("state lock poisoned"))?;
-        // Refresh each workspace's cached branch at most every 2 s (cheap HEAD read).
-        refresh_branches(&mut state, Instant::now());
+        // Refresh git-derived sidebar metadata at most every 2 s. Snapshot
+        // rendering itself must not canonicalize worktree paths per frame.
+        refresh_workspace_metadata(&mut state, Instant::now());
+        let workspace_id = view
+            .map(|view| view.workspace)
+            .filter(|id| state.workspaces.iter().any(|item| item.id == *id))
+            .unwrap_or(state.active_workspace);
         let workspace = state
             .workspaces
             .iter()
-            .find(|item| item.id == state.active_workspace)
+            .find(|item| item.id == workspace_id)
             .expect("active workspace exists");
-        let tab = Self::active_tab(&state);
+        let tab_id = view
+            .and_then(|view| view.tabs.get(&workspace.id).copied())
+            .filter(|id| workspace.tabs.iter().any(|item| item.id == *id))
+            .unwrap_or(workspace.active_tab);
+        let tab = workspace
+            .tabs
+            .iter()
+            .find(|item| item.id == tab_id)
+            .expect("active tab exists");
+        let focused = view
+            .and_then(|view| view.focused.get(&tab.id).copied())
+            .filter(|id| layout::contains(&tab.tree, *id))
+            .unwrap_or(tab.focused);
         let tree = if tab.zoomed {
-            LayoutTree::Leaf { pane: tab.focused }
+            LayoutTree::Leaf { pane: focused }
         } else {
             tab.tree.clone()
         };
@@ -748,8 +1116,7 @@ impl Session {
         let mut ages = HashMap::new();
         for (id, pane) in panes.iter() {
             let detection = &detections[id];
-            let previous = pane.last_state();
-            let age = pane.track_state(detection.state, now);
+            let (previous, age) = pane.transition_state(detection.state, now);
             ages.insert(*id, age);
             // The `track_state` write above makes this fire once per real
             // transition even when several clients snapshot concurrently.
@@ -777,17 +1144,25 @@ impl Session {
             .into_iter()
             .filter_map(|id| {
                 panes.get(&id).map(|pane| {
-                    // vt100 advances its own offset as output arrives while a
-                    // user reads history. Keep that one source of truth and
-                    // snapshot it atomically with the visible cells.
-                    let (screen, scroll_offset) = pane.snapshot();
+                    // The parser stays at its live screen between snapshots;
+                    // this view's offset is installed only long enough to
+                    // render its own historical viewport.
+                    let offset = view
+                        .and_then(|view| view.scroll.get(&id).copied())
+                        .unwrap_or(0);
+                    let (screen, scroll_offset) = pane.snapshot_at(offset);
                     PaneSnapshot {
                         id,
                         title: pane.title.lock().expect("title lock poisoned").clone(),
-                        focused: id == tab.focused,
+                        focused: id == focused,
                         scroll_offset,
                         screen,
                         agent: detections[&id].agent.clone(),
+                        agent_generation: pane.track_agent_identity(
+                            &detections[&id].agent,
+                            &pane.process_evidence(now, false),
+                        ),
+                        activity_revision: pane.activity_revision.load(Ordering::Relaxed),
                         state: detections[&id].state,
                         state_reason: detections[&id].reason.clone(),
                         state_age_secs: ages[&id],
@@ -817,7 +1192,7 @@ impl Session {
                         root: item.root.clone(),
                         color: item.color.clone(),
                         branch: item.branch.clone(),
-                        parent: workspace_parent(&state, item),
+                        parent: item.parent,
                         tabs,
                     }
                 })
@@ -867,8 +1242,7 @@ impl Session {
         }
         let now = Instant::now();
         let detection = pane.detect(&self.manifests, now);
-        let previous = pane.last_state();
-        let age = pane.track_state(detection.state, now);
+        let (previous, age) = pane.transition_state(detection.state, now);
         if let Some(from) = previous.filter(|from| *from != detection.state) {
             self.emit(Event::AgentStateChanged {
                 pane: id,
@@ -885,11 +1259,59 @@ impl Session {
             scroll_offset,
             screen,
             agent: detection.agent.clone(),
+            agent_generation: pane
+                .track_agent_identity(&detection.agent, &pane.process_evidence(now, false)),
+            activity_revision: pane.activity_revision.load(Ordering::Relaxed),
             state: detection.state,
             state_reason: detection.reason.clone(),
             state_age_secs: age,
             cwd: pane.cwd(now),
         })
+    }
+
+    /// Validate the expected agent identity and generation immediately before
+    /// writing. This closes the client-side query/write race for automation.
+    fn prompt_agent(
+        &self,
+        id: PaneId,
+        expected_agent: &str,
+        expected_generation: u64,
+        bytes: &[u8],
+    ) -> Result<PaneSnapshot> {
+        let _dispatch = self
+            .view_dispatch
+            .lock()
+            .map_err(|_| anyhow!("view dispatch lock poisoned"))?;
+        if bytes.len() > MAX_PROMPT_BYTES {
+            bail!("prompt exceeds the {MAX_PROMPT_BYTES}-byte automation limit");
+        }
+        let pane = self
+            .panes
+            .lock()
+            .map_err(|_| anyhow!("pane lock poisoned"))?
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| anyhow!("pane {} not found", id.0))?;
+        let now = Instant::now();
+        let (detection, process) = pane.detect_fresh(&self.manifests, now);
+        let generation = pane.track_agent_identity(&detection.agent, &process);
+        if detection.agent.as_deref() != Some(expected_agent) || generation != expected_generation {
+            bail!("agent pane {} was replaced; resolve the target again", id.0);
+        }
+        if detection.state == AgentStateKind::Blocked {
+            bail!("agent pane {} is blocked", id.0);
+        }
+        pane.write(bytes)?;
+        self.notify();
+        self.pane_snapshot(id)
+    }
+
+    fn pane_snapshot_stable(&self, id: PaneId) -> Result<PaneSnapshot> {
+        let _dispatch = self
+            .view_dispatch
+            .lock()
+            .map_err(|_| anyhow!("view dispatch lock poisoned"))?;
+        self.pane_snapshot(id)
     }
 
     /// Queues a notification with the next sequence number, capping the ring at
@@ -966,6 +1388,40 @@ impl Session {
         Ok(())
     }
 
+    /// The most recently interacting client owns the physical PTY geometry.
+    /// Other views retain their requested dimensions for reconnect/inspection,
+    /// while terminal applications see one coherent size instead of a resize
+    /// race on every output frame.
+    fn resize_for_view(&self, view: &ClientView) -> Result<()> {
+        let _dispatch = self
+            .view_dispatch
+            .lock()
+            .map_err(|_| anyhow!("view dispatch lock poisoned"))?;
+        *self
+            .size
+            .lock()
+            .map_err(|_| anyhow!("size lock poisoned"))? = (view.cols, view.rows);
+        let snapshot = self.snapshot_for(Some(view))?;
+        let mut sizes = Vec::new();
+        pane_sizes(
+            &snapshot.tree,
+            view.cols.max(1),
+            view.rows.saturating_sub(2).max(1),
+            &mut sizes,
+        );
+        let panes = self
+            .panes
+            .lock()
+            .map_err(|_| anyhow!("pane lock poisoned"))?;
+        for (id, width, height) in sizes {
+            if let Some(pane) = panes.get(&id) {
+                pane.resize(width.max(1), height.max(1))?;
+            }
+        }
+        self.notify();
+        Ok(())
+    }
+
     fn resize_current(&self) -> Result<()> {
         let (cols, rows) = *self
             .size
@@ -994,8 +1450,10 @@ impl Session {
         match message {
             // `Version` / `Session` / `Schema` queries, `Subscribe`, and
             // `ReadPane` are answered by `serve_client`; no state changes here.
-            ClientMessage::Query(_) | ClientMessage::Subscribe | ClientMessage::ReadPane { .. } => {
-            }
+            ClientMessage::Query(_)
+            | ClientMessage::Subscribe
+            | ClientMessage::ReadPane { .. }
+            | ClientMessage::PromptAgent { .. } => {}
             ClientMessage::ApplyLayout(file) => self.apply_layout(file)?,
             ClientMessage::MovePaneToTab { pane, tab } => self.move_pane_to_tab(pane, tab)?,
             ClientMessage::RenameSession { name } => self.rename_session(&name)?,
@@ -1363,7 +1821,9 @@ impl Session {
                     root,
                     color: None,
                     branch: None,
-                    branch_checked_at: None,
+                    main_worktree_root: None,
+                    parent: None,
+                    metadata_checked_at: None,
                 });
                 state.active_workspace = id;
                 drop(state);
@@ -1486,11 +1946,18 @@ impl Session {
                 let pane = panes
                     .get(&pane)
                     .ok_or_else(|| anyhow!("pane {} not found", pane.0))?;
-                *pane.hook.lock().expect("hook lock poisoned") = Some(ReportedHook {
+                let mut hook = pane.hook.lock().expect("hook lock poisoned");
+                let changed = hook.as_ref().is_none_or(|previous| previous.state != state);
+                *hook = Some(ReportedHook {
                     state,
                     source,
                     reported_at: Instant::now(),
                 });
+                if changed && matches!(state, AgentStateKind::Working | AgentStateKind::Blocked) {
+                    // Hook reports are authoritative lifecycle transitions even
+                    // before the next snapshot updates sidebar state.
+                    pane.activity_revision.fetch_add(1, Ordering::Relaxed);
+                }
                 self.notify();
             }
         }
@@ -1686,7 +2153,9 @@ impl Session {
             root: Some(dest),
             color: None,
             branch: Some(branch),
-            branch_checked_at: Some(Instant::now()),
+            main_worktree_root: None,
+            parent: None,
+            metadata_checked_at: None,
         });
         state.active_workspace = id;
         drop(state);
@@ -1712,14 +2181,16 @@ impl Session {
         let removal = root
             .as_deref()
             .and_then(|root| git::main_worktree_root(root).map(|main| (main, root.to_path_buf())));
-        // Drop the workspace (and its panes) first so no shell holds the cwd.
+        // Refuse a dirty or otherwise unremovable checkout before changing the
+        // session. A failed removal must leave the user's workspace and panes
+        // available to fix the problem. Git can remove a registered worktree
+        // even while a pane has it as its cwd on supported Unix platforms.
+        if !keep {
+            if let Some((main, dest)) = removal {
+                git::worktree_remove(&main, &dest, false)?;
+            }
+        }
         self.close_workspace(id)?;
-        if keep {
-            return Ok(());
-        }
-        if let Some((main, dest)) = removal {
-            git::worktree_remove(&main, &dest, true)?;
-        }
         Ok(())
     }
 
@@ -1750,7 +2221,7 @@ impl Session {
                 Some(index) => index,
                 None => return Ok(()),
             };
-            if state.workspaces.len() == 1 {
+            let pane_ids = if state.workspaces.len() == 1 {
                 // The last workspace is reset, not removed: its tabs go away and
                 // a fresh one takes their place, so no `WorkspaceClosed` here.
                 let workspace = &mut state.workspaces[index];
@@ -1782,7 +2253,14 @@ impl Session {
                 events.push(Event::WorkspaceClosed { workspace: id });
                 state.active_workspace = state.workspaces[index.saturating_sub(1)].id;
                 ids
+            };
+            // A cached child may have pointed at the workspace just removed.
+            // Refresh all relationships on the next snapshot rather than
+            // presenting a dangling parent for the cache interval.
+            for workspace in &mut state.workspaces {
+                workspace.metadata_checked_at = None;
             }
+            pane_ids
         };
         let mut panes = self
             .panes
@@ -1930,7 +2408,6 @@ impl Session {
         *self.socket.lock().expect("socket lock poisoned") = new_socket.clone();
         *self.name.lock().expect("name lock poisoned") = new_name.to_owned();
         persist::remove_session_file(&old_name);
-        self.save();
         self.emit(Event::SessionRenamed {
             name: new_name.to_owned(),
             socket: new_socket,
@@ -2113,7 +2590,9 @@ impl Session {
                 root: saved.root.clone(),
                 color: saved.color.clone(),
                 branch: None,
-                branch_checked_at: None,
+                main_worktree_root: None,
+                parent: None,
+                metadata_checked_at: None,
             });
         }
         Ok((workspaces, used, highest))
@@ -2149,40 +2628,45 @@ fn locate_tab(state: &SessionState, tab: TabId) -> Option<(usize, usize)> {
         })
 }
 
-/// Refresh each workspace's cached git branch, re-reading HEAD at most once
-/// every 2 s so the sidebar can label branches without a subprocess per frame.
-fn refresh_branches(state: &mut SessionState, now: Instant) {
+/// Refresh git-derived sidebar metadata at most every two seconds. Parent
+/// relationships are calculated from this cache, so hot screen snapshots do no
+/// filesystem work beyond the timed refresh.
+fn refresh_workspace_metadata(state: &mut SessionState, now: Instant) {
+    let mut refreshed = false;
     for workspace in &mut state.workspaces {
         let Some(root) = workspace.root.clone() else {
             workspace.branch = None;
+            workspace.main_worktree_root = None;
+            workspace.parent = None;
             continue;
         };
         let stale = workspace
-            .branch_checked_at
+            .metadata_checked_at
             .map(|at| now.saturating_duration_since(at) >= Duration::from_secs(2))
             .unwrap_or(true);
         if stale {
             workspace.branch = git::branch_of(&root);
-            workspace.branch_checked_at = Some(now);
+            workspace.main_worktree_root = git::main_worktree_root(&root);
+            workspace.metadata_checked_at = Some(now);
+            refreshed = true;
         }
     }
-}
-
-/// The workspace `item` nests under: the one whose root is the main repo of
-/// `item`'s worktree, if such a workspace is open. `None` for a normal workspace.
-fn workspace_parent(state: &SessionState, item: &Workspace) -> Option<WorkspaceId> {
-    let main = item.root.as_deref().and_then(git::main_worktree_root)?;
-    state
+    if !refreshed {
+        return;
+    }
+    let roots: Vec<_> = state
         .workspaces
         .iter()
-        .filter(|other| other.id != item.id)
-        .find(|other| {
-            other
-                .root
-                .as_deref()
-                .is_some_and(|root| same_dir(root, &main))
-        })
-        .map(|other| other.id)
+        .filter_map(|workspace| workspace.root.clone().map(|root| (workspace.id, root)))
+        .collect();
+    for workspace in &mut state.workspaces {
+        workspace.parent = workspace.main_worktree_root.as_deref().and_then(|main| {
+            roots
+                .iter()
+                .find(|(id, root)| *id != workspace.id && same_dir(root, main))
+                .map(|(id, _)| *id)
+        });
+    }
 }
 
 /// Whether two paths point at the same directory, comparing canonical forms so
@@ -2392,17 +2876,33 @@ impl Pane {
             spawn_cwd: cwd,
             child: Mutex::new(child),
             process: Mutex::new(ProcessEvidence {
+                pid: None,
                 name: None,
                 cwd: None,
                 checked_at: Instant::now() - Duration::from_secs(2),
             }),
-            last_state: Mutex::new(None),
-            state_since: Mutex::new(Instant::now()),
+            state: Mutex::new(PaneState {
+                last: None,
+                since: Instant::now(),
+            }),
+            agent_generation: AtomicU64::new(0),
+            agent_identity: Mutex::new(None),
+            activity_revision: AtomicU64::new(0),
         })
     }
     fn snapshot(&self) -> (Screen, usize) {
         let parser = self.parser.lock().expect("PTY parser lock poisoned");
         (snapshot(&parser), parser.screen().scrollback())
+    }
+    /// Render a requested historical offset without leaving the shared parser
+    /// scrolled for another client. `set_scrollback` clamps to available history.
+    fn snapshot_at(&self, offset: usize) -> (Screen, usize) {
+        let mut parser = self.parser.lock().expect("PTY parser lock poisoned");
+        parser.screen_mut().set_scrollback(offset);
+        let actual = parser.screen().scrollback();
+        let screen = snapshot(&parser);
+        parser.screen_mut().set_scrollback(0);
+        (screen, actual)
     }
     /// Full pane text for copy mode / `pane read`. With `scrollback`, walks the
     /// vt100 history and appends the visible screen; otherwise just the visible
@@ -2468,6 +2968,15 @@ impl Pane {
         let offset = scroll_offset_after_delta(parser.screen().scrollback(), delta, usize::MAX);
         parser.screen_mut().set_scrollback(offset);
     }
+    fn scroll_offset_after(&self, delta: i16, current: usize) -> usize {
+        let mut parser = self.parser.lock().expect("PTY parser lock poisoned");
+        parser.screen_mut().set_scrollback(current);
+        let offset = scroll_offset_after_delta(parser.screen().scrollback(), delta, usize::MAX);
+        parser.screen_mut().set_scrollback(offset);
+        let actual = parser.screen().scrollback();
+        parser.screen_mut().set_scrollback(0);
+        actual
+    }
     fn reset_scrollback(&self) {
         self.parser
             .lock()
@@ -2476,6 +2985,25 @@ impl Pane {
             .set_scrollback(0);
     }
     fn detect(&self, manifests: &[manifest::Manifest], now: Instant) -> agent::Detection {
+        self.detect_with_evidence(manifests, now, false).0
+    }
+
+    /// Probe the PTY process group immediately. Guarded automation calls this
+    /// path so its identity check is not protected by the ordinary 2 s cache.
+    fn detect_fresh(
+        &self,
+        manifests: &[manifest::Manifest],
+        now: Instant,
+    ) -> (agent::Detection, ProcessEvidence) {
+        self.detect_with_evidence(manifests, now, true)
+    }
+
+    fn detect_with_evidence(
+        &self,
+        manifests: &[manifest::Manifest],
+        now: Instant,
+        fresh_process: bool,
+    ) -> (agent::Detection, ProcessEvidence) {
         let (screen, title) = {
             let mut parser = self.parser.lock().expect("PTY parser lock poisoned");
             let screen = live_screen_contents(&mut parser);
@@ -2484,7 +3012,7 @@ impl Pane {
         // portable-pty obtains the foreground process-group leader from the PTY itself.
         // `ps` turns that portable pid into a basename without sysctl; unavailable leaders fall
         // back to the login-shell process captured at spawn, with OSC terminal title as evidence.
-        let process = self.process_name(now);
+        let process = self.process_evidence(now, fresh_process);
         let last_output = *self.last_output.lock().expect("output lock poisoned");
         let hook = self
             .hook
@@ -2499,43 +3027,63 @@ impl Pane {
                 output_since_report: last_output > hook.reported_at,
             });
         let output_age = now.saturating_duration_since(last_output);
-        agent::detect(
+        let detection = agent::detect(
             manifests,
-            process.as_deref().or(Some(&self.spawn_process)),
+            process.name.as_deref().or(Some(&self.spawn_process)),
             &title,
             &screen,
             output_age,
             hook,
-        )
+        );
+        (detection, process)
     }
 
-    /// The last state `track_state` recorded, or `None` before the first
-    /// detection. Read before `track_state` so a transition can be spotted.
-    fn last_state(&self) -> Option<AgentStateKind> {
-        *self.last_state.lock().expect("state lock poisoned")
-    }
-
-    /// Records a state transition and returns how many seconds the current state
-    /// has held. `state_since` only resets when the detected state actually changes.
-    fn track_state(&self, state: AgentStateKind, now: Instant) -> u64 {
-        let mut last = self.last_state.lock().expect("state lock poisoned");
-        let mut since = self.state_since.lock().expect("state_since lock poisoned");
-        *since = state_since_after(*last, state, *since, now);
-        *last = Some(state);
-        now.saturating_duration_since(*since).as_secs()
-    }
-
-    fn process_name(&self, now: Instant) -> Option<String> {
-        self.refresh_process(now);
-        self.process
+    /// Return the generation associated with this detection. The first known
+    /// agent receives generation 1; a shell/replacement then a new agent always
+    /// receives a later value, which makes stale prompt guards fail closed.
+    fn track_agent_identity(&self, agent: &Option<String>, process: &ProcessEvidence) -> u64 {
+        let mut identity = self
+            .agent_identity
             .lock()
-            .expect("process lock poisoned")
-            .name
-            .clone()
+            .expect("agent identity lock poisoned");
+        // A display label alone cannot distinguish two consecutive Codex
+        // processes, or a shell retaining an old OSC title. Include the live
+        // foreground PID/process when the platform can expose it.
+        let next = agent.as_ref().map(|agent| {
+            format!(
+                "{agent}|pid={}|process={}",
+                process
+                    .pid
+                    .map_or_else(|| "unknown".into(), |pid| pid.to_string()),
+                process.name.as_deref().unwrap_or("unknown")
+            )
+        });
+        if *identity != next {
+            *identity = next;
+            self.agent_generation.fetch_add(1, Ordering::Relaxed);
+        }
+        self.agent_generation.load(Ordering::Relaxed)
+    }
+
+    /// Record one detection atomically and return the preceding state plus age.
+    fn transition_state(
+        &self,
+        state: AgentStateKind,
+        now: Instant,
+    ) -> (Option<AgentStateKind>, u64) {
+        self.state
+            .lock()
+            .expect("pane state lock poisoned")
+            .transition(state, now)
+    }
+
+    fn process_evidence(&self, now: Instant, force: bool) -> ProcessEvidence {
+        self.refresh_process(now, force);
+        self.process.lock().expect("process lock poisoned").clone()
     }
 
     fn cwd(&self, now: Instant) -> Option<PathBuf> {
-        self.refresh_process(now);
+        self.refresh_process(now, false);
         self.process
             .lock()
             .expect("process lock poisoned")
@@ -2557,9 +3105,9 @@ impl Pane {
     /// Refresh the cached foreground-process name and cwd at most once per 2 s.
     /// The pid comes from the PTY's process-group leader; one `ps` and one
     /// `lsof` (or one procfs read) per pane per tick.
-    fn refresh_process(&self, now: Instant) {
+    fn refresh_process(&self, now: Instant, force: bool) {
         let mut process = self.process.lock().expect("process lock poisoned");
-        if now.saturating_duration_since(process.checked_at) < Duration::from_secs(2) {
+        if !force && now.saturating_duration_since(process.checked_at) < Duration::from_secs(2) {
             return;
         }
         let pid = self
@@ -2568,11 +3116,13 @@ impl Pane {
             .expect("PTY master lock poisoned")
             .process_group_leader();
         if let Some(pid) = pid {
+            process.pid = Some(pid);
             process.name = proc::command_of(pid)
                 .as_deref()
                 .and_then(proc::process_basename);
             process.cwd = proc::cwd_of(pid);
         } else {
+            process.pid = None;
             process.name = None;
             process.cwd = None;
         }
@@ -2907,6 +3457,7 @@ async fn serve_client(stream: UnixStream, session: Arc<Session>) -> Result<()> {
     process_timer.tick().await;
     let mut last_snapshot = Instant::now() - Duration::from_millis(16);
     let mut initialized = false;
+    let mut view = session.new_client_view()?;
     // A fresh client only hears about transitions raised after it attached, so
     // the spawn-time backlog never replays.
     let mut last_notify_seq = session.notify_high_water();
@@ -2947,8 +3498,18 @@ async fn serve_client(stream: UnixStream, session: Arc<Session>) -> Result<()> {
                         }
                         continue;
                     }
+                    ClientMessage::PromptAgent { pane, expected_agent, expected_generation, bytes } => {
+                        match session.prompt_agent(pane, &expected_agent, expected_generation, &bytes) {
+                            Ok(snapshot) => write_server(&mut writer, &ServerMessage::Pane(snapshot)).await?,
+                            Err(error) => {
+                                write_server(&mut writer, &ServerMessage::Error { message: error.to_string() }).await?;
+                                return Ok(());
+                            }
+                        }
+                        continue;
+                    }
                     ClientMessage::Query(QueryKind::Pane(id)) => {
-                        match session.pane_snapshot(id) {
+                        match session.pane_snapshot_stable(id) {
                             Ok(pane) => write_server(&mut writer, &ServerMessage::Pane(pane)).await?,
                             Err(error) => {
                                 write_server(&mut writer, &ServerMessage::Error { message: error.to_string() }).await?;
@@ -2958,7 +3519,7 @@ async fn serve_client(stream: UnixStream, session: Arc<Session>) -> Result<()> {
                         continue;
                     }
                     ClientMessage::Query(QueryKind::Session) => {
-                        write_server(&mut writer, &ServerMessage::Session(session.build_file())).await?;
+                        write_server(&mut writer, &ServerMessage::Session(session.build_file_stable()?)).await?;
                         continue;
                     }
                     ClientMessage::Query(QueryKind::Schema) => {
@@ -2978,13 +3539,18 @@ async fn serve_client(stream: UnixStream, session: Arc<Session>) -> Result<()> {
                 }
                 let hello = matches!(message, ClientMessage::Hello { .. });
                 let kill = matches!(message, ClientMessage::KillSession);
-                match session.handle(message) {
+                let result = if initialized || hello {
+                    session.handle_view(message, &mut view)
+                } else {
+                    session.handle_script(message)
+                };
+                match result {
                     Ok(()) if hello => {
                         initialized = true;
                         write_server(&mut writer, &ServerMessage::Welcome { session: session.session_name(), version: PROTOCOL_VERSION }).await?;
                         // The first client attach sees `restored: true`; clear it
                         // afterward so later snapshots (and `ls`) report normally.
-                        write_server(&mut writer, &ServerMessage::Layout(session.snapshot()?)).await?;
+                        write_server(&mut writer, &ServerMessage::Layout(session.snapshot_for_client(&view)?)).await?;
                         send_notifications(&mut writer, &session, &mut last_notify_seq, subscribed).await?;
                         session.clear_restored();
                     }
@@ -2993,12 +3559,21 @@ async fn serve_client(stream: UnixStream, session: Arc<Session>) -> Result<()> {
                         return Ok(());
                     }
                     Ok(()) => {
-                        write_server(&mut writer, &ServerMessage::Layout(session.snapshot()?)).await?;
+                        let layout = if initialized {
+                            session.snapshot_for_client(&view)?
+                        } else {
+                            session.snapshot_stable()?
+                        };
+                        write_server(&mut writer, &ServerMessage::Layout(layout)).await?;
                         send_notifications(&mut writer, &session, &mut last_notify_seq, subscribed).await?;
                     }
                     Err(error) => {
                         write_server(&mut writer, &ServerMessage::Error { message: error.to_string() }).await?;
-                        return Ok(());
+                        // A rejected interactive action (for example a dirty
+                        // worktree removal) must not strand the attached TUI.
+                        // One-shot callers still receive this Error as their
+                        // reply and terminate on their own.
+                        continue;
                     }
                 }
             }
@@ -3009,7 +3584,7 @@ async fn serve_client(stream: UnixStream, session: Arc<Session>) -> Result<()> {
                     while updates.try_recv().is_ok() {}
                     let remaining = Duration::from_millis(16).saturating_sub(last_snapshot.elapsed());
                     if !remaining.is_zero() { tokio::time::sleep(remaining).await; }
-                    write_server(&mut writer, &ServerMessage::Layout(session.snapshot()?)).await?;
+                    write_server(&mut writer, &ServerMessage::Layout(session.snapshot_for_client(&view)?)).await?;
                     send_notifications(&mut writer, &session, &mut last_notify_seq, subscribed).await?;
                     last_snapshot = Instant::now();
                 }
@@ -3017,7 +3592,7 @@ async fn serve_client(stream: UnixStream, session: Arc<Session>) -> Result<()> {
             },
             _ = process_timer.tick() => {
                 if initialized {
-                    write_server(&mut writer, &ServerMessage::Layout(session.snapshot()?)).await?;
+                    write_server(&mut writer, &ServerMessage::Layout(session.snapshot_for_client(&view)?)).await?;
                     send_notifications(&mut writer, &session, &mut last_notify_seq, subscribed).await?;
                     last_snapshot = Instant::now();
                 }
@@ -3068,7 +3643,7 @@ async fn subscriber_tick(session: Arc<Session>) {
 /// One tick of [`subscriber_tick`], split out so tests can drive it directly.
 fn tick_subscribers(session: &Session) {
     if session.subscribers.load(Ordering::Relaxed) > 0 {
-        let _ = session.snapshot();
+        let _ = session.snapshot_stable();
     }
 }
 
@@ -3120,6 +3695,16 @@ mod tests {
             ),
             PathBuf::from("/tmp/kodade-cli-501/default.sock")
         );
+    }
+    #[test]
+    fn session_names_are_safe_single_path_components() {
+        for invalid in ["", ".", "..", "a/b", "a\\b", "line\nbreak", &"x".repeat(65)] {
+            assert!(
+                validate_session_name(invalid).is_err(),
+                "{invalid:?} should fail"
+            );
+        }
+        assert!(validate_session_name("agent-session_01").is_ok());
     }
     #[test]
     fn vt100_snapshot_retains_terminal_contents() {
@@ -3284,6 +3869,65 @@ mod tests {
     }
 
     #[test]
+    fn agent_state_transition_reports_a_change_once() {
+        let start = Instant::now();
+        let mut state = PaneState {
+            last: Some(AgentStateKind::Working),
+            since: start,
+        };
+
+        let first = state.transition(AgentStateKind::Blocked, start + Duration::from_secs(1));
+        let second = state.transition(AgentStateKind::Blocked, start + Duration::from_secs(2));
+
+        assert_eq!(first.0, Some(AgentStateKind::Working));
+        assert_eq!(second.0, Some(AgentStateKind::Blocked));
+        assert_eq!(second.1, 1);
+    }
+
+    #[tokio::test]
+    async fn concurrent_snapshots_publish_one_agent_transition() {
+        let session = Arc::new(Session::spawn(80, 24, "transition-race".into()).expect("session"));
+        let pane = session.snapshot().expect("initial snapshot").panes[0].id;
+        session
+            .handle(ClientMessage::AgentState {
+                pane,
+                state: AgentStateKind::Working,
+                source: "test".into(),
+            })
+            .expect("report working");
+        session.snapshot().expect("settle working state");
+        let mut events = session.events.subscribe();
+        session
+            .handle(ClientMessage::AgentState {
+                pane,
+                state: AgentStateKind::Blocked,
+                source: "test".into(),
+            })
+            .expect("report blocked");
+
+        let first = Arc::clone(&session);
+        let second = Arc::clone(&session);
+        let first = std::thread::spawn(move || first.snapshot().expect("first snapshot"));
+        let second = std::thread::spawn(move || second.snapshot().expect("second snapshot"));
+        first.join().expect("first thread");
+        second.join().expect("second thread");
+
+        let transitions = std::iter::from_fn(|| events.try_recv().ok())
+            .filter(|event| {
+                matches!(
+                    event,
+                    Event::AgentStateChanged {
+                        pane: changed,
+                        from: AgentStateKind::Working,
+                        to: AgentStateKind::Blocked,
+                    } if *changed == pane
+                )
+            })
+            .count();
+        assert_eq!(transitions, 1);
+    }
+
+    #[test]
     fn scroll_offset_clamps_to_available_history() {
         assert_eq!(scroll_offset_after_delta(1, 99, 2), 2);
         assert_eq!(scroll_offset_after_delta(1, -99, 2), 0);
@@ -3373,7 +4017,9 @@ mod tests {
                     root: None,
                     color: None,
                     branch: None,
-                    branch_checked_at: None,
+                    main_worktree_root: None,
+                    parent: None,
+                    metadata_checked_at: None,
                     tabs: vec![Tab {
                         id: TabId(2),
                         name: "shell".into(),
@@ -3389,7 +4035,9 @@ mod tests {
                     root: None,
                     color: None,
                     branch: None,
-                    branch_checked_at: None,
+                    main_worktree_root: None,
+                    parent: None,
+                    metadata_checked_at: None,
                     tabs: vec![Tab {
                         id: TabId(5),
                         name: "agents".into(),
@@ -3418,7 +4066,9 @@ mod tests {
                 root: None,
                 color: None,
                 branch: None,
-                branch_checked_at: None,
+                main_worktree_root: None,
+                parent: None,
+                metadata_checked_at: None,
                 tabs: vec![Tab {
                     id: TabId(2),
                     name: "agents".into(),
@@ -3680,6 +4330,63 @@ mod tests {
         assert!(!should_notify(Some(Done), Working, true));
     }
 
+    #[tokio::test]
+    async fn stable_readers_wait_out_a_staged_client_view() {
+        use std::sync::mpsc;
+
+        let session = Arc::new(Session::spawn(80, 24, "stable-view".into()).expect("spawn"));
+        let first = session.snapshot().expect("first snapshot");
+        let workspace = first.active_workspace;
+        let first_tab = first.active_tab;
+        session.handle(ClientMessage::NewTab).expect("new tab");
+        let second_tab = session.snapshot().expect("second snapshot").active_tab;
+        {
+            let mut state = session.state.lock().expect("state");
+            state.workspaces[0].active_tab = first_tab;
+        }
+        let mut view = session.new_client_view().expect("client view");
+        view.workspace = workspace;
+        view.tabs.insert(workspace, second_tab);
+        let (staged_tx, staged_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let staging_session = Arc::clone(&session);
+        let staging = std::thread::spawn(move || {
+            let _dispatch = staging_session.view_dispatch.lock().expect("dispatch");
+            let saved = {
+                let mut state = staging_session.state.lock().expect("state");
+                let saved = Session::save_selection(&state);
+                Session::install_view(&mut state, &view);
+                saved
+            };
+            staged_tx.send(()).expect("staged");
+            release_rx.recv().expect("release staging");
+            let mut state = staging_session.state.lock().expect("state");
+            Session::restore_selection(&mut state, saved);
+            ready_tx.send(()).expect("restored");
+        });
+        staged_rx.recv().expect("view installed");
+        let reader_session = Arc::clone(&session);
+        let reader = std::thread::spawn(move || {
+            let file = reader_session.build_file_stable().expect("stable export");
+            let view = reader_session
+                .new_client_view()
+                .expect("stable client view");
+            (file, view)
+        });
+        // The reader cannot complete while the alternate selection is staged.
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(!reader.is_finished());
+        release_tx.send(()).expect("release");
+        ready_rx.recv().expect("restored");
+        staging.join().expect("staging thread");
+        let (file, new_view) = reader.join().expect("reader thread");
+        assert_eq!(file.active_workspace, workspace.0);
+        assert_eq!(file.workspaces[0].active_tab, first_tab.0);
+        assert_eq!(new_view.workspace, workspace);
+        assert_eq!(new_view.tabs[&workspace], first_tab);
+    }
+
     async fn next_server_message(
         lines: &mut tokio::io::Lines<BufReader<tokio::net::unix::OwnedReadHalf>>,
     ) -> ServerMessage {
@@ -3689,6 +4396,263 @@ mod tests {
             .expect("read line")
             .expect("stream open");
         decode::<ServerMessage>(line.as_bytes()).expect("decode server message")
+    }
+
+    async fn next_layout_matching(
+        lines: &mut tokio::io::Lines<BufReader<tokio::net::unix::OwnedReadHalf>>,
+        predicate: impl Fn(&LayoutSnapshot) -> bool,
+    ) -> LayoutSnapshot {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let ServerMessage::Layout(layout) = next_server_message(lines).await {
+                    if predicate(&layout) {
+                        break layout;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("matching layout")
+    }
+
+    async fn next_error(
+        lines: &mut tokio::io::Lines<BufReader<tokio::net::unix::OwnedReadHalf>>,
+    ) -> String {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let ServerMessage::Error { message } = next_server_message(lines).await {
+                    break message;
+                }
+            }
+        })
+        .await
+        .expect("error reply")
+    }
+
+    #[tokio::test]
+    async fn two_socket_clients_keep_selection_scroll_and_size_independent() {
+        let session = Arc::new(Session::spawn(80, 24, "views".into()).expect("spawn session"));
+        let (a_server, a_client) = UnixStream::pair().expect("first socket pair");
+        let (b_server, b_client) = UnixStream::pair().expect("second socket pair");
+        let a_task = tokio::spawn(serve_client(a_server, Arc::clone(&session)));
+        let b_task = tokio::spawn(serve_client(b_server, Arc::clone(&session)));
+        let (a_reader, mut a_writer) = a_client.into_split();
+        let (b_reader, mut b_writer) = b_client.into_split();
+        let mut a = BufReader::new(a_reader).lines();
+        let mut b = BufReader::new(b_reader).lines();
+        for (writer, cols, rows) in [(&mut a_writer, 100, 30), (&mut b_writer, 60, 20)] {
+            writer
+                .write_all(
+                    &encode(&ClientMessage::Hello {
+                        cols,
+                        rows,
+                        version: PROTOCOL_VERSION,
+                    })
+                    .unwrap(),
+                )
+                .await
+                .expect("hello");
+        }
+        assert!(matches!(
+            next_server_message(&mut a).await,
+            ServerMessage::Welcome { .. }
+        ));
+        let first = match next_server_message(&mut a).await {
+            ServerMessage::Layout(layout) => layout,
+            other => panic!("expected layout, got {other:?}"),
+        };
+        assert!(matches!(
+            next_server_message(&mut b).await,
+            ServerMessage::Welcome { .. }
+        ));
+        let b_first = match next_server_message(&mut b).await {
+            ServerMessage::Layout(layout) => layout,
+            other => panic!("expected layout, got {other:?}"),
+        };
+        let first_tab = first.active_tab;
+        let first_pane = first.panes[0].id;
+        assert_eq!(b_first.active_tab, first_tab);
+
+        // Client A creates and selects a tab. Client B keeps the original tab.
+        a_writer
+            .write_all(&encode(&ClientMessage::NewTab).unwrap())
+            .await
+            .expect("new tab");
+        let a_second = next_layout_matching(&mut a, |layout| layout.tabs.len() == 2).await;
+        let second_tab = a_second.active_tab;
+        assert_ne!(second_tab, first_tab);
+        b_writer
+            .write_all(&encode(&ClientMessage::Query(QueryKind::Layout)).unwrap())
+            .await
+            .expect("query b");
+        let b_still_first =
+            next_layout_matching(&mut b, |layout| layout.active_tab == first_tab).await;
+        assert_eq!(b_still_first.active_tab, first_tab);
+
+        // `Input` follows each connection's focused pane, rather than the
+        // session's persisted/script focus. Use the live shells so this is a
+        // real PTY routing assertion instead of inspecting implementation state.
+        let second_pane = a_second.panes[0].id;
+        a_writer
+            .write_all(
+                &encode(&ClientMessage::Input {
+                    bytes: b"printf VIEW_A\\n\r".to_vec(),
+                })
+                .unwrap(),
+            )
+            .await
+            .expect("input a");
+        b_writer
+            .write_all(
+                &encode(&ClientMessage::Input {
+                    bytes: b"printf VIEW_B\\n\r".to_vec(),
+                })
+                .unwrap(),
+            )
+            .await
+            .expect("input b");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let (first_text, _) = session
+                    .read_pane_text(first_pane, true, None)
+                    .expect("read first");
+                let (second_text, _) = session
+                    .read_pane_text(second_pane, true, None)
+                    .expect("read second");
+                if first_text.contains("VIEW_B") && second_text.contains("VIEW_A") {
+                    assert!(!first_text.contains("VIEW_A"));
+                    assert!(!second_text.contains("VIEW_B"));
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("inputs reach their own panes");
+
+        // Scrollback belongs to B's view. Seed real terminal history directly,
+        // then verify B sees it while A remains on its own tab.
+        let pane = session
+            .panes
+            .lock()
+            .expect("panes")
+            .get(&first_pane)
+            .cloned()
+            .expect("first pane");
+        let history = (0..40)
+            .map(|line| format!("line {line}\r\n"))
+            .collect::<String>();
+        pane.parser
+            .lock()
+            .expect("parser")
+            .process(history.as_bytes());
+        b_writer
+            .write_all(
+                &encode(&ClientMessage::ScrollPane {
+                    id: first_pane,
+                    delta: 3,
+                })
+                .unwrap(),
+            )
+            .await
+            .expect("scroll b");
+        let b_scrolled = next_layout_matching(&mut b, |layout| {
+            layout
+                .panes
+                .iter()
+                .any(|pane| pane.id == first_pane && pane.scroll_offset > 0)
+        })
+        .await;
+        assert!(b_scrolled.panes[0].scroll_offset > 0);
+        a_writer
+            .write_all(&encode(&ClientMessage::Query(QueryKind::Layout)).unwrap())
+            .await
+            .expect("query a");
+        let a_still_second =
+            next_layout_matching(&mut a, |layout| layout.active_tab == second_tab).await;
+        assert_eq!(a_still_second.active_tab, second_tab);
+
+        // A's selection mutation takes physical size ownership; B's read-only
+        // query did not resize it back to 60x20.
+        a_writer
+            .write_all(
+                &encode(&ClientMessage::FocusPaneId {
+                    id: a_second.panes[0].id,
+                })
+                .unwrap(),
+            )
+            .await
+            .expect("focus a");
+        let _ = next_layout_matching(&mut a, |layout| layout.active_tab == second_tab).await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if *session.size.lock().expect("size") == (100, 30) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("A's dispatched focus takes geometry ownership");
+
+        drop(a_writer);
+        // Disconnecting A leaves B and the panes alive.
+        b_writer
+            .write_all(&encode(&ClientMessage::Query(QueryKind::Layout)).unwrap())
+            .await
+            .expect("query after detach");
+        let alive = next_layout_matching(&mut b, |layout| layout.active_tab == first_tab).await;
+        assert_eq!(alive.panes[0].id, first_pane);
+        drop(b_writer);
+        a_task.abort();
+        b_task.abort();
+    }
+
+    #[tokio::test]
+    async fn rejected_interactive_command_keeps_attached_socket_usable() {
+        let session = Arc::new(Session::spawn(80, 24, "error-view".into()).expect("spawn session"));
+        let (server, client) = UnixStream::pair().expect("socket pair");
+        let task = tokio::spawn(serve_client(server, session));
+        let (reader, mut writer) = client.into_split();
+        let mut lines = BufReader::new(reader).lines();
+        writer
+            .write_all(
+                &encode(&ClientMessage::Hello {
+                    cols: 80,
+                    rows: 24,
+                    version: PROTOCOL_VERSION,
+                })
+                .unwrap(),
+            )
+            .await
+            .expect("hello");
+        assert!(matches!(
+            next_server_message(&mut lines).await,
+            ServerMessage::Welcome { .. }
+        ));
+        let layout = match next_server_message(&mut lines).await {
+            ServerMessage::Layout(layout) => layout,
+            other => panic!("expected layout, got {other:?}"),
+        };
+        writer
+            .write_all(
+                &encode(&ClientMessage::SetWorkspaceColor {
+                    id: layout.active_workspace,
+                    color: Some("not-a-color".into()),
+                })
+                .unwrap(),
+            )
+            .await
+            .expect("bad command");
+        assert!(next_error(&mut lines).await.contains("workspace color"));
+        writer
+            .write_all(&encode(&ClientMessage::Query(QueryKind::Layout)).unwrap())
+            .await
+            .expect("follow-up query");
+        let recovered = next_layout_matching(&mut lines, |_| true).await;
+        assert_eq!(recovered.active_workspace, layout.active_workspace);
+        drop(writer);
+        task.abort();
     }
 
     #[test]
@@ -3734,6 +4698,55 @@ mod tests {
             .handle(ClientMessage::SetWorkspaceColor { id, color: None })
             .expect("clear accepted");
         assert_eq!(session.snapshot().unwrap().workspaces[0].color, None);
+    }
+
+    #[tokio::test]
+    async fn guarded_prompt_rejects_replacement_and_blocked_agent_before_write() {
+        let mut session = Session::spawn(80, 24, "guarded-prompt".into()).expect("spawn");
+        session.manifests = vec![manifest::Manifest {
+            name: "fake".into(),
+            display: "Fake Agent".into(),
+            process: vec!["fake-agent".into()],
+            title: vec![],
+            resume: None,
+            rules: vec![],
+        }];
+        let pane_id = session.snapshot().expect("snapshot").panes[0].id;
+        let pane = session.panes.lock().unwrap().get(&pane_id).unwrap().clone();
+        {
+            let mut process = pane.process.lock().unwrap();
+            process.name = Some("fake-agent".into());
+            process.checked_at = Instant::now();
+        }
+        let first = session.pane_snapshot(pane_id).expect("recognized pane");
+        assert_eq!(first.agent.as_deref(), Some("Fake Agent"));
+
+        // Same pane id but a new foreground shell invalidates the old guard.
+        pane.process.lock().unwrap().name = Some("sh".into());
+        assert!(session
+            .prompt_agent(
+                pane_id,
+                "Fake Agent",
+                first.agent_generation,
+                b"must-not-write",
+            )
+            .is_err());
+
+        pane.process.lock().unwrap().name = Some("fake-agent".into());
+        let current = session.pane_snapshot(pane_id).expect("agent restored");
+        *pane.hook.lock().unwrap() = Some(ReportedHook {
+            state: AgentStateKind::Blocked,
+            source: "test".into(),
+            reported_at: Instant::now(),
+        });
+        assert!(session
+            .prompt_agent(
+                pane_id,
+                "Fake Agent",
+                current.agent_generation,
+                b"must-not-write",
+            )
+            .is_err());
     }
 
     #[tokio::test]
@@ -4057,6 +5070,81 @@ mod tests {
             })
             .expect("select the source workspace");
         session.snapshot().expect("snapshot after the move");
+    }
+
+    #[tokio::test]
+    async fn failed_worktree_removal_keeps_its_workspace_open() {
+        let base = std::env::temp_dir().join(format!(
+            "kodade-cli-worktree-remove-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let repo = base.join("repo");
+        let worktree = base.join("worktree");
+        fs::create_dir_all(&repo).expect("create repo");
+        for args in [
+            vec!["init", "-q", "-b", "main"],
+            vec!["config", "user.email", "test@example.com"],
+            vec!["config", "user.name", "Test"],
+        ] {
+            assert!(std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(args)
+                .status()
+                .expect("run git")
+                .success());
+        }
+        fs::write(repo.join("README.md"), "base\n").expect("seed repo");
+        assert!(std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["add", "."])
+            .status()
+            .expect("stage")
+            .success());
+        assert!(std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["commit", "-q", "-m", "base"])
+            .status()
+            .expect("commit")
+            .success());
+        git::worktree_add(&repo, "feature", None, &worktree).expect("add worktree");
+        fs::write(worktree.join("dirty.txt"), "preserve me\n").expect("dirty worktree");
+
+        let session = Session::spawn(80, 24, "dirty-worktree".into()).expect("spawn session");
+        session
+            .handle(ClientMessage::NewWorkspace {
+                name: "feature".into(),
+                root: Some(worktree.clone()),
+            })
+            .expect("open worktree workspace");
+        let workspace = session
+            .state
+            .lock()
+            .expect("state")
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.root.as_deref() == Some(worktree.as_path()))
+            .expect("worktree workspace")
+            .id;
+
+        assert!(session.remove_worktree_workspace(workspace, false).is_err());
+        assert!(worktree.join("dirty.txt").exists());
+        assert!(session
+            .state
+            .lock()
+            .expect("state")
+            .workspaces
+            .iter()
+            .any(|item| item.id == workspace));
+
+        git::worktree_remove(&repo, &worktree, true).expect("forced cleanup");
+        fs::remove_dir_all(base).ok();
     }
 
     #[tokio::test]

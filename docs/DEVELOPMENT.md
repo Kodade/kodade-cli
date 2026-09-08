@@ -12,7 +12,9 @@ Ködade CLI is a Rust workspace with three crates:
   Its modules are `main.rs`, `cli.rs`, `app.rs`, `config.rs`, `mode.rs`,
   `render.rs`, `input.rs`, `commands.rs`, `help.rs`, `keys.rs`, `notify.rs`,
   `overlay.rs`, `paste.rs`, `picker.rs`, `remote.rs`, `selection.rs`,
-  `settings.rs`, and `state.rs`. `cli.rs` holds the clap definitions, `main.rs`
+  `settings.rs`, and `state.rs`. Startup/context selection lives in `connection.rs`,
+  read-only diagnostics in `doctor.rs`, lifecycle configuration in `integrations.rs`,
+  and small atomic configuration writes in `atomic_file.rs`. `cli.rs` holds the clap definitions, `main.rs`
   only dispatches them, and `app.rs` holds the attached client's `App` state
   plus its key, mouse, layout, and draw handlers.
 
@@ -42,17 +44,19 @@ identifies it.
 `repo_root` walks up to a `.git` entry, `current_branch` reads `.git/HEAD` (or,
 for a linked worktree, follows the `gitdir:` file to the real HEAD), and
 `main_worktree_root` follows `commondir` to find a worktree's main repo. These
-run on the daemon's 2-second process tick — each `Workspace` caches its `branch`
-so no subprocess runs per frame — and the cached branch plus the derived
-`parent` (the open workspace whose root is the worktree's main repo) travel on
+run on the daemon's 2-second metadata tick — each `Workspace` caches its branch
+and derived `parent` (the open workspace whose root is the worktree's main repo),
+so no filesystem work runs per frame — and those cached values travel on
 `WorkspaceInfo` so the sidebar can nest worktrees and dim their branch.
 
 Mutations shell out: `NewWorktreeWorkspace` runs `git worktree add` under
 `[worktrees] directory` (default `~/.kodade/worktrees`, read with the same tiny
 loader as `[session]`) and opens a `repo:branch` workspace rooted there;
-`RemoveWorktreeWorkspace` closes the workspace and, unless `keep`, runs
-`git worktree remove`. Removal is only attempted when `main_worktree_root`
-resolves, so nothing outside a registered worktree is ever deleted.
+`RemoveWorktreeWorkspace` first runs a non-forced `git worktree remove` unless
+`keep` is set, then closes the workspace only after removal succeeds. A dirty
+or otherwise unremovable checkout therefore stays open with its panes intact.
+Removal is only attempted when `main_worktree_root` resolves, so nothing
+outside a registered worktree is ever deleted.
 
 ## Session persistence and restore
 
@@ -71,7 +75,8 @@ risk); only layout and metadata are.
 
 Writes are debounced ~500 ms and driven by a `layout_generation` counter that
 only layout-changing mutations advance — PTY output never triggers a write. The
-file is written atomically (temp file + rename). SIGTERM flushes a final save;
+file is written atomically and durably (a unique same-directory temp file,
+file sync, rename, and directory sync). SIGTERM flushes a final save;
 an explicit `kill-session` deletes the file so a stopped session is not revived.
 
 On a cold start (no live daemon owns the socket) the daemon rebuilds the layout
@@ -94,6 +99,15 @@ socket per session. Each message is one UTF-8 JSON value followed by a newline;
 PTY input bytes are represented by serde JSON byte arrays. The shared protocol
 types live in `kodade-cli-proto`.
 
+Each connection owns a transient view: selected workspace/tab, focused pane,
+and scrollback offsets are independent and disappear on disconnect. The
+persisted session selection remains the scripting default, so scripts cannot
+redirect an attached client's view. Shared panes have one physical PTY size.
+`Hello`, `Resize`, and later view-changing input use last-interacting
+arbitration: the most recently interacting client sets that size, while a
+read-only query never resizes it. Recoverable request errors reply with
+`Error` but leave an attached client connected for its next request.
+
 Pane contents travel in a `Screen`: a plain `contents` string (used by copy
 mode and `pane read`) plus `rows`, one styled run list per visible terminal
 row. A `Run` is a stretch of adjacent cells sharing foreground color,
@@ -110,8 +124,8 @@ Socket paths are selected in this order:
 3. On other platforms, `$HOME/.local/state/kodade-cli/SESSION.sock` when a
    home directory is available; otherwise `/tmp/kodade-cli-$UID/SESSION.sock`.
 
-Session names must be non-empty path components. They cannot contain `/` or be
-`.` or `..`. The daemon removes a socket file only when it cannot connect to a
+Session names are 1–64 bytes and cannot be `.` or `..`, or contain `/`, `\`,
+or control characters. The CLI and daemon share the same validator. The daemon removes a socket file only when it cannot connect to a
 live daemon at that path. `session rename` renames the socket file in place: the
 listener stays bound, so the same daemon and its PTYs answer on the new path.
 
@@ -150,11 +164,14 @@ are cheap:
    -o ControlPersist=60 USER@HOST kodade-cli --version` checks the remote
    binary; if it is missing, the install one-liner is printed and the command
    exits `1`.
-2. `ssh … kodade-cli daemon NAME` (with `-f`) starts the remote daemon detached
-   when one is not already running (a harmless error if it is).
+2. `ssh … 'nohup kodade-cli daemon NAME </dev/null >/dev/null 2>&1 &'` starts
+   the remote daemon detached when one is not already running. Remote arguments
+   are shell-quoted, and SSH commands have a 30-second ceiling.
 3. `ssh … kodade-cli session path -s NAME` returns the remote socket path.
 4. `ssh -N -L <local>:<remote-socket> …` forwards it (OpenSSH Unix-to-Unix
-   forwarding) to `<runtime>/kodade-cli/remote-<host>-<NAME>.sock`. The command
+   forwarding) to an exclusively allocated private `<runtime>/kodade-cli/remote-PID-N/s.sock`.
+   Each forward owns its directory, so concurrent commands cannot unlink another
+   tunnel. The command
    waits up to 10 s for that local socket to accept a connection.
 
 On exit the forwarding process is stopped and the local socket file removed; the
@@ -172,6 +189,19 @@ only exercised against a real host.
 Out of scope (phase 2): multiple remotes in one sidebar, and auto-installing
 `kodade-cli` on the remote host.
 
+## Startup and context
+
+`connection.rs` connects or starts a local daemon for attachment and creation
+commands. Startup and attachment handshakes have a ten-second limit. A failed
+child reports its status and a log path beside the socket. Queries and destructive
+commands do not start sessions. `doctor` checks configuration, tools, and the
+protocol with a one-second health probe without changing the session.
+
+With no explicit endpoint, CLI commands inherit `KODADE_SESSION` and
+`KODADE_SOCKET`. Explicit `--session`, `--socket`, or `--remote` takes precedence.
+`session path` reports that resolved socket. Configuration writes preserve
+symlinks, permissions, and unrelated integration hooks, even within shared entries.
+
 ## Checks
 
 Run the local gate from the repository root:
@@ -185,3 +215,12 @@ CI mirrors these checks on `ubuntu-latest` and `macos-latest`. CI runs
 
 See [RELEASING.md](RELEASING.md) for versioning, tagging, release artifacts,
 and installer details.
+
+Run `python3 scripts/smoke-test.py` after building to exercise cold startup,
+real PTY output, diagnostics, non-destructive config creation, inherited context,
+rename, and shutdown in an isolated home/runtime.
+
+Terminal modes are owned by `terminal::TerminalModes`; cleanup runs after detach,
+failed setup, UI errors, and before panic reporting. `python3 scripts/tui-smoke-test.py`
+exercises a real controlling PTY, detach, a broken transport, and restoration of
+termios, alternate screen, bracketed paste, and cursor visibility.
