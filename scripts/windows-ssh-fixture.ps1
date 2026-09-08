@@ -116,7 +116,9 @@ Host kodade-unix-fixture
     if (-not $ready) { throw 'Unix SSH fixture did not listen on localhost:2222' }
 
     $previousHome = $env:USERPROFILE
+    $previousUnixHome = $env:HOME
     $env:USERPROFILE = $clientHome
+    $env:HOME = $clientHome
     try {
         Write-Host 'running Windows client through the Unix SSH bridge'
         # Both commands create a Windows authenticated loopback bridge, then
@@ -146,6 +148,7 @@ Host kodade-unix-fixture
         Invoke-Native $WindowsBinary @('--remote', 'kodade-unix-fixture', '--session', $session, 'kill-session') 45 | Out-Null
     } finally {
         $env:USERPROFILE = $previousHome
+        $env:HOME = $previousUnixHome
     }
 } finally {
     if ($null -ne $sshProcess -and -not $sshProcess.HasExited) {
