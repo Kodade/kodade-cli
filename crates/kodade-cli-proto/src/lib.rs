@@ -770,6 +770,18 @@ pub struct Screen {
     pub mouse_reporting: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub graphics: Vec<ImagePlacement>,
+    /// OSC 8 targets attached to visible terminal cells. Older daemons omit it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub links: Vec<LinkRange>,
+}
+
+/// An exclusive horizontal OSC 8 link range in one visible terminal row.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LinkRange {
+    pub row: u16,
+    pub start_col: u16,
+    pub end_col: u16,
+    pub uri: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1186,6 +1198,7 @@ mod tests {
                     bracketed_paste: true,
                     mouse_reporting: false,
                     graphics: Vec::new(),
+                    links: Vec::new(),
                 },
                 agent: None,
                 agent_generation: 0,

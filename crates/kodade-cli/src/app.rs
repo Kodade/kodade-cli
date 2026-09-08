@@ -1072,21 +1072,28 @@ impl App {
                 self.view_needs_resize = false;
             }
             self.sync_title(term)?;
-            term.draw(|frame| self.draw(frame))?;
-            let area = self.content_area(term)?;
-            let hidden = self.center.is_some()
-                || self.help.is_some()
-                || self.settings.is_some()
-                || self.picker.is_some()
-                || self.menu.is_some()
-                || self.copy.is_some()
-                || self.flash_active();
-            let layout = self.layout.as_ref().filter(|_| !hidden);
-            let rects = layout
-                .map(|layout| render::pane_rects_for(layout, area))
-                .unwrap_or_default();
-            self.graphics
-                .draw(term.backend_mut(), &self.socket, layout, &rects)?;
+            crate::terminal::begin_synchronized_output(term.backend_mut())?;
+            let frame_result = (|| -> Result<()> {
+                term.draw(|frame| self.draw(frame))?;
+                let area = self.content_area(term)?;
+                let hidden = self.center.is_some()
+                    || self.help.is_some()
+                    || self.settings.is_some()
+                    || self.picker.is_some()
+                    || self.menu.is_some()
+                    || self.copy.is_some()
+                    || self.flash_active();
+                let layout = self.layout.as_ref().filter(|_| !hidden);
+                let rects = layout
+                    .map(|layout| render::pane_rects_for(layout, area))
+                    .unwrap_or_default();
+                self.graphics
+                    .draw(term.backend_mut(), &self.socket, layout, &rects)?;
+                Ok(())
+            })();
+            let close_result = crate::terminal::end_synchronized_output(term.backend_mut());
+            frame_result?;
+            close_result?;
             if !event::poll(Duration::from_millis(16))? {
                 continue;
             }

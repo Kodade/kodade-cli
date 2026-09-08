@@ -156,6 +156,24 @@ fn word_end(line: Option<&&str>, col: usize) -> usize {
 /// Extracts the `http(s)://` token around a cell: widen to whitespace on both
 /// sides, then trim the brackets and punctuation people wrap URLs in.
 pub fn link_at(screen: &Screen, row: usize, col: usize) -> Option<String> {
+    osc8_link_at(screen, row, col).or_else(|| textual_link_at(screen, row, col))
+}
+
+/// The exact URI that an OSC 8 producer assigned to this cell. This takes
+/// precedence over visible text: labels commonly contain no URL at all.
+fn osc8_link_at(screen: &Screen, row: usize, col: usize) -> Option<String> {
+    screen
+        .links
+        .iter()
+        .find(|link| {
+            usize::from(link.row) == row
+                && usize::from(link.start_col) <= col
+                && col < usize::from(link.end_col)
+        })
+        .map(|link| link.uri.clone())
+}
+
+fn textual_link_at(screen: &Screen, row: usize, col: usize) -> Option<String> {
     let lines = crate::mode::grid(&screen.contents);
     let chars = lines.get(row)?.chars().collect::<Vec<_>>();
     if col >= chars.len() {
@@ -296,6 +314,21 @@ mod tests {
         );
         assert_eq!(link_at(&screen, 1, 3), None);
         assert_eq!(link_at(&screen, 0, 200), None);
+    }
+
+    #[test]
+    fn osc8_link_wins_for_a_labeled_cell() {
+        let mut screen = screen("open docs");
+        screen.links.push(kodade_cli_proto::LinkRange {
+            row: 0,
+            start_col: 5,
+            end_col: 9,
+            uri: "https://example.test/docs".into(),
+        });
+        assert_eq!(
+            link_at(&screen, 0, 6).as_deref(),
+            Some("https://example.test/docs")
+        );
     }
 
     #[test]

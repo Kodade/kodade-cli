@@ -4,6 +4,7 @@ mod agent;
 mod git;
 mod graphics;
 mod history;
+mod hyperlinks;
 mod image_paste;
 pub use image_paste::{validate_png, MAX_IMAGE_BYTES};
 mod layout;
@@ -174,6 +175,7 @@ struct PtyCallbacks {
     title: String,
     graphics: graphics::Store,
     graphics_tracker: graphics::Tracker,
+    hyperlinks: hyperlinks::Tracker,
 }
 impl vt100::Callbacks for PtyCallbacks {
     fn set_window_title(&mut self, _: &mut vt100::Screen, title: &[u8]) {
@@ -3615,11 +3617,14 @@ impl Pane {
                 pixel_width: 0,
                 pixel_height: 0,
             })?;
-        self.parser
+        let mut parser = self
+            .parser
             .lock()
-            .map_err(|_| anyhow!("PTY parser lock poisoned"))?
+            .map_err(|_| anyhow!("PTY parser lock poisoned"))?;
+        parser
             .screen_mut()
             .set_size(terminal_size(rows, cols).0, terminal_size(rows, cols).1);
+        parser.callbacks_mut().hyperlinks.resize(rows, cols);
         Ok(())
     }
     fn write(&self, bytes: &[u8]) -> Result<()> {
@@ -4149,17 +4154,21 @@ fn read_pty(
 fn graphics_text(parser: &mut PtyParser, text: &[u8]) {
     let mut tracker = std::mem::take(&mut parser.callbacks_mut().graphics_tracker);
     let mut store = std::mem::take(&mut parser.callbacks_mut().graphics);
+    let mut hyperlinks = std::mem::take(&mut parser.callbacks_mut().hyperlinks);
     for &byte in text {
         let before_alt = parser.screen().alternate_screen();
         tracker.feed(byte, parser.screen(), &mut store);
+        hyperlinks.feed(byte, parser.screen());
         parser.process(&[byte]);
         let alternate = parser.screen().alternate_screen();
         if alternate && !before_alt {
             store.clear(true);
+            hyperlinks.clear_alternate();
         }
     }
     parser.callbacks_mut().graphics_tracker = tracker;
     parser.callbacks_mut().graphics = store;
+    parser.callbacks_mut().hyperlinks = hyperlinks;
 }
 
 /// Collect the pane's full scrollback plus visible screen as plain-text lines,
@@ -4237,6 +4246,10 @@ fn snapshot(parser: &PtyParser) -> Screen {
             .callbacks()
             .graphics
             .placements(screen.alternate_screen(), screen.scrollback()),
+        links: parser
+            .callbacks()
+            .hyperlinks
+            .ranges(screen.alternate_screen()),
     }
 }
 
@@ -4961,6 +4974,20 @@ mod tests {
         assert!(screen.bracketed_paste);
         assert!(screen.mouse_reporting);
         assert!(!screen.cursor_visible);
+    }
+
+    #[test]
+    fn snapshot_carries_osc8_labeled_link_cells() {
+        let mut parser = pty_parser(2, 20, 100, PtyCallbacks::default());
+        graphics_text(
+            &mut parser,
+            b"\x1b]8;;https://example.test/docs\x1b\\docs\x1b]8;;\x1b\\",
+        );
+        let screen = snapshot(&parser);
+        assert_eq!(screen.contents.trim(), "docs");
+        assert_eq!(screen.links.len(), 1);
+        assert_eq!(screen.links[0].uri, "https://example.test/docs");
+        assert_eq!((screen.links[0].start_col, screen.links[0].end_col), (0, 4));
     }
 
     #[test]

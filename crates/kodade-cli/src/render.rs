@@ -2128,6 +2128,7 @@ mod tests {
                 bracketed_paste: false,
                 mouse_reporting: false,
                 graphics: Vec::new(),
+                links: Vec::new(),
             },
             agent: None,
             agent_generation: 0,
