@@ -106,7 +106,9 @@ setInterval(() => {}, 1000);
 '@ | Set-Content -LiteralPath $nodeScript -NoNewline
     $nodePane = (Invoke-Native $bin @('--session', $session, 'run', '--', 'node.exe', $nodeScript)).Trim()
     if ($nodePane -notmatch '^\d+$') { throw "Node run did not return a pane id: $nodePane" }
-    Wait-Until 'hook-backed Node identity' { (Invoke-Native $bin @('--session', $session, 'agent', 'read', 'Pi') 5).Length -gt 0 }
+    Wait-Until 'hook-backed Node identity' {
+        try { (Invoke-Native $bin @('--session', $session, 'agent', 'read', 'Pi') 5).Length -gt 0 } catch { $false }
+    }
     Invoke-Native $bin @('--session', $session, 'pane', 'send-keys', $nodePane, 'retire', 'Enter') | Out-Null
     Wait-Until 'replacement process identity retirement' {
         try { Invoke-Native $bin @('--session', $session, 'agent', 'read', 'Pi') 5 | Out-Null; $false } catch { $true }
