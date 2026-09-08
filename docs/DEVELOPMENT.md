@@ -277,3 +277,21 @@ termios, alternate screen, bracketed paste, and cursor visibility.
 `python3 scripts/terminal-links-tui-smoke.py` exercises labeled OSC 8 links in
 history and live output, link retirement after a same-text overwrite, and a
 child pane's synchronized-output freeze/release path.
+
+
+## Live daemon handoff
+
+`session upgrade` uses a private Unix socket to transfer PTY descriptors with
+SCM_RIGHTS. `handoff.rs` bounds and authenticates the transport; the source
+transaction owns alias rollback and target termination. Readers stop at
+poll/read boundaries and only the final ownership release lets the target read
+or delete adopted resources. Client transports retain acknowledged view state
+and discard queued input on reconnect. `terminal_replay.rs` exports cloned
+terminal grids, preserving live buffers and a bounded ANSI history tail.
+
+After building, `python3 scripts/smoke-test.py` checks two upgrades with original
+process identity and computed output, failed real import and lost commit
+acknowledgement rollback, and the original hook alias after rename.
+`python3 scripts/handoff-tui-smoke.py` verifies an attached client's independent
+pane focus and actual shell execution through two upgrades, then terminal-mode
+restoration on detach. Both fixtures own their temporary sessions and cleanup.

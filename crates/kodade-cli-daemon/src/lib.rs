@@ -3,6 +3,8 @@
 mod agent;
 mod git;
 mod graphics;
+#[cfg(unix)]
+mod handoff;
 mod history;
 mod hyperlinks;
 mod image_paste;
@@ -12,18 +14,24 @@ mod manifest;
 mod persist;
 mod plugins;
 mod proc;
+mod pty_io;
 mod terminal_modes;
+mod terminal_replay;
 
 use std::{
     collections::{HashMap, HashSet},
     env, fs,
     io::{Read, Write},
     num::NonZeroU16,
-    os::unix::fs::FileTypeExt,
+    os::{
+        fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd},
+        unix::{ffi::OsStrExt, fs::FileTypeExt},
+    },
     path::{Path, PathBuf},
+    process::Command,
     sync::{
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
-        Arc, Mutex,
+        Arc, Condvar, Mutex,
     },
     time::{Duration, Instant},
 };
@@ -86,12 +94,179 @@ struct Session {
     /// Per-daemon socket link injected into every pane. Unlike the public
     /// session socket it survives a session rename, so already-running agent
     /// hooks keep reaching this daemon.
-    hook_socket: PathBuf,
+    hook_socket: Mutex<PathBuf>,
     /// Serializes the short compatibility staging used by [`ClientView`].  The
     /// stored session selection remains the scripting/persistence default; an
     /// attached client temporarily installs only its own selection while one
     /// legacy mutation is dispatched.
     view_dispatch: Mutex<()>,
+    upgraded: AtomicBool,
+    upgrading: broadcast::Sender<()>,
+    upgrade_lock: Mutex<()>,
+    handoff_active: AtomicBool,
+}
+
+/// Source-side staging guard. Dropping it on any validation, transfer, or
+/// importer failure resumes every reader before the source continues serving.
+struct CapturedHandoff {
+    #[allow(dead_code)] // Consumed by the upgrade transaction after validation.
+    manifest: handoff::HandoffManifest,
+    #[allow(dead_code)] // SCM_RIGHTS duplicates these while the source retains ownership.
+    fds: Vec<RawFd>,
+    paused: Vec<Arc<Pane>>,
+    committed: bool,
+}
+
+impl Drop for CapturedHandoff {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        for pane in &self.paused {
+            pane.reader.resume();
+        }
+    }
+}
+
+struct HandoffActive<'a>(Option<&'a AtomicBool>);
+impl Drop for HandoffActive<'_> {
+    fn drop(&mut self) {
+        if let Some(active) = self.0 {
+            active.store(false, Ordering::Release);
+        }
+    }
+}
+
+/// Own target cleanup before the capture guard is allowed to resume the source.
+struct Replacement {
+    directory: PathBuf,
+    /// A short `/tmp` symlink to `directory` when macOS's sockaddr path limit
+    /// would reject the private staging sockets. The staging files still live
+    /// in `directory`, so their final renames stay on the public socket FS.
+    staging_alias: Option<PathBuf>,
+    handoff: PathBuf,
+    staged: PathBuf,
+    staged_hook: PathBuf,
+    public: PathBuf,
+    hook: PathBuf,
+    public_backup: PathBuf,
+    hook_backup: PathBuf,
+    public_saved: bool,
+    hook_saved: bool,
+    committed: bool,
+    child: Option<std::process::Child>,
+    captured: Option<CapturedHandoff>,
+}
+
+fn handoff_nonce() -> Result<String> {
+    let mut bytes = [0_u8; 24];
+    fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+    Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+// macOS has a 104-byte `sockaddr_un::sun_path`; Linux allows 108. Keep the
+// stricter limit so a session valid on both platforms can be upgraded on both.
+const MAX_UNIX_SOCKET_PATH_BYTES: usize = 103;
+
+fn socket_path_fits(path: &Path) -> bool {
+    path.as_os_str().as_bytes().len() <= MAX_UNIX_SOCKET_PATH_BYTES
+}
+
+/// Point a short, unpredictable name in sticky `/tmp` at the owned staging
+/// directory. Socket creation through this symlink still creates entries in
+/// the runtime directory, preserving same-filesystem atomic renames.
+fn staging_alias(directory: &Path) -> Result<PathBuf> {
+    use std::os::unix::fs::symlink;
+
+    let target = fs::canonicalize(directory).context("resolve handoff staging directory")?;
+    let uid = unsafe { libc::geteuid() };
+    for _ in 0..8 {
+        let alias = PathBuf::from(format!("/tmp/.kodade-up-{uid}-{}", &handoff_nonce()?[..12]));
+        match symlink(&target, &alias) {
+            Ok(()) => return Ok(alias),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error).context("create short handoff staging alias"),
+        }
+    }
+    bail!("could not allocate a short handoff staging alias")
+}
+
+impl Replacement {
+    fn new(public: PathBuf, hook: PathBuf) -> Result<Self> {
+        Self::new_in(
+            socket_dir().join(format!(".up-{}", &handoff_nonce()?[..16])),
+            public,
+            hook,
+        )
+    }
+
+    fn new_in(directory: PathBuf, public: PathBuf, hook: PathBuf) -> Result<Self> {
+        use std::os::unix::fs::DirBuilderExt;
+        fs::DirBuilder::new().mode(0o700).create(&directory)?;
+        let staging_alias = if socket_path_fits(&directory.join("new-hook")) {
+            None
+        } else {
+            match staging_alias(&directory) {
+                Ok(alias) => Some(alias),
+                Err(error) => {
+                    let _ = fs::remove_dir(&directory);
+                    return Err(error);
+                }
+            }
+        };
+        let staging_directory = staging_alias.as_ref().unwrap_or(&directory);
+        Ok(Self {
+            handoff: staging_directory.join("handoff"),
+            staged: staging_directory.join("new"),
+            staged_hook: staging_directory.join("new-hook"),
+            public_backup: directory.join("old"),
+            hook_backup: directory.join("old-hook"),
+            directory,
+            staging_alias,
+            public,
+            hook,
+            public_saved: false,
+            hook_saved: false,
+            committed: false,
+            child: None,
+            captured: None,
+        })
+    }
+}
+
+impl Drop for Replacement {
+    fn drop(&mut self) {
+        let mut restored = true;
+        if !self.committed {
+            if let Some(child) = self.child.as_mut() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            for (saved, backup, public) in [
+                (self.public_saved, &self.public_backup, &self.public),
+                (self.hook_saved, &self.hook_backup, &self.hook),
+            ] {
+                if saved {
+                    if let Err(error) = fs::rename(backup, public) {
+                        restored = false;
+                        eprintln!(
+                            "could not restore {}: {error}; recovery socket retained at {}",
+                            public.display(),
+                            backup.display()
+                        );
+                    }
+                }
+            }
+        }
+        if let Some(alias) = &self.staging_alias {
+            let _ = fs::remove_file(alias);
+        }
+        if restored {
+            let _ = fs::remove_dir_all(&self.directory);
+        }
+        // `captured` drops after this method: the target is gone and aliases
+        // are restored before any source reader is resumed.
+    }
 }
 
 /// Selection and viewport state owned by one socket connection.  It is never
@@ -178,6 +353,7 @@ struct PtyCallbacks {
     clipboard: Option<(u64, Vec<u8>, Vec<u8>)>,
     graphics: graphics::Store,
     graphics_tracker: graphics::Tracker,
+    graphics_decoder: graphics::Decoder,
     graphics_placeholder: Vec<u8>,
     graphics_unicode: graphics::UnicodeTracker,
     graphics_virtual_style: graphics::VirtualStyle,
@@ -250,6 +426,7 @@ struct Pane {
     master: Mutex<Box<dyn MasterPty + Send>>,
     parser: Arc<Mutex<PtyParser>>,
     last_output: Arc<Mutex<Instant>>,
+    reader: Arc<ReaderControl>,
     hook: Mutex<Option<ReportedHook>>,
     spawn_process: String,
     /// The command this pane was spawned with and the directory it started in,
@@ -259,7 +436,11 @@ struct Pane {
     native_session: Mutex<Option<NativeSession>>,
     /// Kept so dropping the pane ends its process; otherwise the PTY reader
     /// thread never sees EOF (the daemon and the test runtime would wait forever).
-    child: Mutex<Box<dyn portable_pty::Child + Send>>,
+    child: Mutex<Option<Box<dyn portable_pty::Child + Send>>>,
+    /// Adopted children cannot be waited by this daemon; signal only when the
+    /// PID still has the start identity captured during handoff.
+    adopted_child: Option<(i32, String)>,
+    adopted_child_owned: AtomicBool,
     process: Mutex<ProcessEvidence>,
     // Tracks the current detected state and its start as one atomic transition,
     // so concurrent snapshots cannot publish the same change twice.
@@ -275,7 +456,10 @@ struct Pane {
 
 const MAX_CONTEXT_BYTES: usize = 64 * 1024;
 
-struct ContextFile(PathBuf);
+struct ContextFile {
+    path: PathBuf,
+    owned: AtomicBool,
+}
 
 impl ContextFile {
     fn create(context: &InvocationContext) -> Result<Self> {
@@ -298,25 +482,199 @@ impl ContextFile {
             options.mode(0o600);
         }
         let mut file = options.open(&path)?;
-        let context_file = Self(path);
+        let context_file = Self {
+            path,
+            owned: AtomicBool::new(true),
+        };
         file.write_all(&json)?;
         Ok(context_file)
+    }
+
+    fn import(path: PathBuf) -> Result<Self> {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = fs::symlink_metadata(&path).context("inspect imported context")?;
+        if !metadata.is_file()
+            || metadata.uid() != unsafe { libc::geteuid() }
+            || metadata.mode() & 0o077 != 0
+            || metadata.len() > MAX_CONTEXT_BYTES as u64
+            || path.parent() != Some(std::env::temp_dir().as_path())
+            || !path
+                .file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with("kodade-plugin-context-"))
+        {
+            bail!("invalid private context file in handoff");
+        }
+        Ok(Self {
+            path,
+            owned: AtomicBool::new(false),
+        })
     }
 }
 
 impl Drop for ContextFile {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.0);
+        if self.owned.load(Ordering::Acquire) {
+            let _ = fs::remove_file(&self.path);
+        }
     }
+}
+
+const CHILD_EXIT_GRACE: Duration = Duration::from_millis(250);
+
+/// Poll without letting a process-library implementation turn pane teardown
+/// into an unbounded wait. `portable-pty`'s Unix `kill` starts with SIGHUP and
+/// can return before its SIGKILL fallback, so the caller must retain control
+/// of the final escalation.
+fn child_exited_within(child: &mut dyn portable_pty::Child, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return true,
+            // A failed status query does not establish that the process is
+            // gone. Escalate and leave the waiter with the child handle.
+            Err(_) => return false,
+            Ok(None) if Instant::now() >= deadline => return false,
+            Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+        }
+    }
+}
+
+/// End an owned PTY child without allowing a stuck wait to hold up a session
+/// close or Tokio runtime shutdown. The detached waiter still reaps a killed
+/// child once the platform reports its exit.
+fn terminate_owned_child(mut child: Box<dyn portable_pty::Child + Send>) {
+    let pid = child.process_id().and_then(|pid| i32::try_from(pid).ok());
+    let _ = child.kill();
+    if child_exited_within(&mut *child, CHILD_EXIT_GRACE) {
+        return;
+    }
+
+    #[cfg(unix)]
+    if let Some(pid) = pid {
+        // The child is ours, so PID reuse cannot occur before its wait handle
+        // is dropped. SIGKILL covers portable-pty's failed-SIGHUP path.
+        let _ = unsafe { libc::kill(pid, libc::SIGKILL) };
+        if child_exited_within(&mut *child, CHILD_EXIT_GRACE) {
+            return;
+        }
+    }
+
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
 }
 
 /// Closing a pane terminates its process so the PTY reader thread exits.
 impl Drop for Pane {
     fn drop(&mut self) {
+        self.reader.shutdown();
         if let Ok(mut child) = self.child.lock() {
-            let _ = child.kill();
-            let _ = child.wait();
+            if let Some(child) = child.take() {
+                terminate_owned_child(child);
+            }
         }
+        if let Some((pid, start)) = &self.adopted_child {
+            if !self.adopted_child_owned.load(Ordering::Acquire) {
+                return;
+            }
+            if proc::start_identity(*pid).as_deref() == Some(start) {
+                let _ = unsafe { libc::kill(*pid, libc::SIGTERM) };
+            }
+        }
+    }
+}
+
+/// Coordinates a PTY reader at poll/read boundaries. A handoff waits for the
+/// acknowledgement before another process receives a duplicated master.
+struct ReaderControl {
+    state: Mutex<ReaderState>,
+    changed: Condvar,
+}
+
+struct ReaderState {
+    paused: bool,
+    acknowledged: bool,
+    shutdown: bool,
+}
+
+impl ReaderControl {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(ReaderState {
+                paused: false,
+                acknowledged: false,
+                shutdown: false,
+            }),
+            changed: Condvar::new(),
+        }
+    }
+
+    fn paused() -> Self {
+        Self {
+            state: Mutex::new(ReaderState {
+                paused: true,
+                acknowledged: false,
+                shutdown: false,
+            }),
+            changed: Condvar::new(),
+        }
+    }
+
+    #[allow(dead_code)] // Called by the live-handoff commit phase.
+    fn pause(&self, timeout: Duration) -> Result<()> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow!("PTY reader control lock poisoned"))?;
+        state.paused = true;
+        state.acknowledged = false;
+        self.changed.notify_all();
+        let (state, _) = self
+            .changed
+            .wait_timeout_while(state, timeout, |state| {
+                !state.acknowledged && !state.shutdown
+            })
+            .map_err(|_| anyhow!("PTY reader control lock poisoned"))?;
+        if state.acknowledged {
+            Ok(())
+        } else {
+            bail!("timed out waiting for PTY reader to quiesce")
+        }
+    }
+
+    #[allow(dead_code)] // Called when an import rejects or times out.
+    fn resume(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.paused = false;
+            state.acknowledged = false;
+            self.changed.notify_all();
+        }
+    }
+
+    fn shutdown(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.shutdown = true;
+            state.paused = false;
+            self.changed.notify_all();
+        }
+    }
+
+    /// Returns false once teardown begins. The acknowledgement is published
+    /// before waiting, so a caller that observes it knows no read is active.
+    fn wait_if_paused(&self) -> bool {
+        let mut state = match self.state.lock() {
+            Ok(state) => state,
+            Err(_) => return false,
+        };
+        while state.paused && !state.shutdown {
+            state.acknowledged = true;
+            self.changed.notify_all();
+            state = match self.changed.wait(state) {
+                Ok(state) => state,
+                Err(_) => return false,
+            };
+        }
+        !state.shutdown
     }
 }
 
@@ -483,6 +841,11 @@ pub async fn run(session_name: String) -> Result<()> {
     loop {
         tokio::select! {
             _ = shutdown.recv() => {
+                if session.upgraded.load(Ordering::Acquire) {
+                    // The target owns duplicated PTYs. Exit without Rust drops:
+                    // portable-pty closes a master by writing EOT on Drop.
+                    std::process::exit(0);
+                }
                 // `kill-session` is deliberate: drop the state file so it does
                 // not resurrect on the next cold start.
                 persist::remove_session_file(&session.session_name());
@@ -508,6 +871,84 @@ pub async fn run(session_name: String) -> Result<()> {
                         eprintln!("Ködade CLI client disconnected: {error:#}");
                     }
                 });
+            }
+        }
+    }
+}
+
+/// Hidden daemon mode used by a source daemon during a live upgrade.
+pub async fn run_import(
+    session_name: String,
+    handoff_path: PathBuf,
+    token: String,
+    staged_socket: PathBuf,
+    staged_hook: PathBuf,
+    final_hook: PathBuf,
+) -> Result<()> {
+    validate_session_name(&session_name)?;
+    let received = tokio::task::spawn_blocking(move || handoff::receive(&handoff_path, &token))
+        .await
+        .context("join handoff receiver")?
+        .context("receive live handoff")?;
+    let session = unsafe { Session::import_handoff(received.manifest, received.fds) }?;
+    let session = Arc::new(session);
+    let listener = handoff::bind_listener(&staged_socket).context("bind staged daemon socket")?;
+    fs::hard_link(&staged_socket, &staged_hook).context("link staged hook socket")?;
+    let listener = tokio::net::UnixListener::from_std(listener)?;
+    *session.name.lock().expect("name lock poisoned") = session_name;
+    *session.socket.lock().expect("socket lock poisoned") = socket_path(&session.session_name());
+    *session
+        .hook_socket
+        .lock()
+        .expect("hook socket lock poisoned") = final_hook;
+    let mut control = received.stream;
+    let committed = tokio::task::spawn_blocking(move || {
+        handoff::ready(&mut control)?;
+        handoff::wait_commit(&mut control)?;
+        handoff::committed(&mut control)?;
+        // A lost acknowledgment can still roll the source back. Do not read
+        // output or acquire deletion rights until it releases ownership.
+        handoff::wait_release(&mut control)
+    })
+    .await
+    .context("join handoff commit")?;
+    committed?;
+    session.images.take_ownership();
+    for pane in session.panes.lock().expect("pane lock poisoned").values() {
+        pane.adopted_child_owned.store(true, Ordering::Release);
+        if let Some(context) = &pane._context_file {
+            context.owned.store(true, Ordering::Release);
+        }
+        pane.reader.resume();
+    }
+    // Every fallible staging operation completed before acknowledgment. The
+    // published listener is already registered with the replacement runtime.
+    serve_imported_listener(listener, session).await
+}
+
+async fn serve_imported_listener(listener: UnixListener, session: Arc<Session>) -> Result<()> {
+    let mut shutdown = session.shutdown.subscribe();
+    tokio::spawn(persist_loop(Arc::clone(&session)));
+    if session.pane_history {
+        tokio::spawn(history_loop(Arc::clone(&session)));
+    }
+    tokio::spawn(subscriber_tick(Arc::clone(&session)));
+    loop {
+        tokio::select! {
+            _ = shutdown.recv() => {
+                if session.upgraded.load(Ordering::Acquire) {
+                    std::process::exit(0);
+                }
+                persist::remove_session_file(&session.session_name());
+                drop(listener);
+                let _ = fs::remove_file(session.socket_path());
+                let _ = fs::remove_file(session.hook_socket());
+                return Ok(());
+            }
+            accepted = listener.accept() => {
+                let (stream, _) = accepted?;
+                let session = Arc::clone(&session);
+                tokio::spawn(async move { let _ = serve_client(stream, session).await; });
             }
         }
     }
@@ -633,8 +1074,12 @@ impl Session {
             events,
             subscribers: AtomicUsize::new(0),
             socket: Mutex::new(socket_path(&name_for_socket)),
-            hook_socket: hook_socket_path(),
+            hook_socket: Mutex::new(hook_socket_path()),
             view_dispatch: Mutex::new(()),
+            upgraded: AtomicBool::new(false),
+            upgrading: broadcast::channel(16).0,
+            upgrade_lock: Mutex::new(()),
+            handoff_active: AtomicBool::new(false),
         };
         let pane = session.new_pane("shell", None, None)?;
         let tab = Tab {
@@ -695,8 +1140,12 @@ impl Session {
             events,
             subscribers: AtomicUsize::new(0),
             socket: Mutex::new(socket_path(&file.name)),
-            hook_socket: hook_socket_path(),
+            hook_socket: Mutex::new(hook_socket_path()),
             view_dispatch: Mutex::new(()),
+            upgraded: AtomicBool::new(false),
+            upgrading: broadcast::channel(16).0,
+            upgrade_lock: Mutex::new(()),
+            handoff_active: AtomicBool::new(false),
         };
         let mut resumed_native_sessions = HashSet::new();
         let replay = if session.pane_history {
@@ -873,6 +1322,246 @@ impl Session {
         Ok(self.build_file())
     }
 
+    /// Snapshot layout ids and runtime state only after every source reader
+    /// acknowledges its pause. `CapturedHandoff` is the rollback authority.
+    #[allow(dead_code)] // Used by the live upgrade transaction.
+    fn capture_handoff(&self) -> Result<CapturedHandoff> {
+        let file = self.build_file_stable()?;
+        file.validate()?;
+        let panes: Vec<(PaneId, Arc<Pane>)> = self
+            .panes
+            .lock()
+            .map_err(|_| anyhow!("pane lock poisoned"))?
+            .iter()
+            .map(|(id, pane)| (*id, Arc::clone(pane)))
+            .collect();
+        if panes.len() > handoff::MAX_HANDOFF_FDS {
+            bail!("handoff supports at most 64 PTYs");
+        }
+        let mut captured = CapturedHandoff {
+            manifest: handoff::HandoffManifest::new(file, Vec::new())?,
+            fds: Vec::with_capacity(panes.len()),
+            paused: Vec::with_capacity(panes.len()),
+            committed: false,
+        };
+        let mut captured_bytes = 0;
+        for (id, pane) in panes {
+            let (mut runtime, fd) = pane.capture_handoff()?;
+            captured.paused.push(pane);
+            runtime.pane_id = id.0;
+            captured_bytes += serde_json::to_vec(&runtime)?.len();
+            if captured_bytes > handoff::MAX_MANIFEST_BYTES {
+                bail!("live runtime exceeds handoff limit of 128 MiB");
+            }
+            captured.manifest.panes.push(runtime);
+            captured.fds.push(fd);
+        }
+        captured.manifest.attachments = self.images.snapshot();
+        captured.manifest.notify_seq = self.notify_high_water();
+        captured.manifest.notifications = self
+            .notifications
+            .lock()
+            .map_err(|_| anyhow!("notification lock poisoned"))?
+            .clone();
+        captured.manifest.size = *self
+            .size
+            .lock()
+            .map_err(|_| anyhow!("size lock poisoned"))?;
+        captured.manifest.pane_history = self.pane_history;
+        Ok(captured)
+    }
+
+    /// Freeze source mutation and transfer ownership only after target readiness.
+    fn upgrade(&self, binary: Option<PathBuf>) -> Result<()> {
+        let _upgrade_lock = self
+            .upgrade_lock
+            .try_lock()
+            .map_err(|_| anyhow!("a live upgrade is already in progress"))?;
+        {
+            let _dispatch = self
+                .view_dispatch
+                .lock()
+                .map_err(|_| anyhow!("view dispatch lock poisoned"))?;
+            if self.handoff_active.swap(true, Ordering::AcqRel) {
+                bail!("a live upgrade is already in progress");
+            }
+        }
+        let mut active = HandoffActive(Some(&self.handoff_active));
+        let binary = match binary {
+            Some(binary) => binary,
+            None => {
+                let executable = std::env::current_exe().context("find current executable")?;
+                // Linux marks a running executable as deleted after an atomic
+                // update. The original path now names the verified replacement.
+                #[cfg(target_os = "linux")]
+                let executable = {
+                    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+                    if executable.exists() {
+                        executable
+                    } else {
+                        executable
+                            .as_os_str()
+                            .as_bytes()
+                            .strip_suffix(b" (deleted)")
+                            .map(|path| PathBuf::from(std::ffi::OsString::from_vec(path.to_vec())))
+                            .unwrap_or(executable)
+                    }
+                };
+                executable
+            }
+        };
+        let mut transaction = Replacement::new(self.socket_path(), self.hook_socket())?;
+        let listener = handoff::bind_listener(&transaction.handoff)?;
+        let token = handoff_nonce()?;
+        transaction.child = Some(
+            Command::new(&binary)
+                .arg("daemon")
+                .arg(self.session_name())
+                .arg("--import")
+                .arg(&transaction.handoff)
+                .env("KODADE_HANDOFF_TOKEN", &token)
+                .arg("--staged-socket")
+                .arg(&transaction.staged)
+                .arg("--staged-hook")
+                .arg(&transaction.staged_hook)
+                .arg("--hook-socket")
+                .arg(&transaction.hook)
+                .spawn()
+                .with_context(|| format!("start replacement daemon {}", binary.display()))?,
+        );
+        transaction.captured = Some(self.capture_handoff()?);
+        let captured = transaction.captured.as_ref().expect("captured runtime");
+        let mut control = handoff::accept_and_validate(&listener, &token, &captured.manifest)
+            .context("validate replacement daemon")?;
+        handoff::send_fds(&control, &captured.fds).context("transfer PTY masters")?;
+        handoff::wait_ready(&mut control).context("wait for replacement daemon")?;
+        fs::hard_link(&transaction.public, &transaction.public_backup)?;
+        transaction.public_saved = true;
+        fs::hard_link(&transaction.hook, &transaction.hook_backup)?;
+        transaction.hook_saved = true;
+        fs::rename(&transaction.staged, &transaction.public)?;
+        fs::rename(&transaction.staged_hook, &transaction.hook)?;
+        handoff::commit(&mut control).context("commit replacement daemon")?;
+        handoff::wait_committed(&mut control).context("acknowledge replacement daemon")?;
+        handoff::release(&mut control).context("release runtime ownership")?;
+        transaction.committed = true;
+        transaction
+            .captured
+            .as_mut()
+            .expect("captured runtime")
+            .committed = true;
+        active.0 = None;
+        Ok(())
+    }
+
+    /// Rebuild session layout with its original ids around imported PTY masters.
+    /// Readers remain paused until the transport ownership stage completes.
+    #[allow(dead_code)] // Called by the hidden handoff-import daemon mode.
+    unsafe fn import_handoff(manifest: handoff::HandoffManifest, fds: Vec<RawFd>) -> Result<Self> {
+        let fds: Vec<OwnedFd> = fds.into_iter().map(|fd| OwnedFd::from_raw_fd(fd)).collect();
+        manifest.session.validate()?;
+        if manifest.panes.len() != fds.len() {
+            bail!("handoff runtime/descriptor count mismatch");
+        }
+        let (updates, _) = broadcast::channel(64);
+        let (shutdown, _) = broadcast::channel(16);
+        let (events, _) = broadcast::channel(256);
+        let session = Self {
+            images: image_paste::Inbox::import(manifest.attachments)?,
+            name: Mutex::new(manifest.session.name.clone()),
+            state: Mutex::new(SessionState {
+                workspaces: Vec::new(),
+                active_workspace: WorkspaceId(manifest.session.active_workspace),
+                next_id: 0,
+            }),
+            panes: Mutex::new(HashMap::new()),
+            updates,
+            shutdown,
+            size: Mutex::new(manifest.size),
+            manifests: Mutex::new(manifest::load()?),
+            layout_generation: AtomicU64::new(0),
+            output_generation: Arc::new(AtomicU64::new(1)),
+            pane_history: manifest.pane_history,
+            restored: AtomicBool::new(false),
+            notifications: Mutex::new(manifest.notifications),
+            notify_seq: AtomicU64::new(manifest.notify_seq),
+            events,
+            subscribers: AtomicUsize::new(0),
+            socket: Mutex::new(socket_path(&manifest.session.name)),
+            hook_socket: Mutex::new(hook_socket_path()),
+            view_dispatch: Mutex::new(()),
+            upgraded: AtomicBool::new(false),
+            upgrading: broadcast::channel(16).0,
+            upgrade_lock: Mutex::new(()),
+            handoff_active: AtomicBool::new(false),
+        };
+        let mut runtimes: HashMap<u64, (handoff::PaneRuntime, OwnedFd)> = manifest
+            .panes
+            .into_iter()
+            .zip(fds)
+            .map(|(runtime, fd)| (runtime.pane_id, (runtime, fd)))
+            .collect();
+        let mut maximum = 0;
+        let mut workspaces = Vec::new();
+        for saved in manifest.session.workspaces {
+            maximum = maximum.max(saved.id).max(saved.active_tab);
+            let mut tabs = Vec::new();
+            for saved_tab in saved.tabs {
+                maximum = maximum.max(saved_tab.id).max(saved_tab.focused);
+                for saved_pane in &saved_tab.panes {
+                    maximum = maximum.max(saved_pane.id);
+                    let (runtime, fd) = runtimes
+                        .remove(&saved_pane.id)
+                        .ok_or_else(|| anyhow!("handoff missing pane {}", saved_pane.id))?;
+                    session
+                        .panes
+                        .lock()
+                        .map_err(|_| anyhow!("pane lock poisoned"))?
+                        .insert(
+                            PaneId(saved_pane.id),
+                            Arc::new(Pane::import_handoff(
+                                runtime,
+                                fd.into_raw_fd(),
+                                session.updates.clone(),
+                                Arc::clone(&session.output_generation),
+                            )?),
+                        );
+                }
+                tabs.push(Tab {
+                    id: TabId(saved_tab.id),
+                    name: saved_tab.name,
+                    tree: saved_tab.tree,
+                    focused: PaneId(saved_tab.focused),
+                    zoomed: saved_tab.zoomed,
+                });
+            }
+            workspaces.push(Workspace {
+                id: WorkspaceId(saved.id),
+                name: saved.name,
+                tabs,
+                active_tab: TabId(saved.active_tab),
+                root: saved.root,
+                env: saved.env,
+                color: saved.color,
+                branch: None,
+                main_worktree_root: None,
+                parent: None,
+                metadata_checked_at: None,
+            });
+        }
+        if !runtimes.is_empty() {
+            bail!("handoff includes panes outside the layout");
+        }
+        let mut state = session
+            .state
+            .lock()
+            .map_err(|_| anyhow!("state lock poisoned"))?;
+        state.workspaces = workspaces;
+        state.next_id = maximum;
+        drop(state);
+        Ok(session)
+    }
+
     /// Persist the current layout to this session's state file. Best-effort:
     /// errors are logged, never propagated to the client-facing loop.
     fn save(&self) {
@@ -947,7 +1636,10 @@ impl Session {
     }
 
     fn hook_socket(&self) -> PathBuf {
-        self.hook_socket.clone()
+        self.hook_socket
+            .lock()
+            .expect("hook socket lock poisoned")
+            .clone()
     }
 
     /// Publish a session event to subscribed connections. Never fails: with no
@@ -1357,6 +2049,11 @@ impl Session {
             return self.resize_for_view(view);
         }
         if let ClientMessage::ScrollPane { id, delta } = message {
+            let _dispatch = self
+                .view_dispatch
+                .lock()
+                .map_err(|_| anyhow!("view dispatch lock poisoned"))?;
+            self.ensure_mutation_open()?;
             let pane = self
                 .panes
                 .lock()
@@ -1375,6 +2072,7 @@ impl Session {
             .view_dispatch
             .lock()
             .map_err(|_| anyhow!("view dispatch lock poisoned"))?;
+        self.ensure_mutation_open()?;
         // Set the foreground application's dimensions before delivering input;
         // it may inspect its PTY immediately when the write wakes it.
         if matches!(message, ClientMessage::Input { .. }) {
@@ -1784,6 +2482,7 @@ impl Session {
             .view_dispatch
             .lock()
             .map_err(|_| anyhow!("view dispatch lock poisoned"))?;
+        self.ensure_mutation_open()?;
         if bytes.len() > MAX_PROMPT_BYTES {
             bail!("prompt exceeds the {MAX_PROMPT_BYTES}-byte automation limit");
         }
@@ -1966,6 +2665,7 @@ impl Session {
             .view_dispatch
             .lock()
             .map_err(|_| anyhow!("view dispatch lock poisoned"))?;
+        self.ensure_mutation_open()?;
         self.resize_view_locked(view)
     }
 
@@ -2031,7 +2731,15 @@ impl Session {
         Ok(pane.read_text(scrollback, lines))
     }
 
+    fn ensure_mutation_open(&self) -> Result<()> {
+        if self.handoff_active.load(Ordering::Acquire) {
+            bail!("daemon upgrade in progress");
+        }
+        Ok(())
+    }
+
     fn handle(&self, message: ClientMessage) -> Result<()> {
+        self.ensure_mutation_open()?;
         match message {
             // `Version` / `Session` / `Schema` queries, `Subscribe`, and
             // `ReadPane` are answered by `serve_client`; no state changes here.
@@ -2155,8 +2863,8 @@ impl Session {
                 pane.write(&bytes)?;
                 self.notify();
             }
-            ClientMessage::PasteImage { pane, data } => {
-                self.paste_image(pane, &data)?;
+            ClientMessage::PasteImage { .. } => {
+                bail!("image paste is handled by the socket server")
             }
             ClientMessage::RenamePaneId { id, name } => {
                 let panes = self
@@ -2172,6 +2880,7 @@ impl Session {
             ClientMessage::KillSession => {
                 let _ = self.shutdown.send(());
             }
+            ClientMessage::Upgrade { .. } => bail!("live upgrade is handled by the socket server"),
             ClientMessage::NewTab => {
                 let active = self
                     .state
@@ -3149,6 +3858,11 @@ impl Session {
     }
 
     fn paste_image(&self, id: PaneId, data: &str) -> Result<PathBuf> {
+        let _dispatch = self
+            .view_dispatch
+            .lock()
+            .map_err(|_| anyhow!("view dispatch lock poisoned"))?;
+        self.ensure_mutation_open()?;
         let pane = self
             .panes
             .lock()
@@ -3618,31 +4332,37 @@ impl Pane {
         command.env("KODADE_SOCKET", hook_socket);
         command.env("KODADE_SESSION", session);
         if let Some(context_file) = &context_file {
-            command.env("KODADE_PLUGIN_CONTEXT", &context_file.0);
+            command.env("KODADE_PLUGIN_CONTEXT", &context_file.path);
             command.env("KODADE_PLUGIN_CONTEXT_FORMAT", "json");
         }
         // Scripts inside a pane call the same binary that hosts them.
         if let Ok(exe) = env::current_exe() {
             command.env("KODADE_BIN", exe);
         }
+        let master_fd = pair
+            .master
+            .as_raw_fd()
+            .ok_or_else(|| anyhow!("PTY master has no Unix descriptor"))?;
+        let (reader, writer) = pty_io::pair(master_fd)?;
+        let writer = Arc::new(Mutex::new(writer));
         let child = pair
             .slave
             .spawn_command(command)
             .context("spawn login shell in PTY")?;
-        let writer = Arc::new(Mutex::new(pair.master.take_writer()?));
-        let reader = pair.master.try_clone_reader()?;
         let mut restored_parser = pty_parser(rows, cols, 10_000, PtyCallbacks::default());
         if let Some(replay) = replay.as_ref() {
             restore_screen(&mut restored_parser, &replay.screen, &replay.text);
         }
         let parser = Arc::new(Mutex::new(restored_parser));
         let last_output = Arc::new(Mutex::new(Instant::now()));
+        let reader_control = Arc::new(ReaderControl::new());
         read_pty(
             reader,
             Arc::clone(&parser),
             Arc::clone(&last_output),
             Arc::clone(&writer),
             updates,
+            Arc::clone(&reader_control),
             output_generation,
         );
         Ok(Self {
@@ -3651,12 +4371,15 @@ impl Pane {
             master: Mutex::new(pair.master),
             parser,
             last_output,
+            reader: reader_control,
             hook: Mutex::new(None),
             spawn_process,
             spawn_command: run,
             spawn_cwd: cwd,
+            child: Mutex::new(Some(child)),
+            adopted_child: None,
+            adopted_child_owned: AtomicBool::new(false),
             native_session: Mutex::new(None),
-            child: Mutex::new(child),
             process: Mutex::new(ProcessEvidence {
                 pid: None,
                 name: None,
@@ -3679,6 +4402,254 @@ impl Pane {
             snapshot_for_client(&mut parser),
             parser.screen().scrollback(),
         )
+    }
+
+    /// Freeze this pane's reader and capture only bounded, replayable terminal
+    /// state. The caller owns resuming it on every failed handoff path.
+    fn capture_handoff(&self) -> Result<(handoff::PaneRuntime, RawFd)> {
+        self.reader.pause(Duration::from_secs(2))?;
+        let result = (|| {
+            let fd = self
+                .master
+                .lock()
+                .map_err(|_| anyhow!("PTY master lock poisoned"))?
+                .as_raw_fd()
+                .ok_or_else(|| anyhow!("PTY master has no Unix descriptor"))?;
+            let parser = self
+                .parser
+                .lock()
+                .map_err(|_| anyhow!("PTY parser lock poisoned"))?;
+            let (screen_ansi, history) = terminal_handoff(&parser)?;
+            let child_pid = self
+                .child
+                .lock()
+                .map_err(|_| anyhow!("child lock poisoned"))?
+                .as_ref()
+                .and_then(|child| child.process_id())
+                .map(|pid| pid as i32)
+                .or_else(|| self.adopted_child.as_ref().map(|(pid, _)| *pid));
+            let now = Instant::now();
+            let output_age_ms = now
+                .saturating_duration_since(
+                    *self
+                        .last_output
+                        .lock()
+                        .map_err(|_| anyhow!("output lock poisoned"))?,
+                )
+                .as_millis()
+                .min(u128::from(u64::MAX)) as u64;
+            let hook = self
+                .hook
+                .lock()
+                .map_err(|_| anyhow!("hook lock poisoned"))?
+                .clone();
+            let state_guard = self
+                .state
+                .lock()
+                .map_err(|_| anyhow!("pane state lock poisoned"))?;
+            let state = state_guard.last;
+            let state_age_ms = now
+                .saturating_duration_since(state_guard.since)
+                .as_millis()
+                .min(u128::from(u64::MAX)) as u64;
+            Ok((
+                handoff::PaneRuntime {
+                    pane_id: 0,
+                    child_pid: child_pid.unwrap_or_default(),
+                    rows: parser.screen().size().0.get(),
+                    cols: parser.screen().size().1.get(),
+                    start_identity: child_pid.and_then(proc::start_identity),
+                    terminal_title: parser.callbacks().title.clone(),
+                    title: self
+                        .title
+                        .lock()
+                        .map_err(|_| anyhow!("title lock poisoned"))?
+                        .clone(),
+                    spawn_command: self.spawn_command.clone(),
+                    native_session: self
+                        .native_session
+                        .lock()
+                        .map_err(|_| anyhow!("native session lock poisoned"))?
+                        .clone(),
+                    context_file: self
+                        ._context_file
+                        .as_ref()
+                        .map(|context| context.path.clone()),
+                    cwd: self.saved_cwd(),
+                    agent_identity: self
+                        .agent_identity
+                        .lock()
+                        .map_err(|_| anyhow!("agent identity lock poisoned"))?
+                        .clone(),
+                    agent_generation: self.agent_generation.load(Ordering::Relaxed),
+                    activity_revision: self.activity_revision.load(Ordering::Relaxed),
+                    output_age_ms,
+                    state_age_ms,
+                    hook_age_ms: hook
+                        .as_ref()
+                        .map(|hook| {
+                            now.saturating_duration_since(hook.reported_at)
+                                .as_millis()
+                                .min(u128::from(u64::MAX)) as u64
+                        })
+                        .unwrap_or(0),
+                    hook_agent: hook.as_ref().and_then(|hook| hook.agent.clone()),
+                    hook_process_pid: hook.as_ref().and_then(|hook| hook.process_pid),
+                    hook_process_name: hook.as_ref().and_then(|hook| hook.process_name.clone()),
+                    hook_state: hook.as_ref().map(|hook| hook.state),
+                    hook_source: hook.map(|hook| hook.source),
+                    state,
+                    screen_ansi,
+                    history_ansi: history,
+                    graphics: graphics::HandoffState::capture(
+                        &parser.callbacks().graphics,
+                        &parser.callbacks().graphics_decoder,
+                        &parser.callbacks().graphics_tracker,
+                    )?,
+                    hyperlinks: Some(parser.callbacks().hyperlinks.capture_handoff()?),
+                    graphics_unicode: parser.callbacks().graphics_unicode.capture_handoff()?,
+                    graphics_virtual_style: parser
+                        .callbacks()
+                        .graphics_virtual_style
+                        .capture_handoff()?,
+                    clipboard: parser.callbacks().clipboard.clone(),
+                    graphics_placeholder: parser.callbacks().graphics_placeholder.clone(),
+                    sync_tail: parser.callbacks().sync_tail.clone(),
+                    sync_frozen: parser
+                        .callbacks()
+                        .sync_frozen
+                        .as_ref()
+                        .map(|(started, frame)| {
+                            (
+                                now.saturating_duration_since(*started)
+                                    .as_millis()
+                                    .min(u128::from(u64::MAX))
+                                    as u64,
+                                frame.clone(),
+                            )
+                        }),
+                },
+                fd,
+            ))
+        })();
+        if result.is_err() {
+            self.reader.resume();
+        }
+        result
+    }
+
+    /// Rebuild a pane around an SCM_RIGHTS master. It deliberately starts
+    /// paused: the source continues reading until the ownership stage commits.
+    unsafe fn import_handoff(
+        runtime: handoff::PaneRuntime,
+        fd: RawFd,
+        updates: broadcast::Sender<()>,
+        output_generation: Arc<AtomicU64>,
+    ) -> Result<Self> {
+        let master: Box<dyn MasterPty + Send> = Box::new(handoff::ImportedMaster::from_raw_fd(fd));
+        let master_fd = master
+            .as_raw_fd()
+            .ok_or_else(|| anyhow!("imported master has no fd"))?;
+        let (reader, writer) = pty_io::pair(master_fd)?;
+        let writer = Arc::new(Mutex::new(writer));
+        let mut parser = pty_parser(runtime.rows, runtime.cols, 10_000, PtyCallbacks::default());
+        parser.process(runtime.history_ansi.as_bytes());
+        parser.process(&runtime.screen_ansi);
+        parser.process(runtime.graphics.pending_text());
+        let (graphics, decoder, tracker) = runtime.graphics.restore();
+        parser.callbacks_mut().graphics = graphics;
+        parser.callbacks_mut().graphics_decoder = decoder;
+        parser.callbacks_mut().graphics_tracker = tracker;
+        parser.callbacks_mut().title = runtime.terminal_title;
+        parser.callbacks_mut().hyperlinks = runtime
+            .hyperlinks
+            .map(hyperlinks::Tracker::restore_handoff)
+            .unwrap_or_default();
+        parser.callbacks_mut().graphics_unicode =
+            graphics::UnicodeTracker::restore_handoff(runtime.graphics_unicode);
+        parser.callbacks_mut().graphics_virtual_style =
+            graphics::VirtualStyle::restore_handoff(runtime.graphics_virtual_style);
+        parser.callbacks_mut().clipboard = runtime.clipboard;
+        parser.callbacks_mut().graphics_placeholder = runtime.graphics_placeholder;
+        parser.callbacks_mut().sync_tail = runtime.sync_tail;
+        parser.callbacks_mut().sync_frozen = runtime.sync_frozen.map(|(age, frame)| {
+            (
+                Instant::now()
+                    .checked_sub(Duration::from_millis(age))
+                    .unwrap_or_else(Instant::now),
+                frame,
+            )
+        });
+        let parser = Arc::new(Mutex::new(parser));
+        let last_output = Arc::new(Mutex::new(
+            Instant::now()
+                .checked_sub(Duration::from_millis(runtime.output_age_ms))
+                .unwrap_or_else(Instant::now),
+        ));
+        let context_file = runtime.context_file.map(ContextFile::import).transpose()?;
+        let reader_control = Arc::new(ReaderControl::paused());
+        read_pty(
+            reader,
+            Arc::clone(&parser),
+            Arc::clone(&last_output),
+            Arc::clone(&writer),
+            updates,
+            Arc::clone(&reader_control),
+            output_generation,
+        );
+        Ok(Self {
+            title: Mutex::new(runtime.title),
+            writer,
+            master: Mutex::new(master),
+            parser,
+            last_output,
+            reader: reader_control,
+            hook: Mutex::new(
+                runtime
+                    .hook_state
+                    .zip(runtime.hook_source)
+                    .map(|(state, source)| ReportedHook {
+                        state,
+                        source,
+                        agent: runtime.hook_agent,
+                        process_pid: runtime.hook_process_pid,
+                        process_name: runtime.hook_process_name,
+                        reported_at: Instant::now()
+                            .checked_sub(Duration::from_millis(runtime.hook_age_ms))
+                            .unwrap_or_else(Instant::now),
+                    }),
+            ),
+            spawn_process: runtime
+                .spawn_command
+                .as_ref()
+                .and_then(|command| command.first())
+                .and_then(|command| proc::process_basename(command))
+                .unwrap_or_else(|| "unknown".into()),
+            spawn_command: runtime.spawn_command,
+            spawn_cwd: runtime.cwd,
+            native_session: Mutex::new(runtime.native_session.filter(valid_native_session)),
+            _context_file: context_file,
+            child: Mutex::new(None),
+            adopted_child_owned: AtomicBool::new(false),
+            adopted_child: runtime
+                .start_identity
+                .map(|start| (runtime.child_pid, start)),
+            process: Mutex::new(ProcessEvidence {
+                pid: (runtime.child_pid > 0).then_some(runtime.child_pid),
+                name: None,
+                cwd: None,
+                checked_at: Instant::now() - Duration::from_secs(2),
+            }),
+            state: Mutex::new(PaneState {
+                last: runtime.state,
+                since: Instant::now()
+                    .checked_sub(Duration::from_millis(runtime.state_age_ms))
+                    .unwrap_or_else(Instant::now),
+            }),
+            agent_generation: AtomicU64::new(runtime.agent_generation),
+            agent_identity: Mutex::new(runtime.agent_identity),
+            activity_revision: AtomicU64::new(runtime.activity_revision),
+        })
     }
     /// Render a requested historical offset without leaving the shared parser
     /// scrolled for another client. `set_scrollback` clamps to available history.
@@ -4260,26 +5231,72 @@ fn is_hex_color(value: &str) -> bool {
         .is_some_and(|rest| rest.len() == 6 && rest.bytes().all(|b| b.is_ascii_hexdigit()))
 }
 
-/// PTY reading blocks, so parser ownership stays in Tokio's blocking pool.
+/// Poll a private duplicate of the PTY master. Polling at 50 ms bounds the
+/// handoff pause acknowledgement without changing flags on the shared writer.
 fn read_pty(
-    mut reader: Box<dyn Read + Send>,
+    mut reader: fs::File,
     parser: Arc<Mutex<PtyParser>>,
     last_output: Arc<Mutex<Instant>>,
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
     updates: broadcast::Sender<()>,
+    control: Arc<ReaderControl>,
     output_generation: Arc<AtomicU64>,
 ) {
     tokio::task::spawn_blocking(move || {
-        let mut decoder = graphics::Decoder::default();
         let mut bytes = [0_u8; 4096];
-        while let Ok(count) = reader.read(&mut bytes) {
+        loop {
+            if !control.wait_if_paused() {
+                break;
+            }
+            let mut ready = libc::pollfd {
+                fd: reader.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let polled = unsafe { libc::poll(&mut ready, 1, 50) };
+            if polled < 0 {
+                if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                break;
+            }
+            if polled == 0 {
+                continue;
+            }
+            if ready.revents & libc::POLLIN == 0 {
+                if ready.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 {
+                    break;
+                }
+                continue;
+            }
+            // A pause may have arrived while poll was asleep; acknowledge it
+            // before consuming the readable byte stream.
+            if !control.wait_if_paused() {
+                break;
+            }
+            let count = match reader.read(&mut bytes) {
+                Ok(count) => count,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                    ) =>
+                {
+                    continue
+                }
+                Err(_) => break,
+            };
             if count == 0 {
                 break;
             }
             let mut replies = Vec::new();
             {
                 let mut parser = parser.lock().expect("PTY parser lock poisoned");
-                for token in decoder.feed(&bytes[..count]) {
+                let tokens = parser
+                    .callbacks_mut()
+                    .graphics_decoder
+                    .feed(&bytes[..count]);
+                for token in tokens {
                     match token {
                         graphics::Token::Invalid => {
                             parser.callbacks_mut().graphics.cancel_transfer()
@@ -4418,6 +5435,12 @@ fn resize_parser(parser: &mut PtyParser, rows: u16, cols: u16) {
     callbacks.graphics = graphics;
     callbacks.graphics_tracker.reset_resize();
     callbacks.hyperlinks.resize(rows, cols);
+}
+
+/// Inspect cloned grids so capturing an editor's alternate screen cannot
+/// mutate its live parser or discard the shell beneath it.
+fn terminal_handoff(parser: &PtyParser) -> Result<(Vec<u8>, String)> {
+    terminal_replay::terminal_handoff(parser)
 }
 
 /// Collect the pane's full scrollback plus visible screen as plain-text lines,
@@ -4734,6 +5757,7 @@ async fn serve_client(stream: UnixStream, session: Arc<Session>) -> Result<()> {
     let mut updates = session.updates.subscribe();
     let mut events = session.events.subscribe();
     let mut shutdown = session.shutdown.subscribe();
+    let mut upgrading = session.upgrading.subscribe();
     // Set by `Subscribe`: this connection then receives every session event.
     let mut subscribed = false;
     let mut subscription: Option<SubscriberGuard> = None;
@@ -4844,7 +5868,11 @@ async fn serve_client(stream: UnixStream, session: Arc<Session>) -> Result<()> {
                         continue;
                     }
                     ClientMessage::ReloadManifests => {
-                        match session.reload_manifests() {
+                        let result = {
+                            let _dispatch = session.view_dispatch.lock().map_err(|_| anyhow!("view dispatch lock poisoned"))?;
+                            session.ensure_mutation_open().and_then(|()| session.reload_manifests())
+                        };
+                        match result {
                             Ok(manifests) => {
                                 write_server(&mut writer, &ServerMessage::Manifests(manifests)).await?;
                             }
@@ -4854,6 +5882,31 @@ async fn serve_client(stream: UnixStream, session: Arc<Session>) -> Result<()> {
                             }
                         }
                         continue;
+                    }
+                    ClientMessage::Upgrade { binary } => {
+                        let session_for_upgrade = Arc::clone(&session);
+                        let result = tokio::task::spawn_blocking(move || session_for_upgrade.upgrade(binary))
+                            .await
+                            .context("join live upgrade")?;
+                        match result {
+                            Ok(()) => {
+                                session.upgraded.store(true, Ordering::Release);
+                                let _ = session.upgrading.send(());
+                                let shutdown = session.shutdown.clone();
+                                // This must outlive the requesting socket: a client can vanish
+                                // immediately after committing a valid replacement.
+                                tokio::spawn(async move {
+                                    tokio::time::sleep(Duration::from_millis(50)).await;
+                                    let _ = shutdown.send(());
+                                });
+                                let _ = write_server(&mut writer, &ServerMessage::Upgrading).await;
+                                return Ok(());
+                            }
+                            Err(error) => {
+                                write_server(&mut writer, &ServerMessage::Error { message: format!("{error:#}") }).await?;
+                                continue;
+                            }
+                        }
                     }
                     ClientMessage::Subscribe => {
                         // Counted once per connection; the guard decrements it
@@ -4953,6 +6006,10 @@ async fn serve_client(stream: UnixStream, session: Arc<Session>) -> Result<()> {
             },
             _ = shutdown.recv() => {
                 write_server(&mut writer, &ServerMessage::Shutdown).await?;
+                return Ok(());
+            },
+            _ = upgrading.recv() => {
+                write_server(&mut writer, &ServerMessage::Upgrading).await?;
                 return Ok(());
             },
         }
@@ -5587,13 +6644,92 @@ mod tests {
             .expect("panes")
             .get(&pane)
             .and_then(|pane| pane._context_file.as_ref())
-            .map(|file| file.0.clone())
+            .map(|file| file.path.clone())
             .expect("daemon context file");
         assert!(path.exists());
         session
             .handle(ClientMessage::ClosePane)
             .expect("close pane");
         assert!(!path.exists(), "closing a pane releases its context file");
+    }
+
+    #[tokio::test]
+    async fn handoff_keeps_native_environment_history_and_staged_context_ownership() {
+        let mut source = Session::spawn(76, 21, "handoff-runtime".into()).unwrap();
+        source.pane_history = true;
+        source.state.lock().unwrap().workspaces[0]
+            .env
+            .insert("HANDOFF_VALUE".into(), "kept".into());
+        source
+            .handle(ClientMessage::NewPane {
+                workspace: None,
+                tab: None,
+                split: None,
+                command: Some(vec!["sleep".into(), "60".into()]),
+                name: Some("context".into()),
+                context: Some(Box::new(InvocationContext {
+                    selected_text: Some("live context".into()),
+                    ..Default::default()
+                })),
+            })
+            .unwrap();
+        let pane_id = source
+            .snapshot()
+            .unwrap()
+            .panes
+            .into_iter()
+            .find(|pane| pane.focused)
+            .unwrap()
+            .id;
+        let native = NativeSession {
+            source: "kodade:codex".into(),
+            agent: "codex".into(),
+            id: Some("handoff-conversation".into()),
+            path: None,
+        };
+        let path = {
+            let panes = source.panes.lock().unwrap();
+            let pane = &panes[&pane_id];
+            *pane.native_session.lock().unwrap() = Some(native.clone());
+            pane._context_file.as_ref().unwrap().path.clone()
+        };
+        source.notify_seq.store(99, Ordering::Relaxed);
+        let captured = source.capture_handoff().unwrap();
+        let fds = captured
+            .fds
+            .iter()
+            .map(|fd| {
+                let copy = unsafe { libc::fcntl(*fd, libc::F_DUPFD_CLOEXEC, 0) };
+                assert!(copy >= 0);
+                copy
+            })
+            .collect();
+        let imported = unsafe { Session::import_handoff(captured.manifest.clone(), fds) }.unwrap();
+        assert_eq!(*imported.size.lock().unwrap(), (76, 21));
+        assert!(imported.pane_history);
+        assert_eq!(imported.notify_high_water(), 99);
+        assert_eq!(
+            imported.state.lock().unwrap().workspaces[0].env["HANDOFF_VALUE"],
+            "kept"
+        );
+        assert_eq!(
+            *imported.panes.lock().unwrap()[&pane_id]
+                .native_session
+                .lock()
+                .unwrap(),
+            Some(native)
+        );
+        drop(imported);
+        assert!(
+            path.exists(),
+            "failed target must preserve the source action context"
+        );
+        drop(captured);
+        source.handle(ClientMessage::ClosePane).unwrap();
+        assert!(
+            !path.exists(),
+            "source still owns context cleanup after rollback"
+        );
     }
 
     #[tokio::test]
@@ -5677,6 +6813,47 @@ mod tests {
             ),
             PathBuf::from("/tmp/kodade-cli-501/default.sock")
         );
+    }
+    #[test]
+    fn long_handoff_staging_uses_a_short_alias_on_the_same_filesystem() {
+        let base = PathBuf::from("/tmp").join(format!(
+            "kodade-handoff-{}-{}",
+            std::process::id(),
+            "x".repeat(80)
+        ));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir(&base).expect("create long staging parent");
+        let directory = base.join(".up-0123456789abcdef");
+        let replacement = Replacement::new_in(
+            directory.clone(),
+            base.join("session.sock"),
+            base.join("hooks.sock"),
+        )
+        .expect("create replacement with a short staging alias");
+        let alias = replacement
+            .staging_alias
+            .clone()
+            .expect("long staging path uses an alias");
+        assert!(socket_path_fits(&replacement.handoff));
+        assert!(socket_path_fits(&replacement.staged));
+        assert!(socket_path_fits(&replacement.staged_hook));
+        assert_eq!(
+            fs::canonicalize(replacement.staged.parent().expect("staging parent")).unwrap(),
+            fs::canonicalize(&directory).unwrap(),
+            "the short bind path must resolve into the public socket directory"
+        );
+        let listener = handoff::bind_listener(&replacement.staged).expect("bind via staging alias");
+        fs::hard_link(&replacement.staged, &replacement.staged_hook)
+            .expect("link staged hook through alias");
+        fs::rename(&replacement.staged, &replacement.public)
+            .expect("atomically publish socket from the staging directory");
+        drop(listener);
+        drop(replacement);
+        assert!(
+            fs::symlink_metadata(alias).is_err(),
+            "staging alias is removed with the transaction"
+        );
+        fs::remove_dir_all(base).expect("remove long staging parent");
     }
     #[test]
     fn session_names_are_safe_single_path_components() {
@@ -6099,6 +7276,229 @@ mod tests {
         assert_eq!(pane.snapshot().1, oldest);
         pane.scroll(i16::MIN);
         assert_eq!(pane.snapshot().1, 0);
+    }
+
+    #[tokio::test]
+    async fn closing_hup_and_term_ignoring_pty_child_is_bounded_and_reaps_it() {
+        let (updates, _) = broadcast::channel(1);
+        let pane = Pane::spawn(
+            PaneId(1),
+            "stubborn",
+            40,
+            4,
+            "close-stubborn-pane".into(),
+            hook_socket_path(),
+            updates,
+            Arc::new(AtomicU64::new(0)),
+            None,
+            Some(vec![
+                "sh".into(),
+                "-c".into(),
+                "trap '' HUP TERM; printf 'READY\\n'; while :; do :; done".into(),
+            ]),
+            None,
+            None,
+            HashMap::new(),
+        )
+        .expect("spawn stubborn PTY child");
+        let ready_deadline = Instant::now() + Duration::from_secs(2);
+        while !pane.snapshot().0.contents.contains("READY") {
+            assert!(
+                Instant::now() < ready_deadline,
+                "stubborn PTY child did not install its signal traps"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let pid = pane
+            .child
+            .lock()
+            .expect("child")
+            .as_ref()
+            .and_then(|child| child.process_id())
+            .expect("PTY child has a PID") as i32;
+
+        let started = Instant::now();
+        drop(pane);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "closing a stubborn PTY child blocked for {:?}",
+            started.elapsed()
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while unsafe { libc::kill(pid, 0) } == 0 {
+            assert!(Instant::now() < deadline, "PTY child {pid} survived close");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[tokio::test]
+    async fn paused_pty_reader_stops_parser_until_resumed() {
+        let (updates, _) = broadcast::channel(8);
+        let pane = Pane::spawn(
+            PaneId(1), "ticker", 40, 4, "pause-test".into(), hook_socket_path(), updates,
+            Arc::new(AtomicU64::new(0)), None,
+            Some(vec!["sh".into(), "-c".into(), "i=0; while [ $i -lt 40 ]; do printf 'tick-%s\\n' \"$i\"; i=$((i+1)); sleep 0.03; done".into()]),
+            None, None, HashMap::new(),
+        ).expect("spawn ticker");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !pane.snapshot().0.contents.contains("tick-") {
+            assert!(Instant::now() < deadline, "ticker did not start");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        pane.reader
+            .pause(Duration::from_secs(1))
+            .expect("reader acknowledges pause");
+        let before = pane.snapshot().0.contents;
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(
+            pane.snapshot().0.contents,
+            before,
+            "reader consumed output after acknowledging pause"
+        );
+        pane.reader.resume();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while pane.snapshot().0.contents == before {
+            assert!(
+                Instant::now() < deadline,
+                "reader did not catch buffered output after resume"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    #[test]
+    fn paused_reader_shutdown_wakes_without_hanging() {
+        let control = Arc::new(ReaderControl::new());
+        let reader = Arc::clone(&control);
+        let worker = std::thread::spawn(move || reader.wait_if_paused());
+        // The first worker call can return before pause is requested. Exercise
+        // the blocked state deterministically with a second waiting thread.
+        let _ = worker.join();
+        let reader = Arc::clone(&control);
+        let worker = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(10));
+            reader.wait_if_paused()
+        });
+        control
+            .pause(Duration::from_secs(1))
+            .expect("reader paused");
+        control.shutdown();
+        assert!(!worker.join().expect("reader thread joins"));
+    }
+
+    #[tokio::test]
+    async fn direct_mutators_reject_a_handoff_before_writing_or_creating_attachments() {
+        let session = Session::spawn(40, 8, "handoff-guard".into()).unwrap();
+        let pane = session.snapshot().unwrap().panes[0].id;
+        session.handoff_active.store(true, Ordering::Release);
+        assert!(session
+            .prompt_agent(pane, "codex", 0, b"must not execute\n")
+            .unwrap_err()
+            .to_string()
+            .contains("upgrade in progress"));
+        assert!(session
+            .paste_image(pane, "invalid PNG")
+            .unwrap_err()
+            .to_string()
+            .contains("upgrade in progress"));
+        assert!(session.images.snapshot().is_none());
+        assert!(session.handoff_active.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn imported_master_replays_screen_and_reads_only_after_ownership_stage() {
+        let (updates, _) = broadcast::channel(8);
+        let source = Pane::spawn(
+            PaneId(1),
+            "cat",
+            40,
+            4,
+            "import-test".into(),
+            hook_socket_path(),
+            updates.clone(),
+            Arc::new(AtomicU64::new(0)),
+            None,
+            Some(vec!["cat".into()]),
+            None,
+            None,
+            HashMap::new(),
+        )
+        .expect("spawn cat");
+        source.write(b"before-handoff\n").expect("write source");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        source.agent_generation.store(9, Ordering::Relaxed);
+        source.activity_revision.store(4, Ordering::Relaxed);
+        source.parser.lock().unwrap().callbacks_mut().title = "editor status".into();
+        {
+            let mut parser = source.parser.lock().unwrap();
+            graphics_text(
+                &mut parser,
+                b"\x1b]8;;https://handoff.test\x1b\\link\x1b]8;;\x1b\\\x1b[38;5;42m",
+            );
+        }
+        let (runtime, fd) = source.capture_handoff().expect("pause and capture source");
+        let (sender, receiver) = std::os::unix::net::UnixStream::pair().expect("socket pair");
+        let transfer =
+            std::thread::spawn(move || handoff::send_fds(&sender, &[fd]).expect("send master"));
+        let received = handoff::recv_fds(&receiver, 1).expect("receive master");
+        transfer.join().expect("transfer joins");
+        let imported = unsafe {
+            Pane::import_handoff(runtime, received[0], updates, Arc::new(AtomicU64::new(0)))
+        }
+        .expect("import master");
+        assert!(imported.snapshot().0.contents.contains("before-handoff"));
+        assert_eq!(imported.agent_generation.load(Ordering::Relaxed), 9);
+        assert_eq!(imported.activity_revision.load(Ordering::Relaxed), 4);
+        assert_eq!(
+            imported.parser.lock().unwrap().callbacks().title,
+            "editor status"
+        );
+        {
+            let parser = imported.parser.lock().unwrap();
+            assert_eq!(
+                parser.callbacks().graphics_virtual_style.ids(),
+                Some((42, 0))
+            );
+            assert!(parser
+                .callbacks()
+                .hyperlinks
+                .ranges(false, 0)
+                .iter()
+                .any(|link| link.uri == "https://handoff.test"));
+        }
+        let frozen = imported.snapshot().0.contents;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            imported.snapshot().0.contents,
+            frozen,
+            "target reader started before ownership stage"
+        );
+        imported.reader.resume();
+        imported.write(b"after-handoff\n").expect("write imported");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(imported.snapshot().0.contents.contains("after-handoff"));
+        source.reader.resume();
+    }
+
+    #[test]
+    fn handoff_restores_both_terminal_buffers_and_saved_cursor() {
+        let mut source = pty_parser(6, 30, 100, PtyCallbacks::default());
+        source.process(b"shell line\r\nshell prompt> ");
+        let primary = source.screen().contents_formatted();
+        source.process(b"\x1b[?1049h\x1b[31meditor contents\x1b[0m\x1b[3;5H\x1b7\x1b[5;9H");
+        let alternate = source.screen().contents_formatted();
+        let (screen, history) = terminal_handoff(&source).unwrap();
+        let mut target = pty_parser(6, 30, 100, PtyCallbacks::default());
+        target.process(history.as_bytes());
+        target.process(&screen);
+        assert!(target.screen().alternate_screen());
+        assert_eq!(target.screen().contents_formatted(), alternate);
+        target.process(b"\x1b8");
+        assert_eq!(target.screen().cursor_position(), (2, 4));
+        target.process(b"\x1b[?1049l");
+        assert!(!target.screen().alternate_screen());
+        assert_eq!(target.screen().contents_formatted(), primary);
     }
 
     #[test]

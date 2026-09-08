@@ -192,15 +192,19 @@ pub fn spawn_machine(
     tokio::spawn(async move {
         let mut commands = commands;
         let mut retry = 0u8;
-        let mut cols = cols;
-        let mut rows = rows;
+        let mut viewport = crate::local_endpoint::Viewport {
+            cols,
+            rows,
+            compact: false,
+        };
+        let mut view = crate::reconnect_view::View::default();
         let mut remote_session = profile.session.clone().unwrap_or(session);
         loop {
             let result = connect_machine(
                 &profile,
                 &remote_session,
-                &mut cols,
-                &mut rows,
+                &mut viewport,
+                &mut view,
                 &updates,
                 &mut commands,
             )
@@ -237,11 +241,16 @@ pub fn spawn_machine(
 async fn connect_machine(
     profile: &MachineProfile,
     session: &str,
-    cols: &mut u16,
-    rows: &mut u16,
+    viewport: &mut crate::local_endpoint::Viewport,
+    view: &mut crate::reconnect_view::View,
     updates: &Updates,
     commands: &mut mpsc::Receiver<ClientMessage>,
 ) -> Result<Option<String>> {
+    let crate::local_endpoint::Viewport {
+        cols,
+        rows,
+        compact,
+    } = viewport;
     let (socket, _tunnel) = tokio::select! {
         result = tokio::time::timeout(Duration::from_secs(12), remote::connect_endpoint(&profile.target, session)) => {
             result.context("SSH endpoint setup timed out")??
@@ -288,9 +297,45 @@ async fn connect_machine(
     })
     .await
     .context("endpoint handshake timed out")??;
+    write_endpoint(
+        &mut writer,
+        &ClientMessage::SetCompactView { enabled: *compact },
+    )
+    .await?;
+    for message in view.restore() {
+        write_endpoint(&mut writer, &message).await?;
+    }
+    // A reconnect never replays pending input, including keys queued before
+    // the renderer received the disconnect event.
+    while let Ok(message) = commands.try_recv() {
+        match message {
+            ClientMessage::Resize {
+                cols: next_cols,
+                rows: next_rows,
+            } => {
+                *cols = next_cols;
+                *rows = next_rows;
+            }
+            ClientMessage::SetCompactView { enabled } => *compact = enabled,
+            _ => {}
+        }
+    }
+    write_endpoint(
+        &mut writer,
+        &ClientMessage::Resize {
+            cols: *cols,
+            rows: *rows,
+        },
+    )
+    .await?;
+    write_endpoint(
+        &mut writer,
+        &ClientMessage::SetCompactView { enabled: *compact },
+    )
+    .await?;
     updates
         .send(app::Update::EndpointConnected {
-            session: connected_session,
+            session: connected_session.clone(),
             socket: socket.clone(),
         })
         .await
@@ -306,12 +351,19 @@ async fn connect_machine(
                     write_endpoint(&mut writer, &ClientMessage::Resize { cols: next_cols, rows: next_rows }).await?;
                     continue;
                 }
+                if let ClientMessage::SetCompactView { enabled } = command {
+                    *compact = enabled;
+                }
                 write_endpoint(&mut writer, &command).await?;
             }
             line = lines.next_line() => {
                 let line = line?.ok_or_else(|| anyhow!("endpoint closed"))?;
                 let update = match decode(line.as_bytes()) {
-                    Ok(ServerMessage::Layout(layout)) => Some(app::Update::Layout(layout)),
+                    Ok(ServerMessage::Layout(layout)) => { view.observe(&layout); Some(app::Update::Layout(layout)) },
+                    Ok(ServerMessage::Upgrading) => {
+                        updates.send(app::Update::EndpointFailed { reason: "daemon upgrading; reconnecting".into() }).await?;
+                        return Ok(Some(connected_session));
+                    }
                     Ok(ServerMessage::Clipboard { pane, text }) => Some(app::Update::Clipboard { pane, text }),
                     Ok(ServerMessage::Welcome { session, .. }) => Some(app::Update::Session(session)),
                     Ok(ServerMessage::Notification(notification)) | Ok(ServerMessage::Event(kodade_cli_proto::Event::Notification(notification))) => Some(app::Update::Notification(notification)),

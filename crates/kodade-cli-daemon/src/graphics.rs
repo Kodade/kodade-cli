@@ -7,6 +7,7 @@ use std::collections::{BTreeMap, HashSet};
 use anyhow::{bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use kodade_cli_proto::{ImageData, ImagePlacement};
+use serde::{Deserialize, Serialize};
 use unicode_width::UnicodeWidthChar;
 
 const MAX_IMAGE: usize = 8 * 1024 * 1024;
@@ -28,25 +29,83 @@ pub struct NormalizedByte {
 pub struct UnicodeTracker {
     parser: vte::Parser,
     chars: UnicodeChars,
+    pending: Vec<u8>,
+    overflow: bool,
 }
 
 #[derive(Default)]
-struct UnicodeChars(Vec<char>);
+struct UnicodeChars(Vec<char>, bool);
 
 impl vte::Perform for UnicodeChars {
     fn print(&mut self, c: char) {
         self.0.push(c);
+        self.1 = true;
+    }
+    fn execute(&mut self, byte: u8) {
+        self.1 = matches!(byte, 0x18 | 0x1a);
+    }
+    fn esc_dispatch(&mut self, _: &[u8], _: bool, _: u8) {
+        self.1 = true;
+    }
+    fn csi_dispatch(&mut self, _: &vte::Params, _: &[u8], _: bool, _: char) {
+        self.1 = true;
+    }
+    fn osc_dispatch(&mut self, _: &[&[u8]], _: bool) {
+        self.1 = true;
+    }
+    fn unhook(&mut self) {
+        self.1 = true;
     }
 }
 
 impl UnicodeTracker {
     pub fn feed(&mut self, byte: u8) -> Vec<char> {
         self.chars.0.clear();
+        self.chars.1 = false;
+        let standalone = self.pending.is_empty() && byte < 32 && byte != 27;
+        if self.pending.len() < MAX_FRAME {
+            self.pending.push(byte);
+        } else {
+            self.overflow = true;
+        }
         let mut parser = std::mem::take(&mut self.parser);
         parser.advance(&mut self.chars, &[byte]);
         self.parser = parser;
+        if self.chars.1 || standalone {
+            self.pending.clear();
+            self.overflow = false;
+            // OSC/DCS dispatch at ESC finishes the string, leaving the parser
+            // inside the new escape sequence until the next byte arrives.
+            if byte == 27 {
+                self.pending.push(byte);
+            }
+        }
         std::mem::take(&mut self.chars.0)
     }
+    pub fn capture_handoff(&self) -> Result<UnicodeHandoff> {
+        if self.overflow {
+            bail!("unfinished unicode sequence exceeds handoff limit");
+        }
+        Ok(UnicodeHandoff {
+            pending: self.pending.clone(),
+        })
+    }
+    pub fn restore_handoff(state: UnicodeHandoff) -> Self {
+        let mut result = Self {
+            pending: state.pending,
+            ..Default::default()
+        };
+        let pending = result.pending.clone();
+        result.parser.advance(&mut result.chars, &pending);
+        result.chars.0.clear();
+        result.chars.1 = false;
+        result
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct UnicodeHandoff {
+    pending: Vec<u8>,
 }
 
 // Kitty's ordered row/column diacritic table. Its index, rather than the
@@ -113,22 +172,90 @@ pub struct VirtualStyle {
     parser: vte::Parser,
     foreground: Option<u32>,
     underline: Option<u32>,
+    pending: Vec<u8>,
+    complete: bool,
+    overflow: bool,
 }
 
 impl VirtualStyle {
     pub fn feed(&mut self, byte: u8) {
+        self.complete = false;
+        let standalone = self.pending.is_empty() && byte < 32 && byte != 27;
+        if self.pending.len() < MAX_FRAME {
+            self.pending.push(byte);
+        } else {
+            self.overflow = true;
+        }
         let mut parser = std::mem::take(&mut self.parser);
         parser.advance(self, &[byte]);
         self.parser = parser;
+        if self.complete || standalone {
+            self.pending.clear();
+            self.overflow = false;
+            if byte == 27 {
+                self.pending.push(byte);
+            }
+        }
     }
     pub fn ids(&self) -> Option<(u32, u32)> {
         self.foreground
             .map(|image| (image, self.underline.unwrap_or(0)))
     }
+    pub fn capture_handoff(&self) -> Result<VirtualStyleHandoff> {
+        if self.overflow {
+            bail!("unfinished SGR sequence exceeds handoff limit");
+        }
+        Ok(VirtualStyleHandoff {
+            foreground: self.foreground,
+            underline: self.underline,
+            pending: self.pending.clone(),
+        })
+    }
+    pub fn restore_handoff(state: VirtualStyleHandoff) -> Self {
+        let mut result = Self {
+            foreground: state.foreground,
+            underline: state.underline,
+            pending: state.pending,
+            ..Default::default()
+        };
+        let pending = result.pending.clone();
+        let mut parser = std::mem::take(&mut result.parser);
+        parser.advance(&mut result, &pending);
+        result.parser = parser;
+        result.complete = false;
+        result
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct VirtualStyleHandoff {
+    foreground: Option<u32>,
+    underline: Option<u32>,
+    pending: Vec<u8>,
 }
 
 impl vte::Perform for VirtualStyle {
+    fn print(&mut self, _: char) {
+        self.complete = true;
+    }
+    fn execute(&mut self, byte: u8) {
+        self.complete = matches!(byte, 0x18 | 0x1a);
+    }
+    fn esc_dispatch(&mut self, intermediate: &[u8], ignore: bool, byte: u8) {
+        self.complete = true;
+        if !ignore && intermediate.is_empty() && byte == b'c' {
+            self.foreground = None;
+            self.underline = None;
+        }
+    }
+    fn osc_dispatch(&mut self, _: &[&[u8]], _: bool) {
+        self.complete = true;
+    }
+    fn unhook(&mut self) {
+        self.complete = true;
+    }
     fn csi_dispatch(&mut self, params: &vte::Params, _: &[u8], ignore: bool, command: char) {
+        self.complete = true;
         if ignore || command != 'm' {
             return;
         }
@@ -185,7 +312,7 @@ pub enum Token {
     Invalid,
 }
 
-#[derive(Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Decoder {
     pending: Vec<u8>,
     graphics: bool,
@@ -248,12 +375,13 @@ impl Decoder {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct Transfer {
     params: BTreeMap<String, String>,
     encoded: Vec<u8>,
 }
 
-#[derive(Default)]
+#[derive(Debug, Clone, Default)]
 pub struct Store {
     images: BTreeMap<u32, ImageData>,
     image_numbers: BTreeMap<u32, u32>,
@@ -268,7 +396,7 @@ pub struct Store {
     last_virtual_cell: Option<(bool, i32, u16)>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct StoredPlacement {
     alternate: bool,
     placement: ImagePlacement,
@@ -278,7 +406,7 @@ struct StoredPlacement {
     relative_offset: (i32, i32),
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 struct VirtualCell {
     image_low: u32,
     placement: Option<u32>,
@@ -307,10 +435,12 @@ pub struct Tracker {
     parser: vte::Parser,
     events: Controls,
     margins: [Option<(u16, u16)>; 2],
+    pending: Vec<u8>,
+    overflow: bool,
 }
 
 #[derive(Default)]
-struct Controls(Option<Control>);
+struct Controls(Option<Control>, bool);
 enum Control {
     Print(char),
     Index,
@@ -331,14 +461,17 @@ enum Control {
 
 impl vte::Perform for Controls {
     fn print(&mut self, c: char) {
+        self.1 = true;
         self.0 = Some(Control::Print(c));
     }
     fn execute(&mut self, byte: u8) {
+        self.1 = matches!(byte, 0x18 | 0x1a);
         if matches!(byte, 10..=12) {
             self.0 = Some(Control::Index);
         }
     }
     fn esc_dispatch(&mut self, intermediate: &[u8], ignore: bool, byte: u8) {
+        self.1 = true;
         if ignore || !intermediate.is_empty() {
             return;
         }
@@ -356,6 +489,7 @@ impl vte::Perform for Controls {
         ignore: bool,
         command: char,
     ) {
+        self.1 = true;
         if ignore || !intermediate.is_empty() {
             return;
         }
@@ -380,6 +514,12 @@ impl vte::Perform for Controls {
             _ => None,
         };
     }
+    fn osc_dispatch(&mut self, _: &[&[u8]], _: bool) {
+        self.1 = true;
+    }
+    fn unhook(&mut self) {
+        self.1 = true;
+    }
 }
 
 impl Tracker {
@@ -389,7 +529,21 @@ impl Tracker {
 
     pub fn feed(&mut self, byte: u8, screen: &vt100::Screen, store: &mut Store) -> u16 {
         self.events.0 = None;
+        self.events.1 = false;
+        let standalone_control = self.pending.is_empty() && byte < 32 && byte != 27;
+        if self.pending.len() < MAX_FRAME {
+            self.pending.push(byte);
+        } else {
+            self.overflow = true;
+        }
         self.parser.advance(&mut self.events, &[byte]);
+        if self.events.1 || standalone_control {
+            self.pending.clear();
+            self.overflow = false;
+            if byte == 27 {
+                self.pending.push(byte);
+            }
+        }
         let Some(event) = self.events.0.take() else {
             return 0;
         };
@@ -503,6 +657,125 @@ impl Tracker {
             }
         }
         printed
+    }
+}
+
+/// Bounded graphics and unfinished escape input carried across a live handoff.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub(crate) struct HandoffState {
+    store: HandoffStore,
+    decoder: Decoder,
+    margins: [Option<(u16, u16)>; 2],
+    pending_text: Vec<u8>,
+}
+
+/// The JSON handoff format cannot encode tuple map keys. Keep Store optimized
+/// for terminal updates and serialize its sparse virtual grid as explicit rows.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct HandoffStore {
+    images: BTreeMap<u32, ImageData>,
+    image_numbers: BTreeMap<u32, u32>,
+    placements: Vec<StoredPlacement>,
+    transfer: Option<Transfer>,
+    revision: u64,
+    next_image: u32,
+    next_placement: u32,
+    virtual_cells: Vec<(bool, i32, u16, VirtualCell)>,
+    last_virtual_cell: Option<(bool, i32, u16)>,
+}
+
+impl From<&Store> for HandoffStore {
+    fn from(store: &Store) -> Self {
+        Self {
+            images: store.images.clone(),
+            image_numbers: store.image_numbers.clone(),
+            placements: store.placements.clone(),
+            transfer: store.transfer.clone(),
+            revision: store.revision,
+            next_image: store.next_image,
+            next_placement: store.next_placement,
+            virtual_cells: store
+                .virtual_cells
+                .iter()
+                .map(|(&(alternate, row, col), &cell)| (alternate, row, col, cell))
+                .collect(),
+            last_virtual_cell: store.last_virtual_cell,
+        }
+    }
+}
+
+impl From<HandoffStore> for Store {
+    fn from(store: HandoffStore) -> Self {
+        Self {
+            images: store.images,
+            image_numbers: store.image_numbers,
+            placements: store.placements,
+            transfer: store.transfer,
+            revision: store.revision,
+            next_image: store.next_image,
+            next_placement: store.next_placement,
+            virtual_cells: store
+                .virtual_cells
+                .into_iter()
+                .map(|(alternate, row, col, cell)| ((alternate, row, col), cell))
+                .collect(),
+            last_virtual_cell: store.last_virtual_cell,
+        }
+    }
+}
+
+impl HandoffState {
+    pub(crate) fn capture(store: &Store, decoder: &Decoder, tracker: &Tracker) -> Result<Self> {
+        if tracker.overflow {
+            bail!("unfinished terminal sequence exceeds handoff limit");
+        }
+        let state = Self {
+            store: store.into(),
+            decoder: decoder.clone(),
+            margins: tracker.margins,
+            pending_text: tracker.pending.clone(),
+        };
+        state.validate()?;
+        Ok(state)
+    }
+
+    pub(crate) fn validate(&self) -> Result<()> {
+        if self.store.images.len() > MAX_IMAGES
+            || self.store.placements.len() > MAX_PLACEMENTS
+            || self.decoder.pending.len() > MAX_FRAME
+            || self.pending_text.len() > MAX_FRAME
+            || self
+                .store
+                .images
+                .values()
+                .map(|image| image.data.len())
+                .sum::<usize>()
+                > MAX_STORE * 4 / 3 + MAX_IMAGES * 4
+            || self
+                .store
+                .transfer
+                .as_ref()
+                .is_some_and(|transfer| transfer.encoded.len() > MAX_IMAGE * 4 / 3 + 4)
+        {
+            bail!("graphics handoff exceeds bounded store limits");
+        }
+        Ok(())
+    }
+
+    pub(crate) fn pending_text(&self) -> &[u8] {
+        &self.pending_text
+    }
+
+    pub(crate) fn restore(self) -> (Store, Decoder, Tracker) {
+        let mut tracker = Tracker {
+            margins: self.margins,
+            pending: self.pending_text,
+            ..Default::default()
+        };
+        tracker
+            .parser
+            .advance(&mut tracker.events, &tracker.pending);
+        (self.store.into(), self.decoder, tracker)
     }
 }
 
@@ -1551,6 +1824,150 @@ fn dimensions(format: u32, params: &BTreeMap<String, String>, bytes: &[u8]) -> R
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn handoff_preserves_images_revisions_and_unfinished_chunked_frames() {
+        let mut store = Store::default();
+        store.command(b"a=T,f=24,s=1,v=1,i=7;AAAA", (2, 3), false);
+        let original = store.placements(false, 0);
+        store.command(b"a=T,f=24,s=2,v=1,i=42,p=8,m=1;AAAA", (0, 0), false);
+        let mut decoder = Decoder::default();
+        assert!(decoder.feed(b"\x1b_Gm=0;AA").is_empty());
+        let state = HandoffState::capture(&store, &decoder, &Tracker::default()).unwrap();
+        let state: HandoffState =
+            serde_json::from_slice(&serde_json::to_vec(&state).unwrap()).unwrap();
+        state.validate().unwrap();
+        let (mut restored, mut decoder, _) = state.restore();
+        assert_eq!(restored.placements(false, 0), original);
+        assert_eq!(
+            restored.image(7, original[0].revision).unwrap().data,
+            "AAAA"
+        );
+        let tokens = decoder.feed(b"AA\x1b\\");
+        assert_eq!(tokens.len(), 1);
+        let Token::Graphics(frame) = &tokens[0] else {
+            panic!("expected resumed frame")
+        };
+        assert_eq!(
+            restored.command(frame, (4, 5), false).reply,
+            b"\x1b_Gi=42,p=8;OK\x1b\\"
+        );
+        let placements = restored.placements(false, 0);
+        let added = placements.iter().find(|p| p.image == 42).unwrap();
+        assert!(added.revision > original[0].revision);
+        assert_eq!(restored.image(42, added.revision).unwrap().data, "AAAAAAAA");
+    }
+
+    #[test]
+    fn handoff_continues_partial_utf8_and_terminal_controls_at_every_byte() {
+        let input = "start 界\x1b[31mred\x1b[0m\x1b]2;pane title\x07 done".as_bytes();
+        let mut expected = vt100::Parser::new(12.try_into().unwrap(), 80.try_into().unwrap(), 100);
+        expected.process(input);
+        for split in 0..input.len() {
+            let mut source =
+                vt100::Parser::new(12.try_into().unwrap(), 80.try_into().unwrap(), 100);
+            let mut tracker = Tracker::default();
+            let mut store = Store::default();
+            let mut decoder = Decoder::default();
+            for token in decoder.feed(&input[..split]) {
+                let Token::Text(text) = token else {
+                    panic!("expected text")
+                };
+                for byte in text {
+                    tracker.feed(byte, source.screen(), &mut store);
+                    source.process(&[byte]);
+                }
+            }
+            let state = HandoffState::capture(&store, &decoder, &tracker).unwrap();
+            let state: HandoffState =
+                serde_json::from_slice(&serde_json::to_vec(&state).unwrap()).unwrap();
+            let mut restored =
+                vt100::Parser::new(12.try_into().unwrap(), 80.try_into().unwrap(), 100);
+            restored.process(source.screen().state_formatted().as_bytes());
+            restored.process(state.pending_text());
+            let (mut store, mut decoder, mut tracker) = state.restore();
+            for token in decoder.feed(&input[split..]) {
+                let Token::Text(text) = token else {
+                    panic!("expected text")
+                };
+                for byte in text {
+                    tracker.feed(byte, restored.screen(), &mut store);
+                    restored.process(&[byte]);
+                }
+            }
+            assert_eq!(
+                restored.screen().contents(),
+                expected.screen().contents(),
+                "split {split}"
+            );
+            assert_eq!(
+                restored.screen().contents_formatted(),
+                expected.screen().contents_formatted(),
+                "style at split {split}"
+            );
+        }
+    }
+
+    #[test]
+    fn handoff_rebuilds_unicode_and_sgr_parsers_at_every_byte() {
+        let unicode = "\x1b]0;title\x1b\\\x1bP+qquery\x1b\\\x1b[3\n1m\u{10eeee}\u{0305}".as_bytes();
+        for split in 0..unicode.len() {
+            let mut source = UnicodeTracker::default();
+            for &byte in &unicode[..split] {
+                source.feed(byte);
+            }
+            let state: UnicodeHandoff = serde_json::from_slice(
+                &serde_json::to_vec(&source.capture_handoff().unwrap()).unwrap(),
+            )
+            .unwrap();
+            let mut restored = UnicodeTracker::restore_handoff(state);
+            let mut expected = Vec::new();
+            for &byte in &unicode[split..] {
+                expected.extend(source.feed(byte));
+            }
+            let mut actual = Vec::new();
+            for &byte in &unicode[split..] {
+                actual.extend(restored.feed(byte));
+            }
+            assert_eq!(expected, actual, "unicode split {split}");
+        }
+        let sgr = b"\x1b]0;title\x1b\\\x1bP+qquery\x1b\\\x1b[38;\n5;42;58;5;9m";
+        for split in 0..sgr.len() {
+            let mut source = VirtualStyle::default();
+            for &byte in &sgr[..split] {
+                source.feed(byte);
+            }
+            let state: VirtualStyleHandoff = serde_json::from_slice(
+                &serde_json::to_vec(&source.capture_handoff().unwrap()).unwrap(),
+            )
+            .unwrap();
+            let mut restored = VirtualStyle::restore_handoff(state);
+            for &byte in &sgr[split..] {
+                source.feed(byte);
+                restored.feed(byte);
+            }
+            assert_eq!(source.ids(), restored.ids(), "SGR split {split}");
+            assert_eq!(source.ids(), Some((42, 9)));
+        }
+    }
+
+    #[test]
+    fn unrelated_complete_controls_do_not_accumulate_handoff_state() {
+        let mut unicode = UnicodeTracker::default();
+        let mut style = VirtualStyle::default();
+        for _ in 0..1024 {
+            for &byte in b"\x1b]0;window title\x1b\\\x1bP+qquery\x1b\\" {
+                unicode.feed(byte);
+                style.feed(byte);
+            }
+        }
+        assert!(unicode.capture_handoff().unwrap().pending.is_empty());
+        assert!(style.capture_handoff().unwrap().pending.is_empty());
+        for &byte in b"\x1b[38;5;42m\x1bc" {
+            style.feed(byte);
+        }
+        assert_eq!(style.ids(), None);
+    }
 
     #[test]
     fn decoder_handles_every_split_without_exposing_graphics_to_text() {

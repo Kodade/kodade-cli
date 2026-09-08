@@ -133,6 +133,7 @@ fn run_bounded(command: &mut Command, timeout: Duration) -> Output {
 
 impl Drop for Harness {
     fn drop(&mut self) {
+        let _ = self.command(["kill-session"]);
         let _ = self.daemon.kill();
         let _ = self.daemon.wait();
         let _ = fs::remove_dir_all(&self.root);
@@ -239,6 +240,15 @@ fn hook_backed_node_agent_needs_no_osc_title() {
         "exec node -e 'const { spawnSync } = require(\"child_process\"); const report = state => spawnSync(process.env.KODADE_BIN, [\"-s\", process.env.KODADE_SESSION, \"agent\", \"report\", process.env.KODADE_PANE, state, \"--source\", \"kodade:pi\", \"--native-agent\", \"pi\"]); report(\"working\"); process.stdin.on(\"data\", () => report(\"done\")); setTimeout(() => {}, 10000);'",
     );
     harness.wait_for_agent("Pi");
+    for _ in 0..2 {
+        let upgraded = harness.command(["session", "upgrade"]);
+        assert!(
+            upgraded.status.success(),
+            "upgrade failed: {}",
+            String::from_utf8_lossy(&upgraded.stderr)
+        );
+        harness.wait_for_agent("Pi");
+    }
     thread::sleep(Duration::from_millis(2100));
     let output = harness.command([
         "agent",

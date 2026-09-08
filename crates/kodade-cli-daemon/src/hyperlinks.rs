@@ -2,12 +2,14 @@
 //! state, so keep a small parallel grid whose mutations follow its controls.
 
 use kodade_cli_proto::LinkRange;
+use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use unicode_width::UnicodeWidthChar;
 
 const MAX_URI_BYTES: usize = 2048;
 const MAX_URIS: usize = 128;
 const MAX_LINK_SNAPSHOT_BYTES: usize = 32 * 1024;
+const MAX_PENDING_BYTES: usize = 8192;
 
 #[derive(Default)]
 pub struct Tracker {
@@ -22,17 +24,31 @@ pub struct Tracker {
     history: VecDeque<Vec<Option<u16>>>,
     history_capacity: usize,
     margins: [Option<(u16, u16)>; 2],
+    pending: Vec<u8>,
+    overflow: bool,
 }
 
-#[derive(Default)]
+#[derive(Default, Debug, Clone, Serialize, Deserialize)]
 struct Grid {
     rows: u16,
     cols: u16,
     cells: Vec<Option<u16>>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct HandoffState {
+    active: Option<u16>,
+    uris: Vec<String>,
+    normal: Grid,
+    alternate: Grid,
+    history: VecDeque<Vec<Option<u16>>>,
+    history_capacity: usize,
+    margins: [Option<(u16, u16)>; 2],
+    pending: Vec<u8>,
+}
+
 #[derive(Default)]
-struct Events(Option<Event>);
+struct Events(Option<Event>, bool);
 enum Event {
     Print(char),
     Execute(u8),
@@ -43,23 +59,28 @@ enum Event {
 
 impl vte::Perform for Events {
     fn print(&mut self, c: char) {
+        self.1 = true;
         self.0 = Some(Event::Print(c));
     }
     fn execute(&mut self, b: u8) {
+        self.1 = matches!(b, 0x18 | 0x1a);
         self.0 = Some(Event::Execute(b));
     }
     fn esc_dispatch(&mut self, i: &[u8], ignore: bool, b: u8) {
+        self.1 = true;
         if !ignore && i.is_empty() {
             self.0 = Some(Event::Esc(b));
         }
     }
     fn osc_dispatch(&mut self, p: &[&[u8]], _: bool) {
+        self.1 = true;
         if p.first() == Some(&b"8".as_slice()) && p.len() >= 3 {
             let uri = String::from_utf8_lossy(p[2]).into_owned();
             self.0 = Some(Event::Osc(valid_uri(&uri).then_some(uri)));
         }
     }
     fn csi_dispatch(&mut self, p: &vte::Params, i: &[u8], ignore: bool, c: char) {
+        self.1 = true;
         if ignore || !i.is_empty() {
             return;
         }
@@ -67,6 +88,9 @@ impl vte::Perform for Events {
             c,
             p.iter().map(|x| x.first().copied().unwrap_or(0)).collect(),
         ));
+    }
+    fn unhook(&mut self) {
+        self.1 = true;
     }
 }
 
@@ -209,7 +233,21 @@ impl Tracker {
         let top = margin.0.min(rows - 1);
         let bottom = margin.1.min(rows - 1).max(top);
         self.events.0 = None;
+        self.events.1 = false;
+        let standalone = self.pending.is_empty() && byte < 32 && byte != 27;
+        if self.pending.len() < MAX_PENDING_BYTES {
+            self.pending.push(byte);
+        } else {
+            self.overflow = true;
+        }
         self.parser.advance(&mut self.events, &[byte]);
+        if self.events.1 || standalone {
+            self.pending.clear();
+            self.overflow = false;
+            if byte == 27 {
+                self.pending.push(byte);
+            }
+        }
         let Some(event) = self.events.0.take() else {
             return;
         };
@@ -451,6 +489,38 @@ impl Tracker {
             self.history.pop_front();
         }
     }
+    pub(crate) fn capture_handoff(&self) -> anyhow::Result<HandoffState> {
+        if self.overflow {
+            anyhow::bail!("unfinished hyperlink sequence exceeds handoff limit");
+        }
+        Ok(HandoffState {
+            active: self.active,
+            uris: self.uris.clone(),
+            normal: self.normal.clone(),
+            alternate: self.alternate.clone(),
+            history: self.history.clone(),
+            history_capacity: self.history_capacity,
+            margins: self.margins,
+            pending: self.pending.clone(),
+        })
+    }
+    pub(crate) fn restore_handoff(state: HandoffState) -> Self {
+        let mut result = Self {
+            active: state.active,
+            uris: state.uris,
+            normal: state.normal,
+            alternate: state.alternate,
+            history: state.history,
+            history_capacity: state.history_capacity,
+            margins: state.margins,
+            pending: state.pending,
+            ..Default::default()
+        };
+        let pending = result.pending.clone();
+        result.parser.advance(&mut result.events, &pending);
+        result.events.0 = None;
+        result
+    }
 }
 
 #[cfg(test)]
@@ -556,5 +626,44 @@ mod tests {
             b"\x1b]8;;https://wide\x1b\\\xe7\x95\x8c\x1b]8;;\x1b\\\rX",
         );
         assert!(tracker.ranges(false, 0).is_empty());
+    }
+
+    #[test]
+    fn oversized_partial_osc_refuses_handoff_then_recovers_at_termination() {
+        let (mut tracker, mut screen) = (Tracker::default(), parser());
+        feed(&mut tracker, &mut screen, b"\x1b]0;");
+        feed(
+            &mut tracker,
+            &mut screen,
+            &vec![b'x'; MAX_PENDING_BYTES + 100],
+        );
+        assert_eq!(tracker.pending.len(), MAX_PENDING_BYTES);
+        assert!(tracker.capture_handoff().is_err());
+        feed(&mut tracker, &mut screen, b"\x07");
+        assert!(tracker.capture_handoff().unwrap().pending.is_empty());
+    }
+
+    #[test]
+    fn handoff_rebuilds_every_partial_osc8_byte() {
+        let input = b"\x1b]0;title\x1b\\\x1bP+qquery\x1b\\\x1b]8;;https://example.test/path\x1b\\la\x1b[1\tCbel\x1b]8;;\x1b\\";
+        for split in 0..input.len() {
+            let (mut source, mut source_screen) = (Tracker::default(), parser());
+            feed(&mut source, &mut source_screen, &input[..split]);
+            let state: HandoffState = serde_json::from_slice(
+                &serde_json::to_vec(&source.capture_handoff().unwrap()).unwrap(),
+            )
+            .unwrap();
+            let mut restored = Tracker::restore_handoff(state);
+            for &byte in &input[split..] {
+                source.feed(byte, source_screen.screen());
+                restored.feed(byte, source_screen.screen());
+                source_screen.process(&[byte]);
+            }
+            assert_eq!(
+                source.ranges(false, 0),
+                restored.ranges(false, 0),
+                "split {split}"
+            );
+        }
     }
 }
