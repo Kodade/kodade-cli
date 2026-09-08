@@ -216,7 +216,7 @@ pub struct App {
     selecting: bool,
     /// The most recently completed mouse selection stays available to the
     /// command center until the next selection replaces it.
-    selected_text: Option<String>,
+    selected_text: Option<(EndpointId, PaneId, String)>,
     /// Last left click (when, column, row, count) for double/triple clicks (#12).
     last_click: Option<(Instant, u16, u16, u8)>,
     /// Runtime mouse capture; `prefix m` toggles it without touching the
@@ -2140,14 +2140,15 @@ impl App {
                             workspace: None,
                             tab: None,
                             split: None,
-                            command: Some(crate::plugins::pane_command(
+                            command: Some(crate::plugins::pane_command_with_context(
                                 &plugin,
                                 &directory,
                                 &command,
                                 Some(&action),
                                 &workspace,
                                 &focused_pane,
-                            )),
+                                &context,
+                            )?),
                             name: Some(format!("plugin · {plugin} · {action}")),
                         },
                     )
@@ -2322,7 +2323,6 @@ impl App {
             text
         };
         self.paste_buffer = text.clone();
-        self.selected_text = Some(text.clone());
         self.send_paste(&text, writer).await
     }
 
@@ -2726,6 +2726,7 @@ impl App {
         }
         // Always fill the internal buffer so `prefix ]` can re-paste it (#21).
         self.paste_buffer = text.clone();
+        self.selected_text = Some((self.selected_endpoint.clone(), selection.pane, text.clone()));
         if self.config.copy_on_select {
             let (payload, truncated) = mode::osc52(&text);
             execute!(term.backend_mut(), crossterm::style::Print(payload))?;
@@ -3071,7 +3072,13 @@ impl App {
             tab_id: layout.map(|layout| layout.active_tab.0.to_string()),
             pane: pane.map(|pane| pane.id.0.to_string()),
             cwd: pane.and_then(|pane| pane.cwd.clone()),
-            selected_text: self.selected_text.clone(),
+            selected_text: self.selected_text.as_ref().and_then(
+                |(endpoint, selected_pane, text)| {
+                    (endpoint == &self.selected_endpoint
+                        && pane.is_some_and(|pane| pane.id == *selected_pane))
+                    .then(|| text.clone())
+                },
+            ),
             clicked_url,
         }
     }

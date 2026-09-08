@@ -535,19 +535,28 @@ impl ContextFile {
                 .as_nanos(),
             std::thread::current().name().unwrap_or("ui")
         ));
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&path)?;
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let mut file = options.open(&path)?;
+        let context_file = Self(path);
         use std::io::Write;
         file.write_all(&json)?;
-        Ok(Self(path))
+        Ok(context_file)
     }
 }
 impl Drop for ContextFile {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.0);
+    }
+}
+
+impl ContextFile {
+    fn persist(self) -> PathBuf {
+        let path = self.0.clone();
+        std::mem::forget(self);
+        path
     }
 }
 
@@ -576,12 +585,18 @@ pub async fn run_action_with_context(
         .env("KODADE_PLUGIN_CONTEXT_FORMAT", "json");
     if let Some(workspace) = &context.workspace {
         command.env("KODADE_WORKSPACE", workspace);
+    } else {
+        command.env_remove("KODADE_WORKSPACE");
     }
     if let Some(tab) = &context.tab_id {
         command.env("KODADE_TAB", tab);
+    } else {
+        command.env_remove("KODADE_TAB");
     }
     if let Some(pane) = &context.pane {
         command.env("KODADE_PANE", pane);
+    } else {
+        command.env_remove("KODADE_PANE");
     }
     run_bounded_command(&mut command, timeout, "plugin action").await
 }
@@ -616,6 +631,30 @@ pub fn pane_command(
         "cd \"$KODADE_PLUGIN_DIR\" && sh -lc \"$KODADE_PLUGIN_COMMAND\"".into(),
     ]);
     args
+}
+
+/// Creates a pane command with the same private context contract as a
+/// background action. The fixed wrapper removes the file when the pane command
+/// exits, including a non-zero exit.
+pub fn pane_command_with_context(
+    plugin: &str,
+    directory: &Path,
+    command: &str,
+    action: Option<&str>,
+    workspace: &str,
+    pane: &str,
+    context: &InvocationContext,
+) -> Result<Vec<String>> {
+    let path = ContextFile::create(context)?.persist();
+    let mut args = pane_command(plugin, directory, command, action, workspace, pane);
+    let shell = args.pop().expect("pane wrapper has shell source");
+    let insert = args.len() - 2;
+    args.insert(insert, format!("KODADE_PLUGIN_CONTEXT={}", path.display()));
+    args.insert(insert + 1, "KODADE_PLUGIN_CONTEXT_FORMAT=json".into());
+    args.push(format!(
+        "{shell}; status=$?; rm -f \"$KODADE_PLUGIN_CONTEXT\"; exit $status"
+    ));
+    Ok(args)
 }
 
 struct ManagedStaging {
