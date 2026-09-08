@@ -11,9 +11,9 @@ try {
     $zip = Join-Path $root $name; Compress-Archive -Path $package -DestinationPath $zip
     $sums = Join-Path $root SHA256SUMS
     "$(Get-FileHash -Algorithm SHA256 $zip | Select-Object -Expand Hash)  $name" | Set-Content $sums
-    $metadata = @{ tag_name = "v$version"; prerelease = $false; assets = @(@{ name = $name; browser_download_url = 'fixture://zip' }, @{ name = 'SHA256SUMS'; browser_download_url = 'fixture://sums' }) }
-    function Invoke-RestMethod { param($Uri, [Parameter(ValueFromRemainingArguments=$true)]$Rest) $metadata }
-    function Invoke-WebRequest { param($Uri, $OutFile, [Parameter(ValueFromRemainingArguments=$true)]$Rest) Copy-Item $(if ($Uri -eq 'fixture://zip') {$zip} else {$sums}) $OutFile }
+    $metadata = @{ tag_name = "v$version"; prerelease = $false; assets = @(@{ name = $name; browser_download_url = 'https://fixture.test/zip' }, @{ name = 'SHA256SUMS'; browser_download_url = 'https://fixture.test/sums' }) }
+    function Invoke-RestMethod { param($Uri, [int]$TimeoutSec, [switch]$UseBasicParsing) $metadata }
+    function Invoke-WebRequest { param($Uri, $OutFile, [int]$TimeoutSec, [switch]$UseBasicParsing) Copy-Item $(if ($Uri -eq 'https://fixture.test/zip') {$zip} else {$sums}) $OutFile }
     $dest = Join-Path $root 'a path with spaces\bin'; & (Join-Path $PSScriptRoot '..\install.ps1') -InstallDir $dest -Repository fixture/test
     $installed = Join-Path $dest 'kodade-cli.exe'
     if ((& $installed --version).Trim() -ne "kodade-cli $version") { throw 'installer did not install the exact executable' }
