@@ -2,9 +2,13 @@
 
 use crate::commands;
 use anyhow::{anyhow, bail, Context, Result};
-use kodade_cli_proto::{ClientMessage, PluginAction, PluginManifest, PluginPane};
+use kodade_cli_proto::{
+    ClientMessage, PluginAction, PluginActionContext, PluginLinkHandler, PluginManifest, PluginPane,
+};
 use serde::{Deserialize, Serialize};
 
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 use std::{
     collections::BTreeMap,
     fs,
@@ -17,6 +21,7 @@ const MANIFEST: &str = "kodade-plugin.toml";
 const REGISTRY: &str = "registry.toml";
 const INSTALL_TIMEOUT: Duration = Duration::from_secs(60);
 const KILL_GRACE: Duration = Duration::from_secs(2);
+const MAX_CONTEXT_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct PluginRegistry {
@@ -43,6 +48,37 @@ pub struct PaletteAction {
     pub plugin: String,
     pub directory: PathBuf,
     pub action: PluginAction,
+}
+
+/// Data supplied to an extension command. It is serialized to a private file,
+/// never expanded into the plugin's shell command.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InvocationContext {
+    pub endpoint: String,
+    pub workspace: Option<String>,
+    pub workspace_id: Option<String>,
+    pub tab: Option<String>,
+    pub tab_id: Option<String>,
+    pub pane: Option<String>,
+    pub cwd: Option<PathBuf>,
+    pub selected_text: Option<String>,
+    pub clicked_url: Option<String>,
+}
+
+impl InvocationContext {
+    pub fn supports(&self, action: &PluginAction) -> bool {
+        action.contexts.is_empty()
+            || action.contexts.iter().all(|scope| match scope {
+                PluginActionContext::Global => true,
+                PluginActionContext::Workspace => self.workspace_id.is_some(),
+                PluginActionContext::Tab => self.tab_id.is_some(),
+                PluginActionContext::Pane => self.pane.is_some(),
+                PluginActionContext::Selection => self
+                    .selected_text
+                    .as_ref()
+                    .is_some_and(|text| !text.is_empty()),
+            })
+    }
 }
 
 pub async fn command(
@@ -207,19 +243,37 @@ pub async fn command(
                 .find(|item| item.focused)
                 .map(|item| item.id.0.to_string())
                 .unwrap_or_default();
-            let mut command = tokio::process::Command::new("sh");
-            command
-                .args(["-lc", &action.command])
-                .current_dir(&plugin.installed.path)
-                .env("KODADE_PLUGIN", &plugin.manifest.id)
-                .env("KODADE_ACTION", &action.id)
-                .env("KODADE_SESSION", session)
-                .env("KODADE_SOCKET", socket)
-                .env("KODADE_WORKSPACE", workspace)
-                .env("KODADE_TAB", layout.active_tab.0.to_string())
-                .env("KODADE_PANE", pane);
-            let status =
-                run_bounded_command(&mut command, Duration::from_secs(30), "plugin action").await?;
+            let context = InvocationContext {
+                endpoint: if remote {
+                    "remote".into()
+                } else {
+                    "local".into()
+                },
+                workspace: Some(workspace.to_string()),
+                workspace_id: Some(layout.active_workspace.0.to_string()),
+                tab: layout
+                    .tabs
+                    .iter()
+                    .find(|tab| tab.id == layout.active_tab)
+                    .map(|tab| tab.name.clone()),
+                tab_id: Some(layout.active_tab.0.to_string()),
+                cwd: layout
+                    .panes
+                    .iter()
+                    .find(|item| item.focused)
+                    .and_then(|item| item.cwd.clone()),
+                pane: Some(pane),
+                ..Default::default()
+            };
+            let status = run_action_with_context(
+                &plugin,
+                &action,
+                &context,
+                session,
+                socket,
+                Duration::from_secs(30),
+            )
+            .await?;
             if !status.success() {
                 anyhow::bail!("plugin action {} failed with {status}", action.id);
             }
@@ -268,7 +322,12 @@ pub fn parse_manifest(path: &Path) -> Result<PluginManifest> {
 }
 
 pub fn validate_manifest(manifest: &PluginManifest) -> Result<()> {
-    kodade_cli_proto::validate_plugin_manifest(manifest, env!("CARGO_PKG_VERSION"))
+    kodade_cli_proto::validate_plugin_manifest(manifest, env!("CARGO_PKG_VERSION"))?;
+    for handler in &manifest.link_handlers {
+        regex::Regex::new(&handler.pattern)
+            .with_context(|| format!("invalid URL handler pattern {}", handler.id))?;
+    }
+    Ok(())
 }
 
 pub fn link(path: PathBuf) -> Result<PluginManifest> {
@@ -413,7 +472,7 @@ pub fn pane(id: &str, name: &str) -> Result<(LoadedPlugin, PluginPane)> {
     Ok((plugin, pane))
 }
 
-pub fn palette_actions() -> Result<Vec<PaletteAction>> {
+pub fn palette_actions_for(context: &InvocationContext) -> Result<Vec<PaletteAction>> {
     Ok(installed()?
         .into_iter()
         .filter(|plugin| plugin.installed.enabled)
@@ -422,6 +481,7 @@ pub fn palette_actions() -> Result<Vec<PaletteAction>> {
                 .manifest
                 .actions
                 .into_iter()
+                .filter(|action| context.supports(action))
                 .map(move |action| PaletteAction {
                     plugin: plugin.manifest.id.clone(),
                     directory: plugin.installed.path.clone(),
@@ -429,6 +489,101 @@ pub fn palette_actions() -> Result<Vec<PaletteAction>> {
                 })
         })
         .collect())
+}
+
+pub fn link_handler(url: &str) -> Result<Option<(LoadedPlugin, PluginLinkHandler, PluginAction)>> {
+    Ok(first_link_handler(installed()?, url))
+}
+
+fn first_link_handler(
+    plugins: impl IntoIterator<Item = LoadedPlugin>,
+    url: &str,
+) -> Option<(LoadedPlugin, PluginLinkHandler, PluginAction)> {
+    for plugin in plugins
+        .into_iter()
+        .filter(|plugin| plugin.installed.enabled)
+    {
+        for handler in &plugin.manifest.link_handlers {
+            if regex::Regex::new(&handler.pattern).is_ok_and(|pattern| pattern.is_match(url)) {
+                if let Some(action) = plugin
+                    .manifest
+                    .actions
+                    .iter()
+                    .find(|action| action.id == handler.action)
+                {
+                    return Some((plugin.clone(), handler.clone(), action.clone()));
+                }
+            }
+        }
+    }
+    None
+}
+
+struct ContextFile(PathBuf);
+
+impl ContextFile {
+    fn create(context: &InvocationContext) -> Result<Self> {
+        let json = serde_json::to_vec(context)?;
+        if json.len() > MAX_CONTEXT_BYTES {
+            bail!("plugin context exceeds {} KiB", MAX_CONTEXT_BYTES / 1024);
+        }
+        let path = std::env::temp_dir().join(format!(
+            "kodade-plugin-context-{}-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_nanos(),
+            std::thread::current().name().unwrap_or("ui")
+        ));
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)?;
+        use std::io::Write;
+        file.write_all(&json)?;
+        Ok(Self(path))
+    }
+}
+impl Drop for ContextFile {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
+}
+
+/// Stable execution seam shared by the palette, CLI, and future command work.
+pub async fn run_action_with_context(
+    plugin: &LoadedPlugin,
+    action: &PluginAction,
+    context: &InvocationContext,
+    session: &str,
+    socket: &Path,
+    timeout: Duration,
+) -> Result<std::process::ExitStatus> {
+    if !context.supports(action) {
+        bail!("plugin action {} is not applicable here", action.id);
+    }
+    let context_file = ContextFile::create(context)?;
+    let mut command = tokio::process::Command::new("sh");
+    command
+        .args(["-lc", &action.command])
+        .current_dir(&plugin.installed.path)
+        .env("KODADE_PLUGIN", &plugin.manifest.id)
+        .env("KODADE_ACTION", &action.id)
+        .env("KODADE_SESSION", session)
+        .env("KODADE_SOCKET", socket)
+        .env("KODADE_PLUGIN_CONTEXT", &context_file.0)
+        .env("KODADE_PLUGIN_CONTEXT_FORMAT", "json");
+    if let Some(workspace) = &context.workspace {
+        command.env("KODADE_WORKSPACE", workspace);
+    }
+    if let Some(tab) = &context.tab_id {
+        command.env("KODADE_TAB", tab);
+    }
+    if let Some(pane) = &context.pane {
+        command.env("KODADE_PANE", pane);
+    }
+    run_bounded_command(&mut command, timeout, "plugin action").await
 }
 
 /// Build a shell command for a pane action without interpolating plugin data
@@ -652,11 +807,176 @@ mod tests {
                 command: "printf hello".into(),
                 description: String::new(),
                 pane: false,
+                contexts: vec![],
             }],
             startup: vec![],
             events: vec![],
             panes: vec![],
+            link_handlers: vec![],
         }
+    }
+
+    fn loaded_for_test(directory: PathBuf, action: PluginAction) -> LoadedPlugin {
+        LoadedPlugin {
+            manifest: PluginManifest {
+                manifest_version: 1,
+                id: "demo-plugin".into(),
+                name: "Demo".into(),
+                version: "0.1.0".into(),
+                min_kodade_version: None,
+                build: None,
+                actions: vec![action],
+                startup: vec![],
+                events: vec![],
+                panes: vec![],
+                link_handlers: vec![],
+            },
+            installed: InstalledPlugin {
+                path: directory,
+                linked: true,
+                enabled: true,
+                version: "0.1.0".into(),
+            },
+        }
+    }
+
+    #[test]
+    fn scoped_actions_require_their_declared_context() {
+        let mut action = manifest().actions.remove(0);
+        action.contexts = vec![
+            PluginActionContext::Workspace,
+            PluginActionContext::Selection,
+        ];
+        let none = InvocationContext::default();
+        assert!(!none.supports(&action));
+        let ready = InvocationContext {
+            workspace_id: Some("7".into()),
+            selected_text: Some("quoted value".into()),
+            ..Default::default()
+        };
+        assert!(ready.supports(&action));
+    }
+
+    #[test]
+    fn context_is_capped_before_a_child_can_start() {
+        let context = InvocationContext {
+            selected_text: Some("x".repeat(MAX_CONTEXT_BYTES)),
+            ..Default::default()
+        };
+        assert!(ContextFile::create(&context).is_err());
+    }
+
+    #[tokio::test]
+    async fn action_receives_structured_context_as_data_and_removes_private_file() {
+        let marker =
+            std::env::temp_dir().join(format!("kodade-context-marker-{}", std::process::id()));
+        let action = PluginAction {
+            id: "capture".into(), name: "Capture".into(),
+            command: format!("cp \"$KODADE_PLUGIN_CONTEXT\" {} && printf '%s' \"$KODADE_PLUGIN_CONTEXT\" > {}.path", marker.display(), marker.display()),
+            description: String::new(), pane: false, contexts: vec![PluginActionContext::Selection],
+        };
+        let plugin = loaded_for_test(std::env::temp_dir(), action.clone());
+        let context = InvocationContext {
+            endpoint: "machine:build box".into(),
+            workspace: Some("quoted workspace".into()),
+            workspace_id: Some("9".into()),
+            tab: Some("tab".into()),
+            tab_id: Some("4".into()),
+            pane: Some("3".into()),
+            cwd: Some(PathBuf::from("/tmp/a path")),
+            selected_text: Some("$(not shell) \"quoted\"".into()),
+            clicked_url: Some("https://example.test/a?x='y'".into()),
+        };
+        let status = run_action_with_context(
+            &plugin,
+            &action,
+            &context,
+            "session",
+            Path::new("/tmp/socket"),
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+        assert!(status.success());
+        let actual: InvocationContext =
+            serde_json::from_slice(&fs::read(&marker).unwrap()).unwrap();
+        assert_eq!(actual, context);
+        let private_path = fs::read_to_string(marker.with_extension("path")).unwrap();
+        assert!(
+            !Path::new(&private_path).exists(),
+            "context file must be cleaned after the job"
+        );
+        let _ = fs::remove_file(marker);
+        let _ = fs::remove_file(
+            std::env::temp_dir().join(format!("kodade-context-marker-{}.path", std::process::id())),
+        );
+    }
+
+    #[tokio::test]
+    async fn timed_out_action_removes_its_private_context_file() {
+        let marker =
+            std::env::temp_dir().join(format!("kodade-context-timeout-{}", std::process::id()));
+        let action = PluginAction {
+            id: "slow".into(),
+            name: "Slow".into(),
+            command: format!(
+                "printf '%s' \"$KODADE_PLUGIN_CONTEXT\" > {}; sleep 1",
+                marker.display()
+            ),
+            description: String::new(),
+            pane: false,
+            contexts: vec![],
+        };
+        let plugin = loaded_for_test(std::env::temp_dir(), action.clone());
+        assert!(run_action_with_context(
+            &plugin,
+            &action,
+            &InvocationContext::default(),
+            "session",
+            Path::new("/tmp/socket"),
+            Duration::from_millis(100)
+        )
+        .await
+        .is_err());
+        let path = fs::read_to_string(&marker).unwrap();
+        assert!(!Path::new(&path).exists());
+        let _ = fs::remove_file(marker);
+    }
+
+    #[test]
+    fn url_handlers_choose_enabled_plugin_action_in_manifest_order() {
+        let mut plugin = manifest();
+        plugin.link_handlers = vec![PluginLinkHandler {
+            id: "issue".into(),
+            title: "Issue".into(),
+            pattern: r"^https://example\.test/issues/\d+$".into(),
+            action: "hello".into(),
+        }];
+        assert!(validate_manifest(&plugin).is_ok());
+        let action = plugin.actions[0].clone();
+        let loaded = LoadedPlugin {
+            installed: InstalledPlugin {
+                path: std::env::temp_dir(),
+                linked: true,
+                enabled: true,
+                version: plugin.version.clone(),
+            },
+            manifest: plugin,
+        };
+        assert!(
+            first_link_handler(vec![loaded.clone()], "https://example.test/issues/7").is_some()
+        );
+        assert!(first_link_handler(vec![loaded], "https://example.test/docs/7").is_none());
+        let disabled = loaded_for_test(std::env::temp_dir(), action);
+        let mut disabled = disabled;
+        disabled.manifest.link_handlers = vec![PluginLinkHandler {
+            id: "disabled".into(),
+            title: "Disabled".into(),
+            pattern: ".*".into(),
+            action: "hello".into(),
+        }];
+        disabled.installed.enabled = false;
+        assert!(first_link_handler(vec![disabled], "https://example.test/issues/7").is_none());
     }
     #[test]
     fn manifest_rejects_unsupported_versions_and_duplicate_actions() {

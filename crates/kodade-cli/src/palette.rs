@@ -44,7 +44,15 @@ pub struct Palette {
 }
 
 impl Palette {
+    #[cfg(test)]
     pub fn new(config: &Config) -> Self {
+        Self::with_plugin_context(config, &crate::plugins::InvocationContext::default())
+    }
+
+    pub fn with_plugin_context(
+        config: &Config,
+        context: &crate::plugins::InvocationContext,
+    ) -> Self {
         let mut all = Vec::new();
         // These are the reliable, documented entry commands for the most-used
         // bundled manifests. We send them to the attached daemon rather than
@@ -72,7 +80,7 @@ impl Palette {
             search: "terminal shell new pane tab".into(),
             target: PaletteTarget::Shell,
         });
-        match crate::plugins::palette_actions() {
+        match crate::plugins::palette_actions_for(context) {
             Ok(actions) => {
                 for item in actions {
                     all.push(Item {

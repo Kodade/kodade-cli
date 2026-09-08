@@ -30,6 +30,8 @@ pub struct PluginManifest {
     pub events: Vec<PluginEventHook>,
     #[serde(default)]
     pub panes: Vec<PluginPane>,
+    #[serde(default)]
+    pub link_handlers: Vec<PluginLinkHandler>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -41,6 +43,29 @@ pub struct PluginAction {
     pub description: String,
     #[serde(default)]
     pub pane: bool,
+    /// Where this action is meaningful. An empty list preserves the original
+    /// always-available action behavior.
+    #[serde(default)]
+    pub contexts: Vec<PluginActionContext>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PluginActionContext {
+    Global,
+    Workspace,
+    Tab,
+    Pane,
+    Selection,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginLinkHandler {
+    pub id: String,
+    pub title: String,
+    /// A regular expression matched against a ctrl-clicked URL.
+    pub pattern: String,
+    pub action: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -89,6 +114,22 @@ pub fn validate_plugin_manifest(manifest: &PluginManifest, current_version: &str
             || !action_ids.insert(&action.id)
         {
             bail!("plugin actions need unique ids, names, and commands");
+        }
+    }
+    let action_ids: std::collections::HashSet<_> = manifest
+        .actions
+        .iter()
+        .map(|action| action.id.as_str())
+        .collect();
+    let mut handler_ids = std::collections::HashSet::new();
+    for handler in &manifest.link_handlers {
+        if !plugin_id(&handler.id)
+            || handler.title.trim().is_empty()
+            || handler.pattern.trim().is_empty()
+            || !action_ids.contains(handler.action.as_str())
+            || !handler_ids.insert(&handler.id)
+        {
+            bail!("plugin link handlers need unique ids, a pattern, and a known action");
         }
     }
     if manifest
