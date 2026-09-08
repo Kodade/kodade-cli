@@ -4966,19 +4966,6 @@ async fn send_notifications(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::OnceLock;
-
-    // portable-pty uses process-global terminal state on macOS.  Keep the
-    // integration tests parallel with ordinary tests, but never overlap two
-    // real PTY sessions.
-    static REAL_PTY_TEST_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
-
-    async fn real_pty_test_lock() -> tokio::sync::MutexGuard<'static, ()> {
-        REAL_PTY_TEST_LOCK
-            .get_or_init(|| tokio::sync::Mutex::new(()))
-            .lock()
-            .await
-    }
 
     #[test]
     fn osc52_callback_keeps_only_bounded_copy_requests() {
@@ -5041,7 +5028,6 @@ mod tests {
 
     #[tokio::test]
     async fn real_pty_osc52_reaches_only_the_live_focused_client() {
-        let _lock = real_pty_test_lock().await;
         let session = Arc::new(Session::spawn(80, 24, "clipboard-pty".into()).expect("session"));
         let (client, server) = UnixStream::pair().expect("socket pair");
         let server_task = tokio::spawn(serve_client(server, Arc::clone(&session)));
@@ -5095,11 +5081,11 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn real_pty_negotiates_kitty_input_and_receives_shift_enter() {
-        let _lock = real_pty_test_lock().await;
         let session = Session::spawn(80, 24, "keyboard-pty".into()).expect("session");
         session
             .handle(ClientMessage::Input {
-                bytes: b"printf '\\033[>3u'; IFS= read -r value; printf '\\nbytes:'; printf '%s' \"$value\" | od -An -tx1\n".to_vec(),
+                bytes: br#"exec python3 -c 'import os,termios,tty;fd=os.open("/dev/tty",os.O_RDWR);old=termios.tcgetattr(fd);tty.setraw(fd);os.write(fd,b"\x1b[>3u");value=os.read(fd,64);termios.tcsetattr(fd,termios.TCSADRAIN,old);print("bytes:"+value.hex())'
+"#.to_vec(),
             })
             .expect("send negotiation command");
         tokio::time::timeout(Duration::from_secs(2), async {
@@ -5119,7 +5105,7 @@ mod tests {
         .expect("PTY negotiated Kitty keyboard mode");
         session
             .handle(ClientMessage::Input {
-                bytes: b"\x1b[13;2u\n".to_vec(),
+                bytes: b"\x1b[13;2u".to_vec(),
             })
             .expect("send Shift+Enter sequence");
         let screen = tokio::time::timeout(Duration::from_secs(2), async {
@@ -5127,35 +5113,36 @@ mod tests {
                 let screen = session.snapshot().expect("snapshot").panes[0]
                     .screen
                     .clone();
-                if screen.contents.contains("1b 5b 31 33 3b 32 75") {
+                if screen.contents.contains("bytes:1b5b31333b3275") {
                     break screen;
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
         .await
-        .expect("PTY received Shift+Enter bytes");
+        .unwrap_or_else(|_| {
+            panic!(
+                "PTY received Shift+Enter bytes; screen={:?}",
+                session.snapshot().expect("snapshot").panes[0]
+                    .screen
+                    .contents
+            )
+        });
         assert_eq!(screen.keyboard.kitty_flags, 3);
     }
 
     #[cfg(unix)]
     #[tokio::test]
     async fn real_pty_receives_xtgettcap_reply() {
-        let _lock = real_pty_test_lock().await;
         let session = Session::spawn(80, 24, "capability-pty".into()).expect("session");
-        session.handle(ClientMessage::Input { bytes: b"printf '\\033P+q5463\\033\\\\'; IFS= read -r value; printf '\\nbytes:'; printf '%s' \"$value\" | od -An -tx1\n".to_vec() }).expect("send capability query");
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        session
-            .handle(ClientMessage::Input {
-                bytes: b"\n".to_vec(),
-            })
-            .expect("finish read");
+        session.handle(ClientMessage::Input { bytes: br#"exec python3 -c 'import os,termios,tty;fd=os.open("/dev/tty",os.O_RDWR);old=termios.tcgetattr(fd);tty.setraw(fd);os.write(fd,b"\x1bP+q5463\x1b\\");value=os.read(fd,128);termios.tcsetattr(fd,termios.TCSADRAIN,old);print("bytes:"+value.hex())'
+"#.to_vec() }).expect("send capability query");
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
                 if session.snapshot().expect("snapshot").panes[0]
                     .screen
                     .contents
-                    .contains("1b 50 31 2b 72 35 34 36 33 3d 33 31 1b 5c")
+                    .contains("bytes:1b50312b72353436333d33311b5c")
                 {
                     break;
                 }
@@ -5163,7 +5150,14 @@ mod tests {
             }
         })
         .await
-        .expect("PTY received XTGETTCAP reply");
+        .unwrap_or_else(|_| {
+            panic!(
+                "PTY received XTGETTCAP reply; screen={:?}",
+                session.snapshot().expect("snapshot").panes[0]
+                    .screen
+                    .contents
+            )
+        });
     }
 
     #[tokio::test]
