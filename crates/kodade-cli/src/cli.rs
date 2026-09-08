@@ -502,6 +502,20 @@ pub enum AgentCommand {
     },
     /// Refresh agent-detection manifests from the repo (opt-in network call).
     UpdateManifests,
+    /// Inspect the active manifest cache, or atomically reload local overrides.
+    Manifests {
+        /// Re-read bundled and user override manifests without restarting.
+        #[arg(long)]
+        reload: bool,
+        /// Print JSON instead of an aligned table.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Validate a manifest file against the daemon schema without installing it.
+    ValidateManifest {
+        #[arg(value_name = "PATH")]
+        path: PathBuf,
+    },
     /// Wait until a pane reaches an agent state; exits 2 on timeout.
     Wait {
         #[arg(value_name = "TARGET")]
@@ -578,21 +592,44 @@ pub enum IntegrateCommand {
         /// Merge the hooks into ~/.claude/settings.json instead of printing them.
         #[arg(long)]
         write: bool,
+        /// Remove only Ködade-managed hooks from the settings file.
+        #[arg(long, conflicts_with = "write")]
+        remove: bool,
     },
     /// Gemini CLI hooks (Claude-compatible) that report agent state.
     GeminiCli {
         /// Merge the hooks into ~/.gemini/settings.json instead of printing them.
         #[arg(long)]
         write: bool,
+        /// Remove only Ködade-managed hooks from the settings file.
+        #[arg(long, conflicts_with = "write")]
+        remove: bool,
     },
-    /// Codex `notify` entry that reports agent state.
+    /// Codex lifecycle hooks that report agent state without replacing `notify`.
     Codex {
-        /// Merge the entry into ~/.codex/config.toml instead of printing it.
+        /// Merge the entries into ~/.codex/hooks.json instead of printing them.
         #[arg(long)]
         write: bool,
-        /// Replace an existing `notify` entry instead of refusing.
+        /// Retained for compatibility; Codex hooks never replace `notify`.
         #[arg(long)]
         force: bool,
+        /// Remove only Ködade-managed hooks from ~/.codex/hooks.json.
+        #[arg(long, conflicts_with = "write")]
+        remove: bool,
+    },
+    /// OpenCode local plugin (official API documented; fixture-tested here).
+    OpenCode {
+        #[arg(long)]
+        write: bool,
+        #[arg(long, conflicts_with = "write")]
+        remove: bool,
+    },
+    /// Pi global extension (verified against installed Pi 0.85.1 docs).
+    Pi {
+        #[arg(long)]
+        write: bool,
+        #[arg(long, conflicts_with = "write")]
+        remove: bool,
     },
 }
 
@@ -714,7 +751,10 @@ mod tests {
         assert_eq!(
             parse(&["kodade-cli", "integrate", "claude-code", "--write"]).command,
             Some(Command::Integrate {
-                target: IntegrateCommand::ClaudeCode { write: true }
+                target: IntegrateCommand::ClaudeCode {
+                    write: true,
+                    remove: false
+                }
             })
         );
         assert_eq!(
@@ -889,14 +929,18 @@ mod tests {
             Some(Command::Integrate {
                 target: IntegrateCommand::Codex {
                     write: true,
-                    force: true
+                    force: true,
+                    remove: false,
                 }
             })
         );
         assert_eq!(
             parse(&["kodade-cli", "integrate", "gemini-cli", "--write"]).command,
             Some(Command::Integrate {
-                target: IntegrateCommand::GeminiCli { write: true }
+                target: IntegrateCommand::GeminiCli {
+                    write: true,
+                    remove: false
+                }
             })
         );
         assert_eq!(

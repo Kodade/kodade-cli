@@ -357,10 +357,10 @@ Requires OpenSSH with Unix-domain forwarding (`-L localsock:remotesock`), which
 is standard on current macOS and Linux.
 
 `kodade-cli integrate list` shows the available integrations.
-`kodade-cli integrate <agent>` prints the hook/notify settings and
+`kodade-cli integrate <agent>` prints the hook settings and
 `--write` installs them: `claude-code` and `gemini-cli` merge hooks into their
-`settings.json`; `codex` merges a `notify` entry into `~/.codex/config.toml`
-(add `--force` to replace an existing one). See
+`settings.json`; `codex` merges marked lifecycle hooks into
+`~/.codex/hooks.json` without replacing its separate `notify` setting. See
 [docs/AGENT-DETECTION.md](docs/AGENT-DETECTION.md) for details.
 
 See [docs/CONFIG.md](docs/CONFIG.md), [docs/AGENT-DETECTION.md](docs/AGENT-DETECTION.md),

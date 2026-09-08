@@ -10,7 +10,7 @@ then `working`, `done`, `idle`, and `unknown`.
 - `working`: The agent is actively producing output, or a hook or manifest
   explicitly reports this state.
 - `done`: The agent's turn finished. Lifecycle "turn ended" hooks report this
-  (`Stop` for Claude Code, `AfterAgent` for Gemini CLI, `notify` for Codex), so it marks a
+  (`Stop` for Claude Code, `AfterAgent` for Gemini CLI, `Stop` for Codex), so it marks a
   completed turn rather than a decayed working state. The current built-in
   manifests do not define a `done` screen rule. A hook-reported `done`
   *sticks*: unlike the other states it has no TTL and stays until the pane
@@ -209,13 +209,13 @@ state, so detection does not depend on screen strings alone.
   following its [official hook events](https://geminicli.com/docs/hooks/).
   Earlier Ködade hooks under Claude event names are removed while unrelated
   hooks and their matcher metadata are preserved.
-- `integrate codex [--write] [--force]` — Codex uses a single top-level
-  `notify` program. Codex fires `notify` only when a turn completes, so this
-  merges `notify = ["sh", "-c", "<report done>"]` into
-  `~/.codex/config.toml` with `toml_edit`, preserving comments. Codex appends a
-  JSON payload as the program's last argument (`$0` for `sh -c`), which the
-  report command ignores. An existing Ködade entry is refreshed idempotently;
-  an unrelated `notify` entry is preserved unless `--force` is supplied.
+- `integrate codex [--write]` — installs Ködade-owned lifecycle commands in
+  `~/.codex/hooks.json`: `UserPromptSubmit` → working, `Stop` → done, and
+  `PermissionRequest` → blocked. It never replaces the separate legacy
+  `notify` setting in `~/.codex/config.toml`. Codex must have hooks enabled
+  for the workspace under its normal trust/settings policy; if it does not run
+  the commands, Ködade continues with process and screen detection. Use
+  `integrate codex --remove` to remove only Ködade's marked commands.
 
 Merges are idempotent and never remove unrelated keys or hooks. A previously
 installed Ködade report hook for the same event is upgraded in place (matched

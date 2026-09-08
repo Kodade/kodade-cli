@@ -348,7 +348,8 @@ mod tests {
         assert_eq!(pane.title, "fake-agent");
 
         let mut output = String::new();
-        for _ in 0..20 {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
             output = commands::read_pane(&socket, pane.id, true, None)
                 .await
                 .expect("read started pane");
@@ -357,7 +358,10 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
-        assert!(output.contains("fake-agent-ready"));
+        assert!(
+            output.contains("fake-agent-ready"),
+            "started pane output: {output:?}"
+        );
 
         let reply = commands::request(&socket, ClientMessage::KillSession)
             .await

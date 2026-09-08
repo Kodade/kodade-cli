@@ -11,6 +11,7 @@ use std::{
     collections::HashMap,
     env, fs,
     io::{Read, Write},
+    os::unix::fs::FileTypeExt,
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
@@ -22,9 +23,10 @@ use std::{
 use anyhow::{anyhow, bail, Context, Result};
 use kodade_cli_proto::{
     decode, encode, schema_message, AgentInfo, AgentStateKind, CellColor, ClientMessage, Direction,
-    Event, LayoutSnapshot, LayoutTree, Notification, PaneId, PaneSnapshot, QueryKind, Run, Screen,
-    ServerMessage, SidebarTabInfo, SplitAxis, TabId, TabInfo, WorkspaceId, WorkspaceInfo,
-    ATTR_BOLD, ATTR_DIM, ATTR_INVERSE, ATTR_ITALIC, ATTR_UNDERLINE, PROTOCOL_VERSION,
+    Event, LayoutSnapshot, LayoutTree, ManifestInfo, Notification, PaneId, PaneSnapshot, QueryKind,
+    Run, Screen, ServerMessage, SidebarTabInfo, SplitAxis, TabId, TabInfo, WorkspaceId,
+    WorkspaceInfo, ATTR_BOLD, ATTR_DIM, ATTR_INVERSE, ATTR_ITALIC, ATTR_UNDERLINE,
+    PROTOCOL_VERSION,
 };
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use tokio::{
@@ -41,7 +43,9 @@ struct Session {
     updates: broadcast::Sender<()>,
     shutdown: broadcast::Sender<()>,
     size: Mutex<(u16, u16)>,
-    manifests: Vec<manifest::Manifest>,
+    /// Reloadable detection rules. Replacing this lock happens only after a
+    /// complete replacement set has parsed successfully.
+    manifests: Mutex<Vec<manifest::Manifest>>,
     /// Bumped by every layout-changing mutation (via `notify`), never by PTY
     /// output. The persist task watches this so scrollback churn is not saved.
     /// Kept on `Session` (not `SessionState`) so `notify` can bump it without
@@ -66,6 +70,10 @@ struct Session {
     /// Path of the bound socket file. `session rename` renames the file in
     /// place, so teardown reads it from here rather than from the start value.
     socket: Mutex<PathBuf>,
+    /// Per-daemon socket link injected into every pane. Unlike the public
+    /// session socket it survives a session rename, so already-running agent
+    /// hooks keep reaching this daemon.
+    hook_socket: PathBuf,
     /// Serializes the short compatibility staging used by [`ClientView`].  The
     /// stored session selection remains the scripting/persistence default; an
     /// attached client temporarily installs only its own selection while one
@@ -231,16 +239,7 @@ impl PaneState {
 /// Validate downloaded detection rules against the same schema used at startup.
 pub fn validate_agent_manifest(source: &str) -> Result<String> {
     let manifest: manifest::Manifest = toml::from_str(source).context("parse agent manifest")?;
-    if manifest.name.trim().is_empty() || manifest.display.trim().is_empty() {
-        bail!("agent manifest needs a name and display label");
-    }
-    if manifest
-        .rules
-        .iter()
-        .any(|rule| rule.any.is_empty() || rule.any.iter().any(|needle| needle.trim().is_empty()))
-    {
-        bail!("agent manifest rules need nonempty match text");
-    }
+    manifest::validate(&manifest)?;
     Ok(manifest.name)
 }
 /// Kept in step with the CLI: a prompt is one atomic PTY writer submission.
@@ -248,6 +247,15 @@ const MAX_PROMPT_BYTES: usize = 64 * 1024;
 
 pub fn socket_path(session: &str) -> PathBuf {
     socket_dir().join(format!("{session}.sock"))
+}
+
+fn hook_socket_path() -> PathBuf {
+    // Keep hook transport out of the public socket directory: `session ls`
+    // deliberately scans its direct `*.sock` children. A PID is unique among
+    // concurrent daemons and keeps this path comfortably under sockaddr limits.
+    socket_dir()
+        .join("hooks")
+        .join(format!("{}.sock", std::process::id()))
 }
 
 /// Directory holding one `<session>.sock` per live session. `session ls` scans
@@ -297,8 +305,41 @@ pub async fn run(session_name: String) -> Result<()> {
         remove_stale_socket(&socket).await?;
     }
     let listener = UnixListener::bind(&socket).context("bind Ködade CLI socket")?;
+    let hook_socket = hook_socket_path();
+    fs::create_dir_all(hook_socket.parent().expect("hook socket has parent"))
+        .context("create Ködade hook socket directory")?;
+    if let Ok(metadata) = fs::symlink_metadata(&hook_socket) {
+        if !metadata.file_type().is_socket() {
+            drop(listener);
+            let _ = fs::remove_file(&socket);
+            bail!(
+                "refusing to replace non-socket Ködade hook path {}",
+                hook_socket.display()
+            );
+        }
+        // A PID-reused stale socket is safe to remove only after this process
+        // has exclusively bound the public session name. A live socket is not.
+        if let Err(error) = remove_stale_socket(&hook_socket).await {
+            drop(listener);
+            let _ = fs::remove_file(&socket);
+            return Err(error).context("remove stale Ködade hook socket");
+        }
+    }
+    if let Err(error) = fs::hard_link(&socket, &hook_socket) {
+        drop(listener);
+        let _ = fs::remove_file(&socket);
+        return Err(error).context("link stable Ködade hook socket");
+    }
     // Binding succeeded, so no live daemon owns this session: safe to restore.
-    let session = Arc::new(load_session(&session_name)?);
+    let session = match load_session(&session_name) {
+        Ok(session) => Arc::new(session),
+        Err(error) => {
+            drop(listener);
+            let _ = fs::remove_file(&hook_socket);
+            let _ = fs::remove_file(&socket);
+            return Err(error);
+        }
+    };
     // The socket name wins over whatever the state file recorded (it may have
     // been renamed or copied), so `save` and teardown stay on this path.
     *session.name.lock().expect("name lock poisoned") = session_name.clone();
@@ -319,12 +360,14 @@ pub async fn run(session_name: String) -> Result<()> {
                 persist::remove_session_file(&session.session_name());
                 drop(listener);
                 let _ = fs::remove_file(session.socket_path());
+                let _ = fs::remove_file(session.hook_socket());
                 return Ok(());
             }
             _ = sigterm.recv() => {
                 session.save();
                 drop(listener);
                 let _ = fs::remove_file(session.socket_path());
+                let _ = fs::remove_file(session.hook_socket());
                 return Ok(());
             }
             accepted = listener.accept() => {
@@ -345,8 +388,12 @@ pub async fn run(session_name: String) -> Result<()> {
 fn load_session(name: &str) -> Result<Session> {
     if let Some(path) = persist::session_file_path(name) {
         match persist::read_session_file(&path) {
-            Ok(Some(file)) => {
+            Ok(Some(mut file)) => {
                 let resume_agents = persist::resume_agents_setting();
+                // The file may have been copied or survived a partial rename;
+                // the bound public name and its hook link are authoritative
+                // before restored panes inherit their environment.
+                file.name = name.to_owned();
                 return Session::restore(file, resume_agents);
             }
             Ok(None) => {}
@@ -424,7 +471,7 @@ impl Session {
             updates,
             shutdown,
             size: Mutex::new((cols, rows)),
-            manifests: manifest::load()?,
+            manifests: Mutex::new(manifest::load()?),
             layout_generation: AtomicU64::new(0),
             restored: AtomicBool::new(false),
             notifications: Mutex::new(Vec::new()),
@@ -432,6 +479,7 @@ impl Session {
             events,
             subscribers: AtomicUsize::new(0),
             socket: Mutex::new(socket_path(&name_for_socket)),
+            hook_socket: hook_socket_path(),
             view_dispatch: Mutex::new(()),
         };
         let pane = session.new_pane("shell", None, None)?;
@@ -481,7 +529,7 @@ impl Session {
             updates,
             shutdown,
             size: Mutex::new((80, 24)),
-            manifests: manifest::load()?,
+            manifests: Mutex::new(manifest::load()?),
             layout_generation: AtomicU64::new(0),
             restored: AtomicBool::new(true),
             notifications: Mutex::new(Vec::new()),
@@ -489,8 +537,13 @@ impl Session {
             events,
             subscribers: AtomicUsize::new(0),
             socket: Mutex::new(socket_path(&file.name)),
+            hook_socket: hook_socket_path(),
             view_dispatch: Mutex::new(()),
         };
+        let manifests = session
+            .manifests
+            .lock()
+            .map_err(|_| anyhow!("manifest lock poisoned"))?;
         let mut workspaces = Vec::new();
         let mut workspace_ids: HashMap<u64, WorkspaceId> = HashMap::new();
         for saved in &file.workspaces {
@@ -502,7 +555,7 @@ impl Session {
                 let mut pane_ids: HashMap<PaneId, PaneId> = HashMap::new();
                 for saved_pane in &saved_tab.panes {
                     let cwd = restore_cwd(saved_pane.cwd.clone(), saved.root.clone());
-                    let command = resume_command(saved_pane, resume_agents, &session.manifests);
+                    let command = resume_command(saved_pane, resume_agents, &manifests);
                     let new_id = session.new_pane(&saved_pane.title, cwd, command)?;
                     pane_ids.insert(PaneId(saved_pane.id), new_id);
                 }
@@ -551,6 +604,7 @@ impl Session {
             state.workspaces = workspaces;
             state.active_workspace = active_workspace;
         }
+        drop(manifests);
         Ok(session)
     }
 
@@ -656,6 +710,10 @@ impl Session {
         self.name.lock().expect("name lock poisoned").clone()
     }
 
+    fn hook_socket(&self) -> PathBuf {
+        self.hook_socket.clone()
+    }
+
     /// Publish a session event to subscribed connections. Never fails: with no
     /// subscribers the send is a no-op.
     fn emit(&self, event: Event) {
@@ -687,6 +745,7 @@ impl Session {
             cols,
             rows,
             self.session_name(),
+            self.hook_socket(),
             self.updates.clone(),
             cwd,
             command,
@@ -962,8 +1021,15 @@ impl Session {
             self.notify();
             return Ok(());
         }
-        // A view-changing operation becomes the PTY size arbiter. Read-only
-        // queries deliberately do not resize a session another client is using.
+        let _dispatch = self
+            .view_dispatch
+            .lock()
+            .map_err(|_| anyhow!("view dispatch lock poisoned"))?;
+        // A view-changing operation becomes the PTY size arbiter. This is
+        // under the same dispatch lock as selection staging, so another client
+        // cannot publish its dimensions between the arbitration and dispatch.
+        // Read-only queries deliberately do not resize a session another client
+        // is using.
         if !matches!(
             message,
             ClientMessage::Query(_) | ClientMessage::Subscribe | ClientMessage::ReadPane { .. }
@@ -973,10 +1039,6 @@ impl Session {
                 .lock()
                 .map_err(|_| anyhow!("size lock poisoned"))? = (view.cols, view.rows);
         }
-        let _dispatch = self
-            .view_dispatch
-            .lock()
-            .map_err(|_| anyhow!("view dispatch lock poisoned"))?;
         let saved = {
             let mut state = self
                 .state
@@ -1031,6 +1093,40 @@ impl Session {
             .lock()
             .map_err(|_| anyhow!("view dispatch lock poisoned"))?;
         self.snapshot()
+    }
+
+    fn manifest_info(&self) -> Result<Vec<ManifestInfo>> {
+        let manifests = self
+            .manifests
+            .lock()
+            .map_err(|_| anyhow!("manifest lock poisoned"))?;
+        Ok(manifests
+            .iter()
+            .map(|manifest| ManifestInfo {
+                name: manifest.name.clone(),
+                display: manifest.display.clone(),
+                process: manifest.process.clone(),
+                title: manifest.title.clone(),
+                rules: manifest.rules.len(),
+                source: manifest.source.label().into(),
+            })
+            .collect())
+    }
+
+    /// Parse the whole replacement set before holding the active cache lock.
+    /// A bad local override therefore leaves the running detection behavior
+    /// untouched until the user fixes it and retries reload.
+    fn reload_manifests(&self) -> Result<Vec<ManifestInfo>> {
+        let replacement = manifest::load()?;
+        {
+            let mut manifests = self
+                .manifests
+                .lock()
+                .map_err(|_| anyhow!("manifest lock poisoned"))?;
+            *manifests = replacement;
+        }
+        self.notify();
+        self.manifest_info()
     }
 
     fn snapshot_for_client(&self, view: &ClientView) -> Result<LayoutSnapshot> {
@@ -1102,9 +1198,13 @@ impl Session {
             .lock()
             .map_err(|_| anyhow!("pane lock poisoned"))?;
         let now = Instant::now();
+        let manifests = self
+            .manifests
+            .lock()
+            .map_err(|_| anyhow!("manifest lock poisoned"))?;
         let detections: HashMap<_, _> = panes
             .iter()
-            .map(|(id, pane)| (*id, pane.detect(&self.manifests, now)))
+            .map(|(id, pane)| (*id, pane.detect(&manifests, now)))
             .collect();
         // Age is tracked once per snapshot, after detection settles on a state.
         // The same pass spots transitions into blocked/done and queues a
@@ -1238,7 +1338,11 @@ impl Session {
             bail!("pane {} not found", id.0);
         }
         let now = Instant::now();
-        let detection = pane.detect(&self.manifests, now);
+        let manifests = self
+            .manifests
+            .lock()
+            .map_err(|_| anyhow!("manifest lock poisoned"))?;
+        let detection = pane.detect(&manifests, now);
         let (previous, age) = pane.transition_state(detection.state, now);
         if let Some(from) = previous.filter(|from| *from != detection.state) {
             self.emit(Event::AgentStateChanged {
@@ -1290,7 +1394,11 @@ impl Session {
             .cloned()
             .ok_or_else(|| anyhow!("pane {} not found", id.0))?;
         let now = Instant::now();
-        let (detection, process) = pane.detect_fresh(&self.manifests, now);
+        let manifests = self
+            .manifests
+            .lock()
+            .map_err(|_| anyhow!("manifest lock poisoned"))?;
+        let (detection, process) = pane.detect_fresh(&manifests, now);
         let generation = pane.track_agent_identity(&detection.agent, &process);
         if detection.agent.as_deref() != Some(expected_agent) || generation != expected_generation {
             bail!("agent pane {} was replaced; resolve the target again", id.0);
@@ -1299,6 +1407,7 @@ impl Session {
             bail!("agent pane {} is blocked", id.0);
         }
         pane.write(bytes)?;
+        drop(manifests);
         self.notify();
         self.pane_snapshot(id)
     }
@@ -1390,6 +1499,10 @@ impl Session {
     /// while terminal applications see one coherent size instead of a resize
     /// race on every output frame.
     fn resize_for_view(&self, view: &ClientView) -> Result<()> {
+        let _dispatch = self
+            .view_dispatch
+            .lock()
+            .map_err(|_| anyhow!("view dispatch lock poisoned"))?;
         *self
             .size
             .lock()
@@ -1447,6 +1560,9 @@ impl Session {
             | ClientMessage::Subscribe
             | ClientMessage::ReadPane { .. }
             | ClientMessage::PromptAgent { .. } => {}
+            ClientMessage::ReloadManifests => {
+                self.reload_manifests()?;
+            }
             ClientMessage::ApplyLayout(file) => self.apply_layout(file)?,
             ClientMessage::MovePaneToTab { pane, tab } => self.move_pane_to_tab(pane, tab)?,
             ClientMessage::RenameSession { name } => self.rename_session(&name)?,
@@ -2795,6 +2911,7 @@ impl Pane {
         cols: u16,
         rows: u16,
         session: String,
+        hook_socket: PathBuf,
         updates: broadcast::Sender<()>,
         cwd: Option<PathBuf>,
         run: Option<Vec<String>>,
@@ -2832,7 +2949,7 @@ impl Pane {
             command.cwd(dir);
         }
         command.env("KODADE_PANE", id.0.to_string());
-        command.env("KODADE_SOCKET", socket_path(&session));
+        command.env("KODADE_SOCKET", hook_socket);
         command.env("KODADE_SESSION", session);
         // Scripts inside a pane call the same binary that hosts them.
         if let Ok(exe) = env::current_exe() {
@@ -3519,6 +3636,30 @@ async fn serve_client(stream: UnixStream, session: Arc<Session>) -> Result<()> {
                         write_server(&mut writer, &schema_message()).await?;
                         continue;
                     }
+                    ClientMessage::Query(QueryKind::Manifests) => {
+                        match session.manifest_info() {
+                            Ok(manifests) => {
+                                write_server(&mut writer, &ServerMessage::Manifests(manifests)).await?;
+                            }
+                            Err(error) => {
+                                write_server(&mut writer, &ServerMessage::Error { message: error.to_string() }).await?;
+                                return Ok(());
+                            }
+                        }
+                        continue;
+                    }
+                    ClientMessage::ReloadManifests => {
+                        match session.reload_manifests() {
+                            Ok(manifests) => {
+                                write_server(&mut writer, &ServerMessage::Manifests(manifests)).await?;
+                            }
+                            Err(error) => {
+                                write_server(&mut writer, &ServerMessage::Error { message: error.to_string() }).await?;
+                                continue;
+                            }
+                        }
+                        continue;
+                    }
                     ClientMessage::Subscribe => {
                         // Counted once per connection; the guard decrements it
                         // however this loop exits.
@@ -3937,6 +4078,7 @@ mod tests {
             20,
             2,
             "scroll-test".into(),
+            hook_socket_path(),
             updates,
             None,
             Some(vec!["sleep".into(), "60".into()]),
@@ -4250,6 +4392,7 @@ mod tests {
             title: Vec::new(),
             resume: Some("codex resume --last".into()),
             rules: Vec::new(),
+            source: manifest::ManifestSource::Builtin,
         }];
         let agent = persist::PaneFile {
             id: 1,
@@ -4577,7 +4720,16 @@ mod tests {
             .await
             .expect("focus a");
         let _ = next_layout_matching(&mut a, |layout| layout.active_tab == second_tab).await;
-        assert_eq!(*session.size.lock().expect("size"), (100, 30));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if *session.size.lock().expect("size") == (100, 30) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("A's dispatched focus takes geometry ownership");
         drop(a_writer);
         // Disconnecting A leaves B and the panes alive.
         b_writer
@@ -4685,14 +4837,15 @@ mod tests {
 
     #[tokio::test]
     async fn guarded_prompt_rejects_replacement_and_blocked_agent_before_write() {
-        let mut session = Session::spawn(80, 24, "guarded-prompt".into()).expect("spawn");
-        session.manifests = vec![manifest::Manifest {
+        let session = Session::spawn(80, 24, "guarded-prompt".into()).expect("spawn");
+        *session.manifests.lock().unwrap() = vec![manifest::Manifest {
             name: "fake".into(),
             display: "Fake Agent".into(),
             process: vec!["fake-agent".into()],
             title: vec![],
             resume: None,
             rules: vec![],
+            source: manifest::ManifestSource::Builtin,
         }];
         let pane_id = session.snapshot().expect("snapshot").panes[0].id;
         let pane = session.panes.lock().unwrap().get(&pane_id).unwrap().clone();
@@ -4730,6 +4883,82 @@ mod tests {
                 b"must-not-write",
             )
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn existing_pane_hooks_keep_their_stable_socket_after_session_rename() {
+        let unique = format!(
+            "hook-rename-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let renamed = format!("{unique}-new");
+        let public = socket_path(&unique);
+        let stable = hook_socket_path();
+        let new_public = socket_path(&renamed);
+        let _ = fs::remove_file(&public);
+        let _ = fs::remove_file(&stable);
+        let _ = fs::remove_file(&new_public);
+        fs::create_dir_all(public.parent().unwrap()).unwrap();
+        fs::create_dir_all(stable.parent().unwrap()).unwrap();
+        let listener = UnixListener::bind(&public).unwrap();
+        fs::hard_link(&public, &stable).unwrap();
+        let session = Arc::new(Session::spawn(80, 24, unique.clone()).expect("spawn session"));
+
+        session.rename_session(&renamed).expect("rename session");
+        let pane = session.snapshot().unwrap().panes[0].id;
+        let server = {
+            let session = Arc::clone(&session);
+            tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.expect("accept hook reporter");
+                let _ = serve_client(stream, session).await;
+            })
+        };
+        let shim = std::env::temp_dir().join(format!("kodade-hook-report-{unique}"));
+        fs::write(
+            &shim,
+            "#!/usr/bin/env python3\nimport json, os, socket, sys\ns = socket.socket(socket.AF_UNIX)\ns.connect(os.environ['KODADE_SOCKET'])\ns.sendall((json.dumps({'AgentState': {'pane': int(sys.argv[3]), 'state': sys.argv[4], 'source': 'hook'}}) + '\\n').encode())\n",
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&shim, fs::Permissions::from_mode(0o700)).unwrap();
+        let command = format!(
+            "KODADE_BIN={}; export KODADE_BIN; KODADE_INTEGRATION=kodade-cli; if [ -n \"${{KODADE_PANE:-}}\" ] && [ -n \"${{KODADE_SOCKET:-}}\" ]; then \"$KODADE_BIN\" agent report \"$KODADE_PANE\" working; fi\n",
+            shim.display()
+        );
+        session
+            .panes
+            .lock()
+            .unwrap()
+            .get(&pane)
+            .unwrap()
+            .write(command.as_bytes())
+            .unwrap();
+        let mut seen = false;
+        for _ in 0..40 {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            if session
+                .snapshot()
+                .is_ok_and(|layout| layout.panes[0].state == AgentStateKind::Working)
+            {
+                seen = true;
+                break;
+            }
+        }
+        assert!(
+            seen,
+            "existing pane hook did not report through the stable socket: {:?}",
+            session.snapshot().unwrap().panes[0].screen.contents
+        );
+        assert!(stable.exists());
+        server.await.unwrap();
+
+        let _ = fs::remove_file(&shim);
+        let _ = fs::remove_file(&stable);
+        let _ = fs::remove_file(&new_public);
     }
 
     #[tokio::test]

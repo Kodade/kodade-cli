@@ -5,15 +5,22 @@ use serde_json::{json, Value};
 use std::{fs, path::Path};
 
 /// Integrations that install a lifecycle hook / notify entry for a known agent.
-pub const INTEGRATIONS: &[&str] = &["claude-code", "codex", "gemini-cli"];
+pub const INTEGRATIONS: &[&str] = &["claude-code", "codex", "gemini-cli", "opencode", "pi"];
 
-/// Prefix shared by every Ködade report hook/notify command, used to detect and
-/// replace a previously installed entry (e.g. migrating an old Stop->idle hook).
-const REPORT_PREFIX: &str = "kodade-cli agent report $KODADE_PANE ";
+/// Marker shared by every Ködade-managed hook command. It is deliberately
+/// distinct from a user's arbitrary `kodade-cli` invocation.
+const REPORT_PREFIX: &str = "KODADE_INTEGRATION=kodade-cli;";
+const LEGACY_REPORT_PREFIX: &str = "kodade-cli agent report $KODADE_PANE ";
 
 /// Command each hook/notify entry runs; `state` is the state it reports.
 fn report_command(state: &str) -> String {
-    format!("{REPORT_PREFIX}{state} -s \"$KODADE_SESSION\"")
+    format!(
+        "{REPORT_PREFIX} if [ -n \"${{KODADE_PANE:-}}\" ] && [ -n \"${{KODADE_SOCKET:-}}\" ]; then \"${{KODADE_BIN:-kodade-cli}}\" agent report \"$KODADE_PANE\" {state} >/dev/null 2>&1 || true; fi"
+    )
+}
+
+fn is_report_command(command: &str) -> bool {
+    command.starts_with(REPORT_PREFIX) || command.starts_with(LEGACY_REPORT_PREFIX)
 }
 
 /// List every known integration and whether its config directory is present.
@@ -22,8 +29,16 @@ pub fn integrate_list() -> Result<()> {
     for agent in INTEGRATIONS {
         let (target, mechanism) = match *agent {
             "claude-code" => (".claude/settings.json", "hooks"),
-            "codex" => (".codex/config.toml", "notify"),
+            "codex" => (".codex/hooks.json", "hooks"),
             "gemini-cli" => (".gemini/settings.json", "hooks"),
+            "opencode" => (
+                ".config/opencode/plugins/kodade-cli-agent-state.js",
+                "plugin (official docs; fixture-tested)",
+            ),
+            "pi" => (
+                ".pi/agent/extensions/kodade-cli-agent-state.ts",
+                "extension (Pi 0.85.1 locally verified)",
+            ),
             _ => continue,
         };
         let path = home.as_ref().map(|home| home.join(target));
@@ -57,72 +72,45 @@ pub fn integrate_claude_code(write: bool) -> Result<()> {
     Ok(())
 }
 
-/// Codex runs a single `notify` program with a JSON payload appended as the last
-/// argument. `sh -c '<script>'` receives that payload as `$0`, which the report
-/// script ignores.
-fn codex_notify() -> toml_edit::Array {
-    let mut array = toml_edit::Array::new();
-    array.push("sh");
-    array.push("-c");
-    array.push(report_command("done"));
-    array
-}
-
-pub fn integrate_codex(write: bool, force: bool) -> Result<()> {
+pub fn unintegrate_claude_code() -> Result<()> {
     let home = dirs::home_dir().ok_or_else(|| anyhow!("home directory unavailable"))?;
-    let path = home.join(".codex/config.toml");
-    let source = match fs::read_to_string(&path) {
-        Ok(source) => source,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(error) => return Err(error.into()),
-    };
-    let merged = match merge_codex_notify(&source, force)? {
-        Some(merged) => merged,
-        None => {
-            println!(
-                "Codex already has a `notify` entry in {}.\n\
-                 Ködade will not overwrite it. Re-run with --force to replace it, or add manually:\n{}",
-                path.display(),
-                notify_preview()
-            );
-            return Ok(());
-        }
-    };
-    if !write {
-        println!("{}", notify_preview());
-        return Ok(());
-    }
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    crate::atomic_file::write(&path, merged.as_bytes())?;
-    println!("installed Codex notify hook in {}", path.display());
+    let path = home.join(".claude/settings.json");
+    remove_hook_settings(&path)?;
+    println!("removed Ködade Claude Code hooks from {}", path.display());
     Ok(())
 }
 
-/// Insert the Ködade `notify` entry into a Codex config, preserving comments and
-/// other keys. Returns `None` when a `notify` already exists and `force` is off.
-fn merge_codex_notify(source: &str, force: bool) -> Result<Option<String>> {
-    let mut doc = source
-        .parse::<toml_edit::DocumentMut>()
-        .context("parse Codex config.toml")?;
-    let ours = doc
-        .get("notify")
-        .and_then(toml_edit::Item::as_array)
-        .and_then(|array| array.get(2))
-        .and_then(toml_edit::Value::as_str)
-        .is_some_and(|command| command.starts_with(REPORT_PREFIX));
-    if doc.contains_key("notify") && !force && !ours {
-        return Ok(None);
-    }
-    doc["notify"] = toml_edit::value(codex_notify());
-    Ok(Some(doc.to_string()))
+/// Codex hooks are a separate JSON document. Keeping Ködade entries there
+/// preserves any existing `notify` command in config.toml.
+fn codex_hooks() -> Value {
+    json!({
+        "Stop": [{ "hooks": [{ "type": "command", "command": report_command("done") }] }],
+        "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": report_command("working") }] }],
+        "PermissionRequest": [{ "hooks": [{ "type": "command", "command": report_command("blocked") }] }]
+    })
 }
 
-fn notify_preview() -> String {
-    let mut preview = toml_edit::DocumentMut::new();
-    preview["notify"] = toml_edit::value(codex_notify());
-    preview.to_string().trim_end().to_string()
+pub fn integrate_codex(write: bool, _force: bool) -> Result<()> {
+    let home = dirs::home_dir().ok_or_else(|| anyhow!("home directory unavailable"))?;
+    let path = home.join(".codex/hooks.json");
+    if !write {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({ "hooks": codex_hooks() }))?
+        );
+        return Ok(());
+    }
+    merge_hook_settings(&path, &codex_hooks())?;
+    println!("installed Codex hooks in {}", path.display());
+    Ok(())
+}
+
+pub fn unintegrate_codex() -> Result<()> {
+    let home = dirs::home_dir().ok_or_else(|| anyhow!("home directory unavailable"))?;
+    let path = home.join(".codex/hooks.json");
+    remove_hook_settings(&path)?;
+    println!("removed Ködade Codex hooks from {}", path.display());
+    Ok(())
 }
 
 /// Gemini has its own lifecycle event names; see geminicli.com/docs/hooks/.
@@ -148,6 +136,128 @@ pub fn integrate_gemini(write: bool, _force: bool) -> Result<()> {
     merge_hook_settings(&path, &gemini_hooks())?;
     println!("installed Gemini CLI hooks in {}", path.display());
     Ok(())
+}
+
+pub fn unintegrate_gemini() -> Result<()> {
+    let home = dirs::home_dir().ok_or_else(|| anyhow!("home directory unavailable"))?;
+    let path = home.join(".gemini/settings.json");
+    remove_hook_settings(&path)?;
+    println!("removed Ködade Gemini CLI hooks from {}", path.display());
+    Ok(())
+}
+
+pub fn integrate_pi(write: bool) -> Result<()> {
+    let home = dirs::home_dir().ok_or_else(|| anyhow!("home directory unavailable"))?;
+    let root = std::env::var_os("PI_CODING_AGENT_DIR")
+        .map(Into::into)
+        .unwrap_or_else(|| home.join(".pi/agent"));
+    let path = root.join("extensions/kodade-cli-agent-state.ts");
+    if !write {
+        println!("{}", pi_extension());
+        return Ok(());
+    }
+    if !root.exists() {
+        bail!("Pi agent directory {} does not exist", root.display());
+    }
+    write_owned_file(&path, pi_extension())?;
+    println!("installed Pi extension in {}", path.display());
+    Ok(())
+}
+
+pub fn unintegrate_pi() -> Result<()> {
+    let home = dirs::home_dir().ok_or_else(|| anyhow!("home directory unavailable"))?;
+    let root = std::env::var_os("PI_CODING_AGENT_DIR")
+        .map(Into::into)
+        .unwrap_or_else(|| home.join(".pi/agent"));
+    remove_owned_file(&root.join("extensions/kodade-cli-agent-state.ts"))?;
+    Ok(())
+}
+
+pub fn integrate_opencode(write: bool) -> Result<()> {
+    let home = dirs::home_dir().ok_or_else(|| anyhow!("home directory unavailable"))?;
+    let path = home.join(".config/opencode/plugins/kodade-cli-agent-state.js");
+    if !write {
+        println!("{}", opencode_plugin());
+        return Ok(());
+    }
+    if !path
+        .parent()
+        .and_then(Path::parent)
+        .is_some_and(Path::exists)
+    {
+        bail!(
+            "OpenCode config directory {} does not exist",
+            path.parent().unwrap().parent().unwrap().display()
+        );
+    }
+    write_owned_file(&path, opencode_plugin())?;
+    println!("installed OpenCode plugin in {}", path.display());
+    Ok(())
+}
+
+pub fn unintegrate_opencode() -> Result<()> {
+    let home = dirs::home_dir().ok_or_else(|| anyhow!("home directory unavailable"))?;
+    remove_owned_file(&home.join(".config/opencode/plugins/kodade-cli-agent-state.js"))
+}
+
+fn write_owned_file(path: &Path, contents: &str) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    crate::atomic_file::write(path, contents.as_bytes())
+}
+
+fn remove_owned_file(path: &Path) -> Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Pi 0.85.1's installed extension documentation verifies these lifecycle
+/// events and the global extension location. It stays silent outside a TUI pane.
+fn pi_extension() -> &'static str {
+    r#"// Installed by Ködade CLI. Pi 0.85.1 extension API.
+import { spawn } from "node:child_process";
+const enabled = () => process.env.KODADE_PANE && process.env.KODADE_SOCKET;
+function report(state) {
+  if (!enabled()) return;
+  const child = spawn(process.env.KODADE_BIN || "kodade-cli", ["agent", "report", process.env.KODADE_PANE, state], { detached: true, stdio: "ignore" });
+  child.on("error", () => {});
+  child.unref();
+}
+export default function (pi) {
+  if (!enabled()) return;
+  let tui = false;
+  pi.on("session_start", (_event, ctx) => { tui = ctx?.mode === "tui"; if (tui) report("idle"); });
+  pi.on("agent_start", () => { if (tui) report("working"); });
+  pi.on("agent_settled", () => { if (tui) report("done"); });
+}
+"#
+}
+
+/// OpenCode documents auto-loaded local plugins and `session.status` events.
+/// The adapter deliberately reports only the documented busy/idle states.
+fn opencode_plugin() -> &'static str {
+    r#"// Installed by Ködade CLI. OpenCode plugin API (official docs fixture).
+import { spawn } from "node:child_process";
+const enabled = () => process.env.KODADE_PANE && process.env.KODADE_SOCKET;
+function report(state) {
+  if (!enabled()) return;
+  const child = spawn(process.env.KODADE_BIN || "kodade-cli", ["agent", "report", process.env.KODADE_PANE, state], { detached: true, stdio: "ignore" });
+  child.on("error", () => {});
+  child.unref();
+}
+export const KodadeCli = async () => ({
+  event: async ({ event }) => {
+    if (!enabled() || event?.type !== "session.status") return;
+    const status = event.properties?.status?.type;
+    if (status === "busy" || status === "retry") report("working");
+    else if (status === "idle") report("done");
+  },
+});
+"#
 }
 
 /// Opt-in manifest refresh: download the manifest index and each listed file
@@ -257,11 +367,7 @@ fn merge_hook_settings(path: &Path, new_hooks: &Value) -> Result<()> {
                 return true;
             };
             let before = nested.len();
-            nested.retain(|hook| {
-                !hook["command"]
-                    .as_str()
-                    .is_some_and(|command| command.starts_with(REPORT_PREFIX))
-            });
+            nested.retain(|hook| !hook["command"].as_str().is_some_and(is_report_command));
             nested.len() == before || !nested.is_empty()
         });
     }
@@ -278,6 +384,35 @@ fn merge_hook_settings(path: &Path, new_hooks: &Value) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
+    crate::atomic_file::write(
+        path,
+        format!("{}\n", serde_json::to_string_pretty(&settings)?).as_bytes(),
+    )?;
+    Ok(())
+}
+
+/// Remove only command entries generated by Ködade. Empty event arrays are
+/// pruned, while every user setting, matcher, and sibling hook remains.
+fn remove_hook_settings(path: &Path) -> Result<()> {
+    let source = match fs::read_to_string(path) {
+        Ok(source) => source,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    let mut settings: Value = serde_json::from_str(&source).context("parse settings.json")?;
+    let Some(hooks) = settings.get_mut("hooks").and_then(Value::as_object_mut) else {
+        return Ok(());
+    };
+    for destination in hooks.values_mut().filter_map(Value::as_array_mut) {
+        destination.retain_mut(|entry| {
+            let Some(nested) = entry["hooks"].as_array_mut() else {
+                return true;
+            };
+            nested.retain(|hook| !hook["command"].as_str().is_some_and(is_report_command));
+            !nested.is_empty()
+        });
+    }
+    hooks.retain(|_, entries| !entries.as_array().is_some_and(Vec::is_empty));
     crate::atomic_file::write(
         path,
         format!("{}\n", serde_json::to_string_pretty(&settings)?).as_bytes(),
@@ -333,23 +468,28 @@ mod tests {
     }
 
     #[test]
-    fn codex_notify_merge_preserves_and_guards() {
-        // Fresh config: notify is added and the report command is present.
-        let merged = merge_codex_notify("model = \"gpt-5\"\n", false)
-            .unwrap()
-            .expect("notify inserted");
-        assert!(merged.contains("model = \"gpt-5\""));
-        assert!(merged.contains("kodade-cli agent report"));
-        // Existing notify without --force is left untouched.
-        assert!(merge_codex_notify("notify = [\"x\"]\n", false)
-            .unwrap()
-            .is_none());
-        // --force replaces it.
-        let forced = merge_codex_notify("notify = [\"x\"]\n", true)
-            .unwrap()
-            .expect("notify replaced");
-        assert!(forced.contains("kodade-cli agent report"));
-        assert!(!forced.contains("\"x\""));
+    fn codex_hooks_use_the_owned_lifecycle_surface() {
+        let hooks = codex_hooks();
+        for event in ["UserPromptSubmit", "Stop", "PermissionRequest"] {
+            let command = hooks[event][0]["hooks"][0]["command"].as_str().unwrap();
+            assert!(command.starts_with(REPORT_PREFIX));
+            assert!(command.contains("${KODADE_BIN:-kodade-cli}"));
+            assert!(command.contains("${KODADE_SOCKET:-}"));
+            assert!(!command.contains(" -s "));
+            assert!(command.contains(">/dev/null 2>&1 || true"));
+        }
+    }
+
+    #[test]
+    fn generated_extensions_use_the_inherited_socket_and_documented_status_shape() {
+        for extension in [pi_extension(), opencode_plugin()] {
+            assert!(!extension.contains("\"-s\""));
+            assert!(extension.contains("child.on(\"error\", () => {})"));
+        }
+        let opencode = opencode_plugin();
+        assert!(opencode.contains("event.properties?.status?.type"));
+        assert!(opencode.contains("status === \"busy\""));
+        assert!(opencode.contains("status === \"idle\""));
     }
 
     #[test]
@@ -409,6 +549,29 @@ mod tests {
         assert!(entries.iter().any(|entry| entry == &json!({
             "matcher": "custom", "hooks": [{"type":"command", "command":"echo user-hook", "timeout":42}]
         })), "unrelated hook and its entry metadata must survive: {updated}");
+        fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[test]
+    fn uninstall_is_idempotent_and_preserves_user_hook_siblings() {
+        let temp = std::env::temp_dir().join(format!("kodade-uninstall-{}", std::process::id()));
+        fs::create_dir_all(&temp).unwrap();
+        let path = temp.join("hooks.json");
+        merge_hook_settings(&path, &codex_hooks()).unwrap();
+        let mut settings: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        settings["hooks"]["Stop"][0]["hooks"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"type":"command","command":"echo user"}));
+        fs::write(&path, serde_json::to_vec(&settings).unwrap()).unwrap();
+        remove_hook_settings(&path).unwrap();
+        remove_hook_settings(&path).unwrap();
+        let settings: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            settings["hooks"]["Stop"][0]["hooks"],
+            json!([{"type":"command","command":"echo user"}])
+        );
+        assert!(settings["hooks"].get("UserPromptSubmit").is_none());
         fs::remove_dir_all(temp).unwrap();
     }
 }
