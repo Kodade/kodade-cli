@@ -6,10 +6,7 @@ use kodade_cli_proto::{
 };
 use regex::Regex;
 use std::{fs, path::Path, time::Duration};
-use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
-    net::UnixStream,
-};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 /// Poll interval for `agent wait` / `pane wait-output`.
 const POLL: Duration = Duration::from_millis(250);
@@ -37,7 +34,7 @@ pub fn parse_state(value: &str) -> Result<AgentStateKind> {
 /// redirects every scripting command through the forwarded local socket (#23).
 pub async fn request(socket: &Path, message: ClientMessage) -> Result<ServerMessage> {
     let exchange = async {
-        let stream = UnixStream::connect(socket)
+        let stream = crate::transport::connect(socket)
             .await
             .with_context(|| format!("no Ködade CLI daemon at {}", socket.display()))?;
         let (reader, mut writer) = stream.into_split();
@@ -306,7 +303,7 @@ pub async fn session_entries() -> Result<Vec<SessionEntry>> {
 /// Connect to a socket and ask for its layout, giving up after [`PROBE_TIMEOUT`].
 async fn probe_session(path: &Path) -> Option<LayoutSnapshot> {
     let probe = async {
-        let stream = UnixStream::connect(path).await.ok()?;
+        let stream = crate::transport::connect(path).await.ok()?;
         let (reader, mut writer) = stream.into_split();
         writer
             .write_all(&encode(&layout_query()).ok()?)
@@ -382,7 +379,7 @@ pub fn format_event(event: &Event) -> String {
 
 /// Subscribe to a session and print every event until the daemon goes away.
 pub async fn stream_events(socket: &Path, json: bool) -> Result<()> {
-    let stream = UnixStream::connect(socket)
+    let stream = crate::transport::connect(socket)
         .await
         .with_context(|| format!("no Ködade CLI daemon at {}", socket.display()))?;
     let (reader, mut writer) = stream.into_split();

@@ -23,6 +23,7 @@ mod selection;
 mod settings;
 mod state;
 mod terminal;
+mod transport;
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{CommandFactory, FromArgMatches};
@@ -34,7 +35,6 @@ use ratatui::{backend::CrosstermBackend, Terminal};
 use std::{path::Path, time::Duration};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
-    net::UnixStream,
     sync::mpsc,
 };
 
@@ -967,7 +967,7 @@ async fn attach(socket: &Path, session: &str, config: &config::Config) -> Result
 
 /// Sets up the terminal, hands the socket to `App`, and always restores it.
 async fn tui(
-    stream: UnixStream,
+    stream: transport::Stream,
     config: &config::Config,
     session: &str,
     socket: &Path,
@@ -1029,7 +1029,7 @@ async fn tui(
 /// the daemon sends when it rejects our `Hello`) prints a message and exits 1
 /// so the user never sees a half-drawn screen (#23).
 async fn handshake(
-    lines: &mut tokio::io::Lines<BufReader<tokio::net::unix::OwnedReadHalf>>,
+    lines: &mut tokio::io::Lines<BufReader<transport::OwnedReadHalf>>,
     state: &mut app::App,
 ) -> Result<()> {
     loop {

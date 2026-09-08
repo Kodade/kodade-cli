@@ -23,7 +23,7 @@ use std::{
     process::{Command, Stdio},
     time::{Duration, Instant},
 };
-use tokio::{io::AsyncWriteExt, net::unix::OwnedWriteHalf, sync::mpsc};
+use tokio::{io::AsyncWriteExt, sync::mpsc};
 
 use crate::{
     attention, config, help, input, mode, notify,
@@ -455,7 +455,10 @@ impl App {
 
     /// `prefix N`: focus the pane of the most recent unread notification and
     /// mark it read; an empty stack just says so.
-    async fn notification_jump(&mut self, writer: &mut OwnedWriteHalf) -> Result<()> {
+    async fn notification_jump(
+        &mut self,
+        writer: &mut crate::transport::OwnedWriteHalf,
+    ) -> Result<()> {
         match self.notifier.pop_unread() {
             Some(notification) => {
                 write(
@@ -621,7 +624,7 @@ impl App {
     pub async fn run(
         &mut self,
         term: &mut Term,
-        writer: &mut OwnedWriteHalf,
+        writer: &mut crate::transport::OwnedWriteHalf,
         rx: &mut mpsc::Receiver<Update>,
     ) -> Result<()> {
         loop {
@@ -678,7 +681,7 @@ impl App {
     pub async fn handle_key(
         &mut self,
         key: KeyEvent,
-        writer: &mut OwnedWriteHalf,
+        writer: &mut crate::transport::OwnedWriteHalf,
         term: &mut Term,
     ) -> Result<Flow> {
         // Any keystroke ends a mouse selection (#12).
@@ -726,7 +729,7 @@ impl App {
     async fn handle_rename_key(
         &mut self,
         key: KeyEvent,
-        writer: &mut OwnedWriteHalf,
+        writer: &mut crate::transport::OwnedWriteHalf,
     ) -> Result<()> {
         match key.code {
             KeyCode::Enter => {
@@ -759,7 +762,7 @@ impl App {
     async fn handle_confirm_key(
         &mut self,
         key: KeyEvent,
-        writer: &mut OwnedWriteHalf,
+        writer: &mut crate::transport::OwnedWriteHalf,
     ) -> Result<()> {
         let confirm = self.confirm.take().expect("confirm exists");
         if matches!(key.code, KeyCode::Char('y') | KeyCode::Char('Y')) {
@@ -772,7 +775,7 @@ impl App {
     async fn handle_new_workspace_key(
         &mut self,
         key: KeyEvent,
-        writer: &mut OwnedWriteHalf,
+        writer: &mut crate::transport::OwnedWriteHalf,
     ) -> Result<()> {
         match key.code {
             KeyCode::Enter => {
@@ -808,7 +811,7 @@ impl App {
     async fn handle_worktree_new_key(
         &mut self,
         key: KeyEvent,
-        writer: &mut OwnedWriteHalf,
+        writer: &mut crate::transport::OwnedWriteHalf,
     ) -> Result<()> {
         match key.code {
             KeyCode::Enter => {
@@ -856,7 +859,7 @@ impl App {
     async fn handle_worktree_confirm_key(
         &mut self,
         key: KeyEvent,
-        writer: &mut OwnedWriteHalf,
+        writer: &mut crate::transport::OwnedWriteHalf,
     ) -> Result<()> {
         let (id, _) = self
             .worktree_confirm
@@ -886,7 +889,7 @@ impl App {
     async fn handle_resize_key(
         &mut self,
         key: KeyEvent,
-        writer: &mut OwnedWriteHalf,
+        writer: &mut crate::transport::OwnedWriteHalf,
     ) -> Result<()> {
         let (direction, cells) = match key.code {
             KeyCode::Esc | KeyCode::Enter => {
@@ -911,7 +914,7 @@ impl App {
     async fn handle_copy_key(
         &mut self,
         key: KeyEvent,
-        writer: &mut OwnedWriteHalf,
+        writer: &mut crate::transport::OwnedWriteHalf,
         term: &mut Term,
     ) -> Result<()> {
         let Some(mut cm) = self.copy.take() else {
@@ -1072,7 +1075,7 @@ impl App {
     async fn open_in_editor(
         &mut self,
         cm: &mode::CopyMode,
-        writer: &mut OwnedWriteHalf,
+        writer: &mut crate::transport::OwnedWriteHalf,
     ) -> Result<bool> {
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1099,7 +1102,11 @@ impl App {
     }
 
     // Context menu: move the selection or run the highlighted action.
-    async fn handle_menu_key(&mut self, key: KeyEvent, writer: &mut OwnedWriteHalf) -> Result<()> {
+    async fn handle_menu_key(
+        &mut self,
+        key: KeyEvent,
+        writer: &mut crate::transport::OwnedWriteHalf,
+    ) -> Result<()> {
         match key.code {
             KeyCode::Esc => self.menu = None,
             KeyCode::Up | KeyCode::Char('k') => {
@@ -1124,7 +1131,7 @@ impl App {
         &mut self,
         key: KeyEvent,
         current: usize,
-        writer: &mut OwnedWriteHalf,
+        writer: &mut crate::transport::OwnedWriteHalf,
         term: &mut Term,
     ) -> Result<()> {
         let rows = self.sidebar_flat();
@@ -1234,7 +1241,7 @@ impl App {
     async fn handle_prefix_key(
         &mut self,
         key: KeyEvent,
-        writer: &mut OwnedWriteHalf,
+        writer: &mut crate::transport::OwnedWriteHalf,
         term: &mut Term,
     ) -> Result<Flow> {
         self.prefix = false;
@@ -1261,7 +1268,7 @@ impl App {
     async fn run_action(
         &mut self,
         action: config::Action,
-        writer: &mut OwnedWriteHalf,
+        writer: &mut crate::transport::OwnedWriteHalf,
         term: &mut Term,
     ) -> Result<Flow> {
         match action {
@@ -1482,7 +1489,7 @@ impl App {
     async fn handle_settings_key(
         &mut self,
         key: KeyEvent,
-        writer: &mut OwnedWriteHalf,
+        writer: &mut crate::transport::OwnedWriteHalf,
         term: &mut Term,
     ) -> Result<()> {
         let Some(mut menu) = self.settings.take() else {
@@ -1517,7 +1524,7 @@ impl App {
     async fn handle_picker_key(
         &mut self,
         key: KeyEvent,
-        writer: &mut OwnedWriteHalf,
+        writer: &mut crate::transport::OwnedWriteHalf,
     ) -> Result<()> {
         let Some(mut picker) = self.picker.take() else {
             return Ok(());
@@ -1544,7 +1551,7 @@ impl App {
     async fn handle_center_key(
         &mut self,
         key: KeyEvent,
-        writer: &mut OwnedWriteHalf,
+        writer: &mut crate::transport::OwnedWriteHalf,
         term: &mut Term,
     ) -> Result<Flow> {
         let Some(mut center) = self.center.take() else {
@@ -1613,7 +1620,7 @@ impl App {
     async fn activate_palette(
         &mut self,
         target: palette::PaletteTarget,
-        writer: &mut OwnedWriteHalf,
+        writer: &mut crate::transport::OwnedWriteHalf,
         term: &mut Term,
     ) -> Result<Flow> {
         match target {
@@ -1658,7 +1665,7 @@ impl App {
     async fn activate_pick(
         &mut self,
         target: PickTarget,
-        writer: &mut OwnedWriteHalf,
+        writer: &mut crate::transport::OwnedWriteHalf,
     ) -> Result<()> {
         match target {
             PickTarget::Workspace(id) => {
@@ -1699,7 +1706,7 @@ impl App {
     async fn apply_setting(
         &mut self,
         setting: settings::Setting,
-        writer: &mut OwnedWriteHalf,
+        writer: &mut crate::transport::OwnedWriteHalf,
         term: &mut Term,
     ) -> Result<()> {
         match setting {
@@ -1760,7 +1767,11 @@ impl App {
     }
 
     // Tells the daemon the pane area after the sidebar changed.
-    async fn send_resize(&self, writer: &mut OwnedWriteHalf, term: &mut Term) -> Result<()> {
+    async fn send_resize(
+        &self,
+        writer: &mut crate::transport::OwnedWriteHalf,
+        term: &mut Term,
+    ) -> Result<()> {
         let size = term.size()?;
         write(
             writer,
@@ -1773,7 +1784,11 @@ impl App {
     }
 
     // A bracketed-paste event: sanitize (when enabled), remember it, and send it.
-    async fn handle_paste(&mut self, text: String, writer: &mut OwnedWriteHalf) -> Result<()> {
+    async fn handle_paste(
+        &mut self,
+        text: String,
+        writer: &mut crate::transport::OwnedWriteHalf,
+    ) -> Result<()> {
         let text = if self.config.paste_sanitize {
             paste::sanitize(&text)
         } else {
@@ -1788,7 +1803,7 @@ impl App {
     async fn handle_paste_event(
         &mut self,
         text: String,
-        writer: &mut OwnedWriteHalf,
+        writer: &mut crate::transport::OwnedWriteHalf,
     ) -> Result<()> {
         if let Some(CenterOverlay::Palette(palette)) = &mut self.center {
             if let Some(filter) = &mut palette.overlay.filter {
@@ -1805,7 +1820,11 @@ impl App {
 
     // Frames text for the focused pane and sends it, pacing multi-chunk pastes.
     // Bracketed panes get the paste markers; the daemon writes the bytes as-is.
-    async fn send_paste(&self, text: &str, writer: &mut OwnedWriteHalf) -> Result<()> {
+    async fn send_paste(
+        &self,
+        text: &str,
+        writer: &mut crate::transport::OwnedWriteHalf,
+    ) -> Result<()> {
         let bracketed = self
             .layout
             .as_ref()
@@ -1828,7 +1847,7 @@ impl App {
     pub async fn handle_mouse(
         &mut self,
         mouse: MouseEvent,
-        writer: &mut OwnedWriteHalf,
+        writer: &mut crate::transport::OwnedWriteHalf,
         term: &mut Term,
     ) -> Result<Flow> {
         if !self.mouse_capture || self.layout.is_none() {
@@ -1932,7 +1951,7 @@ impl App {
     async fn center_mouse(
         &mut self,
         mouse: MouseEvent,
-        writer: &mut OwnedWriteHalf,
+        writer: &mut crate::transport::OwnedWriteHalf,
         term: &mut Term,
     ) -> Result<Flow> {
         if matches!(
@@ -1988,7 +2007,7 @@ impl App {
     async fn mouse_left_down(
         &mut self,
         mouse: MouseEvent,
-        writer: &mut OwnedWriteHalf,
+        writer: &mut crate::transport::OwnedWriteHalf,
         term: &mut Term,
     ) -> Result<()> {
         let area_width = term.size()?.width;
@@ -2087,7 +2106,7 @@ impl App {
     async fn passthrough(
         &mut self,
         mouse: MouseEvent,
-        writer: &mut OwnedWriteHalf,
+        writer: &mut crate::transport::OwnedWriteHalf,
         term: &mut Term,
     ) -> Result<bool> {
         if !self.config.passthrough
@@ -2244,7 +2263,7 @@ impl App {
     async fn settings_mouse(
         &mut self,
         mouse: MouseEvent,
-        writer: &mut OwnedWriteHalf,
+        writer: &mut crate::transport::OwnedWriteHalf,
         term: &mut Term,
     ) -> Result<()> {
         if !matches!(
@@ -2277,7 +2296,7 @@ impl App {
     async fn picker_mouse(
         &mut self,
         mouse: MouseEvent,
-        writer: &mut OwnedWriteHalf,
+        writer: &mut crate::transport::OwnedWriteHalf,
         term: &mut Term,
     ) -> Result<()> {
         if !matches!(
@@ -2351,14 +2370,14 @@ impl App {
     // Focuses the workspace, tab, or pane behind a sidebar row.
     async fn activate_sidebar(
         &mut self,
-        writer: &mut OwnedWriteHalf,
+        writer: &mut crate::transport::OwnedWriteHalf,
         target: render::SidebarTarget,
     ) -> Result<()> {
         write(writer, &sidebar_message(target)).await
     }
 
     // Runs the highlighted menu action and closes the menu.
-    async fn execute_menu(&mut self, writer: &mut OwnedWriteHalf) -> Result<()> {
+    async fn execute_menu(&mut self, writer: &mut crate::transport::OwnedWriteHalf) -> Result<()> {
         let menu = self.menu.take().expect("menu exists");
         if let mode::MenuTarget::Pane(id) = menu.target {
             write(writer, &ClientMessage::FocusPaneId { id }).await?;
@@ -2648,7 +2667,10 @@ fn sidebar_message(target: render::SidebarTarget) -> ClientMessage {
 }
 
 // One encoded message per socket write keeps the framing newline-delimited.
-async fn write(writer: &mut OwnedWriteHalf, message: &ClientMessage) -> Result<()> {
+async fn write(
+    writer: &mut crate::transport::OwnedWriteHalf,
+    message: &ClientMessage,
+) -> Result<()> {
     writer
         .write_all(&kodade_cli_proto::encode(message)?)
         .await?;

@@ -6,6 +6,7 @@ mod layout;
 mod manifest;
 mod persist;
 mod proc;
+mod transport;
 
 use std::{
     collections::HashMap,
@@ -19,6 +20,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use crate::transport::{OwnedWriteHalf, Stream};
 use anyhow::{anyhow, bail, Context, Result};
 use kodade_cli_proto::{
     decode, encode, schema_message, AgentInfo, AgentStateKind, CellColor, ClientMessage, Direction,
@@ -27,9 +29,9 @@ use kodade_cli_proto::{
     ATTR_BOLD, ATTR_DIM, ATTR_INVERSE, ATTR_ITALIC, ATTR_UNDERLINE, PROTOCOL_VERSION,
 };
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
+
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
-    net::{UnixListener, UnixStream},
     sync::broadcast,
 };
 
@@ -247,7 +249,14 @@ pub fn validate_agent_manifest(source: &str) -> Result<String> {
 const MAX_PROMPT_BYTES: usize = 64 * 1024;
 
 pub fn socket_path(session: &str) -> PathBuf {
-    socket_dir().join(format!("{session}.sock"))
+    #[cfg(windows)]
+    {
+        return transport::endpoint(session);
+    }
+    #[cfg(not(windows))]
+    {
+        socket_dir().join(format!("{session}.sock"))
+    }
 }
 
 /// Directory holding one `<session>.sock` per live session. `session ls` scans
@@ -296,7 +305,9 @@ pub async fn run(session_name: String) -> Result<()> {
     if socket.exists() {
         remove_stale_socket(&socket).await?;
     }
-    let listener = UnixListener::bind(&socket).context("bind Ködade CLI socket")?;
+    let listener = transport::bind(&socket)
+        .await
+        .context("bind Ködade CLI socket")?;
     // Binding succeeded, so no live daemon owns this session: safe to restore.
     let session = Arc::new(load_session(&session_name)?);
     // The socket name wins over whatever the state file recorded (it may have
@@ -384,7 +395,7 @@ async fn persist_loop(session: Arc<Session>) {
 
 async fn remove_stale_socket(socket: &Path) -> Result<()> {
     if let Ok(Ok(_)) =
-        tokio::time::timeout(Duration::from_millis(250), UnixStream::connect(socket)).await
+        tokio::time::timeout(Duration::from_millis(250), transport::connect(socket)).await
     {
         bail!("Ködade CLI daemon already running: {}", socket.display());
     }
@@ -3444,7 +3455,7 @@ fn pane_sizes(tree: &LayoutTree, width: u16, height: u16, output: &mut Vec<(Pane
     }
 }
 
-async fn serve_client(stream: UnixStream, session: Arc<Session>) -> Result<()> {
+async fn serve_client(stream: Stream, session: Arc<Session>) -> Result<()> {
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader).lines();
     let mut updates = session.updates.subscribe();
@@ -3647,10 +3658,7 @@ fn tick_subscribers(session: &Session) {
     }
 }
 
-async fn write_server(
-    writer: &mut tokio::net::unix::OwnedWriteHalf,
-    message: &ServerMessage,
-) -> Result<()> {
+async fn write_server(writer: &mut OwnedWriteHalf, message: &ServerMessage) -> Result<()> {
     writer.write_all(&encode(message)?).await?;
     Ok(())
 }
@@ -3658,7 +3666,7 @@ async fn write_server(
 /// Flushes any notifications this client has not seen yet, always after a fresh
 /// snapshot so the client can resolve workspace/tab names from it.
 async fn send_notifications(
-    writer: &mut tokio::net::unix::OwnedWriteHalf,
+    writer: &mut OwnedWriteHalf,
     session: &Arc<Session>,
     last_seq: &mut u64,
     subscribed: bool,
@@ -3673,9 +3681,10 @@ async fn send_notifications(
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use tokio::net::{UnixListener, UnixStream};
     #[test]
     fn socket_path_uses_runtime_directory_when_available() {
         assert_eq!(

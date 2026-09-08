@@ -8,7 +8,7 @@ use std::{
 };
 
 use anyhow::{bail, Context, Result};
-use tokio::{net::UnixStream, time::Instant};
+use tokio::time::Instant;
 
 const START_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -35,7 +35,11 @@ pub fn daemon_log(socket: &Path) -> PathBuf {
 }
 
 /// Connect to an existing daemon, optionally starting one on this local path.
-pub async fn connect(socket: &Path, session: &str, autostart: bool) -> Result<UnixStream> {
+pub async fn connect(
+    socket: &Path,
+    session: &str,
+    autostart: bool,
+) -> Result<crate::transport::Stream> {
     let mut command = Command::new(std::env::current_exe().context("locate Ködade binary")?);
     command.args(["daemon", session]);
     connect_with_command(socket, autostart, command, START_TIMEOUT).await
@@ -46,14 +50,16 @@ async fn connect_with_command(
     autostart: bool,
     mut command: Command,
     timeout: Duration,
-) -> Result<UnixStream> {
-    match UnixStream::connect(socket).await {
+) -> Result<crate::transport::Stream> {
+    match crate::transport::connect(socket).await {
         Ok(stream) => return Ok(stream),
         Err(error)
             if autostart
                 && matches!(
-                    error.kind(),
-                    std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+                    error
+                        .downcast_ref::<std::io::Error>()
+                        .map(std::io::Error::kind),
+                    Some(std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused)
                 ) => {}
         Err(error) => {
             return Err(error).with_context(|| {
@@ -87,7 +93,7 @@ async fn connect_with_command(
     let deadline = Instant::now() + timeout;
     loop {
         // Concurrent starters may race; connecting to the winner is success.
-        if let Ok(stream) = UnixStream::connect(socket).await {
+        if let Ok(stream) = crate::transport::connect(socket).await {
             return Ok(stream);
         }
         if let Some(status) = child.try_wait().context("check daemon startup")? {
