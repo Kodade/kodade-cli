@@ -39,6 +39,11 @@ pub enum ClientMessage {
         cols: u16,
         rows: u16,
     },
+    /// Per-client narrow projection: show only the focused pane while keeping
+    /// the shared tab tree and its other PTYs intact.
+    SetCompactView {
+        enabled: bool,
+    },
     SplitRight,
     SplitDown,
     ClosePane,
@@ -697,6 +702,7 @@ pub const CLIENT_MESSAGE_NAMES: &[&str] = &[
     "Hello",
     "Input",
     "Resize",
+    "SetCompactView",
     "SplitRight",
     "SplitDown",
     "ClosePane",
@@ -767,6 +773,7 @@ pub fn client_message_name(message: &ClientMessage) -> &'static str {
         ClientMessage::Hello { .. } => "Hello",
         ClientMessage::Input { .. } => "Input",
         ClientMessage::Resize { .. } => "Resize",
+        ClientMessage::SetCompactView { .. } => "SetCompactView",
         ClientMessage::SplitRight => "SplitRight",
         ClientMessage::SplitDown => "SplitDown",
         ClientMessage::ClosePane => "ClosePane",
@@ -981,6 +988,7 @@ mod tests {
             },
             ClientMessage::Input { bytes: vec![1] },
             ClientMessage::Resize { cols: 80, rows: 24 },
+            ClientMessage::SetCompactView { enabled: true },
             ClientMessage::SplitRight,
             ClientMessage::SplitDown,
             ClientMessage::ClosePane,

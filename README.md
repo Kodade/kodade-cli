@@ -114,7 +114,7 @@ sidebar and `enter` selects a row (folding/unfolding a workspace, or activating 
 
 The sidebar has three shapes cycled by `prefix b`: the full list, a compact
 3-column rail of workspace state dots, and a hidden 1-column gutter. It is
-configurable via `[sidebar]` (`width`, `collapsed`, `auto_hide_below`,
+configurable via `[sidebar]` (`width`, `collapsed`, `auto_hide_below`, `compact_view`,
 `agents_panel`) and auto-hides on narrow terminals. Every workspace can be
 folded (`enter` in navigate, `*` expands all; remembered per session), an agents
 panel below the workspaces lists agent panes by urgency, and each workspace

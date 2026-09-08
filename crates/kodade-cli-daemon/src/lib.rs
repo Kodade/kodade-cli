@@ -88,6 +88,7 @@ struct ClientView {
     scroll: HashMap<PaneId, usize>,
     cols: u16,
     rows: u16,
+    compact: bool,
 }
 
 impl ClientView {
@@ -111,6 +112,7 @@ impl ClientView {
             scroll: HashMap::new(),
             cols,
             rows,
+            compact: false,
         }
     }
 }
@@ -950,6 +952,10 @@ impl Session {
     /// mutation implementation without allowing that temporary selection to
     /// escape to a different socket or into persisted state.
     fn handle_view(&self, message: ClientMessage, view: &mut ClientView) -> Result<()> {
+        if let ClientMessage::SetCompactView { enabled } = message {
+            view.compact = enabled;
+            return self.resize_for_view(view);
+        }
         if let ClientMessage::Hello { cols, rows, .. } | ClientMessage::Resize { cols, rows } =
             message
         {
@@ -1103,7 +1109,7 @@ impl Session {
             .and_then(|view| view.focused.get(&tab.id).copied())
             .filter(|id| layout::contains(&tab.tree, *id))
             .unwrap_or(tab.focused);
-        let tree = if tab.zoomed {
+        let tree = if tab.zoomed || view.is_some_and(|view| view.compact) {
             LayoutTree::Leaf { pane: focused }
         } else {
             tab.tree.clone()
@@ -1473,6 +1479,7 @@ impl Session {
                 version: _,
             }
             | ClientMessage::Resize { cols, rows } => self.resize(cols, rows)?,
+            ClientMessage::SetCompactView { .. } => {}
             ClientMessage::Input { bytes } => {
                 let state = self
                     .state
@@ -4649,6 +4656,40 @@ mod tests {
         })
         .await
         .expect("error reply")
+    }
+
+    #[tokio::test]
+    async fn compact_view_projects_focused_pane_without_mutating_tab_layout() {
+        let session = Session::spawn(100, 30, "compact-view".into()).expect("spawn session");
+        session.handle(ClientMessage::SplitRight).expect("split");
+        let full = session.snapshot().expect("full snapshot");
+        assert!(matches!(full.tree, LayoutTree::Split { .. }));
+        let mut view = session.new_client_view().expect("view");
+        session
+            .handle_view(ClientMessage::SetCompactView { enabled: true }, &mut view)
+            .expect("enable compact");
+        let compact = session
+            .snapshot_for_client(&view)
+            .expect("compact snapshot");
+        assert!(matches!(compact.tree, LayoutTree::Leaf { .. }));
+        assert!(!compact.zoomed);
+        let state = session.state.lock().expect("state");
+        assert!(!state.workspaces[0].tabs[0].zoomed);
+        assert!(matches!(
+            state.workspaces[0].tabs[0].tree,
+            LayoutTree::Split { .. }
+        ));
+        drop(state);
+        session
+            .handle_view(ClientMessage::SetCompactView { enabled: false }, &mut view)
+            .expect("disable compact");
+        assert!(matches!(
+            session
+                .snapshot_for_client(&view)
+                .expect("restored snapshot")
+                .tree,
+            LayoutTree::Split { .. }
+        ));
     }
 
     #[tokio::test]

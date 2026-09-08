@@ -323,6 +323,12 @@ impl App {
     /// Collapse a full sidebar under the auto-hide column threshold, and restore
     /// it once the terminal is wide enough again (#19).
     pub fn apply_auto_hide(&mut self, cols: u16) {
+        if self.compact_enabled(cols) {
+            self.sidebar_mode = SidebarMode::Hidden;
+            self.auto_hidden = true;
+            self.sidebar_hidden_at = Some(Instant::now());
+            return;
+        }
         let below = cols < self.config.sidebar_auto_hide_below;
         if below && self.sidebar_mode == SidebarMode::Full {
             self.sidebar_mode = config_collapsed_mode(&self.config);
@@ -339,6 +345,16 @@ impl App {
     /// Pane width for the current sidebar state, used by `Hello` and `Resize`.
     pub fn pane_cols(&self, cols: u16) -> u16 {
         pane_cols(cols, self.sidebar_width())
+    }
+
+    /// A compact view is a daemon-side per-client projection, never a shared
+    /// zoom mutation. The threshold leaves enough room for a usable shell.
+    pub fn compact_enabled(&self, cols: u16) -> bool {
+        match self.config.compact_view {
+            config::CompactViewMode::Auto => cols < config::COMPACT_VIEW_AUTO_BELOW,
+            config::CompactViewMode::On => true,
+            config::CompactViewMode::Off => false,
+        }
     }
 
     /// Stores a new snapshot. Copy mode refreshes its full-history buffer
@@ -687,8 +703,17 @@ impl App {
             match event::read()? {
                 Event::Resize(cols, rows) => {
                     self.apply_auto_hide(cols);
-                    let cols = self.pane_cols(cols);
-                    write(writer, &ClientMessage::Resize { cols, rows }).await?
+                    let compact = self.compact_enabled(cols);
+                    let pane_cols = self.pane_cols(cols);
+                    write(
+                        writer,
+                        &ClientMessage::Resize {
+                            cols: pane_cols,
+                            rows,
+                        },
+                    )
+                    .await?;
+                    write(writer, &ClientMessage::SetCompactView { enabled: compact }).await?
                 }
                 Event::Key(key) => {
                     if self.handle_key(key, writer, term).await? == Flow::Detach {
@@ -2750,6 +2775,32 @@ mod tests {
         app.apply_auto_hide(120);
         assert_eq!(app.sidebar_mode, SidebarMode::Full);
         assert!(!app.auto_hidden);
+    }
+
+    #[test]
+    fn compact_view_auto_projects_only_narrow_terminals() {
+        let mut config = config::Config::default();
+        let app = App::new(
+            &config,
+            "compact-test",
+            PathBuf::from("/tmp/kodade-test.sock"),
+        );
+        assert!(app.compact_enabled(config::COMPACT_VIEW_AUTO_BELOW - 1));
+        assert!(!app.compact_enabled(config::COMPACT_VIEW_AUTO_BELOW));
+        config.compact_view = config::CompactViewMode::On;
+        let app = App::new(
+            &config,
+            "compact-test",
+            PathBuf::from("/tmp/kodade-test.sock"),
+        );
+        assert!(app.compact_enabled(200));
+        config.compact_view = config::CompactViewMode::Off;
+        let app = App::new(
+            &config,
+            "compact-test",
+            PathBuf::from("/tmp/kodade-test.sock"),
+        );
+        assert!(!app.compact_enabled(1));
     }
 
     #[test]
