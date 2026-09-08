@@ -4,7 +4,6 @@ use base64::{engine::general_purpose::STANDARD, Engine};
 use std::{
     fs,
     io::{Cursor, Write},
-    os::unix::fs::{DirBuilderExt, OpenOptionsExt},
     path::PathBuf,
     sync::Mutex,
 };
@@ -64,8 +63,16 @@ impl Inbox {
                 .as_nanos();
             let path =
                 std::env::temp_dir().join(format!("kodade-images-{}-{nonce}", std::process::id()));
-            fs::DirBuilder::new()
-                .mode(0o700)
+            #[cfg(unix)]
+            let mut builder = fs::DirBuilder::new();
+            #[cfg(windows)]
+            let builder = fs::DirBuilder::new();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt;
+                builder.mode(0o700);
+            }
+            builder
                 .create(&path)
                 .context("create private image directory")?;
             *state = Some(Directory {
@@ -81,12 +88,14 @@ impl Inbox {
         }
         directory.next += 1;
         let path = directory.path.join(format!("image-{}.png", directory.next));
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&path)
-            .context("save PNG")?;
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&path).context("save PNG")?;
         if let Err(error) = file.write_all(&bytes).and_then(|_| file.sync_all()) {
             let _ = fs::remove_file(&path);
             return Err(error.into());
@@ -149,7 +158,9 @@ mod tests {
         let inbox = Inbox::default();
         let path = inbox.save(&STANDARD.encode(&bytes)).unwrap();
         assert_eq!(fs::read(&path).unwrap(), bytes);
+        #[cfg(unix)]
         use std::os::unix::fs::PermissionsExt;
+        #[cfg(unix)]
         assert_eq!(
             fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o600

@@ -27,6 +27,8 @@ jobs:
             target: x86_64-unknown-linux-gnu
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
 
     steps:
       - uses: actions/checkout@v4
@@ -35,7 +37,8 @@ jobs:
           toolchain: stable
           target: ${{ matrix.target }}
       - run: cargo build --release --locked --package kodade-cli --target ${{ matrix.target }}
-      - name: Package release archive
+      - name: Package Unix release archive
+        if: runner.os != 'Windows'
         shell: bash
         env:
           VERSION: ${{ github.ref_name }}
@@ -48,10 +51,30 @@ jobs:
           cp "target/${{ matrix.target }}/release/kodade-cli" "$STAGING/kodade-cli"
           cp LICENSE NOTICE README.md "$STAGING/"
           tar -czf "$ARCHIVE" -C package "kodade-cli-${VERSION}-${{ matrix.target }}"
+      - name: Package Windows release archive
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          $version = $env:VERSION.TrimStart('v')
+          $name = "kodade-cli-$version-${{ matrix.target }}"
+          $staging = "package/$name"
+          New-Item -ItemType Directory -Force -Path $staging | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/kodade-cli.exe" "$staging/kodade-cli.exe"
+          Copy-Item LICENSE, NOTICE, README.md $staging
+          Compress-Archive -Path $staging -DestinationPath "$name.zip" -Force
       - uses: actions/upload-artifact@v4
+        if: runner.os != 'Windows'
         with:
           name: kodade-cli-${{ matrix.target }}
           path: kodade-cli-*.tar.gz
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        if: runner.os == 'Windows'
+        with:
+          name: kodade-cli-${{ matrix.target }}
+          path: kodade-cli-*.zip
           if-no-files-found: error
 
   release:
@@ -66,7 +89,7 @@ jobs:
           merge-multiple: true
       - name: Generate checksums
         working-directory: dist
-        run: sha256sum kodade-cli-*.tar.gz > SHA256SUMS
+        run: sha256sum kodade-cli-* > SHA256SUMS
       - uses: softprops/action-gh-release@v2
         with:
           files: dist/*
