@@ -193,8 +193,9 @@ fn terminal_size(rows: u16, cols: u16) -> (NonZeroU16, NonZeroU16) {
     )
 }
 
-fn pty_parser(rows: u16, cols: u16, scrollback: usize, callbacks: PtyCallbacks) -> PtyParser {
+fn pty_parser(rows: u16, cols: u16, scrollback: usize, mut callbacks: PtyCallbacks) -> PtyParser {
     let (rows, cols) = terminal_size(rows, cols);
+    callbacks.hyperlinks.set_history_capacity(scrollback);
     PtyParser::new_with_callbacks(rows, cols, scrollback, callbacks)
 }
 
@@ -4265,7 +4266,7 @@ fn snapshot(parser: &PtyParser) -> Screen {
         links: parser
             .callbacks()
             .hyperlinks
-            .ranges(screen.alternate_screen()),
+            .ranges(screen.alternate_screen(), screen.scrollback()),
     }
 }
 
@@ -5016,6 +5017,21 @@ mod tests {
         assert_eq!(screen.links.len(), 1);
         assert_eq!(screen.links[0].uri, "https://example.test/docs");
         assert_eq!((screen.links[0].start_col, screen.links[0].end_col), (0, 4));
+    }
+
+    #[test]
+    fn scrolled_snapshot_carries_retained_osc8_link_cells() {
+        let mut parser = pty_parser(2, 20, 100, PtyCallbacks::default());
+        graphics_text(
+            &mut parser,
+            b"\x1b]8;;https://example.test/history\x1b\\one\x1b]8;;\x1b\\\r\nplain\r\nlast",
+        );
+        parser.screen_mut().set_scrollback(1);
+        let screen = snapshot(&parser);
+        assert!(screen.links.iter().any(|link| {
+            (link.row, link.start_col, link.end_col, link.uri.as_str())
+                == (0, 0, 3, "https://example.test/history")
+        }));
     }
 
     #[test]
@@ -6758,21 +6774,24 @@ mod tests {
                 })
                 .expect("spawn pane");
         }
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        let contents: Vec<_> = session
-            .panes
-            .lock()
-            .expect("panes")
-            .values()
-            .map(|pane| pane.snapshot().0.contents)
-            .collect();
-        assert_eq!(
-            contents
-                .iter()
-                .filter(|text| text.contains("per-workspace"))
-                .count(),
-            2
-        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let ready = session
+                .panes
+                .lock()
+                .expect("panes")
+                .values()
+                .filter(|pane| pane.snapshot().0.contents.contains("per-workspace"))
+                .count();
+            if ready == 2 {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "workspace environment did not reach both panes"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         assert_eq!(
             session
                 .build_file()
@@ -6807,13 +6826,23 @@ mod tests {
                 context: None,
             })
             .expect("spawn restored pane");
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        assert!(restored
-            .panes
-            .lock()
-            .expect("panes")
-            .values()
-            .any(|pane| pane.snapshot().0.contents.contains("per-workspace")));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let ready = restored
+                .panes
+                .lock()
+                .expect("panes")
+                .values()
+                .any(|pane| pane.snapshot().0.contents.contains("per-workspace"));
+            if ready {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "restored workspace environment did not reach its pane"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 
     #[tokio::test]
