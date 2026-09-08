@@ -769,6 +769,13 @@ pub enum IntegrateCommand {
         #[arg(long, conflicts_with = "write")]
         remove: bool,
     },
+    /// Antigravity CLI lifecycle hooks.
+    Antigravity {
+        #[arg(long)]
+        write: bool,
+        #[arg(long, conflicts_with = "write")]
+        remove: bool,
+    },
 }
 
 #[derive(Debug, Subcommand, PartialEq, Eq)]

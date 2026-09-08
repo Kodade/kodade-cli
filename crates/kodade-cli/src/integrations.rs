@@ -17,6 +17,7 @@ pub const INTEGRATIONS: &[&str] = &[
     "omp",
     "kilo",
     "hermes",
+    "antigravity",
     "opencode",
     "pi",
 ];
@@ -59,6 +60,7 @@ pub fn integrate_list() -> Result<()> {
                 ".hermes/plugins/kodade_cli_agent_state/__init__.py",
                 "plugin",
             ),
+            "antigravity" => (".gemini/config/hooks.json", "hooks"),
             "opencode" => (
                 ".config/opencode/plugins/kodade-cli-agent-state.js",
                 "plugin (official docs; fixture-tested)",
@@ -69,13 +71,15 @@ pub fn integrate_list() -> Result<()> {
             ),
             _ => continue,
         };
-        let path = if *agent == "copilot" {
-            Some(
+        let path = match *agent {
+            "copilot" => Some(
                 copilot_dir(home.as_deref(), std::env::var_os("COPILOT_HOME"))?
                     .join("hooks/kodade-cli.json"),
-            )
-        } else {
-            home.as_ref().map(|home| home.join(target))
+            ),
+            "antigravity" => home
+                .as_deref()
+                .map(|home| antigravity_config_dir(home).join("hooks.json")),
+            _ => home.as_ref().map(|home| home.join(target)),
         };
         let available = match &path {
             // "available" = the agent's config directory exists on this machine.
@@ -89,6 +93,62 @@ pub fn integrate_list() -> Result<()> {
         println!("{agent:<12} {status:<10} {shown} ({mechanism})");
     }
     Ok(())
+}
+
+/// Antigravity command hooks consume JSON on stdin and expect a JSON object on
+/// stdout. Its documented lifecycle does not expose a resume command, so this
+/// reports state only and deliberately does not persist `conversationId`.
+fn antigravity_report_command(state: &str) -> String {
+    format!(
+        "{REPORT_PREFIX} if [ -n \"${{KODADE_PANE:-}}\" ] && [ -n \"${{KODADE_SOCKET:-}}\" ]; then \"${{KODADE_BIN:-kodade-cli}}\" agent report \"$KODADE_PANE\" {state} --source kodade:antigravity >/dev/null 2>&1 || true; fi; printf '{{}}\\n'"
+    )
+}
+
+/// Antigravity discovers named hook blocks from `~/.gemini/config/hooks.json`.
+/// Ködade owns only its block, so sibling hook definitions remain intact.
+fn antigravity_hooks() -> Value {
+    json!({
+        "PreInvocation": [{
+            "type": "command",
+            "command": antigravity_report_command("working"),
+            "timeout": 5,
+        }],
+        "Stop": [{
+            "type": "command",
+            "command": antigravity_report_command("done"),
+            "timeout": 5,
+        }],
+    })
+}
+
+fn antigravity_config_dir(home: &Path) -> std::path::PathBuf {
+    std::env::var_os("ANTIGRAVITY_CLI_CONFIG_DIR")
+        .filter(|path| !path.is_empty())
+        .map(Into::into)
+        .unwrap_or_else(|| home.join(".gemini/config"))
+}
+
+pub fn integrate_antigravity(write: bool) -> Result<()> {
+    let home = dirs::home_dir().ok_or_else(|| anyhow!("home directory unavailable"))?;
+    let path = antigravity_config_dir(&home).join("hooks.json");
+    if !write {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({ "kodade-cli": antigravity_hooks() }))?
+        );
+        return Ok(());
+    }
+    merge_named_hook_block(&path, "kodade-cli", antigravity_hooks())?;
+    println!("installed Antigravity hooks in {}", path.display());
+    Ok(())
+}
+
+pub fn unintegrate_antigravity() -> Result<()> {
+    let home = dirs::home_dir().ok_or_else(|| anyhow!("home directory unavailable"))?;
+    remove_named_hook_block(
+        &antigravity_config_dir(&home).join("hooks.json"),
+        "kodade-cli",
+    )
 }
 
 /// Copilot CLI uses independently-loaded, versioned hook documents.
@@ -838,6 +898,36 @@ fn merge_root_hook_settings(path: &Path, new_hooks: &Value) -> Result<()> {
     )
 }
 
+fn merge_named_hook_block(path: &Path, name: &str, block: Value) -> Result<()> {
+    let mut hooks: serde_json::Map<String, Value> = match fs::read_to_string(path) {
+        Ok(source) => serde_json::from_str(&source).context("parse hooks.json")?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Default::default(),
+        Err(error) => return Err(error.into()),
+    };
+    hooks.insert(name.to_owned(), block);
+    write_owned_file(
+        path,
+        &format!("{}\n", serde_json::to_string_pretty(&hooks)?),
+    )
+}
+
+fn remove_named_hook_block(path: &Path, name: &str) -> Result<()> {
+    let source = match fs::read_to_string(path) {
+        Ok(source) => source,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    let mut hooks: serde_json::Map<String, Value> =
+        serde_json::from_str(&source).context("parse hooks.json")?;
+    if hooks.remove(name).is_some() {
+        crate::atomic_file::write(
+            path,
+            format!("{}\n", serde_json::to_string_pretty(&hooks)?).as_bytes(),
+        )?;
+    }
+    Ok(())
+}
+
 fn merge_hooks_value(settings: &mut Value, new_hooks: &Value) -> Result<()> {
     let hooks = settings
         .as_object_mut()
@@ -1050,6 +1140,32 @@ mod tests {
         assert_eq!(
             copilot_dir(Some(home), None).unwrap(),
             home.join(".copilot")
+        );
+    }
+
+    #[test]
+    fn antigravity_uses_flat_lifecycle_handlers_and_preserves_sibling_blocks() {
+        let hooks = antigravity_hooks();
+        for event in ["PreInvocation", "Stop"] {
+            assert_eq!(hooks[event][0]["type"], "command");
+            assert!(hooks[event][0]["command"]
+                .as_str()
+                .is_some_and(|command| command.contains("--source kodade:antigravity")));
+        }
+        let path = std::env::temp_dir().join(format!("kodade-antigravity-{}", std::process::id()));
+        fs::write(&path, r#"{"user":{"Stop":[{"command":"echo keep"}]}}"#).unwrap();
+        merge_named_hook_block(&path, "kodade-cli", hooks).unwrap();
+        remove_named_hook_block(&path, "kodade-cli").unwrap();
+        let retained: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(retained["user"]["Stop"][0]["command"], "echo keep");
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn antigravity_config_dir_uses_its_default_root() {
+        assert_eq!(
+            antigravity_config_dir(Path::new("/tmp/kodade-home")),
+            Path::new("/tmp/kodade-home/.gemini/config")
         );
     }
 

@@ -444,6 +444,13 @@ async fn main() -> Result<()> {
                     integrations::integrate_hermes(write)
                 }
             }
+            cli::IntegrateCommand::Antigravity { write, remove } => {
+                if remove {
+                    integrations::unintegrate_antigravity()
+                } else {
+                    integrations::integrate_antigravity(write)
+                }
+            }
         },
         Some(cli::Command::Tab { command }) => tab(&socket, command).await,
         Some(cli::Command::Workspace { command }) => workspace(&socket, command).await,

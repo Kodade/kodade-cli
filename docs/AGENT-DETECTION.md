@@ -255,12 +255,16 @@ state, so detection does not depend on screen strings alone.
   `session_id` lifecycle callbacks and restores an exact conversation with
   `hermes --resume ID`, as specified in Hermes' [hooks](https://github.com/NousResearch/hermes-agent/blob/main/website/docs/user-guide/features/hooks.md)
   and [sessions](https://github.com/NousResearch/hermes-agent/blob/main/website/docs/user-guide/sessions.md) references.
+- `integrate antigravity [--write]` — installs a Ködade-owned block in
+  `~/.gemini/config/hooks.json` (or `$ANTIGRAVITY_CLI_CONFIG_DIR/hooks.json`). It reports
+  `PreInvocation` → working and `Stop` → done. Antigravity documents the hook
+  configuration, lifecycle events, and `conversationId`, but not an ID-resume CLI contract,
+  so Ködade does not persist a native session identity for restore.
 
 
 The remaining registry names are not installed as lifecycle integrations yet.
 Devin's public docs describe hosted integrations but no local CLI hook/session
-contract. Antigravity documents configurable hooks, but does not publish a
-session-identity or ID-resume contract in its [CLI codelab](https://codelabs.developers.google.com/genai-for-dev-antigravity-cli?hl=en).
+ contract.
 Grok documents hook discovery under `~/.grok/hooks`, but this release's public
 hook page was not available as a stable payload contract; its documented
 [status line](https://docs.x.ai/build/features/status-line) does expose a
