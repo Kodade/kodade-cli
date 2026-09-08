@@ -27,3 +27,11 @@ jobs:
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo build
       - run: cargo test
+      - name: Exercise live client handoff
+        if: runner.os != 'Windows'
+        run: python3 scripts/handoff-tui-smoke.py target/debug/kodade-cli
+      - name: Exercise Unix upgrade rollback and live extension context
+        if: runner.os == 'Linux'
+        run: |
+          python3 scripts/smoke-test.py target/debug/kodade-cli
+          python3 scripts/plugin-context-tui-smoke.py target/debug/kodade-cli --handoff

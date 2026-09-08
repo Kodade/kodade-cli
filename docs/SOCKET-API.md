@@ -365,3 +365,9 @@ sequences and image transfers retain their bounded parser state.
 At the CLI, use `kodade-cli session upgrade` after installing an update, or
 `kodade-cli --remote HOST session upgrade` for a Unix host. Supplying `--binary`
 through `--remote` is rejected; install the desired binary on the host first.
+
+Live runtime transfer also retains each workspace environment, exact native
+conversation reference, guarded hook process identity, notification sequence,
+and the active history-persistence setting. Daemon-owned extension context
+files remain readable by the existing child and transfer cleanup ownership only
+after the final release; a rejected importer cannot delete the source file.

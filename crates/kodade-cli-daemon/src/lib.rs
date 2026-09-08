@@ -4274,6 +4274,9 @@ impl Pane {
                                 .min(u128::from(u64::MAX)) as u64
                         })
                         .unwrap_or(0),
+                    hook_agent: hook.as_ref().and_then(|hook| hook.agent.clone()),
+                    hook_process_pid: hook.as_ref().and_then(|hook| hook.process_pid),
+                    hook_process_name: hook.as_ref().and_then(|hook| hook.process_name.clone()),
                     hook_state: hook.as_ref().map(|hook| hook.state),
                     hook_source: hook.map(|hook| hook.source),
                     state,
@@ -4360,6 +4363,9 @@ impl Pane {
                     .map(|(state, source)| ReportedHook {
                         state,
                         source,
+                        agent: runtime.hook_agent,
+                        process_pid: runtime.hook_process_pid,
+                        process_name: runtime.hook_process_name,
                         reported_at: Instant::now()
                             .checked_sub(Duration::from_millis(runtime.hook_age_ms))
                             .unwrap_or_else(Instant::now),

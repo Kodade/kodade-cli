@@ -125,6 +125,12 @@ pub(crate) struct PaneRuntime {
     #[serde(default)]
     pub(crate) hook_source: Option<String>,
     #[serde(default)]
+    pub(crate) hook_agent: Option<String>,
+    #[serde(default)]
+    pub(crate) hook_process_pid: Option<i32>,
+    #[serde(default)]
+    pub(crate) hook_process_name: Option<String>,
+    #[serde(default)]
     pub(crate) state: Option<kodade_cli_proto::AgentStateKind>,
     /// Bounded formatted active screen; this is replayed into a fresh parser.
     #[serde(default)]
