@@ -1228,7 +1228,13 @@ impl App {
             }
             if let Some(bytes) = bytes_for_mode(key, keyboard) {
                 write(writer, &ClientMessage::Input { bytes }).await?;
-                if key.kind == KeyEventKind::Press {
+                if key.kind == KeyEventKind::Press
+                    && bytes_for_mode(
+                        KeyEvent::new_with_kind(key.code, key.modifiers, KeyEventKind::Release),
+                        keyboard,
+                    )
+                    .is_some()
+                {
                     if let Some(pane) = self.focused_pane {
                         self.forwarded_keys.insert(
                             (key.code, key.modifiers),
@@ -3585,10 +3591,19 @@ pub fn bytes(k: KeyEvent) -> Option<Vec<u8>> {
 pub fn bytes_for_mode(k: KeyEvent, modes: KeyboardModes) -> Option<Vec<u8>> {
     // Event types alone do not change legacy encodings; only emit releases for
     // keys that the negotiated disambiguation mode represents as CSI sequences.
-    if k.kind == KeyEventKind::Release && modes.kitty_flags & 0b11 != 0b11 {
+    if k.kind == KeyEventKind::Release
+        && matches!(
+            k.code,
+            KeyCode::Char(_) | KeyCode::Enter | KeyCode::Tab | KeyCode::Backspace
+        )
+    {
         return None;
     }
-    if modes.kitty_flags & 1 != 0 {
+    let functional = matches!(
+        k.code,
+        KeyCode::Up | KeyCode::Down | KeyCode::Right | KeyCode::Left
+    );
+    if modes.kitty_flags & 1 != 0 || (modes.kitty_flags & 2 != 0 && functional) {
         let code = match k.code {
             KeyCode::Char(c) => c as u32,
             KeyCode::Enter => 13,
@@ -3690,10 +3705,7 @@ mod tests {
         );
         let release =
             KeyEvent::new_with_kind(KeyCode::Enter, KeyModifiers::SHIFT, KeyEventKind::Release);
-        assert_eq!(
-            bytes_for_mode(release, modes),
-            Some(b"\x1b[13;2:3u".to_vec())
-        );
+        assert_eq!(bytes_for_mode(release, modes), None);
         assert_eq!(
             bytes_for_mode(
                 release,
@@ -4065,18 +4077,18 @@ mod tests {
             },
         )
         .unwrap();
-        let press = KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT);
+        let press = KeyEvent::new(KeyCode::Up, KeyModifiers::SHIFT);
         app.handle_key(press, &mut writer, &mut term).await.unwrap();
         assert_eq!(
             local_rx.recv().await,
             Some(ClientMessage::Input {
-                bytes: b"\x1b[13;2u".to_vec()
+                bytes: b"\x1b[1;2A".to_vec()
             })
         );
         app.selected_endpoint = remote;
         app.focused_pane = Some(PaneId(99));
         let release =
-            KeyEvent::new_with_kind(KeyCode::Enter, KeyModifiers::SHIFT, KeyEventKind::Release);
+            KeyEvent::new_with_kind(KeyCode::Up, KeyModifiers::SHIFT, KeyEventKind::Release);
         app.handle_key(release, &mut writer, &mut term)
             .await
             .unwrap();
@@ -4084,7 +4096,7 @@ mod tests {
             local_rx.recv().await,
             Some(ClientMessage::SendToPane {
                 id: PaneId(1),
-                bytes: b"\x1b[13;2:3u".to_vec()
+                bytes: b"\x1b[1;2:3A".to_vec()
             })
         );
         assert!(remote_rx.try_recv().is_err());

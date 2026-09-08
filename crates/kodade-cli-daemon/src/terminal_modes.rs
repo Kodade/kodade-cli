@@ -13,6 +13,7 @@ pub struct Modes {
     replies: Vec<u8>,
     capability_parser: vte::Parser,
     capability_events: CapabilityEvents,
+    reset_escaped: bool,
 }
 
 impl Modes {
@@ -29,6 +30,11 @@ impl Modes {
     }
 
     pub fn feed(&mut self, byte: u8) {
+        if self.reset_escaped && byte == b'c' {
+            *self = Self::default();
+            return;
+        }
+        self.reset_escaped = byte == 27;
         self.capability_events.completed = None;
         self.capability_parser
             .advance(&mut self.capability_events, &[byte]);
