@@ -117,6 +117,31 @@ pub fn write_session_file(path: &Path, file: &SessionFile) -> Result<()> {
     Ok(())
 }
 
+/// Atomically publish private terminal data with owner-only permissions.
+pub fn write_private_file(path: &Path, bytes: &[u8]) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).context("create private state directory")?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
+        }
+    }
+    let (temp, mut file) = create_unique_temp(path)?;
+    let mut cleanup = TempGuard::new(temp.clone());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    }
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    drop(file);
+    fs::rename(&temp, path)?;
+    cleanup.disarm();
+    sync_parent(path)
+}
+
 /// Removes a temp file only while this writer still owns that pathname.
 struct TempGuard(Option<PathBuf>);
 
@@ -180,6 +205,7 @@ pub fn remove_session_file(name: &str) {
     if let Some(path) = session_file_path(name) {
         let _ = fs::remove_file(&path);
         let _ = fs::remove_file(path.with_extension("json.tmp"));
+        crate::history::remove_for_session(name);
     }
 }
 
@@ -197,8 +223,8 @@ struct DaemonConfig {
 
 #[derive(Debug, Default, Deserialize)]
 struct SessionConfig {
-    #[serde(default)]
-    resume_agents: bool,
+    #[serde(flatten)]
+    settings: kodade_cli_proto::SessionSettings,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -248,8 +274,19 @@ pub fn resume_agents_setting() -> bool {
         return false;
     };
     toml::from_str::<DaemonConfig>(&text)
-        .map(|config| config.session.resume_agents)
+        .map(|config| config.session.settings.resume_agents)
         .unwrap_or(false)
+}
+
+pub fn session_settings() -> kodade_cli_proto::SessionSettings {
+    let Some(home) = dirs::home_dir() else {
+        return Default::default();
+    };
+    fs::read_to_string(home.join(".config/kodade-cli/config.toml"))
+        .ok()
+        .and_then(|text| toml::from_str::<DaemonConfig>(&text).ok())
+        .map(|config| config.session.settings)
+        .unwrap_or_default()
 }
 
 /// Number of debounced writes produced by change events at the given instants.

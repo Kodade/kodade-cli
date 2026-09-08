@@ -213,6 +213,9 @@ names, cwds, and zoom — never scrollback) is saved under
 and rebuilt with fresh panes on the next cold start; a corrupt file degrades to
 a clean start and `kodade-cli ls` marks a restored session `(restored)`. Set
 `[session] resume_agents = true` to re-run an agent's resume command on restore.
+`[session] pane_history = true` additionally retains a bounded local screen replay
+after a cold restart; it is off by default and does not imply that the original
+process survived.
 
 The CLI's dark theme uses charcoal backgrounds and off-white text with the
 Ködade orange accent `#E7A33B` and a purple-free ANSI palette. `theme = "auto"`

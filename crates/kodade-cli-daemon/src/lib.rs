@@ -3,6 +3,7 @@
 mod agent;
 mod git;
 mod graphics;
+mod history;
 mod image_paste;
 pub use image_paste::{validate_png, MAX_IMAGE_BYTES};
 mod layout;
@@ -56,6 +57,9 @@ struct Session {
     /// Kept on `Session` (not `SessionState`) so `notify` can bump it without
     /// re-locking state — several handlers call `notify` while holding the lock.
     layout_generation: AtomicU64,
+    /// Bumped by PTY output. Only the opt-in history loop observes this.
+    output_generation: Arc<AtomicU64>,
+    pane_history: bool,
     /// True from a cold restore until the first client `Hello`; surfaced as
     /// `LayoutSnapshot.restored` so `ls` can print `(restored)`.
     restored: AtomicBool,
@@ -357,6 +361,11 @@ pub async fn run(session_name: String) -> Result<()> {
     let mut shutdown = session.shutdown.subscribe();
     // Debounced layout persistence runs alongside the accept loop.
     tokio::spawn(persist_loop(Arc::clone(&session)));
+    if session.pane_history {
+        tokio::spawn(history_loop(Arc::clone(&session)));
+    } else {
+        history::remove_for_session(&session.session_name());
+    }
     // Keeps agent detection running for event subscribers with no TUI attached.
     tokio::spawn(subscriber_tick(Arc::clone(&session)));
     // Flush state on SIGTERM so a stopped daemon (e.g. logout) can be restored.
@@ -441,6 +450,22 @@ async fn persist_loop(session: Arc<Session>) {
     }
 }
 
+/// Persist a bounded replay at most every two seconds, and only after PTY
+/// output. Layout persistence remains independent and never writes terminal
+/// text by default.
+async fn history_loop(session: Arc<Session>) {
+    let mut saved = session.output_generation.load(Ordering::Relaxed);
+    loop {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let current = session.output_generation.load(Ordering::Relaxed);
+        if current == saved {
+            continue;
+        }
+        session.save_history();
+        saved = current;
+    }
+}
+
 async fn remove_stale_socket(socket: &Path) -> Result<()> {
     if let Ok(Ok(_)) =
         tokio::time::timeout(Duration::from_millis(250), UnixStream::connect(socket)).await
@@ -486,6 +511,8 @@ impl Session {
             size: Mutex::new((cols, rows)),
             manifests: Mutex::new(manifest::load()?),
             layout_generation: AtomicU64::new(0),
+            output_generation: Arc::new(AtomicU64::new(0)),
+            pane_history: persist::session_settings().pane_history,
             restored: AtomicBool::new(false),
             notifications: Mutex::new(Vec::new()),
             notify_seq: AtomicU64::new(0),
@@ -545,6 +572,8 @@ impl Session {
             size: Mutex::new((80, 24)),
             manifests: Mutex::new(manifest::load()?),
             layout_generation: AtomicU64::new(0),
+            output_generation: Arc::new(AtomicU64::new(0)),
+            pane_history: persist::session_settings().pane_history,
             restored: AtomicBool::new(true),
             notifications: Mutex::new(Vec::new()),
             notify_seq: AtomicU64::new(0),
@@ -553,6 +582,20 @@ impl Session {
             socket: Mutex::new(socket_path(&file.name)),
             hook_socket: hook_socket_path(),
             view_dispatch: Mutex::new(()),
+        };
+        let replay = if session.pane_history {
+            persist::session_file_path(&file.name)
+                .and_then(|path| {
+                    history::read(&history::path_for(&path), &file)
+                        .ok()
+                        .flatten()
+                })
+                .unwrap_or_default()
+                .into_iter()
+                .map(|entry| (entry.pane, entry))
+                .collect::<HashMap<_, _>>()
+        } else {
+            HashMap::new()
         };
         let manifests = session
             .manifests
@@ -570,7 +613,14 @@ impl Session {
                 for saved_pane in &saved_tab.panes {
                     let cwd = restore_cwd(saved_pane.cwd.clone(), saved.root.clone());
                     let command = resume_command(saved_pane, resume_agents, &manifests);
-                    let new_id = session.new_pane(&saved_pane.title, cwd, command)?;
+                    // A native resume owns its pane's first output; replay only
+                    // plain-shell restorations so it can never overwrite it.
+                    let replay = command
+                        .is_none()
+                        .then(|| replay.get(&saved_pane.id).cloned())
+                        .flatten();
+                    let new_id =
+                        session.new_pane_with_replay(&saved_pane.title, cwd, command, replay)?;
                     pane_ids.insert(PaneId(saved_pane.id), new_id);
                 }
                 let tree = remap_tree(&saved_tab.tree, &pane_ids);
@@ -704,6 +754,40 @@ impl Session {
         }
     }
 
+    fn save_history(&self) {
+        let Ok(_dispatch) = self.view_dispatch.lock() else {
+            return;
+        };
+        let file = self.build_file();
+        let Some(state_path) = persist::session_file_path(&file.name) else {
+            return;
+        };
+        let panes = self
+            .panes
+            .lock()
+            .expect("pane lock poisoned")
+            .iter()
+            .filter_map(|(id, pane)| {
+                let (text, _) = pane.read_text(true, None);
+                let text = utf8_tail(&text, history::MAX_PANE_TEXT);
+                let (screen, _) = pane.snapshot();
+                let entry = history::PaneHistory {
+                    pane: id.0,
+                    text,
+                    screen,
+                };
+                // Omit a single pathological frame rather than losing every pane.
+                serde_json::to_vec(&entry)
+                    .ok()
+                    .filter(|bytes| bytes.len() <= history::MAX_PANE_TEXT * 2)
+                    .map(|_| entry)
+            })
+            .collect();
+        if let Err(error) = history::write(&history::path_for(&state_path), file, panes) {
+            eprintln!("Ködade CLI could not persist pane history: {error:#}");
+        }
+    }
+
     fn next_id(&self) -> u64 {
         let mut state = self.state.lock().expect("state lock poisoned");
         state.next_id += 1;
@@ -767,6 +851,16 @@ impl Session {
         self.new_pane_with_id(self.pane_id(), title, cwd, command)
     }
 
+    fn new_pane_with_replay(
+        &self,
+        title: &str,
+        cwd: Option<PathBuf>,
+        command: Option<Vec<String>>,
+        replay: Option<history::PaneHistory>,
+    ) -> Result<PaneId> {
+        self.new_pane_with_id_replay(self.pane_id(), title, cwd, command, replay)
+    }
+
     /// Spawn a pane under a caller-chosen id, used by `layout apply` so a pane
     /// that is already alive keeps its id.
     fn new_pane_with_id(
@@ -775,6 +869,16 @@ impl Session {
         title: &str,
         cwd: Option<PathBuf>,
         command: Option<Vec<String>>,
+    ) -> Result<PaneId> {
+        self.new_pane_with_id_replay(id, title, cwd, command, None)
+    }
+    fn new_pane_with_id_replay(
+        &self,
+        id: PaneId,
+        title: &str,
+        cwd: Option<PathBuf>,
+        command: Option<Vec<String>>,
+        replay: Option<history::PaneHistory>,
     ) -> Result<PaneId> {
         let (cols, rows) = *self.size.lock().expect("size lock poisoned");
         let pane = Arc::new(Pane::spawn(
@@ -785,8 +889,10 @@ impl Session {
             self.session_name(),
             self.hook_socket(),
             self.updates.clone(),
+            Arc::clone(&self.output_generation),
             cwd,
             command,
+            replay,
         )?);
         self.panes
             .lock()
@@ -2612,7 +2718,10 @@ impl Session {
         fs::remove_file(&old_socket).context("remove the old session socket")?;
         *self.socket.lock().expect("socket lock poisoned") = new_socket.clone();
         *self.name.lock().expect("name lock poisoned") = new_name.to_owned();
-        persist::remove_session_file(&old_name);
+        if let Some(path) = persist::session_file_path(&old_name) {
+            let _ = fs::remove_file(path);
+        }
+        history::rename_for_session(&old_name, new_name);
         self.emit(Event::SessionRenamed {
             name: new_name.to_owned(),
             socket: new_socket,
@@ -3039,8 +3148,10 @@ impl Pane {
         session: String,
         hook_socket: PathBuf,
         updates: broadcast::Sender<()>,
+        output_generation: Arc<AtomicU64>,
         cwd: Option<PathBuf>,
         run: Option<Vec<String>>,
+        replay: Option<history::PaneHistory>,
     ) -> Result<Self> {
         let pty_system = native_pty_system();
         let pair = pty_system.openpty(PtySize {
@@ -3087,12 +3198,12 @@ impl Pane {
             .context("spawn login shell in PTY")?;
         let writer = Arc::new(Mutex::new(pair.master.take_writer()?));
         let reader = pair.master.try_clone_reader()?;
-        let parser = Arc::new(Mutex::new(PtyParser::new_with_callbacks(
-            rows,
-            cols,
-            10_000,
-            PtyCallbacks::default(),
-        )));
+        let mut restored_parser =
+            PtyParser::new_with_callbacks(rows, cols, 10_000, PtyCallbacks::default());
+        if let Some(replay) = replay.as_ref() {
+            restore_screen(&mut restored_parser, &replay.screen, &replay.text);
+        }
+        let parser = Arc::new(Mutex::new(restored_parser));
         let last_output = Arc::new(Mutex::new(Instant::now()));
         read_pty(
             reader,
@@ -3100,6 +3211,7 @@ impl Pane {
             Arc::clone(&last_output),
             Arc::clone(&writer),
             updates,
+            output_generation,
         );
         Ok(Self {
             title: Mutex::new(title.into()),
@@ -3510,6 +3622,7 @@ fn read_pty(
     last_output: Arc<Mutex<Instant>>,
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
     updates: broadcast::Sender<()>,
+    output_generation: Arc<AtomicU64>,
 ) {
     tokio::task::spawn_blocking(move || {
         let mut decoder = graphics::Decoder::default();
@@ -3558,6 +3671,7 @@ fn read_pty(
                 }
             }
             *last_output.lock().expect("output lock poisoned") = Instant::now();
+            output_generation.fetch_add(1, Ordering::Relaxed);
             let _ = updates.send(());
         }
     });
@@ -3622,6 +3736,19 @@ fn live_screen_contents(parser: &mut PtyParser) -> String {
     parser.screen_mut().set_scrollback(offset);
     contents
 }
+
+/// Keep the newest complete UTF-8 suffix; terminal text never cuts a scalar in
+/// half when it is written to the private history record.
+fn utf8_tail(text: &str, limit: usize) -> String {
+    if text.len() <= limit {
+        return text.to_owned();
+    }
+    let mut start = text.len() - limit;
+    while !text.is_char_boundary(start) {
+        start += 1;
+    }
+    text[start..].to_owned()
+}
 /// Build a wire `Screen` from the pane's terminal state: plain `contents` for
 /// copy mode plus one styled run list per visible row (#7).
 fn snapshot(parser: &PtyParser) -> Screen {
@@ -3640,6 +3767,71 @@ fn snapshot(parser: &PtyParser) -> Screen {
             .callbacks()
             .graphics
             .placements(screen.alternate_screen(), screen.scrollback()),
+    }
+}
+
+/// Rebuild a saved visible grid before the PTY reader starts. Scrollback text
+/// is intentionally kept only in the private record for future format changes;
+/// the formatted active screen is what a just-attached user sees.
+fn restore_screen(parser: &mut PtyParser, screen: &Screen, history: &str) {
+    let (rows, cols) = parser.screen().size();
+    if screen.rows.len() > usize::from(rows)
+        || screen.rows.iter().any(|row| row.len() > usize::from(cols))
+    {
+        return;
+    }
+    parser.process(b"\x1b[2J\x1b[H");
+    // Populate scrollback first, then redraw the formatted active frame.
+    parser.process(history.as_bytes());
+    parser.process(b"\x1b[H");
+    for (row, runs) in screen.rows.iter().enumerate() {
+        for run in runs {
+            let mut sgr = String::from("\x1b[0");
+            if run.attrs & ATTR_BOLD != 0 {
+                sgr.push_str(";1");
+            }
+            if run.attrs & ATTR_DIM != 0 {
+                sgr.push_str(";2");
+            }
+            if run.attrs & ATTR_ITALIC != 0 {
+                sgr.push_str(";3");
+            }
+            if run.attrs & ATTR_UNDERLINE != 0 {
+                sgr.push_str(";4");
+            }
+            if run.attrs & ATTR_INVERSE != 0 {
+                sgr.push_str(";7");
+            }
+            append_sgr_color(&mut sgr, &run.fg, true);
+            append_sgr_color(&mut sgr, &run.bg, false);
+            sgr.push('m');
+            parser.process(sgr.as_bytes());
+            parser.process(run.text.as_bytes());
+        }
+        if row + 1 < screen.rows.len() {
+            parser.process(b"\r\n");
+        }
+    }
+    parser.process(b"\x1b[0m");
+    let cursor_row = screen.cursor_row.min(rows.saturating_sub(1)) + 1;
+    let cursor_col = screen.cursor_col.min(cols.saturating_sub(1)) + 1;
+    parser.process(format!("\x1b[{cursor_row};{cursor_col}H").as_bytes());
+    if !screen.cursor_visible {
+        parser.process(b"\x1b[?25l");
+    }
+}
+
+fn append_sgr_color(out: &mut String, color: &CellColor, foreground: bool) {
+    match color {
+        CellColor::Default => out.push_str(if foreground { ";39" } else { ";49" }),
+        CellColor::Indexed(value) => {
+            out.push_str(if foreground { ";38;5;" } else { ";48;5;" });
+            out.push_str(&value.to_string());
+        }
+        CellColor::Rgb(red, green, blue) => {
+            out.push_str(if foreground { ";38;2;" } else { ";48;2;" });
+            out.push_str(&format!("{red};{green};{blue}"));
+        }
     }
 }
 
@@ -4382,6 +4574,20 @@ mod tests {
         assert_eq!(scroll_offset_after_delta(1, -99, 2), 0);
     }
 
+    #[test]
+    fn cold_history_replay_restores_formatted_active_screen() {
+        let mut source = PtyParser::new_with_callbacks(3, 20, 100, PtyCallbacks::default());
+        source.process(b"\x1b[31mred ready\x1b[0m");
+        let saved = snapshot(&source);
+        let mut restored = PtyParser::new_with_callbacks(3, 20, 100, PtyCallbacks::default());
+        restore_screen(
+            &mut restored,
+            &saved,
+            "earlier one\nearlier two\nearlier three\nearlier four\n",
+        );
+        assert!(restored.screen().contents().contains("red ready"));
+    }
+
     #[tokio::test]
     async fn pane_snapshot_keeps_history_anchored_while_output_arrives() {
         let (updates, _) = broadcast::channel(1);
@@ -4395,8 +4601,10 @@ mod tests {
             "scroll-test".into(),
             hook_socket_path(),
             updates,
+            Arc::new(AtomicU64::new(0)),
             None,
             Some(vec!["sleep".into(), "60".into()]),
+            None,
         )
         .expect("test pane");
         // The reader keeps the original parser, so shell profile output cannot

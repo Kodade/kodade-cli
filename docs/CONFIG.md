@@ -326,10 +326,12 @@ the same `config.toml`, read by the daemon, controls restore behavior:
 | Setting | Default | Description |
 |---|---|---|
 | `session.resume_agents` | `false` | When `true`, a restored pane whose saved command matches an agent manifest with a `resume` string re-runs that resume command (e.g. `codex resume --last`) instead of starting a plain shell. Panes with no matching manifest always restore as shells. |
+| `session.pane_history` | `false` | When `true`, retain up to 64 KiB of plain text and a formatted active screen per pane (2 MiB per session total) for cold-restart replay. It is private local state, never written by default. Native agent resume takes precedence. |
 
 ```toml
 [session]
 resume_agents = true
+pane_history = true
 ```
 
 ## Git worktrees
