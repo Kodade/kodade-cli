@@ -928,6 +928,7 @@ pub async fn run_import(
         if let Some(context) = &pane._context_file {
             context.owned.store(true, Ordering::Release);
         }
+        pane.flush_terminal_replies();
         pane.reader.resume();
     }
     // Every fallible staging operation completed before acknowledgment. The
@@ -4429,7 +4430,7 @@ impl Pane {
                 .map_err(|_| anyhow!("PTY master lock poisoned"))?
                 .as_raw_fd()
                 .ok_or_else(|| anyhow!("PTY master has no Unix descriptor"))?;
-            let parser = self
+            let mut parser = self
                 .parser
                 .lock()
                 .map_err(|_| anyhow!("PTY parser lock poisoned"))?;
@@ -4542,6 +4543,11 @@ impl Pane {
                                 frame.clone(),
                             )
                         }),
+                    terminal_modes: parser
+                        .callbacks_mut()
+                        .terminal_modes
+                        .capture_handoff()
+                        .map_err(anyhow::Error::msg)?,
                 },
                 fd,
             ))
@@ -4594,6 +4600,13 @@ impl Pane {
                 frame,
             )
         });
+        parser.callbacks_mut().terminal_modes =
+            terminal_modes::Modes::restore_handoff(runtime.terminal_modes)
+                .map_err(anyhow::Error::msg)?;
+        let pending_terminal = parser.callbacks().terminal_modes.pending_bytes().to_vec();
+        if !pending_terminal.is_empty() {
+            graphics_text_resume(&mut parser, &pending_terminal);
+        }
         let parser = Arc::new(Mutex::new(parser));
         let last_output = Arc::new(Mutex::new(
             Instant::now()
@@ -4664,6 +4677,23 @@ impl Pane {
             agent_identity: Mutex::new(runtime.agent_identity),
             activity_revision: AtomicU64::new(runtime.activity_revision),
         })
+    }
+
+    /// Send replies captured before a successful handoff before consuming new
+    /// PTY output. Failed imports never call this, so the source can continue
+    /// with its original queue.
+    fn flush_terminal_replies(&self) {
+        let replies = self
+            .parser
+            .lock()
+            .ok()
+            .map(|mut parser| parser.callbacks_mut().terminal_modes.take_replies())
+            .unwrap_or_default();
+        if !replies.is_empty() {
+            if let Ok(mut writer) = self.writer.lock() {
+                let _ = writer.write_all(&replies);
+            }
+        }
     }
     /// Render a requested historical offset without leaving the shared parser
     /// scrolled for another client. `set_scrollback` clamps to available history.
@@ -5363,6 +5393,16 @@ fn read_pty(
 /// Track the cell movement that also moves graphics; terminal controls remain
 /// interpreted by vt100, and image state follows clear/reset/alternate buffers.
 fn graphics_text(parser: &mut PtyParser, text: &[u8]) {
+    graphics_text_inner(parser, text, true)
+}
+
+/// Replay an incomplete terminal control sequence after restoring `Modes`.
+/// The mode parser has already consumed this suffix to rebuild its DCS state.
+fn graphics_text_resume(parser: &mut PtyParser, text: &[u8]) {
+    graphics_text_inner(parser, text, false)
+}
+
+fn graphics_text_inner(parser: &mut PtyParser, text: &[u8], feed_modes: bool) {
     let mut tracker = std::mem::take(&mut parser.callbacks_mut().graphics_tracker);
     let mut store = std::mem::take(&mut parser.callbacks_mut().graphics);
     let mut hyperlinks = std::mem::take(&mut parser.callbacks_mut().hyperlinks);
@@ -5370,7 +5410,9 @@ fn graphics_text(parser: &mut PtyParser, text: &[u8]) {
     let mut placeholder = std::mem::take(&mut parser.callbacks_mut().graphics_placeholder);
     let mut unicode = std::mem::take(&mut parser.callbacks_mut().graphics_unicode);
     for &raw in text {
-        parser.callbacks_mut().terminal_modes.feed(raw);
+        if feed_modes {
+            parser.callbacks_mut().terminal_modes.feed(raw);
+        }
         style.feed(raw);
         let chars = unicode.feed(raw);
         let mut placeholder_cell = None;
@@ -7450,6 +7492,12 @@ mod tests {
                 &mut parser,
                 b"\x1b]8;;https://handoff.test\x1b\\link\x1b]8;;\x1b\\\x1b[38;5;42m",
             );
+            // Preserve independent keyboard stacks plus a CSI that ends after
+            // the reader pause. The target must complete it exactly once.
+            graphics_text(
+                &mut parser,
+                b"\x1b[>3u\x1b[?1049h\x1b[>1u\x1b[?1049l\x1b[>4\x11;2",
+            );
         }
         let (runtime, fd) = source.capture_handoff().expect("pause and capture source");
         let (sender, receiver) = std::os::unix::net::UnixStream::pair().expect("socket pair");
@@ -7469,7 +7517,7 @@ mod tests {
             "editor status"
         );
         {
-            let parser = imported.parser.lock().unwrap();
+            let mut parser = imported.parser.lock().unwrap();
             assert_eq!(
                 parser.callbacks().graphics_virtual_style.ids(),
                 Some((42, 0))
@@ -7480,6 +7528,12 @@ mod tests {
                 .ranges(false, 0)
                 .iter()
                 .any(|link| link.uri == "https://handoff.test"));
+            assert_eq!(snapshot(&parser).keyboard.kitty_flags, 3);
+            graphics_text(&mut parser, b"m");
+            assert_eq!(snapshot(&parser).keyboard.modify_other_keys, 2);
+            graphics_text(&mut parser, b"\x1b[?1049h");
+            assert_eq!(snapshot(&parser).keyboard.kitty_flags, 1);
+            graphics_text(&mut parser, b"\x1b[?1049l");
         }
         let frozen = imported.snapshot().0.contents;
         tokio::time::sleep(Duration::from_millis(100)).await;

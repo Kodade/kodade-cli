@@ -217,6 +217,20 @@ finally:
         drain()
         assert raw(second_raw) == b"\x1b[113;5u\x1b[113;5:3u", "consumed prefix/palette/rename key release reached pane"
 
+        # A live upgrade must keep each pane's negotiated keyboard protocol.
+        # Keep this attached real TTY through two replacement daemons, then
+        # verify Shift+Enter still reaches the original focused child verbatim.
+        for generation in (1, 2):
+            command("session", "upgrade")
+            wait_for(
+                f"Kitty mode after upgrade {generation}",
+                lambda: next(p for p in panes() if p["id"] == second_id)["screen"]["keyboard"]["kitty_flags"] == 3,
+            )
+            drain()
+        host_key(b"\x1b[13;2u")
+        expect_bytes("Shift-Enter after two live upgrades", second_raw,
+                     b"\x1b[113;5u\x1b[113;5:3u\x1b[13;2u")
+
         # A non-negotiating child still gets legacy bytes but never host releases.
         legacy_cmd, legacy_raw, legacy_hex, legacy_ready = recorder("legacy", negotiate=False)
         legacy_id = int(command("split", "--", *legacy_cmd).stdout.strip())
@@ -278,4 +292,4 @@ finally:
                        capture_output=True)
         shutil.rmtree(runtime, ignore_errors=True)
 
-print("Terminal keyboard TUI smoke passed: detection, real PTY forwarding, focus ownership, modal consumption, legacy releases, and detach restoration")
+print("Terminal keyboard TUI smoke passed: detection, real PTY forwarding, two live upgrades, focus ownership, modal consumption, legacy releases, and detach restoration")

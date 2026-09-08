@@ -1,8 +1,44 @@
 //! Small, bounded terminal negotiation state owned by each pane parser.
 
 use kodade_cli_proto::KeyboardModes;
+use serde::{Deserialize, Serialize};
 
 const SUPPORTED_KITTY_FLAGS: u8 = 0b11;
+const MAX_STACK_DEPTH: usize = 16;
+pub(crate) const MAX_PENDING_BYTES: usize = 4096;
+const MAX_REPLY_BYTES: usize = 16 * 1024;
+
+/// The small part of terminal parsing that cannot be recreated from a screen
+/// replay.  The pending bytes begin at ESC and are replayed into vt100 when a
+/// replacement daemon takes ownership.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub(crate) struct HandoffState {
+    #[serde(default)]
+    main_keyboard: KeyboardModes,
+    #[serde(default)]
+    alternate_keyboard: KeyboardModes,
+    #[serde(default)]
+    main_keyboard_stack: Vec<u8>,
+    #[serde(default)]
+    alternate_keyboard_stack: Vec<u8>,
+    #[serde(default)]
+    replies: Vec<u8>,
+    #[serde(default)]
+    pending: Vec<u8>,
+}
+
+impl HandoffState {
+    pub(crate) fn validate(&self) -> Result<(), &'static str> {
+        if self.main_keyboard_stack.len() > MAX_STACK_DEPTH
+            || self.alternate_keyboard_stack.len() > MAX_STACK_DEPTH
+            || self.replies.len() > MAX_REPLY_BYTES
+            || self.pending.len() > MAX_PENDING_BYTES
+        {
+            return Err("terminal mode handoff exceeds bounded state");
+        }
+        Ok(())
+    }
+}
 
 #[derive(Default)]
 pub struct Modes {
@@ -14,6 +50,8 @@ pub struct Modes {
     capability_parser: vte::Parser,
     capability_events: CapabilityEvents,
     reset_escaped: bool,
+    pending: PendingSequence,
+    replies_overflow: bool,
 }
 
 impl Modes {
@@ -29,7 +67,55 @@ impl Modes {
         std::mem::take(&mut self.replies)
     }
 
+    pub(crate) fn capture_handoff(&mut self) -> Result<HandoffState, &'static str> {
+        if self.pending.overflow || self.replies_overflow {
+            return Err("terminal negotiation state overflowed during handoff");
+        }
+        let state = HandoffState {
+            main_keyboard: self.main_keyboard,
+            alternate_keyboard: self.alternate_keyboard,
+            main_keyboard_stack: self.main_keyboard_stack.clone(),
+            alternate_keyboard_stack: self.alternate_keyboard_stack.clone(),
+            // Reader batches drain replies before their pause acknowledgement.
+            // Retain any synthetic/direct-parser reply in the source until
+            // commit succeeds; the source then exits and the importer writes
+            // this copied queue once before it begins reading.
+            replies: self.replies.clone(),
+            pending: self.pending.bytes.clone(),
+        };
+        state.validate()?;
+        Ok(state)
+    }
+
+    pub(crate) fn restore_handoff(state: HandoffState) -> Result<Self, &'static str> {
+        state.validate()?;
+        let mut modes = Self {
+            main_keyboard: state.main_keyboard,
+            alternate_keyboard: state.alternate_keyboard,
+            main_keyboard_stack: state.main_keyboard_stack,
+            alternate_keyboard_stack: state.alternate_keyboard_stack,
+            replies: state.replies,
+            pending: PendingSequence::from_bytes(state.pending.clone()),
+            ..Self::default()
+        };
+        // vte's parser is intentionally not serializable. Replaying only the
+        // incomplete suffix reconstitutes its DCS capability state without
+        // issuing a completed query twice.
+        for byte in state.pending {
+            modes
+                .capability_parser
+                .advance(&mut modes.capability_events, &[byte]);
+            modes.capability_events.completed = None;
+        }
+        Ok(modes)
+    }
+
+    pub(crate) fn pending_bytes(&self) -> &[u8] {
+        &self.pending.bytes
+    }
+
     pub fn feed(&mut self, byte: u8) {
+        self.pending.feed(byte);
         if self.reset_escaped && byte == b'c' {
             *self = Self::default();
             return;
@@ -47,7 +133,7 @@ impl Modes {
         let mut reply = Vec::new();
         for encoded in query.split(|byte| *byte == b';') {
             let Ok(name) = decode_hex(encoded) else {
-                self.replies.extend_from_slice(b"\x1bP0+r\x1b\\");
+                self.extend_reply(b"\x1bP0+r\x1b\\");
                 return;
             };
             let value: &[u8] = match name.as_slice() {
@@ -55,7 +141,7 @@ impl Modes {
                 b"RGB" => b"8",
                 b"Ms" => b"\x1b]52;%p1%s;%p2%s\x07",
                 _ => {
-                    self.replies.extend_from_slice(b"\x1bP0+r\x1b\\");
+                    self.extend_reply(b"\x1bP0+r\x1b\\");
                     return;
                 }
             };
@@ -66,9 +152,18 @@ impl Modes {
             reply.push(b'=');
             hex_encode(value, &mut reply);
         }
-        self.replies.extend_from_slice(b"\x1bP1+r");
-        self.replies.extend_from_slice(&reply);
-        self.replies.extend_from_slice(b"\x1b\\");
+        self.extend_reply(b"\x1bP1+r");
+        self.extend_reply(&reply);
+        self.extend_reply(b"\x1b\\");
+    }
+
+    fn extend_reply(&mut self, bytes: &[u8]) {
+        if self.replies.len().saturating_add(bytes.len()) > MAX_REPLY_BYTES {
+            self.replies.clear();
+            self.replies_overflow = true;
+        } else if !self.replies_overflow {
+            self.replies.extend_from_slice(bytes);
+        }
     }
 
     pub fn csi(
@@ -98,7 +193,7 @@ impl Modes {
                 }
             }
             (Some(b'<'), 'u') => self.pop_keyboard(alternate_screen, p(0).max(1) as usize),
-            (Some(b'?'), 'u') => self.replies.extend_from_slice(
+            (Some(b'?'), 'u') => self.extend_reply(
                 format!("\x1b[?{}u", self.keyboard(alternate_screen).kitty_flags).as_bytes(),
             ),
             // xterm modifyOtherKeys levels are 0, 1, and 2.
@@ -108,26 +203,29 @@ impl Modes {
             (Some(b'>'), 'n') if p(0) == 4 => {
                 self.keyboard_mut(alternate_screen).modify_other_keys = 0
             }
-            (Some(b'?'), 'm') if p(0) == 4 => self.replies.extend_from_slice(
+            (Some(b'?'), 'm') if p(0) == 4 => self.extend_reply(
                 format!(
                     "\x1b[>4;{}m",
                     self.keyboard(alternate_screen).modify_other_keys
                 )
                 .as_bytes(),
             ),
+            // Device/status replies only identify capabilities this parser
+            // implements; applications use this probe before enhanced input.
+            (None, 'c') => self.extend_reply(b"\x1b[?6c"),
             // DSR: terminal OK and current cursor position.
-            (None, 'n') if p(0) == 5 => self.replies.extend_from_slice(b"\x1b[0n"),
-            (None, 'n') if p(0) == 6 => self
-                .replies
-                .extend_from_slice(format!("\x1b[{};{}R", cursor.0 + 1, cursor.1 + 1).as_bytes()),
-            (Some(b'?'), 'n') if p(0) == 6 => self
-                .replies
-                .extend_from_slice(format!("\x1b[?{};{}R", cursor.0 + 1, cursor.1 + 1).as_bytes()),
+            (None, 'n') if p(0) == 5 => self.extend_reply(b"\x1b[0n"),
+            (None, 'n') if p(0) == 6 => {
+                self.extend_reply(format!("\x1b[{};{}R", cursor.0 + 1, cursor.1 + 1).as_bytes())
+            }
+            (Some(b'?'), 'n') if p(0) == 6 => {
+                self.extend_reply(format!("\x1b[?{};{}R", cursor.0 + 1, cursor.1 + 1).as_bytes())
+            }
             // xterm text-area character size query. Pixel size is deliberately
             // unanswered because this terminal does not render pixel geometry.
-            (None, 't') if p(0) == 18 => self
-                .replies
-                .extend_from_slice(format!("\x1b[8;{rows};{cols}t").as_bytes()),
+            (None, 't') if p(0) == 18 => {
+                self.extend_reply(format!("\x1b[8;{rows};{cols}t").as_bytes())
+            }
             _ => {}
         }
     }
@@ -141,7 +239,7 @@ impl Modes {
         } else {
             (&mut self.main_keyboard_stack, &mut self.main_keyboard)
         };
-        if stack.len() == 16 {
+        if stack.len() == MAX_STACK_DEPTH {
             stack.remove(0);
         }
         stack.push(keyboard.kitty_flags);
@@ -173,6 +271,102 @@ impl Modes {
 
 fn kitty_flags(flags: u16) -> u8 {
     (flags & u16::from(SUPPORTED_KITTY_FLAGS)) as u8
+}
+
+#[derive(Default)]
+struct PendingSequence {
+    bytes: Vec<u8>,
+    state: PendingState,
+    overflow: bool,
+}
+
+#[derive(Clone, Copy, Default)]
+enum PendingState {
+    #[default]
+    Ground,
+    Escape,
+    Csi,
+    Dcs,
+    Osc,
+    StringEscape,
+}
+
+impl PendingSequence {
+    fn from_bytes(bytes: Vec<u8>) -> Self {
+        let mut pending = Self::default();
+        for byte in bytes {
+            pending.feed(byte);
+        }
+        pending
+    }
+
+    fn feed(&mut self, byte: u8) {
+        use PendingState::*;
+        match self.state {
+            Ground => {
+                if byte == 0x1b {
+                    self.start(byte, Escape);
+                }
+            }
+            Escape => match byte {
+                b'[' => self.push(byte, Csi),
+                b'P' => self.push(byte, Dcs),
+                b']' => self.push(byte, Osc),
+                b'^' | b'_' => self.push(byte, Osc),
+                0x1b => self.start(byte, Escape),
+                0x18 | 0x1a | 0x30..=0x7e => self.finish(),
+                _ => self.push(byte, Escape),
+            },
+            Csi => {
+                if byte == 0x1b {
+                    self.start(byte, Escape);
+                } else if byte == 0x18 || byte == 0x1a || (0x40..=0x7e).contains(&byte) {
+                    self.finish();
+                } else {
+                    self.push(byte, Csi);
+                }
+            }
+            Dcs | Osc => match byte {
+                0x07 if matches!(self.state, Osc) => self.finish(),
+                0x18 | 0x1a => self.finish(),
+                0x1b => self.push(byte, StringEscape),
+                _ => self.push(byte, self.state),
+            },
+            StringEscape => {
+                if byte == b'\\' {
+                    self.finish();
+                } else if byte == 0x1b {
+                    self.push(byte, StringEscape);
+                } else {
+                    // An ESC not followed by ST aborts the string and starts
+                    // an ordinary escape sequence in xterm/vte.
+                    self.start(byte, Escape);
+                }
+            }
+        }
+    }
+
+    fn start(&mut self, byte: u8, state: PendingState) {
+        self.bytes.clear();
+        self.overflow = false;
+        self.bytes.push(byte);
+        self.state = state;
+    }
+
+    fn push(&mut self, byte: u8, state: PendingState) {
+        if self.bytes.len() == MAX_PENDING_BYTES {
+            self.bytes.clear();
+            self.overflow = true;
+        } else if !self.overflow {
+            self.bytes.push(byte);
+        }
+        self.state = state;
+    }
+
+    fn finish(&mut self) {
+        self.bytes.clear();
+        self.state = PendingState::Ground;
+    }
 }
 
 #[derive(Default)]
@@ -279,7 +473,11 @@ mod tests {
         m.csi((24, 80), (2, 3), false, Some(b'?'), &[&[4]], 'm');
         m.csi((24, 80), (2, 3), false, Some(b'?'), &[&[6]], 'n');
         m.csi((24, 80), (2, 3), false, None, &[&[18]], 't');
-        assert_eq!(m.take_replies(), b"\x1b[>4;0m\x1b[?3;4R\x1b[8;24;80t");
+        m.csi((24, 80), (2, 3), false, None, &[], 'c');
+        assert_eq!(
+            m.take_replies(),
+            b"\x1b[>4;0m\x1b[?3;4R\x1b[8;24;80t\x1b[?6c"
+        );
     }
 
     #[test]
@@ -292,5 +490,31 @@ mod tests {
             m.take_replies(),
             b"\x1bP1+r5463=31;524742=38;4d73=1b5d35323b25703125733b257032257307;5375=31\x1b\\"
         );
+    }
+
+    #[test]
+    fn handoff_rebuilds_partial_dcs_without_replaying_replies() {
+        let mut source = Modes::default();
+        for byte in b"\x1bP+q546" {
+            source.feed(*byte);
+        }
+        let state = source.capture_handoff().unwrap();
+        assert_eq!(state.pending, b"\x1bP+q546");
+        let mut target = Modes::restore_handoff(state).unwrap();
+        for byte in b"3\x1b\\" {
+            target.feed(*byte);
+        }
+        assert_eq!(target.take_replies(), b"\x1bP1+r5463=31\x1b\\");
+    }
+
+    #[test]
+    fn partial_sequences_are_bounded_and_fail_closed_for_handoff() {
+        let mut modes = Modes::default();
+        modes.feed(0x1b);
+        modes.feed(b']');
+        for _ in 0..=MAX_PENDING_BYTES {
+            modes.feed(b'x');
+        }
+        assert!(modes.capture_handoff().is_err());
     }
 }

@@ -90,7 +90,9 @@ impl MasterPty for ImportedMaster {
     }
 }
 
-pub(crate) const HANDOFF_VERSION: u32 = 1;
+// Version 2 adds parser-owned keyboard/capability state. Older importers must
+// reject this handoff rather than silently dropping a pane's negotiated input.
+pub(crate) const HANDOFF_VERSION: u32 = 2;
 pub(crate) const MAX_HANDOFF_FDS: usize = 64;
 const MAX_TOKEN_BYTES: usize = 256;
 pub(crate) const MAX_MANIFEST_BYTES: usize = 128 * 1024 * 1024;
@@ -153,6 +155,8 @@ pub(crate) struct PaneRuntime {
     pub(crate) sync_tail: Vec<u8>,
     #[serde(default)]
     pub(crate) sync_frozen: Option<(u64, kodade_cli_proto::Screen)>,
+    #[serde(default)]
+    pub(crate) terminal_modes: crate::terminal_modes::HandoffState,
     #[serde(default)]
     pub(crate) agent_generation: u64,
     #[serde(default)]
@@ -227,6 +231,7 @@ impl HandoffManifest {
             pane.graphics
                 .validate()
                 .map_err(|error| data(&error.to_string()))?;
+            pane.terminal_modes.validate().map_err(data)?;
         }
         // Layout validation belongs to the importer, after it has accepted the
         // transport. Keeping it out of this boundary lets a new daemon report
