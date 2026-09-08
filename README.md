@@ -25,7 +25,10 @@ Current development also includes:
 - Local and saved SSH machines in one workspace, with independent reconnects.
 - A command center (`prefix space`) and attention history (`prefix A`).
 - Guarded agent launch/prompt/wait automation and live integration reloads.
-- Local extensions with command actions, event hooks, and terminal panes.
+- Local extensions with selected-text context, URL handlers, event hooks, and terminal panes.
+- [Configured command shortcuts](docs/CONFIG.md#configured-commands), workspace environments, and existing worktree open.
+- Exact native conversation restore and opt-in terminal history after a cold restart.
+- An offline [agent automation guide](docs/AGENT-GUIDE.md), available with `kodade-cli agent guide`.
 - Terminal images, PNG paste, and a focused view for narrow terminals.
 - Verified stable/preview updates for standalone installations.
 

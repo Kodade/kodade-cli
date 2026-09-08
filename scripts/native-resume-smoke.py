@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 import json, os, pathlib, shutil, signal, subprocess, sys, tempfile, time
 
-binary = pathlib.Path(sys.argv[1]).resolve() if len(sys.argv) == 2 else sys.exit("usage: native-resume-smoke.sh PATH")
+binary = pathlib.Path(sys.argv[1]).resolve() if len(sys.argv) == 2 else sys.exit("usage: native-resume-smoke.py PATH")
 root = pathlib.Path(tempfile.mkdtemp(prefix="kodade-native-resume-")); procs = []
 try:
     home, runtime, state, bindir, work = (root / n for n in ("home", "runtime", "state", "bin", "work"))
