@@ -120,6 +120,7 @@ mod tests {
         TerminalColors {
             foreground: [1, 2, 3],
             background: [4, 5, 6],
+            cursor: [10, 11, 12],
             palette: [[7, 8, 9]; 16],
         }
     }
