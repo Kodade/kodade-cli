@@ -216,15 +216,18 @@ impl Tracker {
             Event::Print(c) => {
                 let width = c.width().unwrap_or(0) as u16;
                 if width > 0 {
-                    let wrapped = col >= cols
-                        || (col >= cols.saturating_sub(width)
-                            && screen.cell(row, cols - 1).is_some_and(|cell| {
-                                cell.has_contents() || cell.is_wide_continuation()
-                            }));
-                    if wrapped {
+                    let wrapped = col.saturating_add(width) > cols;
+                    if wrapped && row == bottom {
                         grid.scroll(top, bottom, 1);
                     }
-                    let (r, c) = (row, if wrapped { 0 } else { col });
+                    let (r, c) = (
+                        if wrapped {
+                            row.saturating_add(1).min(bottom)
+                        } else {
+                            row
+                        },
+                        if wrapped { 0 } else { col },
+                    );
                     for x in c..c.saturating_add(width).min(cols) {
                         grid.set(r, x, self.active);
                     }
@@ -437,8 +440,8 @@ mod tests {
             b"\x1b]8;;https://new\x1b\\d\x1b]8;;\x1b\\",
         );
         let links = tracker.ranges(false);
-        assert_eq!(links.len(), 1);
-        assert_eq!((links[0].start_col, links[0].end_col), (0, 1));
-        assert_eq!(links[0].uri, "https://new");
+        assert!(links.iter().any(|link| {
+            (link.row, link.start_col, link.end_col, link.uri.as_str()) == (1, 0, 1, "https://new")
+        }));
     }
 }

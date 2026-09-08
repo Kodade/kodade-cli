@@ -176,6 +176,8 @@ struct PtyCallbacks {
     graphics: graphics::Store,
     graphics_tracker: graphics::Tracker,
     hyperlinks: hyperlinks::Tracker,
+    sync_tail: Vec<u8>,
+    sync_frozen: Option<(Instant, Screen)>,
 }
 impl vt100::Callbacks for PtyCallbacks {
     fn set_window_title(&mut self, _: &mut vt100::Screen, title: &[u8]) {
@@ -3551,8 +3553,11 @@ impl Pane {
         })
     }
     fn snapshot(&self) -> (Screen, usize) {
-        let parser = self.parser.lock().expect("PTY parser lock poisoned");
-        (snapshot(&parser), parser.screen().scrollback())
+        let mut parser = self.parser.lock().expect("PTY parser lock poisoned");
+        (
+            snapshot_for_client(&mut parser),
+            parser.screen().scrollback(),
+        )
     }
     /// Render a requested historical offset without leaving the shared parser
     /// scrolled for another client. `set_scrollback` clamps to available history.
@@ -3560,7 +3565,7 @@ impl Pane {
         let mut parser = self.parser.lock().expect("PTY parser lock poisoned");
         parser.screen_mut().set_scrollback(offset);
         let actual = parser.screen().scrollback();
-        let screen = snapshot(&parser);
+        let screen = snapshot_for_client(&mut parser);
         parser.screen_mut().set_scrollback(0);
         (screen, actual)
     }
@@ -4159,6 +4164,17 @@ fn graphics_text(parser: &mut PtyParser, text: &[u8]) {
         let before_alt = parser.screen().alternate_screen();
         tracker.feed(byte, parser.screen(), &mut store);
         hyperlinks.feed(byte, parser.screen());
+        let tail = &mut parser.callbacks_mut().sync_tail;
+        tail.push(byte);
+        if tail.len() > 8 {
+            tail.remove(0);
+        }
+        if tail.ends_with(b"\x1b[?2026h") {
+            let frame = snapshot(parser);
+            parser.callbacks_mut().sync_frozen = Some((Instant::now(), frame));
+        } else if tail.ends_with(b"\x1b[?2026l") {
+            parser.callbacks_mut().sync_frozen = None;
+        }
         parser.process(&[byte]);
         let alternate = parser.screen().alternate_screen();
         if alternate && !before_alt {
@@ -4251,6 +4267,18 @@ fn snapshot(parser: &PtyParser) -> Screen {
             .hyperlinks
             .ranges(screen.alternate_screen()),
     }
+}
+
+/// A pane's synchronized output is atomic for clients, but never indefinitely:
+/// a malformed producer is released after one second while parsing continues.
+fn snapshot_for_client(parser: &mut PtyParser) -> Screen {
+    if let Some((started, frame)) = parser.callbacks().sync_frozen.as_ref() {
+        if started.elapsed() < Duration::from_secs(1) {
+            return frame.clone();
+        }
+    }
+    parser.callbacks_mut().sync_frozen = None;
+    snapshot(parser)
 }
 
 /// Rebuild recent text and the saved visible grid before the PTY reader starts.
@@ -5003,6 +5031,31 @@ mod tests {
             .iter()
             .flat_map(|row| row.iter())
             .any(|run| run.text.contains("2026")));
+    }
+
+    #[test]
+    fn pane_synchronized_output_holds_then_releases_a_frame() {
+        let mut parser = pty_parser(2, 20, 100, PtyCallbacks::default());
+        graphics_text(&mut parser, b"old");
+        graphics_text(&mut parser, b"\x1b[?2026hpartial");
+        assert_eq!(snapshot_for_client(&mut parser).contents.trim(), "old");
+        graphics_text(&mut parser, b" final\x1b[?2026l");
+        assert_eq!(
+            snapshot_for_client(&mut parser).contents.trim(),
+            "oldpartial final"
+        );
+    }
+
+    #[test]
+    fn pane_synchronized_output_timeout_releases_without_more_bytes() {
+        let mut parser = pty_parser(2, 20, 100, PtyCallbacks::default());
+        graphics_text(&mut parser, b"old\x1b[?2026hpartial");
+        let callbacks = parser.callbacks_mut();
+        callbacks.sync_frozen.as_mut().unwrap().0 = Instant::now() - Duration::from_secs(2);
+        assert_eq!(
+            snapshot_for_client(&mut parser).contents.trim(),
+            "oldpartial"
+        );
     }
 
     #[test]
