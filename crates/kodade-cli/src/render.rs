@@ -256,6 +256,17 @@ pub fn render(frame: &mut Frame, layout: &LayoutSnapshot, ui: &Ui, theme: &Theme
                     *rect,
                 );
                 // The block cursor only makes sense on the live focused pane.
+                if !crate::graphics::supported()
+                    && !pane.screen.graphics.is_empty()
+                    && rect.width > 2
+                    && rect.height > 2
+                {
+                    frame.render_widget(
+                        Paragraph::new("[image · Kitty graphics required]")
+                            .style(Style::default().fg(theme.dim)),
+                        Rect::new(rect.x + 1, rect.y + 1, rect.width - 2, 1),
+                    );
+                }
                 if pane.focused && copy.is_none() && pane.scroll_offset == 0 {
                     render_cursor(frame, &pane.screen, *rect, theme);
                 }
@@ -2068,6 +2079,7 @@ mod tests {
                 )]],
                 bracketed_paste: false,
                 mouse_reporting: false,
+                graphics: Vec::new(),
             },
             agent: None,
             agent_generation: 0,

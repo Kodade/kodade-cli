@@ -8,7 +8,9 @@ mod config;
 mod connection;
 mod doctor;
 mod endpoints;
+mod graphics;
 mod help;
+mod image_paste;
 mod input;
 mod integrations;
 mod keys;
@@ -432,6 +434,11 @@ async fn pane(socket: &Path, command: cli::PaneCommand) -> Result<()> {
             } else {
                 println!("{}", commands::format_panes(&layout));
             }
+            Ok(())
+        }
+        cli::PaneCommand::PasteImage { pane, path } => {
+            let path = image_paste::paste(socket, pane, path.as_deref()).await?;
+            println!("{}", path.display());
             Ok(())
         }
         cli::PaneCommand::SendKeys {

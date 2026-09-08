@@ -123,6 +123,8 @@ struct DragState {
 }
 
 pub struct App {
+    graphics: crate::graphics::Renderer,
+    image_clipboard: crate::image_paste::Clipboard,
     layout: Option<LayoutSnapshot>,
     /// Per-machine snapshots stay available while a disconnected endpoint
     /// reconnects. The canvas always renders the selected endpoint only.
@@ -288,6 +290,8 @@ impl App {
             machine_profiles: Vec::new(),
             local_session: session.to_string(),
             catalog_checked: Instant::now(),
+            graphics: crate::graphics::Renderer::default(),
+            image_clipboard: crate::image_paste::Clipboard::default(),
             prefix: false,
             rename: false,
             new_workspace: false,
@@ -913,6 +917,18 @@ impl App {
         rx: &mut mpsc::Receiver<crate::endpoints::UpdatePacket>,
         updates: &mpsc::Sender<crate::endpoints::UpdatePacket>,
     ) -> Result<()> {
+        let result = self.run_loop(term, writer, rx, updates).await;
+        let cleanup = self.graphics.clear(term.backend_mut());
+        result.and(cleanup)
+    }
+
+    async fn run_loop(
+        &mut self,
+        term: &mut Term,
+        writer: &mut Router,
+        rx: &mut mpsc::Receiver<crate::endpoints::UpdatePacket>,
+        updates: &mpsc::Sender<crate::endpoints::UpdatePacket>,
+    ) -> Result<()> {
         loop {
             while let Ok(note) = self.plugin_results.try_recv() {
                 self.set_note(note);
@@ -920,6 +936,9 @@ impl App {
             self.sync_machine_catalog(writer, updates, term).await;
             if let Some(notice) = writer.take_notice() {
                 self.set_note(notice);
+            }
+            if let Some(note) = self.image_clipboard.poll() {
+                self.set_note(note);
             }
             let mut layout_changed = false;
             while let Ok(packet) = rx.try_recv() {
@@ -1019,6 +1038,20 @@ impl App {
             }
             self.sync_title(term)?;
             term.draw(|frame| self.draw(frame))?;
+            let area = self.content_area(term)?;
+            let hidden = self.center.is_some()
+                || self.help.is_some()
+                || self.settings.is_some()
+                || self.picker.is_some()
+                || self.menu.is_some()
+                || self.copy.is_some()
+                || self.flash_active();
+            let layout = self.layout.as_ref().filter(|_| !hidden);
+            let rects = layout
+                .map(|layout| render::pane_rects_for(layout, area))
+                .unwrap_or_default();
+            self.graphics
+                .draw(term.backend_mut(), &self.socket, layout, &rects)?;
             if !event::poll(Duration::from_millis(16))? {
                 continue;
             }
@@ -1800,6 +1833,13 @@ impl App {
                 } else {
                     let text = self.paste_buffer.clone();
                     self.send_paste(&text, writer).await?;
+                }
+            }
+            config::Action::PasteImage => {
+                if let Some(pane) = self.focused_pane {
+                    if self.image_clipboard.start(self.socket.clone(), pane) {
+                        self.set_note(" reading clipboard image…");
+                    }
                 }
             }
             config::Action::NotificationJump => self.notification_jump(writer).await?,

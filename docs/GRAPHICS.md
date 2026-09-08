@@ -1,0 +1,69 @@
+# Images in Ködade CLI
+
+Images emitted by a pane stay with its terminal screen. The daemon retains
+image data, clients fetch each revision separately, and placements are clipped
+to pane interiors. Opening an overlay hides images; closing it restores them
+without uploading the same pixels again.
+
+Rendering turns on automatically in Kitty and Ghostty. Set
+`KODADE_GRAPHICS=kitty` for another terminal configured to support the Kitty
+graphics protocol, or `KODADE_GRAPHICS=off` to disable it. Other terminals show
+an image hint. Image paste works independently of rendering.
+
+## Paste an image
+
+Press `prefix I` or choose **paste clipboard image** from the command center.
+Ködade uploads the PNG to the selected pane's daemon and inserts a quoted path
+without pressing Enter. Over SSH, the agent receives a path on its own machine.
+
+```sh
+kodade-cli pane paste-image 3 ./screenshot.png
+kodade-cli --remote buildbox pane paste-image 3 ./screenshot.png
+kodade-cli pane paste-image 3  # host clipboard
+```
+
+Clipboard readers are `wl-paste` on Wayland, `xclip` on X11, and `pngpaste` on
+macOS. Missing readers produce an actionable message; specifying a file needs
+none of them. Paths must name regular files. PNG pixels are validated as well
+as headers. Each session retains at most 64 attachments / 64 MiB in a private
+temporary directory, with files mode `0600`. Orderly shutdown removes them.
+A forced process kill can leave them for the OS's temporary-file cleanup.
+
+## Protocol support and limits
+
+Supported Kitty actions are direct, uncompressed RGB (`f=24`), RGBA (`f=32`),
+and PNG (`f=100`) transmission (`a=t`), transmit and place (`a=T`), place
+(`a=p`), query (`a=q`), and all/image deletion (`a=d,d=a/A/i/I`). Image IDs,
+revisions, chunking, quiet responses, cell-sized placements, source cropping,
+z order, and cursor movement policy are retained. Automatic sizes use an 8×16 cell-pixel
+estimate; an explicit single cell dimension preserves the crop aspect ratio. Images follow full-screen
+scrolling and scrolling margins. Clear screen and alternate-buffer entry
+clear the appropriate placements.
+
+Send large transfers in Kitty's 4096-byte base64 chunks. Limits are 8 MiB
+decoded per image, 16 megapixels / 64 MiB decoded PNG pixels, 16 stored images
+and 64 placements per pane, and 32 MiB image data per pane. Host caches have
+image and byte limits too. Layouts carry placement metadata; pixel data travels
+through `Query(Image)`. Daemon JSON requests are capped at 16 MiB before
+deserialization, while partial uploads survive concurrent screen updates.
+
+File/shared-memory transfers, compression, animation, virtual Unicode and
+relative placements, pixel placement offsets, and the remaining delete selectors are not implemented.
+Unsupported transmission modes return an error. Ködade never reads a path
+supplied by a graphics escape sequence. This is bounded Kitty support, not
+the full protocol.
+
+## Verification
+
+Kitty 0.48.2 on Linux arm64 was exercised in a real graphical terminal window.
+`scripts/graphics-smoke-test.py` also uses a real daemon and controlling PTY to
+check image emission/fetch, modal hide/restore, resize, detach cleanup, PNG
+paste, and session attachment cleanup. The isolated localhost OpenSSH smoke also verifies PNG upload, image metadata,
+rename, and attachment cleanup through real forwarded sockets. Unit tests cover chunk boundaries,
+failed transfers, quotas, atomic replacement, scrolling, clipping, PNG
+validation, FIFO rejection, and interrupted partial socket reads. Ghostty
+support follows its documented Kitty implementation; it has not been visually
+tested in this environment.
+
+References: [Kitty graphics protocol](https://sw.kovidgoyal.net/kitty/graphics-protocol/)
+and [Ghostty graphics support](https://ghostty.org/docs/features).

@@ -7,6 +7,7 @@ inside one temporary directory. All child processes have timeouts and cleanup
 only touches those owned paths/processes.
 """
 
+import base64
 import json
 import os
 import pty
@@ -16,10 +17,12 @@ import threading
 import struct
 from pathlib import Path
 import socket
+import struct
 import subprocess
 import sys
 import tempfile
 import time
+import zlib
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -275,6 +278,24 @@ def main() -> None:
             tui_drain_stop.set()
             os.close(master)
             tui = None
+            # Pixels travel over the forwarded socket; the returned attachment
+            # belongs to the remote daemon and survives a session rename.
+            def png_chunk(kind, data):
+                return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data))
+            png = (b"\x89PNG\r\n\x1a\n"
+                   + png_chunk(b"IHDR", struct.pack(">IIBBBBB", 1, 1, 8, 2, 0, 0, 0))
+                   + png_chunk(b"IDAT", zlib.compress(b"\0\xff\x80\x40"))
+                   + png_chunk(b"IEND", b""))
+            image_source = local_home / "client-only.png"
+            image_source.write_bytes(png)
+            attachment = Path(run("--remote", "kodade-smoke", "-s", SESSION, "pane", "paste-image", pane, str(image_source)).stdout.strip())
+            assert attachment != image_source and attachment.read_bytes() == png
+            frame = b"\x1b_Ga=T,f=100,i=7,c=4,r=2,C=1;" + base64.b64encode(png) + b"\x1b\\"
+            image_pane = run("--remote", "kodade-smoke", "-s", SESSION, "run", "--", "python3", "-c", f"import os,time;os.write(1,{frame!r});time.sleep(60)").stdout.strip()
+            wait_until("forwarded graphics metadata", lambda: any(
+                str(p["id"]) == image_pane and p["screen"].get("graphics")
+                for p in json.loads(run("--remote", "kodade-smoke", "-s", SESSION, "ls", "--json").stdout)["panes"]
+            ))
 
             # Two concurrent event streams each hold a tunnel. Stopping one
             # cannot remove the other's local endpoint or disconnect its stream.
@@ -314,7 +335,9 @@ def main() -> None:
             if not renamed_socket.exists() or renamed_socket == remote_socket:
                 raise RuntimeError("remote session rename did not produce its new socket")
             run("--remote", "kodade-smoke", "-s", RENAMED, "pane", "read", pane)
-            print("SSH smoke passed: daemon startup, run/read, independent tunnels, rename, teardown")
+            run("--remote", "kodade-smoke", "-s", RENAMED, "kill-session")
+            assert not attachment.exists(), "remote attachment survived session shutdown"
+            print("SSH smoke passed: daemon startup, run/read, PNG upload, graphics, independent tunnels, rename, teardown")
         finally:
             if tui is not None and tui.poll() is None:
                 tui.terminate()

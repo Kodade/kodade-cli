@@ -196,6 +196,13 @@ pub enum Command {
 
 #[derive(Debug, Subcommand, PartialEq, Eq)]
 pub enum PaneCommand {
+    /// Paste a PNG path without submitting. With no PATH, use the host clipboard.
+    PasteImage {
+        #[arg(value_name = "PANE", value_parser = pane_id)]
+        pane: PaneId,
+        #[arg(value_name = "PATH")]
+        path: Option<PathBuf>,
+    },
     /// Print a pane's text. Defaults to the visible screen; `--scrollback`
     /// includes the full history and `--lines N` keeps only the last N lines.
     Read {

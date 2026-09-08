@@ -233,6 +233,7 @@ pub enum Action {
     DisplayPanes,
     // Paste (#21): re-paste the internal buffer.
     PasteBuffer,
+    PasteImage,
     /// Toggle mouse capture at runtime so the host terminal can select (#12).
     MouseToggle,
     // Help overlay (#6).
@@ -305,6 +306,7 @@ const ACTIONS: &[(&str, Action)] = &[
     ("settings", Action::Settings),
     ("display_panes", Action::DisplayPanes),
     ("paste_buffer", Action::PasteBuffer),
+    ("paste_image", Action::PasteImage),
     ("mouse_toggle", Action::MouseToggle),
     ("help", Action::Help),
     ("notification_jump", Action::NotificationJump),
@@ -413,6 +415,7 @@ impl Action {
             Self::ReloadConfig
             | Self::Settings
             | Self::PasteBuffer
+            | Self::PasteImage
             | Self::MouseToggle
             | Self::WorkspacePicker
             | Self::Goto
@@ -589,6 +592,7 @@ impl Default for Config {
             ("=", Action::LayoutEven),
             ("q", Action::DisplayPanes),
             ("]", Action::PasteBuffer),
+            ("I", Action::PasteImage),
             ("m", Action::MouseToggle),
             ("?", Action::Help),
             // #14 took `o`/`O` for next/prev pane, so notification jump uses `N`.
