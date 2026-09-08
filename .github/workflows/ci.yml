@@ -57,3 +57,7 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: ./scripts/windows-smoke.ps1
+      - name: Verify PowerShell Windows installer
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: ./scripts/windows-installer-test.ps1

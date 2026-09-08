@@ -29,6 +29,12 @@ the release repository's normal latest-release endpoint:
 curl -fsSL https://raw.githubusercontent.com/Kodade/kodade-cli/main/install.sh | sh
 ```
 
+On Windows x64, Windows PowerShell 5.1+ can install the verified release with:
+
+```powershell
+irm https://raw.githubusercontent.com/Kodade/kodade-cli/main/install.ps1 | iex
+```
+
 For a non-default destination, set `KODADE_INSTALL_DIR` before running it. The
 installer downloads the latest matching archive and verifies it against
 `SHA256SUMS` before installing.
