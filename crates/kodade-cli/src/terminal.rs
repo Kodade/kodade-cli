@@ -9,12 +9,19 @@ use std::sync::{
 use anyhow::Result;
 use crossterm::{
     cursor::Show,
-    event::{DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture},
+    event::{
+        DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    },
     execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{
+        disable_raw_mode, enable_raw_mode, supports_keyboard_enhancement, EnterAlternateScreen,
+        LeaveAlternateScreen,
+    },
 };
 
 static ACTIVE: AtomicBool = AtomicBool::new(false);
+static KEYBOARD_ENHANCED: AtomicBool = AtomicBool::new(false);
 static PANIC_HOOK: Once = Once::new();
 
 pub const SYNC_BEGIN: &[u8] = b"\x1b[?2026h";
@@ -45,6 +52,17 @@ impl TerminalModes {
         let modes = Self;
         let mut stdout = std::io::stdout();
         execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
+        if supports_keyboard_enhancement().unwrap_or(false) {
+            execute!(
+                stdout,
+                PushKeyboardEnhancementFlags(
+                    KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                        | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+                        | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES,
+                ),
+            )?;
+            KEYBOARD_ENHANCED.store(true, Ordering::Release);
+        }
         if mouse {
             execute!(stdout, EnableMouseCapture)?;
         }
@@ -68,6 +86,9 @@ fn restore() {
     // A failed frame or a detached client must never leave a host terminal
     // waiting for a synchronized-output terminator.
     let _ = end_synchronized_output(&mut stdout);
+    if KEYBOARD_ENHANCED.swap(false, Ordering::AcqRel) {
+        let _ = execute!(stdout, PopKeyboardEnhancementFlags);
+    }
     let _ = execute!(stdout, DisableBracketedPaste);
     let _ = execute!(stdout, DisableMouseCapture);
     let _ = execute!(stdout, LeaveAlternateScreen);

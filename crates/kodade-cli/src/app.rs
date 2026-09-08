@@ -7,13 +7,14 @@
 use anyhow::{anyhow, Result};
 use crossterm::{
     event::{
-        self, Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+        self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
+        MouseEventKind,
     },
     execute,
 };
 use kodade_cli_proto::{
-    AgentStateKind, ClientMessage, Direction, LayoutSnapshot, Notification, PaneId, Screen,
-    ServerMessage, SidebarTabInfo, SplitAxis, WorkspaceId, WorkspaceInfo,
+    AgentStateKind, ClientMessage, Direction, KeyboardModes, LayoutSnapshot, Notification, PaneId,
+    Screen, ServerMessage, SidebarTabInfo, SplitAxis, WorkspaceId, WorkspaceInfo,
 };
 use ratatui::{backend::CrosstermBackend, layout::Rect, style::Color, Frame, Terminal};
 #[cfg(test)]
@@ -1159,6 +1160,15 @@ impl App {
         writer: &mut Router,
         term: &mut Term,
     ) -> Result<Flow> {
+        let keyboard = self.focused_keyboard();
+        if key.kind == KeyEventKind::Release {
+            if keyboard.kitty_flags & 2 != 0 {
+                if let Some(bytes) = bytes_for_mode(key, keyboard) {
+                    write(writer, &ClientMessage::Input { bytes }).await?;
+                }
+            }
+            return Ok(Flow::Continue);
+        }
         // Any keystroke ends a mouse selection (#12).
         self.clear_selection();
         if self.worktree_confirm.is_some() {
@@ -1191,15 +1201,32 @@ impl App {
             return self.handle_prefix_key(key, writer, term).await;
         } else if config::normalize_key(key) == self.config.prefix {
             self.prefix = true;
-        } else if let Some(command) = self.config.command(key, true).cloned() {
-            return self.run_configured_command(command, writer).await;
-        } else if let Some(action) = self.config.global_action(key) {
-            // Global chords (ctrl/alt, no `prefix+`) fire before the pane sees the key.
-            return self.run_action(action, writer, term).await;
-        } else if let Some(bytes) = bytes(key) {
+        } else if key.kind == KeyEventKind::Press {
+            if let Some(command) = self.config.command(key, true).cloned() {
+                return self.run_configured_command(command, writer).await;
+            }
+            if let Some(action) = self.config.global_action(key) {
+                // Global chords (ctrl/alt, no `prefix+`) fire before the pane sees the key.
+                return self.run_action(action, writer, term).await;
+            }
+            if let Some(bytes) = bytes_for_mode(key, keyboard) {
+                write(writer, &ClientMessage::Input { bytes }).await?;
+            }
+        } else if let Some(bytes) = bytes_for_mode(key, keyboard) {
             write(writer, &ClientMessage::Input { bytes }).await?;
         }
         Ok(Flow::Continue)
+    }
+
+    fn focused_keyboard(&self) -> KeyboardModes {
+        self.layout
+            .as_ref()
+            .and_then(|layout| {
+                self.focused_pane
+                    .and_then(|id| layout.panes.iter().find(|pane| pane.id == id))
+            })
+            .map(|pane| pane.screen.keyboard)
+            .unwrap_or_default()
     }
 
     // Rename mode: type a name, enter commits it to the stored target.
@@ -1719,7 +1746,7 @@ impl App {
             write(
                 writer,
                 &ClientMessage::Input {
-                    bytes: bytes(key).unwrap_or_default(),
+                    bytes: bytes_for_mode(key, self.focused_keyboard()).unwrap_or_default(),
                 },
             )
             .await?;
@@ -3524,9 +3551,135 @@ pub fn bytes(k: KeyEvent) -> Option<Vec<u8>> {
     Some(b)
 }
 
+/// Encode only modes a pane explicitly negotiated; legacy terminals retain the
+/// historical bytes above.
+pub fn bytes_for_mode(k: KeyEvent, modes: KeyboardModes) -> Option<Vec<u8>> {
+    if modes.kitty_flags & 1 != 0 {
+        let code = match k.code {
+            KeyCode::Char(c) => c as u32,
+            KeyCode::Enter => 13,
+            KeyCode::Tab => 9,
+            KeyCode::Backspace => 127,
+            KeyCode::Esc => 27,
+            _ => return bytes(k),
+        };
+        let encoded = match k.code {
+            KeyCode::Char(_) => k
+                .modifiers
+                .intersects(KeyModifiers::ALT | KeyModifiers::CONTROL),
+            KeyCode::Esc => true,
+            _ => !k.modifiers.is_empty(),
+        };
+        if !encoded {
+            return bytes(k);
+        }
+        if k.kind == KeyEventKind::Release && modes.kitty_flags & 2 == 0 {
+            return None;
+        }
+        let mut modifier = 1;
+        if k.modifiers.contains(KeyModifiers::SHIFT) {
+            modifier += 1;
+        }
+        if k.modifiers.contains(KeyModifiers::ALT) {
+            modifier += 2;
+        }
+        if k.modifiers.contains(KeyModifiers::CONTROL) {
+            modifier += 4;
+        }
+        let event = match k.kind {
+            KeyEventKind::Press => "",
+            KeyEventKind::Repeat => ":2",
+            KeyEventKind::Release => ":3",
+        };
+        return Some(format!("\x1b[{code};{modifier}{event}u").into_bytes());
+    }
+    let modify_other_keys = match modes.modify_other_keys {
+        1 => k.modifiers.contains(KeyModifiers::ALT),
+        2 => !k.modifiers.is_empty(),
+        _ => false,
+    };
+    if modify_other_keys {
+        if let KeyCode::Char(c) = k.code {
+            let mut modifier = 1;
+            if k.modifiers.contains(KeyModifiers::SHIFT) {
+                modifier += 1;
+            }
+            if k.modifiers.contains(KeyModifiers::ALT) {
+                modifier += 2;
+            }
+            if k.modifiers.contains(KeyModifiers::CONTROL) {
+                modifier += 4;
+            }
+            return Some(format!("\x1b[27;{modifier};{}~", c as u32).into_bytes());
+        }
+    }
+    bytes(k)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn enhanced_keyboard_encodes_shift_enter_and_event_types() {
+        let modes = KeyboardModes {
+            kitty_flags: 3,
+            modify_other_keys: 0,
+        };
+        let shift_enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT);
+        assert_eq!(
+            bytes_for_mode(shift_enter, modes),
+            Some(b"\x1b[13;2u".to_vec())
+        );
+        let repeat =
+            KeyEvent::new_with_kind(KeyCode::Enter, KeyModifiers::SHIFT, KeyEventKind::Repeat);
+        assert_eq!(
+            bytes_for_mode(repeat, modes),
+            Some(b"\x1b[13;2:2u".to_vec())
+        );
+        let release =
+            KeyEvent::new_with_kind(KeyCode::Enter, KeyModifiers::SHIFT, KeyEventKind::Release);
+        assert_eq!(
+            bytes_for_mode(release, modes),
+            Some(b"\x1b[13;2:3u".to_vec())
+        );
+        assert_eq!(
+            bytes_for_mode(
+                release,
+                KeyboardModes {
+                    kitty_flags: 1,
+                    modify_other_keys: 0
+                }
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn modify_other_keys_preserves_legacy_level_one_behavior() {
+        let alt = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::ALT);
+        let shift = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::SHIFT);
+        assert_eq!(
+            bytes_for_mode(
+                alt,
+                KeyboardModes {
+                    kitty_flags: 0,
+                    modify_other_keys: 1
+                }
+            ),
+            Some(b"\x1b[27;3;120~".to_vec())
+        );
+        assert_eq!(
+            bytes_for_mode(
+                shift,
+                KeyboardModes {
+                    kitty_flags: 0,
+                    modify_other_keys: 1
+                }
+            ),
+            Some(b"x".to_vec())
+        );
+    }
 
     #[test]
     fn auto_hide_collapses_at_80_columns_and_restores_when_widened() {

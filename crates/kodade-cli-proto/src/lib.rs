@@ -779,6 +779,15 @@ pub struct Screen {
     /// OSC 8 targets attached to visible terminal cells. Older daemons omit it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub links: Vec<LinkRange>,
+    #[serde(default)]
+    pub keyboard: KeyboardModes,
+}
+
+/// Per-pane input protocols negotiated by the program in that pane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct KeyboardModes {
+    pub kitty_flags: u8,
+    pub modify_other_keys: u8,
 }
 
 /// An exclusive horizontal OSC 8 link range in one visible terminal row.
@@ -1207,6 +1216,7 @@ mod tests {
                     mouse_reporting: false,
                     graphics: Vec::new(),
                     links: Vec::new(),
+                    keyboard: KeyboardModes::default(),
                 },
                 agent: None,
                 agent_generation: 0,

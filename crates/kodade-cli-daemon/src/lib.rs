@@ -12,6 +12,7 @@ mod manifest;
 mod persist;
 mod plugins;
 mod proc;
+mod terminal_modes;
 
 use std::{
     collections::{HashMap, HashSet},
@@ -180,6 +181,7 @@ struct PtyCallbacks {
     hyperlinks: hyperlinks::Tracker,
     sync_tail: Vec<u8>,
     sync_frozen: Option<(Instant, Screen)>,
+    terminal_modes: terminal_modes::Modes,
 }
 impl vt100::Callbacks for PtyCallbacks {
     fn set_window_title(&mut self, _: &mut vt100::Screen, title: &[u8]) {
@@ -187,6 +189,27 @@ impl vt100::Callbacks for PtyCallbacks {
     }
     fn copy_to_clipboard(&mut self, _: &mut vt100::Screen, ty: &[u8], data: &[u8]) {
         self.record_clipboard(ty, data);
+    }
+    fn unhandled_csi(
+        &mut self,
+        screen: &mut vt100::Screen,
+        i1: Option<u8>,
+        _: Option<u8>,
+        params: &[&[u16]],
+        c: char,
+    ) {
+        let (rows, cols) = screen.size();
+        self.terminal_modes.csi(
+            (rows.get(), cols.get()),
+            screen.cursor_position(),
+            screen.alternate_screen(),
+            i1,
+            params,
+            c,
+        );
+    }
+    fn unhandled_osc(&mut self, _: &mut vt100::Screen, params: &[&[u8]]) {
+        self.terminal_modes.osc(params);
     }
 }
 impl PtyCallbacks {
@@ -4287,6 +4310,10 @@ fn read_pty(
                         }
                     }
                 }
+                for byte in &bytes[..count] {
+                    parser.callbacks_mut().terminal_modes.feed(*byte);
+                }
+                replies.extend(parser.callbacks_mut().terminal_modes.take_replies());
             }
             if !replies.is_empty() {
                 if let Ok(mut writer) = writer.lock() {
@@ -4417,6 +4444,10 @@ fn snapshot(parser: &PtyParser) -> Screen {
             .callbacks()
             .hyperlinks
             .ranges(screen.alternate_screen(), screen.scrollback()),
+        keyboard: parser
+            .callbacks()
+            .terminal_modes
+            .keyboard(screen.alternate_screen()),
     }
 }
 
@@ -5043,6 +5074,78 @@ mod tests {
         server_task.await.unwrap().unwrap();
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn real_pty_negotiates_kitty_input_and_receives_shift_enter() {
+        let session = Session::spawn(80, 24, "keyboard-pty".into()).expect("session");
+        session
+            .handle(ClientMessage::Input {
+                bytes: b"printf '\\033[>3u'; IFS= read -r value; printf '\\nbytes:'; printf '%s' \"$value\" | od -An -tx1\n".to_vec(),
+            })
+            .expect("send negotiation command");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if session.snapshot().expect("snapshot").panes[0]
+                    .screen
+                    .keyboard
+                    .kitty_flags
+                    == 3
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("PTY negotiated Kitty keyboard mode");
+        session
+            .handle(ClientMessage::Input {
+                bytes: b"\x1b[13;2u\n".to_vec(),
+            })
+            .expect("send Shift+Enter sequence");
+        let screen = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let screen = session.snapshot().expect("snapshot").panes[0]
+                    .screen
+                    .clone();
+                if screen.contents.contains("1b 5b 31 33 3b 32 75") {
+                    break screen;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("PTY received Shift+Enter bytes");
+        assert_eq!(screen.keyboard.kitty_flags, 3);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn real_pty_receives_xtgettcap_reply() {
+        let session = Session::spawn(80, 24, "capability-pty".into()).expect("session");
+        session.handle(ClientMessage::Input { bytes: b"printf '\\033P+q5463\\033\\\\'; IFS= read -r value; printf '\\nbytes:'; printf '%s' \"$value\" | od -An -tx1\n".to_vec() }).expect("send capability query");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        session
+            .handle(ClientMessage::Input {
+                bytes: b"\n".to_vec(),
+            })
+            .expect("finish read");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if session.snapshot().expect("snapshot").panes[0]
+                    .screen
+                    .contents
+                    .contains("1b 50 31 2b 72 35 34 36 33 3d 33 31 1b 5c")
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("PTY received XTGETTCAP reply");
+    }
+
     #[tokio::test]
     async fn osc52_is_delivered_to_each_clients_currently_viewed_pane_only() {
         let session =
@@ -5412,6 +5515,22 @@ mod tests {
         assert!(screen.bracketed_paste);
         assert!(screen.mouse_reporting);
         assert!(!screen.cursor_visible);
+    }
+
+    #[test]
+    fn terminal_keyboard_queries_handle_split_sequences_and_alternate_screen() {
+        let mut parser = pty_parser(2, 10, 100, PtyCallbacks::default());
+        parser.process(b"\x1b[>3");
+        parser.process(b"u\x1b[6n");
+        assert_eq!(snapshot(&parser).keyboard.kitty_flags, 3);
+        assert_eq!(
+            parser.callbacks_mut().terminal_modes.take_replies(),
+            b"\x1b[1;1R"
+        );
+        parser.process(b"\x1b[?1049h\x1b[>1u");
+        assert_eq!(snapshot(&parser).keyboard.kitty_flags, 1);
+        parser.process(b"\x1b[?1049l");
+        assert_eq!(snapshot(&parser).keyboard.kitty_flags, 3);
     }
 
     #[test]

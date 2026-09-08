@@ -2129,6 +2129,7 @@ mod tests {
                 mouse_reporting: false,
                 graphics: Vec::new(),
                 links: Vec::new(),
+                keyboard: Default::default(),
             },
             agent: None,
             agent_generation: 0,
