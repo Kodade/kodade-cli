@@ -16,6 +16,8 @@ use kodade_cli_proto::{
     ServerMessage, SidebarTabInfo, SplitAxis, WorkspaceId, WorkspaceInfo,
 };
 use ratatui::{backend::CrosstermBackend, layout::Rect, style::Color, Frame, Terminal};
+#[cfg(test)]
+use ratatui::{TerminalOptions, Viewport};
 use std::{
     collections::HashSet,
     io::Write,
@@ -187,6 +189,9 @@ pub struct App {
     mouse_capture: bool,
     config: config::Config,
     theme: config::Theme,
+    plugin_results: mpsc::UnboundedReceiver<String>,
+    plugin_result_tx: mpsc::UnboundedSender<String>,
+    remote_endpoint: bool,
 }
 
 /// How long the `prefix q` pane-id flash stays up.
@@ -239,6 +244,7 @@ impl App {
             .unwrap_or_else(|| "N".to_string());
         let ui_state = state::State::load();
         let onboarding_decided = ui_state.onboarding_seen;
+        let (plugin_result_tx, plugin_results) = mpsc::unbounded_channel();
         Self {
             layout: None,
             prefix: false,
@@ -285,7 +291,16 @@ impl App {
             mouse_capture: config.mouse,
             theme: config.resolve_theme(),
             config: config.clone(),
+            plugin_results,
+            plugin_result_tx,
+            remote_endpoint: false,
         }
+    }
+
+    /// Extension directories live on the client filesystem. A forwarded socket
+    /// must never make the palette execute one locally by accident.
+    pub fn set_remote_endpoint(&mut self, remote: bool) {
+        self.remote_endpoint = remote;
     }
 
     /// Sets the status-bar note in the default color; clears after `NOTE_TTL`.
@@ -625,6 +640,9 @@ impl App {
         rx: &mut mpsc::Receiver<Update>,
     ) -> Result<()> {
         loop {
+            while let Ok(note) = self.plugin_results.try_recv() {
+                self.set_note(note);
+            }
             let mut layout_changed = false;
             while let Ok(update) = rx.try_recv() {
                 match update {
@@ -1648,6 +1666,97 @@ impl App {
                     },
                 )
                 .await?;
+            }
+            palette::PaletteTarget::PluginAction {
+                plugin,
+                directory: _,
+                action,
+                command: _,
+                pane: _,
+            } => {
+                if self.remote_endpoint {
+                    self.set_note(" plugin actions are local-only for remote sessions");
+                    return Ok(Flow::Continue);
+                }
+                let (live_plugin, live_action) = match crate::plugins::action(&plugin, &action) {
+                    Ok(action) => action,
+                    Err(error) => {
+                        self.set_note(format!(" plugin {plugin}/{action}: {error}"));
+                        return Ok(Flow::Continue);
+                    }
+                };
+                let directory = live_plugin.installed.path;
+                let command = live_action.command;
+                let pane = live_action.pane;
+                let workspace = self
+                    .active_workspace()
+                    .map(|workspace| workspace.name.clone())
+                    .unwrap_or_default();
+                let focused_pane = self
+                    .focused_pane
+                    .map(|pane| pane.0.to_string())
+                    .unwrap_or_default();
+                if pane {
+                    write(
+                        writer,
+                        &ClientMessage::NewPane {
+                            workspace: None,
+                            tab: None,
+                            split: None,
+                            command: Some(crate::plugins::pane_command(
+                                &plugin,
+                                &directory,
+                                &command,
+                                Some(&action),
+                                &workspace,
+                                &focused_pane,
+                            )),
+                            name: Some(format!("plugin · {plugin} · {action}")),
+                        },
+                    )
+                    .await?;
+                } else {
+                    let session = self.session_name.clone();
+                    let socket = self.socket.clone();
+                    let result_tx = self.plugin_result_tx.clone();
+                    let note = format!(" plugin {plugin}/{action} started");
+                    // A palette action must never own the UI task: child stdio
+                    // stays off the raw terminal and completion is reaped in
+                    // the background.
+                    tokio::spawn(async move {
+                        let mut child = tokio::process::Command::new("sh");
+                        child
+                            .args(["-lc", &command])
+                            .current_dir(&directory)
+                            .env("KODADE_PLUGIN", &plugin)
+                            .env("KODADE_ACTION", &action)
+                            .env("KODADE_SESSION", session)
+                            .env("KODADE_SOCKET", socket)
+                            .env("KODADE_WORKSPACE", workspace)
+                            .env("KODADE_PANE", focused_pane)
+                            .stdin(Stdio::null())
+                            .stdout(Stdio::null())
+                            .stderr(Stdio::null());
+                        let message = match crate::plugins::run_bounded_command(
+                            &mut child,
+                            Duration::from_secs(30),
+                            "plugin action",
+                        )
+                        .await
+                        {
+                            Ok(status) if status.success() => {
+                                format!(" plugin {plugin}/{action} complete")
+                            }
+                            Ok(status) => format!(" plugin {plugin}/{action} failed: {status}"),
+                            Err(error) => format!(" plugin {plugin}/{action} failed: {error}"),
+                        };
+                        let _ = result_tx.send(message);
+                    });
+                    self.set_note(note);
+                }
+            }
+            palette::PaletteTarget::PluginUnavailable(error) => {
+                self.set_note(format!(" plugin registry error: {error}"));
             }
         }
         Ok(Flow::Continue)
@@ -2798,7 +2907,13 @@ mod tests {
             "palette-test",
             PathBuf::from("/tmp/kodade-test.sock"),
         );
-        let mut term = Terminal::new(CrosstermBackend::new(std::io::stdout())).unwrap();
+        let mut term = Terminal::with_options(
+            CrosstermBackend::new(std::io::stdout()),
+            TerminalOptions {
+                viewport: Viewport::Fixed(Rect::new(0, 0, 80, 24)),
+            },
+        )
+        .unwrap();
 
         let (client, mut daemon) = tokio::net::UnixStream::pair().unwrap();
         let (_, mut writer) = client.into_split();
@@ -2890,13 +3005,53 @@ mod tests {
         app.center = Some(CenterOverlay::Palette(palette));
         let (client, _daemon) = tokio::net::UnixStream::pair().unwrap();
         let (_, mut writer) = client.into_split();
-        let mut term = Terminal::new(CrosstermBackend::new(std::io::stdout())).unwrap();
+        let mut term = Terminal::with_options(
+            CrosstermBackend::new(std::io::stdout()),
+            TerminalOptions {
+                viewport: Viewport::Fixed(Rect::new(0, 0, 80, 24)),
+            },
+        )
+        .unwrap();
 
         assert_eq!(
             app.handle_center_key(KeyEvent::from(KeyCode::Enter), &mut writer, &mut term)
                 .await
                 .unwrap(),
             Flow::Detach
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_palette_plugin_action_is_explicitly_local_only() {
+        let config = config::Config::default();
+        let mut app = App::new(&config, "remote", PathBuf::from("/tmp/kodade-test.sock"));
+        app.set_remote_endpoint(true);
+        let mut term = Terminal::with_options(
+            CrosstermBackend::new(std::io::stdout()),
+            TerminalOptions {
+                viewport: Viewport::Fixed(Rect::new(0, 0, 80, 24)),
+            },
+        )
+        .unwrap();
+        let (client, daemon) = tokio::net::UnixStream::pair().unwrap();
+        let (_, mut writer) = client.into_split();
+        app.activate_palette(
+            palette::PaletteTarget::PluginAction {
+                plugin: "demo".into(),
+                directory: PathBuf::from("/tmp"),
+                action: "run".into(),
+                command: "false".into(),
+                pane: false,
+            },
+            &mut writer,
+            &mut term,
+        )
+        .await
+        .unwrap();
+        assert!(app.note().unwrap().0.contains("local-only"));
+        let mut bytes = [0; 1];
+        assert!(
+            matches!(daemon.try_read(&mut bytes), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
         );
     }
 

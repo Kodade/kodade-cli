@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 anyhow.workspace = true
 dirs.workspace = true
+libc.workspace = true
 kodade-cli-proto = { path = "../kodade-cli-proto" }
 portable-pty.workspace = true
 serde.workspace = true

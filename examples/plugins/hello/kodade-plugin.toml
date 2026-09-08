@@ -1,0 +1,21 @@
+manifest_version = 1
+id = "hello-plugin"
+name = "Hello plugin"
+version = "0.1.0"
+
+[[actions]]
+id = "hello"
+name = "Write greeting"
+command = "printf 'hello from %s\\n' \"$KODADE_WORKSPACE\""
+description = "Print a contextual greeting"
+
+[[panes]]
+name = "monitor"
+command = "while true; do date; sleep 1; done"
+
+[[startup]]
+command = "printf 'started %s\\n' \"$KODADE_SESSION\""
+
+[[events]]
+event = "pane_opened"
+command = "printf 'opened %s\\n' \"$KODADE_PANE\""

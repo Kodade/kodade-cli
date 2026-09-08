@@ -45,6 +45,11 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand, PartialEq, Eq)]
 pub enum Command {
+    /// Manage local, versioned command extensions.
+    Plugin {
+        #[command(subcommand)]
+        command: PluginCommand,
+    },
     /// Run the session daemon (started automatically when attaching).
     Daemon {
         /// Session name; defaults to the global --session value.
@@ -527,6 +532,31 @@ pub enum IntegrateCommand {
     },
 }
 
+#[derive(Debug, Subcommand, PartialEq, Eq)]
+pub enum PluginCommand {
+    /// List installed extensions and whether they are enabled.
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Register a local extension directory without copying it.
+    Link { path: PathBuf },
+    /// Clone a GitHub OWNER/REPO[/SUBDIR] extension into Ködade's managed directory.
+    Install { source: String },
+    /// Stop loading an extension while retaining its files and registry entry.
+    Disable { id: String },
+    /// Re-enable a registered extension.
+    Enable { id: String },
+    /// Remove a local link from the registry; its source directory remains untouched.
+    Unlink { id: String },
+    /// Remove a managed extension and its registry entry. Linked directories are protected.
+    Uninstall { id: String },
+    /// Run an extension action in the current workspace/pane context.
+    Run { id: String, action: String },
+    /// Open a named extension pane in a new Ködade tab.
+    Pane { id: String, pane: String },
+}
+
 // Pane ids are plain integers on the wire; keep the error message script-friendly.
 pub fn session_name(value: &str) -> Result<String, String> {
     kodade_cli_daemon::validate_session_name(value).map_err(|error| error.to_string())?;
@@ -575,6 +605,20 @@ mod tests {
                 "{name:?}"
             );
         }
+    }
+
+    #[test]
+    fn parses_plugin_lifecycle_commands() {
+        assert!(matches!(
+            parse(&["kodade-cli", "plugin", "link", "./demo"]).command,
+            Some(Command::Plugin {
+                command: PluginCommand::Link { .. }
+            })
+        ));
+        assert!(matches!(
+            parse(&["kodade-cli", "plugin", "run", "demo", "hello"]).command,
+            Some(Command::Plugin { command: PluginCommand::Run { id, action } }) if id == "demo" && action == "hello"
+        ));
     }
 
     fn parse(args: &[&str]) -> Cli {

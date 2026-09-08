@@ -16,6 +16,7 @@ mod overlay;
 mod palette;
 mod paste;
 mod picker;
+mod plugins;
 mod remote;
 mod render;
 mod selection;
@@ -74,6 +75,9 @@ async fn main() -> Result<()> {
                 | cli::Command::Split { .. }
                 | cli::Command::NewTab { .. }
                 | cli::Command::Worktree { .. }
+                | cli::Command::Plugin {
+                    command: cli::PluginCommand::Run { .. } | cli::PluginCommand::Pane { .. }
+                }
                 | cli::Command::KillSession
         )
     );
@@ -114,13 +118,16 @@ async fn main() -> Result<()> {
     // print its warnings twice.
     match command {
         // No subcommand attaches the TUI to the session.
-        None => attach(&socket, &session, &config::Config::load()).await,
+        None => attach(&socket, &session, &config::Config::load(), remote.is_some()).await,
         Some(cli::Command::Doctor { json }) => {
             if let Some(host) = remote.as_deref() {
                 remote::run_doctor(host, &session, json).await
             } else {
                 doctor::run(&socket, &session, json).await
             }
+        }
+        Some(cli::Command::Plugin { command }) => {
+            plugins::command(&socket, &session, remote.is_some(), command).await
         }
         Some(cli::Command::Daemon { session: name }) => {
             kodade_cli_daemon::run(name.unwrap_or(session)).await
@@ -698,7 +705,7 @@ async fn agent(
             commands::layout(
                 commands::request(socket, ClientMessage::FocusPaneId { id: pane }).await?,
             )?;
-            attach(socket, session, config).await
+            attach(socket, session, config, false).await
         }
         cli::AgentCommand::Rename { pane, name } => {
             commands::layout(
@@ -815,12 +822,12 @@ async fn worktree(socket: &Path, command: cli::WorktreeCommand) -> Result<()> {
 /// background when the socket is the local path and nothing answers. A remote
 /// (forwarded) socket is never auto-started here — `remote::resolve_socket`
 /// already ensured the remote daemon is up.
-async fn attach(socket: &Path, session: &str, config: &config::Config) -> Result<()> {
+async fn attach(socket: &Path, session: &str, config: &config::Config, remote: bool) -> Result<()> {
     // Only spawn a daemon for this host's own socket; a `--remote` tunnel socket
     // differs from the local path and must not trigger a local daemon.
     let can_spawn = socket == kodade_cli_daemon::socket_path(session).as_path();
     let stream = connection::connect(socket, session, can_spawn).await?;
-    tui(stream, config, session, socket).await
+    tui(stream, config, session, socket, remote).await
 }
 
 /// Sets up the terminal, hands the socket to `App`, and always restores it.
@@ -829,10 +836,12 @@ async fn tui(
     config: &config::Config,
     session: &str,
     socket: &Path,
+    remote: bool,
 ) -> Result<()> {
     let (reader, mut writer) = stream.into_split();
     let mut lines = BufReader::new(reader).lines();
     let mut state = app::App::new(config, session, socket.to_path_buf());
+    state.set_remote_endpoint(remote);
     let (cols, rows) = crossterm::terminal::size()?;
     // Collapse the sidebar before the first Hello so a narrow launch starts with
     // the right pane width (#19).

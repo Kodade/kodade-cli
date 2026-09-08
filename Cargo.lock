@@ -736,6 +736,7 @@ dependencies = [
  "anyhow",
  "dirs",
  "kodade-cli-proto",
+ "libc",
  "portable-pty",
  "serde",
  "serde_json",
