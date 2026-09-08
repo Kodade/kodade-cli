@@ -186,6 +186,9 @@ pub struct App {
     paste_buffer: String,
     /// Agent notifications: unread stack and effect computation (#10).
     notifier: notify::Notifier,
+    /// Notifications are keyed by endpoint so colliding pane ids can never
+    /// make `NotificationJump` target another daemon.
+    pending_notifications: BTreeMap<EndpointId, Vec<Notification>>,
     /// Session reported by the daemon's `Welcome`; shown in the status bar (#11).
     session_name: String,
     /// Socket the client is attached to (local or an SSH-forwarded one for
@@ -305,6 +308,7 @@ impl App {
             note: None,
             paste_buffer: String::new(),
             notifier: notify::Notifier::new(config, jump_hint),
+            pending_notifications: BTreeMap::new(),
             session_name: session.to_string(),
             socket,
             flash_until: None,
@@ -365,9 +369,12 @@ impl App {
             .filter(|profile| profile.enabled)
         {
             let id = EndpointId::Machine(profile.id.clone());
-            if prior.iter().any(|old| old.id == profile.id && old.enabled) {
+            if prior.iter().any(|old| old == profile) {
                 continue;
             }
+            router.unregister(&id);
+            self.endpoint_layouts.remove(&id);
+            self.endpoint_contexts.remove(&id);
             let (sender, receiver) = mpsc::channel(64);
             router.register(id, sender);
             let Ok(size) = term.size() else { continue };
@@ -380,7 +387,8 @@ impl App {
                 receiver,
             );
         }
-        self.configure_machines(&self.machine_profiles.clone());
+        self.endpoints
+            .reconcile(&self.machine_profiles, Instant::now());
         if !router.ids().contains(&self.selected_endpoint) {
             self.select_endpoint(EndpointId::Local, router);
         }
@@ -402,8 +410,26 @@ impl App {
         self.confirm = None;
         self.menu = None;
         self.picker = None;
+        self.center = None;
+        self.rename = false;
+        self.rename_target = None;
+        self.new_workspace = false;
+        self.worktree_new = false;
+        self.worktree_confirm = None;
         self.navigate = None;
         self.clear_selection();
+        self.focused_pane = None;
+        self.last_pane = None;
+        self.collapsed.clear();
+        self.seeded_ids.clear();
+        let jump_hint = self
+            .config
+            .chords_for(config::Action::NotificationJump)
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| "N".into());
+        self.notifier = notify::Notifier::new(&self.config, jump_hint);
+        let pending = self.pending_notifications.remove(&next).unwrap_or_default();
         if let Some((session, socket)) = self.endpoint_contexts.get(&next).cloned() {
             self.session_name = session;
             self.socket = socket;
@@ -420,6 +446,12 @@ impl App {
             .or_else(|| self.endpoint_labels.get(&next).cloned())
             .unwrap_or_else(|| "endpoint".into());
         self.set_note(format!("machine: {label}"));
+        if !pending.is_empty() {
+            self.set_note(format!(
+                "machine: {label} · {} pending notification(s)",
+                pending.len()
+            ));
+        }
     }
 
     fn machine_rows(&self) -> Vec<(EndpointId, String, String, bool)> {
@@ -796,6 +828,20 @@ impl App {
                     self.endpoint_contexts
                         .insert(endpoint.clone(), (session.clone(), socket.clone()));
                 }
+                if endpoint == EndpointId::Local {
+                    if let Update::SessionRenamed { name, socket } = &update {
+                        self.endpoint_contexts
+                            .insert(endpoint.clone(), (name.clone(), socket.clone()));
+                    }
+                }
+                if let Update::Notification(notification) = &update {
+                    if endpoint != *writer.selected() {
+                        self.pending_notifications
+                            .entry(endpoint.clone())
+                            .or_default()
+                            .push(notification.clone());
+                    }
+                }
                 // Background machines keep cached snapshots, but only the
                 // selected endpoint is allowed to alter the active canvas.
                 if &endpoint != writer.selected() {
@@ -867,14 +913,6 @@ impl App {
     ) -> Result<Flow> {
         // Any keystroke ends a mouse selection (#12).
         self.clear_selection();
-        if self.prefix
-            && (key.code == KeyCode::Char('M')
-                || (key.code == KeyCode::Char('m') && key.modifiers.contains(KeyModifiers::SHIFT)))
-        {
-            self.prefix = false;
-            self.select_next_endpoint(writer);
-            return Ok(Flow::Continue);
-        }
         if self.worktree_confirm.is_some() {
             self.handle_worktree_confirm_key(key, writer).await?;
         } else if self.confirm.is_some() {
@@ -1617,6 +1655,7 @@ impl App {
                 }
             }
             config::Action::NotificationJump => self.notification_jump(writer).await?,
+            config::Action::NextMachine => self.select_next_endpoint(writer),
             other => {
                 if let Some(message) = other.message() {
                     write(writer, &message).await?

@@ -239,6 +239,8 @@ pub enum Action {
     Help,
     // Notifications (#10): jump to the most recent unread notification.
     NotificationJump,
+    /// Cycle attached local/saved-machine endpoints.
+    NextMachine,
 }
 
 /// Every remappable action and its config name. Single source of truth for
@@ -306,6 +308,7 @@ const ACTIONS: &[(&str, Action)] = &[
     ("mouse_toggle", Action::MouseToggle),
     ("help", Action::Help),
     ("notification_jump", Action::NotificationJump),
+    ("next_machine", Action::NextMachine),
 ];
 
 impl Action {
@@ -415,6 +418,7 @@ impl Action {
             | Self::Goto
             | Self::Help
             | Self::NotificationJump => return None,
+            Self::NextMachine => return None,
         })
     }
 }
@@ -589,6 +593,7 @@ impl Default for Config {
             ("?", Action::Help),
             // #14 took `o`/`O` for next/prev pane, so notification jump uses `N`.
             ("N", Action::NotificationJump),
+            ("M", Action::NextMachine),
         ] {
             bindings.insert(
                 parse_key_chord(binding).expect("built-in key is valid"),

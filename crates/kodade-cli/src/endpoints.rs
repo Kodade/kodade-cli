@@ -314,6 +314,43 @@ impl Manager {
             })
             .collect()
     }
+
+    /// Reconcile profile metadata without throwing away live snapshots or an
+    /// endpoint's current online/offline state.
+    pub fn reconcile(&mut self, profiles: &[MachineProfile], now: Instant) {
+        self.endpoints.retain(|id, _| {
+            matches!(id, EndpointId::Local)
+                || profiles
+                    .iter()
+                    .any(|profile| EndpointId::Machine(profile.id.clone()) == *id)
+        });
+        for profile in profiles {
+            let id = EndpointId::Machine(profile.id.clone());
+            match self.endpoints.get_mut(&id) {
+                Some(endpoint) => {
+                    endpoint.label = profile.label.clone();
+                    if !profile.enabled {
+                        endpoint.status = Status::Disabled;
+                    }
+                }
+                None => {
+                    self.endpoints.insert(
+                        id,
+                        Endpoint {
+                            label: profile.label.clone(),
+                            status: if profile.enabled {
+                                Status::Connecting
+                            } else {
+                                Status::Disabled
+                            },
+                            cached: None,
+                            retry_at: now,
+                        },
+                    );
+                }
+            }
+        }
+    }
     pub fn update(&mut self, id: &EndpointId, layout: LayoutSnapshot) {
         if let Some(e) = self.endpoints.get_mut(id) {
             e.cached = Some(layout);
