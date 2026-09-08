@@ -99,9 +99,10 @@ with tempfile.TemporaryDirectory(prefix="kt-") as directory:
             with connection:
                 connection.settimeout(3)
                 reader = connection.makefile("rb")
-                assert "Hello" in json.loads(reader.readline())
-                connection.sendall(b'{"Welcome":{"session":"failure","version":1}}\n')
+                hello = json.loads(reader.readline())["Hello"]
+                connection.sendall(json.dumps({"Welcome": {"session": "failure", "version": hello["version"]}}).encode() + b"\n")
                 assert json.loads(reader.readline()) == {"SetCompactView": {"enabled": False}}
+                assert "SetTerminalColors" in json.loads(reader.readline())
                 assert json.loads(reader.readline()) == "Subscribe"
                 reader.close()
             deadline = time.monotonic() + 5
@@ -126,9 +127,10 @@ with tempfile.TemporaryDirectory(prefix="kt-") as directory:
             with connection:
                 connection.settimeout(5)
                 reader = connection.makefile("rb")
-                assert "Hello" in json.loads(reader.readline())
-                connection.sendall(b'{"Welcome":{"session":"rejected","version":1}}\n')
+                hello = json.loads(reader.readline())["Hello"]
+                connection.sendall(json.dumps({"Welcome": {"session": "rejected", "version": hello["version"]}}).encode() + b"\n")
                 assert json.loads(reader.readline()) == {"SetCompactView": {"enabled": False}}
+                assert "SetTerminalColors" in json.loads(reader.readline())
                 assert json.loads(reader.readline()) == "Subscribe"
                 layout = {"Layout": {"active_workspace": 1, "active_tab": 2,
                     "workspaces": [{"id": 1, "name": "main", "active": True, "state": "idle",
