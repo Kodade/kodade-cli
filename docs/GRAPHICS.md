@@ -22,9 +22,11 @@ kodade-cli --remote buildbox pane paste-image 3 ./screenshot.png
 kodade-cli pane paste-image 3  # host clipboard
 ```
 
-Clipboard readers are `wl-paste` on Wayland, `xclip` on X11, and `pngpaste` on
-macOS. Missing readers produce an actionable message; specifying a file needs
-none of them. Paths must name regular files. PNG pixels are validated as well
+Clipboard readers are `wl-paste` on Wayland, `xclip` on X11, `pngpaste` on
+macOS, and native `PNG`, `DIB`, or `DIBV5` clipboard formats on Windows.
+Windows converts common 24/32-bit RGB and bitfield screenshots to PNG. Missing
+Unix readers produce an actionable message; specifying a file needs none of
+them. Paths must name regular files. PNG pixels are validated as well
 as headers. Each session retains at most 64 attachments / 64 MiB in a private
 temporary directory, with files mode `0600`. Orderly shutdown removes them.
 A forced process kill can leave them for the OS's temporary-file cleanup.

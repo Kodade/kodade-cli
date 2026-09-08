@@ -319,7 +319,7 @@ fn has_fresh_activity(snapshot: &PaneSnapshot, _baseline_screen: &str) -> bool {
     )
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use kodade_cli_proto::ServerMessage;

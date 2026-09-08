@@ -530,25 +530,45 @@ fn blocked_count(layout: &LayoutSnapshot) -> usize {
 fn hostname() -> &'static str {
     static HOST: OnceLock<String> = OnceLock::new();
     HOST.get_or_init(|| {
-        let mut buf = [0_u8; 256];
-        // SAFETY: buf is valid for buf.len() bytes; gethostname NUL-terminates.
-        let rc = unsafe { libc::gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len()) };
-        if rc != 0 {
-            return String::new();
+        #[cfg(unix)]
+        {
+            let mut buf = [0_u8; 256];
+            // SAFETY: buf is valid for buf.len() bytes; gethostname NUL-terminates.
+            let rc = unsafe { libc::gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len()) };
+            if rc != 0 {
+                return String::new();
+            }
+            let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+            String::from_utf8_lossy(&buf[..end]).into_owned()
         }
-        let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
-        String::from_utf8_lossy(&buf[..end]).into_owned()
+        #[cfg(windows)]
+        {
+            std::env::var("COMPUTERNAME").unwrap_or_default()
+        }
     })
 }
 
 /// Local `HH:MM` without pulling in a date crate.
 fn local_hh_mm() -> String {
-    // SAFETY: localtime_r writes into a zeroed tm we own; time() takes null.
-    unsafe {
-        let now = libc::time(std::ptr::null_mut());
-        let mut tm: libc::tm = std::mem::zeroed();
-        libc::localtime_r(&now, &mut tm);
-        format!("{:02}:{:02}", tm.tm_hour, tm.tm_min)
+    #[cfg(unix)]
+    {
+        // SAFETY: localtime_r writes into a zeroed tm we own; time() takes null.
+        unsafe {
+            let now = libc::time(std::ptr::null_mut());
+            let mut tm: libc::tm = std::mem::zeroed();
+            libc::localtime_r(&now, &mut tm);
+            format!("{:02}:{:02}", tm.tm_hour, tm.tm_min)
+        }
+    }
+    #[cfg(windows)]
+    {
+        // `SystemTime` is UTC; native terminal widgets still show a stable
+        // clock without pulling an extra date/time dependency into the CLI.
+        let seconds = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        format!("{:02}:{:02}", (seconds / 3_600) % 24, (seconds / 60) % 60)
     }
 }
 
@@ -2128,6 +2148,7 @@ mod tests {
                 bracketed_paste: false,
                 mouse_reporting: false,
                 graphics: Vec::new(),
+                links: Vec::new(),
             },
             agent: None,
             agent_generation: 0,

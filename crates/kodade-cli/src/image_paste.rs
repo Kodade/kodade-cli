@@ -2,13 +2,20 @@
 use anyhow::{bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use kodade_cli_proto::{ClientMessage, PaneId, ServerMessage};
+#[cfg(not(windows))]
+use std::process::Stdio;
 use std::{
     io::Read,
     path::{Path, PathBuf},
-    process::Stdio,
     time::Duration,
 };
-use tokio::{io::AsyncReadExt, sync::mpsc};
+#[cfg(not(windows))]
+use tokio::io::AsyncReadExt;
+use tokio::sync::mpsc;
+
+#[cfg(windows)]
+#[path = "windows_image_clipboard.rs"]
+mod windows_image_clipboard;
 
 pub async fn paste(socket: &Path, pane: PaneId, path: Option<&Path>) -> Result<PathBuf> {
     let bytes = if let Some(path) = path {
@@ -76,45 +83,57 @@ mod tests {
 }
 
 async fn clipboard() -> Result<Vec<u8>> {
-    let (program, args): (&str, &[&str]) = if cfg!(target_os = "macos") {
-        ("pngpaste", &["-"])
-    } else if std::env::var_os("WAYLAND_DISPLAY").is_some() {
-        ("wl-paste", &["--type", "image/png", "--no-newline"])
-    } else {
-        (
-            "xclip",
-            &["-selection", "clipboard", "-t", "image/png", "-o"],
-        )
-    };
-    let mut child = tokio::process::Command::new(program)
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .kill_on_drop(true)
-        .spawn()
-        .with_context(|| {
-            format!("image clipboard needs {program}; install it or use pane paste-image PANE PATH")
-        })?;
-    let mut stdout = child
-        .stdout
-        .take()
-        .expect("piped clipboard")
-        .take(kodade_cli_daemon::MAX_IMAGE_BYTES as u64 + 1);
-    tokio::time::timeout(Duration::from_secs(5), async {
-        let mut bytes = Vec::new();
-        stdout.read_to_end(&mut bytes).await?;
-        if bytes.len() > kodade_cli_daemon::MAX_IMAGE_BYTES {
-            child.kill().await?;
-            bail!("clipboard image exceeds 8 MiB");
-        }
-        if !child.wait().await?.success() || bytes.is_empty() {
-            bail!("clipboard has no PNG image");
-        }
-        Ok(bytes)
-    })
-    .await
-    .context("clipboard read timed out after 5s")?
+    #[cfg(windows)]
+    {
+        tokio::task::spawn_blocking(windows_image_clipboard::read)
+            .await
+            .context("Windows image clipboard worker")?
+    }
+
+    #[cfg(not(windows))]
+    {
+        let (program, args): (&str, &[&str]) = if cfg!(target_os = "macos") {
+            ("pngpaste", &["-"])
+        } else if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+            ("wl-paste", &["--type", "image/png", "--no-newline"])
+        } else {
+            (
+                "xclip",
+                &["-selection", "clipboard", "-t", "image/png", "-o"],
+            )
+        };
+        let mut child = tokio::process::Command::new(program)
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .with_context(|| {
+                format!(
+                    "image clipboard needs {program}; install it or use pane paste-image PANE PATH"
+                )
+            })?;
+        let mut stdout = child
+            .stdout
+            .take()
+            .expect("piped clipboard")
+            .take(kodade_cli_daemon::MAX_IMAGE_BYTES as u64 + 1);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let mut bytes = Vec::new();
+            stdout.read_to_end(&mut bytes).await?;
+            if bytes.len() > kodade_cli_daemon::MAX_IMAGE_BYTES {
+                child.kill().await?;
+                bail!("clipboard image exceeds 8 MiB");
+            }
+            if !child.wait().await?.success() || bytes.is_empty() {
+                bail!("clipboard has no PNG image");
+            }
+            Ok(bytes)
+        })
+        .await
+        .context("clipboard read timed out after 5s")?
+    }
 }
 
 pub struct Clipboard {

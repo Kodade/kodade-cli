@@ -15,6 +15,7 @@ clap_complete.workspace = true
 serde_json.workspace = true
 dirs.workspace = true
 flate2.workspace = true
+getrandom.workspace = true
 anyhow.workspace = true
 crossterm.workspace = true
 kodade-cli-daemon = { path = "../kodade-cli-daemon" }
@@ -25,7 +26,12 @@ regex.workspace = true
 serde.workspace = true
 semver.workspace = true
 sha2.workspace = true
+zip.workspace = true
 tar.workspace = true
 tokio.workspace = true
 toml.workspace = true
 toml_edit.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true
+png.workspace = true

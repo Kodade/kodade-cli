@@ -16,7 +16,7 @@ use kodade_cli_proto::{
     ServerMessage, SidebarTabInfo, SplitAxis, WorkspaceId, WorkspaceInfo,
 };
 use ratatui::{backend::CrosstermBackend, layout::Rect, style::Color, Frame, Terminal};
-#[cfg(test)]
+#[cfg(all(test, unix))]
 use ratatui::{TerminalOptions, Viewport};
 use std::{
     collections::HashMap,
@@ -76,6 +76,10 @@ type Term = Terminal<CrosstermBackend<std::io::Stdout>>;
 
 /// Server messages the attached client acts on; the reader task drops the rest.
 pub enum Update {
+    Clipboard {
+        pane: PaneId,
+        text: String,
+    },
     RequestError(String),
     Layout(LayoutSnapshot),
     Session(String),
@@ -226,6 +230,7 @@ pub struct App {
     config: config::Config,
     theme: config::Theme,
     plugin_results: mpsc::UnboundedReceiver<String>,
+    clipboard: crate::clipboard::Clipboard,
     plugin_result_tx: mpsc::UnboundedSender<String>,
     remote_endpoint: bool,
     primary_remote: bool,
@@ -347,6 +352,7 @@ impl App {
             theme: config.resolve_theme(),
             config: config.clone(),
             plugin_results,
+            clipboard: crate::clipboard::Clipboard::default(),
             plugin_result_tx,
             remote_endpoint: false,
             primary_remote: false,
@@ -955,6 +961,19 @@ impl App {
         updates: &mpsc::Sender<crate::endpoints::UpdatePacket>,
     ) -> Result<()> {
         loop {
+            while let Some(copy) = self.clipboard.completed() {
+                if let Some(sequence) = copy.sequence {
+                    term.backend_mut().write_all(sequence.as_bytes())?;
+                    term.backend_mut().flush()?;
+                }
+                if copy.notify {
+                    self.set_note(if copy.truncated {
+                        " copied (truncated to 100KB)"
+                    } else {
+                        " copied"
+                    });
+                }
+            }
             while let Ok(note) = self.plugin_results.try_recv() {
                 self.set_note(note);
             }
@@ -1036,6 +1055,11 @@ impl App {
                     continue;
                 }
                 match update {
+                    Update::Clipboard { pane, text } => {
+                        let _ = pane;
+                        self.clipboard
+                            .request(text, endpoint != EndpointId::Local, false);
+                    }
                     Update::Layout(layout) => {
                         self.handle_layout(layout);
                         self.replay_pending_notifications();
@@ -1072,21 +1096,28 @@ impl App {
                 self.view_needs_resize = false;
             }
             self.sync_title(term)?;
-            term.draw(|frame| self.draw(frame))?;
-            let area = self.content_area(term)?;
-            let hidden = self.center.is_some()
-                || self.help.is_some()
-                || self.settings.is_some()
-                || self.picker.is_some()
-                || self.menu.is_some()
-                || self.copy.is_some()
-                || self.flash_active();
-            let layout = self.layout.as_ref().filter(|_| !hidden);
-            let rects = layout
-                .map(|layout| render::pane_rects_for(layout, area))
-                .unwrap_or_default();
-            self.graphics
-                .draw(term.backend_mut(), &self.socket, layout, &rects)?;
+            crate::terminal::begin_synchronized_output(term.backend_mut())?;
+            let frame_result = (|| -> Result<()> {
+                term.draw(|frame| self.draw(frame))?;
+                let area = self.content_area(term)?;
+                let hidden = self.center.is_some()
+                    || self.help.is_some()
+                    || self.settings.is_some()
+                    || self.picker.is_some()
+                    || self.menu.is_some()
+                    || self.copy.is_some()
+                    || self.flash_active();
+                let layout = self.layout.as_ref().filter(|_| !hidden);
+                let rects = layout
+                    .map(|layout| render::pane_rects_for(layout, area))
+                    .unwrap_or_default();
+                self.graphics
+                    .draw(term.backend_mut(), &self.socket, layout, &rects)?;
+                Ok(())
+            })();
+            let close_result = crate::terminal::end_synchronized_output(term.backend_mut());
+            frame_result?;
+            close_result?;
             if !event::poll(Duration::from_millis(16))? {
                 continue;
             }
@@ -1350,7 +1381,7 @@ impl App {
         &mut self,
         key: KeyEvent,
         writer: &mut Router,
-        term: &mut Term,
+        _term: &mut Term,
     ) -> Result<()> {
         let Some(mut cm) = self.copy.take() else {
             return Ok(());
@@ -1417,18 +1448,14 @@ impl App {
                 cm.anchor = Some(cm.cursor);
             }
 
-            // Yank the selection (or current line) through OSC 52.
+            // Yank the selection (or current line) through the local clipboard,
+            // with OSC 52 retained for SSH and unavailable host tools.
             KeyCode::Char('y') => {
                 let text = cm.yank_text();
                 self.paste_buffer = text.clone();
-                let (payload, truncated) = mode::osc52(&text);
-                execute!(term.backend_mut(), crossterm::style::Print(payload))?;
-                term.backend_mut().flush()?;
-                self.set_note(if truncated {
-                    " copied (truncated to 100KB)"
-                } else {
-                    " copied"
-                });
+                self.clipboard
+                    .request(text, self.selected_endpoint != EndpointId::Local, true);
+                self.set_note(" copying");
                 keep = false;
             }
 
@@ -3497,7 +3524,7 @@ pub fn bytes(k: KeyEvent) -> Option<Vec<u8>> {
     Some(b)
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
