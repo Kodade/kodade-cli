@@ -5,17 +5,37 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
   RUST_TEST_THREADS: 4
 
 jobs:
+  linux-ssh-fixture:
+    # Windows remote mode must talk to a Unix daemon. Build that target once
+    # here; the Windows smoke imports it into an isolated WSL1 SSH fixture.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          target: x86_64-unknown-linux-musl
+      - run: cargo build -p kodade-cli --target x86_64-unknown-linux-musl
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-kodade-cli
+          path: target/x86_64-unknown-linux-musl/debug/kodade-cli
+          if-no-files-found: error
+
   check:
+    needs: linux-ssh-fixture
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
 
     steps:
       - uses: actions/checkout@v4
@@ -29,6 +49,21 @@ jobs:
       - run: cargo build
       - run: cargo test
       - name: Exercise graphics media through a real PTY
+        if: runner.os != 'Windows'
         run: python3 scripts/graphics-media-smoke.py target/debug/kodade-cli
       - name: Exercise terminal links and synchronized pane frames
+        if: runner.os != 'Windows'
         run: python3 scripts/terminal-links-tui-smoke.py target/debug/kodade-cli
+      - name: Download Unix SSH fixture binary
+        if: runner.os == 'Windows'
+        uses: actions/download-artifact@v4
+        with:
+          name: linux-kodade-cli
+          path: .windows-ssh-fixture
+      - name: Verify native Windows Unicode clipboard
+        if: runner.os == 'Windows'
+        run: cargo test windows_native_clipboard_roundtrips_unicode -- --ignored
+      - name: Smoke native Windows daemon, loopback IPC, and ConPTY
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/windows-smoke.ps1

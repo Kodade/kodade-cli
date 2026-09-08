@@ -1,5 +1,7 @@
 //! Verified standalone release updates. Package-managed installs only receive guidance.
 
+#[cfg(windows)]
+use std::collections::HashSet;
 use std::{
     fs,
     fs::OpenOptions,
@@ -112,12 +114,11 @@ pub fn platform_asset_for(version: &str, os: &str, arch: &str) -> Result<String>
         ("linux", "aarch64") => "aarch64-unknown-linux-gnu",
         ("macos", "aarch64") => "aarch64-apple-darwin",
         ("macos", "x86_64") => "x86_64-apple-darwin",
-        ("windows", _) => {
-            bail!("Windows standalone updates are unavailable until Windows release archives ship")
-        }
+        ("windows", "x86_64") => "x86_64-pc-windows-msvc",
         _ => bail!("no standalone update asset for this platform"),
     };
-    Ok(format!("kodade-cli-{version}-{target}.tar.gz"))
+    let extension = if os == "windows" { "zip" } else { "tar.gz" };
+    Ok(format!("kodade-cli-{version}-{target}.{extension}"))
 }
 
 pub fn release_asset_url<'a>(release: &'a Release, name: &str) -> Result<&'a str> {
@@ -174,6 +175,7 @@ pub fn verify(bytes: &[u8], expected: &str) -> Result<()> {
 
 /// Verify a published archive before extracting the executable for a remote
 /// install. The caller owns transport and atomic replacement on that host.
+#[cfg_attr(windows, allow(dead_code))]
 pub fn verified_binary(archive: &[u8], expected: &str) -> Result<Vec<u8>> {
     verify(archive, expected)?;
     Ok(extract_binary(archive)?.0)
@@ -227,10 +229,52 @@ pub fn install_archive(archive: &[u8], expected: &str, destination: &Path) -> Re
         .sync_all()
         .context("sync replacement executable")?;
     drop(staged_file);
-    fs::rename(&staged, &destination).context("atomically replace executable")?;
-    cleanup.0 = None;
-    sync_parent(parent)?;
+    #[cfg(unix)]
+    {
+        fs::rename(&staged, &destination).context("atomically replace executable")?;
+        cleanup.0 = None;
+        sync_parent(parent)?;
+    }
+    #[cfg(windows)]
+    {
+        let _helper = schedule_windows_replacement(&staged, &destination)?;
+        // The detached helper owns the staged file after this point. It first
+        // moves the old executable aside, then restores it if the replacement
+        // move fails, so a failed update keeps a runnable binary.
+        cleanup.0 = None;
+    }
     Ok(())
+}
+
+#[cfg(windows)]
+fn schedule_windows_replacement(staged: &Path, destination: &Path) -> Result<std::process::Child> {
+    let old = destination.with_extension(format!("old-{}.exe", std::process::id()));
+    let quote = |path: &Path| -> Result<String> {
+        let text = path.to_str().context("update path is not valid Unicode")?;
+        if text.contains('"') || text.contains('\r') || text.contains('\n') {
+            bail!("update path contains unsupported characters");
+        }
+        Ok(format!("'{}'", text.replace('\'', "''")))
+    };
+    let staged = quote(staged)?;
+    let destination = quote(destination)?;
+    let old = quote(&old)?;
+    // The child must outlive this executable. PowerShell's delayed loop waits
+    // until the image handle is released, then performs a recoverable swap.
+    let script = format!(
+        "$ErrorActionPreference='Stop'; if(Test-Path -LiteralPath {destination}){{for($i=0;$i -lt 100;$i++){{try{{Move-Item -LiteralPath {destination} -Destination {old}; break}}catch{{Start-Sleep -Milliseconds 100}}}}; if(-not(Test-Path -LiteralPath {old})){{Remove-Item -LiteralPath {staged} -Force -ErrorAction SilentlyContinue; exit 1}}; try{{Move-Item -LiteralPath {staged} -Destination {destination}}}catch{{if(-not(Test-Path -LiteralPath {destination})){{Move-Item -LiteralPath {old} -Destination {destination}}}; Remove-Item -LiteralPath {staged} -Force -ErrorAction SilentlyContinue; exit 1}}; Remove-Item -LiteralPath {old} -Force -ErrorAction SilentlyContinue}}else{{try{{Move-Item -LiteralPath {staged} -Destination {destination}}}catch{{Remove-Item -LiteralPath {staged} -Force -ErrorAction SilentlyContinue; exit 1}}}}; exit 0"
+    );
+    Command::new("powershell.exe")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-WindowStyle",
+            "Hidden",
+            "-Command",
+            &script,
+        ])
+        .spawn()
+        .context("start deferred Windows executable replacement")
 }
 
 struct TempFileCleanup(Option<PathBuf>);
@@ -243,6 +287,14 @@ impl Drop for TempFileCleanup {
 }
 
 fn extract_binary(archive: &[u8]) -> Result<(Vec<u8>, u32)> {
+    #[cfg(windows)]
+    return extract_zip_binary(archive);
+    #[cfg(not(windows))]
+    extract_tar_binary(archive)
+}
+
+#[cfg(not(windows))]
+fn extract_tar_binary(archive: &[u8]) -> Result<(Vec<u8>, u32)> {
     let decoder = flate2::read::GzDecoder::new(Cursor::new(archive));
     let mut archive = tar::Archive::new(LimitedReader::new(decoder, MAX_EXTRACTED_ARCHIVE));
     let mut binary = None;
@@ -288,11 +340,61 @@ fn extract_binary(archive: &[u8]) -> Result<(Vec<u8>, u32)> {
     binary.context("release archive has no kodade-cli executable")
 }
 
+#[cfg(windows)]
+fn extract_zip_binary(archive: &[u8]) -> Result<(Vec<u8>, u32)> {
+    let mut archive = zip::ZipArchive::new(Cursor::new(archive)).context("read release zip")?;
+    let mut binary = None;
+    let mut extracted = 0usize;
+    let mut names = HashSet::new();
+    for index in 0..archive.len() {
+        let entry = archive.by_index(index).context("read release zip entry")?;
+        let name = entry.name();
+        let path = Path::new(name);
+        if path.is_absolute()
+            || path
+                .components()
+                .any(|part| !matches!(part, std::path::Component::Normal(_)))
+        {
+            bail!("release zip contains an unsafe path");
+        }
+        if !names.insert(path.to_owned()) {
+            bail!("release zip contains duplicate paths");
+        }
+        let mode = entry.unix_mode().unwrap_or(0);
+        if mode & 0o170000 == 0o120000 {
+            bail!("release zip contains links");
+        }
+        extracted = extracted.saturating_add(entry.size() as usize);
+        if extracted > MAX_EXTRACTED_ARCHIVE {
+            bail!("release zip exceeds 96 MiB extracted");
+        }
+        if path
+            .file_name()
+            .is_some_and(|file| file == "kodade-cli.exe")
+        {
+            if binary.is_some() || entry.is_dir() {
+                bail!("release zip must contain exactly one regular kodade-cli.exe");
+            }
+            let mut bytes = Vec::new();
+            entry
+                .take((MAX_BINARY + 1) as u64)
+                .read_to_end(&mut bytes)?;
+            if bytes.len() > MAX_BINARY {
+                bail!("release zip executable exceeds 64 MiB");
+            }
+            binary = Some((bytes, 0));
+        }
+    }
+    binary.context("release zip has no kodade-cli.exe executable")
+}
+
+#[cfg_attr(windows, allow(dead_code))]
 struct LimitedReader<R> {
     inner: R,
     remaining: usize,
 }
 
+#[cfg_attr(windows, allow(dead_code))]
 impl<R> LimitedReader<R> {
     fn new(inner: R, limit: usize) -> Self {
         Self {
@@ -302,6 +404,7 @@ impl<R> LimitedReader<R> {
     }
 }
 
+#[cfg_attr(windows, allow(dead_code))]
 impl<R: Read> Read for LimitedReader<R> {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
         if buffer.is_empty() {
@@ -317,8 +420,8 @@ impl<R: Read> Read for LimitedReader<R> {
     }
 }
 
+#[cfg(unix)]
 fn sync_parent(parent: &Path) -> Result<()> {
-    #[cfg(unix)]
     fs::File::open(parent)
         .context("open update destination directory")?
         .sync_all()
@@ -415,7 +518,10 @@ mod tests {
             platform_asset_for("1.2.3", "linux", "aarch64").unwrap(),
             "kodade-cli-1.2.3-aarch64-unknown-linux-gnu.tar.gz"
         );
-        assert!(platform_asset_for("1.2.3", "windows", "x86_64").is_err());
+        assert_eq!(
+            platform_asset_for("1.2.3", "windows", "x86_64").unwrap(),
+            "kodade-cli-1.2.3-x86_64-pc-windows-msvc.zip"
+        );
     }
 
     #[test]
@@ -511,6 +617,57 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn windows_deferred_replacement_waits_for_a_running_executable() {
+        use std::time::{Duration, Instant};
+
+        let root =
+            std::env::temp_dir().join(format!("kodade-update-windows-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let destination = root.join("kodade-cli.exe");
+        fs::copy(std::env::var_os("COMSPEC").unwrap(), &destination).unwrap();
+        let mut running = Command::new(&destination)
+            .args(["/C", "ping", "127.0.0.1", "-n", "3", ">", "NUL"])
+            .spawn()
+            .unwrap();
+        let archive = fixture_zip(&[("package/kodade-cli.exe", b"updated executable")]);
+        let digest = format!("{:x}", Sha256::digest(&archive));
+
+        install_archive(&archive, &digest, &destination).unwrap();
+        running.wait().unwrap();
+        // The detached helper retries a busy executable for up to ten seconds.
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while Instant::now() < deadline
+            && !matches!(fs::read(&destination), Ok(bytes) if bytes == b"updated executable")
+        {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert_eq!(fs::read(&destination).unwrap(), b"updated executable");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_failed_replacement_restores_the_old_executable() {
+        let root =
+            std::env::temp_dir().join(format!("kodade-update-restore-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let destination = root.join("kodade-cli.exe");
+        fs::write(&destination, b"working executable").unwrap();
+
+        let mut helper =
+            schedule_windows_replacement(&root.join("missing-update"), &destination).unwrap();
+        assert!(!helper.wait().unwrap().success());
+        assert_eq!(fs::read(&destination).unwrap(), b"working executable");
+        assert!(!destination
+            .with_extension(format!("old-{}.exe", std::process::id()))
+            .exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn archive_rejects_links_duplicates_nonexecutables_and_large_binaries() {
         let noexec = fixture_archive(&[("package/kodade-cli", b"not executable", 0o644)]);
@@ -555,5 +712,17 @@ mod tests {
             tar.finish().unwrap();
         }
         encoder.finish().unwrap()
+    }
+
+    #[cfg(windows)]
+    fn fixture_zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut archive = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        for (path, bytes) in entries {
+            archive
+                .start_file(*path, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            archive.write_all(bytes).unwrap();
+        }
+        archive.finish().unwrap().into_inner()
     }
 }

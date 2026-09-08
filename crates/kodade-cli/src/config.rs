@@ -1,4 +1,6 @@
-use std::{collections::HashMap, fmt::Write as _, fs, io::Write, path::PathBuf};
+#[cfg(unix)]
+use std::io::Write;
+use std::{collections::HashMap, fmt::Write as _, fs, path::PathBuf};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use kodade_cli_proto::{AgentStateKind, ClientMessage, Direction, SessionSettings};
@@ -1559,6 +1561,7 @@ fn parse_rgb_color(value: &str) -> Result<Color, String> {
     }
 }
 
+#[cfg(unix)]
 fn terminal_background() -> Option<String> {
     // OSC 11 replies with `ESC ] 11 ; rgb:rrrr/gggg/bbbb BEL`. Query before the TUI enters raw mode.
     use std::{io::Read, os::fd::AsRawFd};
@@ -1594,6 +1597,13 @@ fn terminal_background() -> Option<String> {
     })();
     let _ = crossterm::terminal::disable_raw_mode();
     result
+}
+
+#[cfg(not(unix))]
+fn terminal_background() -> Option<String> {
+    // Windows terminals do not provide a portable OSC response channel before
+    // raw mode. Keep the configured/default theme instead of consuming input.
+    None
 }
 
 #[cfg(test)]

@@ -23,6 +23,7 @@ use std::{
 const MANIFEST: &str = "kodade-plugin.toml";
 const REGISTRY: &str = "registry.toml";
 const INSTALL_TIMEOUT: Duration = Duration::from_secs(60);
+#[cfg(unix)]
 const KILL_GRACE: Duration = Duration::from_secs(2);
 const MAX_CONTEXT_BYTES: usize = 64 * 1024;
 
@@ -540,13 +541,25 @@ impl ContextFile {
         if json.len() > MAX_CONTEXT_BYTES {
             bail!("plugin context exceeds {} KiB", MAX_CONTEXT_BYTES / 1024);
         }
+        let thread = std::thread::current()
+            .name()
+            .unwrap_or("ui")
+            .chars()
+            .map(|ch| {
+                if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                    ch
+                } else {
+                    '_'
+                }
+            })
+            .collect::<String>();
         let path = std::env::temp_dir().join(format!(
             "kodade-plugin-context-{}-{}-{}.json",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)?
                 .as_nanos(),
-            std::thread::current().name().unwrap_or("ui")
+            thread
         ));
         let mut options = fs::OpenOptions::new();
         options.write(true).create_new(true);
@@ -578,9 +591,25 @@ pub async fn run_action_with_context(
         bail!("plugin action {} is not applicable here", action.id);
     }
     let context_file = ContextFile::create(context)?;
-    let mut command = tokio::process::Command::new("sh");
+    #[cfg(unix)]
+    let mut command = {
+        let mut command = tokio::process::Command::new("sh");
+        command.args(["-lc", &action.command]);
+        command
+    };
+    #[cfg(windows)]
+    let mut command = {
+        let mut command = tokio::process::Command::new(
+            std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".into()),
+        );
+        command.args(["/D", "/C"]);
+        // `cmd /C` parses the remaining command line itself. Passing the
+        // action through normal argv quoting makes redirections and quoted
+        // paths part of one literal argument instead.
+        command.raw_arg(&action.command);
+        command
+    };
     command
-        .args(["-lc", &action.command])
         .current_dir(&plugin.installed.path)
         .env("KODADE_PLUGIN", &plugin.manifest.id)
         .env("KODADE_ACTION", &action.id)
@@ -743,6 +772,7 @@ pub async fn run_bounded_command(
     label: &str,
 ) -> Result<std::process::ExitStatus> {
     command.stdin(Stdio::null());
+    #[cfg(unix)]
     unsafe {
         command.pre_exec(|| {
             if libc::setpgid(0, 0) == -1 {
@@ -752,17 +782,21 @@ pub async fn run_bounded_command(
         });
     }
     let mut child = command.spawn().with_context(|| format!("start {label}"))?;
+    #[cfg(unix)]
     let pid = child
         .id()
         .ok_or_else(|| anyhow!("{label} has no process id"))? as i32;
     match tokio::time::timeout(timeout, child.wait()).await {
         Ok(status) => {
             let status = status.with_context(|| format!("wait for {label}"))?;
+            #[cfg(unix)]
             settle_group(pid).await;
             Ok(status)
         }
         Err(_) => {
+            #[cfg(unix)]
             terminate_group(pid, libc::SIGTERM);
+            #[cfg(unix)]
             settle_group(pid).await;
             let _ = child.wait().await;
             bail!("{label} timed out after {} seconds", timeout.as_secs());
@@ -770,6 +804,7 @@ pub async fn run_bounded_command(
     }
 }
 
+#[cfg(unix)]
 async fn settle_group(pid: i32) {
     // The leader can exit on TERM while a grandchild ignores it. Check the
     // process group independently, then always escalate after the grace.
@@ -780,6 +815,7 @@ async fn settle_group(pid: i32) {
     }
 }
 
+#[cfg(unix)]
 fn group_alive(pid: i32) -> bool {
     unsafe {
         libc::kill(-pid, 0) == 0
@@ -787,6 +823,7 @@ fn group_alive(pid: i32) -> bool {
     }
 }
 
+#[cfg(unix)]
 fn terminate_group(pid: i32, signal: i32) {
     // The child made itself group leader in pre_exec; a negative pid targets
     // the entire group, including shell descendants from a plugin build.
@@ -890,10 +927,25 @@ mod tests {
     async fn action_receives_structured_context_as_data_and_removes_private_file() {
         let marker =
             std::env::temp_dir().join(format!("kodade-context-marker-{}", std::process::id()));
+        #[cfg(unix)]
+        let command = format!(
+            "cp \"$KODADE_PLUGIN_CONTEXT\" {} && printf '%s' \"$KODADE_PLUGIN_CONTEXT\" > {}.path",
+            marker.display(),
+            marker.display()
+        );
+        #[cfg(windows)]
+        let command = format!(
+            "type \"%KODADE_PLUGIN_CONTEXT%\" > \"{}\" & echo %KODADE_PLUGIN_CONTEXT%> \"{}.path\"",
+            marker.display(),
+            marker.display()
+        );
         let action = PluginAction {
-            id: "capture".into(), name: "Capture".into(),
-            command: format!("cp \"$KODADE_PLUGIN_CONTEXT\" {} && printf '%s' \"$KODADE_PLUGIN_CONTEXT\" > {}.path", marker.display(), marker.display()),
-            description: String::new(), pane: false, contexts: vec![PluginActionContext::Selection],
+            id: "capture".into(),
+            name: "Capture".into(),
+            command,
+            description: String::new(),
+            pane: false,
+            contexts: vec![PluginActionContext::Selection],
         };
         let plugin = loaded_for_test(std::env::temp_dir(), action.clone());
         let context = InvocationContext {
@@ -923,7 +975,7 @@ mod tests {
         assert_eq!(actual, context);
         let private_path = fs::read_to_string(marker.with_extension("path")).unwrap();
         assert!(
-            !Path::new(&private_path).exists(),
+            !Path::new(private_path.trim()).exists(),
             "context file must be cleaned after the job"
         );
         let _ = fs::remove_file(marker);
@@ -936,13 +988,20 @@ mod tests {
     async fn timed_out_action_removes_its_private_context_file() {
         let marker =
             std::env::temp_dir().join(format!("kodade-context-timeout-{}", std::process::id()));
+        #[cfg(unix)]
+        let command = format!(
+            "printf '%s' \"$KODADE_PLUGIN_CONTEXT\" > {}; sleep 5",
+            marker.display()
+        );
+        #[cfg(windows)]
+        let command = format!(
+            "echo %KODADE_PLUGIN_CONTEXT%> \"{}\" & ping 127.0.0.1 -n 6 > NUL",
+            marker.display()
+        );
         let action = PluginAction {
             id: "slow".into(),
             name: "Slow".into(),
-            command: format!(
-                "printf '%s' \"$KODADE_PLUGIN_CONTEXT\" > {}; sleep 30",
-                marker.display()
-            ),
+            command,
             description: String::new(),
             pane: false,
             contexts: vec![],
@@ -959,7 +1018,7 @@ mod tests {
         .await
         .is_err());
         let path = fs::read_to_string(&marker).unwrap();
-        assert!(!Path::new(&path).exists());
+        assert!(!Path::new(path.trim()).exists());
         let _ = fs::remove_file(marker);
     }
 

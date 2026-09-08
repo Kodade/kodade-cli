@@ -83,6 +83,9 @@ pub enum Command {
         #[arg(value_parser = session_name)]
         session: Option<String>,
     },
+    /// Proxy a local daemon connection over stdin/stdout for an SSH client.
+    #[command(hide = true)]
+    Bridge,
     /// Diagnose configuration, tools, and daemon health without starting a session.
     #[command(visible_alias = "status")]
     Doctor {
