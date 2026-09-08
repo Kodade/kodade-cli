@@ -212,8 +212,11 @@ control connection; `ls` prefixes each line with `host:`. The command builders (
 local socket resolver are unit-tested in `remote.rs`; the live tunnel path is
 only exercised against a real host.
 
-Out of scope (phase 2): multiple remotes in one sidebar, and auto-installing
-`kodade-cli` on the remote host.
+Saved remote profiles and independent connection workers are implemented in
+`machines.rs` and `endpoints.rs`; see [MACHINES.md](MACHINES.md). Each worker
+tags updates with its connection generation so a queued message from a removed
+profile cannot update a replacement. The app retains one layout cache per
+endpoint. OpenSSH remains responsible for credentials.
 
 ## Startup and context
 
@@ -250,3 +253,21 @@ Terminal modes are owned by `terminal::TerminalModes`; cleanup runs after detach
 failed setup, UI errors, and before panic reporting. `python3 scripts/tui-smoke-test.py`
 exercises a real controlling PTY, detach, a broken transport, and restoration of
 termios, alternate screen, bracketed paste, and cursor visibility.
+
+
+## Live daemon handoff
+
+`session upgrade` uses a private Unix socket to transfer PTY descriptors with
+SCM_RIGHTS. `handoff.rs` bounds and authenticates the transport; the source
+transaction owns alias rollback and target termination. Readers stop at
+poll/read boundaries and only the final ownership release lets the target read
+or delete adopted resources. Client transports retain acknowledged view state
+and discard queued input on reconnect. `terminal_replay.rs` exports cloned
+terminal grids, preserving live buffers and a bounded ANSI history tail.
+
+After building, `python3 scripts/smoke-test.py` checks two upgrades with original
+process identity and computed output, failed real import and lost commit
+acknowledgement rollback, and the original hook alias after rename.
+`python3 scripts/handoff-tui-smoke.py` verifies an attached client's independent
+pane focus and actual shell execution through two upgrades, then terminal-mode
+restoration on detach. Both fixtures own their temporary sessions and cleanup.

@@ -14,7 +14,8 @@ the second.
      `/tmp/kodade-cli-$UID/SESSION.sock`.
 - Every message is one UTF-8 JSON value followed by `\n`. There is no length
   prefix and no framing beyond the newline; embedded newlines are escaped by
-  JSON itself.
+  JSON itself. Client requests are capped at 16 MiB before deserialization;
+  partial uploads survive concurrent screen updates.
 - Enums use serde's external tagging: a unit variant is a bare string
   (`"ZoomPane"`), a struct variant is a single-key object
   (`{"FocusPaneId":{"id":3}}`), and a newtype variant wraps its payload
@@ -44,6 +45,8 @@ printf '%s\n' '{"Query":"Layout"}' | nc -U /tmp/kodade-cli-$UID/default.sock
 | --- | --- | --- |
 | `Query(Layout)` | `{"Query":"Layout"}` | `Layout` |
 | `Query(Pane)` | `{"Query":{"Pane":3}}` | `Pane` |
+| `Query(Image)` | `{"Query":{"Image":{"pane":3,"id":7,"revision":1}}}` | `Image { pane, image }` |
+| `PasteImage` | `{"PasteImage":{"pane":3,"data":"base64 PNG"}}` | `ImagePasted { pane, path }` |
 | `Query(Session)` | `{"Query":"Session"}` | `Session` |
 | `Query(Version)` | `{"Query":"Version"}` | `Version` |
 | `Query(Schema)` | `{"Query":"Schema"}` | `Schema` |
@@ -65,6 +68,7 @@ printf '%s\n' '{"Query":"Layout"}' | nc -U /tmp/kodade-cli-$UID/default.sock
 | `RenamePaneId` / `RenameTabId` / `RenameWorkspaceId` | `{"RenameTabId":{"id":2,"name":"agents"}}` | `Layout` |
 | `RenameSession` | `{"RenameSession":{"name":"work"}}` | `Layout` |
 | `KillSession` | `"KillSession"` | `Shutdown` |
+| `Upgrade` | `{"Upgrade":{"binary":null}}` | `Upgrading` or `Error` |
 | `NewTab` | `"NewTab"` | `Layout` |
 | `NextTab` / `PrevTab` | `"NextTab"` | `Layout` |
 | `SelectTab` | `{"SelectTab":{"id":2}}` | `Layout` |
@@ -302,3 +306,54 @@ bytes, no path separators or control characters, and neither `.` nor `..`.
 
 `doctor --json` probes `Query(Version)` without starting the daemon. Its JSON
 contains `version`, `session`, `socket`, and `checks` (`name`, `status`, `detail`).
+
+## Images
+
+`Screen.graphics` carries image revision, placement ID, cell position/extent,
+source pixel crop, and z order. `Query(Image)` fetches one exact revision as
+`ImageData { id, revision, format, width, height, data }`; stale revisions fail.
+Image bytes use base64, bounded to 8 MiB decoded. `PasteImage` validates a PNG,
+saves it privately on the daemon host, and pastes its quoted path without
+submitting input. See [GRAPHICS.md](GRAPHICS.md) for modes, limits, and cleanup.
+
+## Compact client views
+
+`SetCompactView { enabled }` applies after `Hello` to that connection alone.
+The layout tree projects the focused pane while `panes` retains active-tab
+identities for switching. Other processes and the persisted split tree stay
+alive; disabling restores the split projection. Focus and input reapply the
+interacting client's PTY dimensions. Ködade's auto mode enables this below
+70 columns; compact headers provide previous/next pane, Switch, and Hosts
+controls, with the usual keyboard bindings available.
+
+
+## Live daemon upgrade
+
+`{"Upgrade":{"binary":null}}` replaces the daemon with the installed executable.
+An explicit absolute `binary` path selects a local replacement. Linux and macOS
+transfer the existing PTY masters; child programs are not restarted. The target
+must accept the handoff schema and socket protocol version. Failed validation,
+import, or preparation leaves the source daemon and its panes running.
+
+The source pauses PTY readers and rejects mutations while it transfers layout,
+bounded terminal state, graphics, and attachment ownership. The replacement
+binds private sockets before the source publishes them. A final ownership
+release follows the target's preparation acknowledgement; until release, target
+readers remain paused and failed transactions can restore the source aliases.
+
+After successful release the source sends the unit message `"Upgrading"` to
+attached clients, closes their connections, and exits. Ködade clients reconnect
+to the same public socket, restore their own selection/viewport/scroll offsets,
+and resubscribe. Queued input and in-flight requests are not replayed. Other
+clients should repeat `Hello` and `Subscribe` and explicitly restore their view.
+An upgrade is distinct from `"Shutdown"`, which means the session was stopped.
+
+The bounded transfer supports up to 64 PTYs, a 128 MiB serialized runtime,
+128 KiB of formatted screen state per pane, and a 64 KiB ANSI history tail per
+pane. Complete logical history rows are retained within that budget. Oversized
+screen/runtime state refuses the upgrade and resumes the source. Pending input
+sequences and image transfers retain their bounded parser state.
+
+At the CLI, use `kodade-cli session upgrade` after installing an update, or
+`kodade-cli --remote HOST session upgrade` for a Unix host. Supplying `--binary`
+through `--remote` is rejected; install the desired binary on the host first.

@@ -72,13 +72,63 @@ with tempfile.TemporaryDirectory(prefix="kodade-smoke-") as directory:
         assert run("-s", "../outside", "session", "path", success=False).returncode != 0
 
         # Targeting across one-shot connections must preserve the CLI script selection.
-        other = run("run", "--name", "other", "--", "sh", "-c", "sleep 30").stdout.strip()
+        other = run("run", "--name", "other", "--", "/bin/sh").stdout.strip()
+        identity_file = root / "pane-identity"
+        run("send", other, f"printf '%s' \"$$\" > {identity_file}")
+        deadline = time.monotonic() + 4
+        while not identity_file.exists():
+            assert time.monotonic() < deadline, "shell did not execute identity command"
+            time.sleep(0.05)
+        child = int(identity_file.read_text())
+        start = Path(f"/proc/{child}/stat").read_text().rsplit(")", 1)[1].split()[19]
         old_daemon = daemon_pid("default")
-        child = int(subprocess.check_output(["pgrep", "-P", str(old_daemon)], text=True).splitlines()[0])
         # A failed replacement leaves the source usable; successful replacements
         # preserve the original PTY process through two daemon PID changes.
         assert run("session", "upgrade", "--binary", "/no/such/kodade", success=False).returncode != 0
         run("ls", "--json")
+        # Fail after the real importer owns staged panes, then after aliases
+        # switch but before commit acknowledgement. Both must resume the source.
+        broken_import = root / "broken-import"
+        broken_import.write_text("#!/usr/bin/env python3\nimport os,sys\na=sys.argv[1:]\na[a.index('--staged-socket')+1]=" + repr(str(root / "missing/sub/socket")) + "\nos.execv(" + repr(str(binary)) + ", [" + repr(str(binary)) + "]+a)\n")
+        broken_commit = root / "broken-commit"
+        broken_commit.write_text("""#!/usr/bin/env python3
+import os,socket,struct,sys
+args=sys.argv[1:]
+def arg(name): return args[args.index(name)+1]
+s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM)
+s.connect(arg('--import'))
+s.sendall(os.environ['KODADE_HANDOFF_TOKEN'].encode()+b'\\n')
+def exact(n):
+ out=b''
+ while len(out)<n:
+  chunk=s.recv(n-len(out))
+  assert chunk
+  out+=chunk
+ return out
+exact(struct.unpack('!I',exact(4))[0])
+s.sendall(b'validated\\n')
+marker,ancillary,flags,addr=s.recvmsg(1,socket.CMSG_SPACE(64*4))
+assert marker==b'F' and ancillary
+listener=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM)
+listener.bind(arg('--staged-socket'))
+listener.listen(1)
+os.link(arg('--staged-socket'),arg('--staged-hook'))
+s.sendall(b'ready\\n')
+assert exact(7)==b'commit\\n'
+# Deliberately exit without committed: descriptors close and source rolls back.
+""")
+        for phase, replacement in enumerate((broken_import, broken_commit)):
+            replacement.chmod(0o700)
+            assert run("session", "upgrade", "--binary", str(replacement), success=False).returncode != 0
+            assert daemon_pid("default") == old_daemon
+            check = root / f"rollback-{phase}"
+            run("send", other, f"printf '%s:%s' \"$$\" \"$((23 * 17))\" > {check}")
+            deadline = time.monotonic() + 4
+            while not check.exists() or not check.read_text():
+                assert time.monotonic() < deadline, "source did not resume after failed import/commit"
+                time.sleep(0.05)
+            assert check.read_text() == f"{child}:391"
+            assert not list(socket.parent.glob(".up-*")), "rollback staging leaked"
         run("session", "upgrade")
         first_target = daemon_pid("default")
         assert first_target != old_daemon
@@ -86,11 +136,15 @@ with tempfile.TemporaryDirectory(prefix="kodade-smoke-") as directory:
         run("session", "upgrade")
         assert daemon_pid("default") not in (old_daemon, first_target)
         os.kill(child, 0)
-        run("send", other, "echo UPGRADE_SMOKE_OK")
+        result_file = root / "upgrade-result"
+        run("send", other, f"printf '%s:%s' \"$$\" \"$((173 * 29))\" > {result_file}")
         deadline = time.monotonic() + 4
-        while "UPGRADE_SMOKE_OK" not in run("pane", "read", other).stdout:
-            assert time.monotonic() < deadline, "pane did not survive upgrade"
+        while not result_file.exists():
+            assert time.monotonic() < deadline, "original shell did not execute after two upgrades"
             time.sleep(0.05)
+        assert result_file.read_text() == f"{child}:5017"
+        assert Path(f"/proc/{child}/stat").read_text().rsplit(")", 1)[1].split()[19] == start
+        assert not list(socket.parent.glob(".up-*")), "handoff staging leaked"
         run("pane", "kill", pane)
         run("pane", "read", other)
         assert run("pane", "read", pane, success=False).returncode != 0
@@ -114,6 +168,13 @@ with tempfile.TemporaryDirectory(prefix="kodade-smoke-") as directory:
         explicit = run("-s", "elsewhere", "session", "path", extra=inherited).stdout.strip()
         assert explicit != renamed_socket
         assert not Path(explicit).exists()
+        hook_check = root / "old-hook-alias"
+        run("--socket", renamed_socket, "send", other,
+            f'if "$KODADE_BIN" agent report "$KODADE_PANE" working --source handoff; then printf passed > {hook_check}; fi')
+        deadline = time.monotonic() + 4
+        while not hook_check.exists():
+            assert time.monotonic() < deadline, "original pane hook did not follow two upgrades and rename"
+            time.sleep(0.05)
         run("--socket", renamed_socket, "kill-session")
         deadline = time.monotonic() + 3
         while Path(renamed_socket).exists():

@@ -7,10 +7,15 @@ mod commands;
 mod config;
 mod connection;
 mod doctor;
+mod endpoints;
+mod graphics;
 mod help;
+mod image_paste;
 mod input;
 mod integrations;
 mod keys;
+mod local_endpoint;
+mod machines;
 mod mode;
 mod notify;
 mod overlay;
@@ -18,18 +23,19 @@ mod palette;
 mod paste;
 mod picker;
 mod plugins;
+mod reconnect_view;
 mod remote;
 mod render;
 mod selection;
 mod settings;
 mod state;
 mod terminal;
+mod update;
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{CommandFactory, FromArgMatches};
 use kodade_cli_proto::{
-    decode, encode, ClientMessage, Direction, Event, QueryKind, ServerMessage, SplitAxis,
-    PROTOCOL_VERSION,
+    decode, encode, ClientMessage, Direction, QueryKind, ServerMessage, SplitAxis, PROTOCOL_VERSION,
 };
 use ratatui::{backend::CrosstermBackend, Terminal};
 use std::{path::Path, time::Duration};
@@ -53,6 +59,9 @@ async fn main() -> Result<()> {
     )?;
     let session = args.session.clone();
     let remote = args.remote.clone();
+    if remote.is_some() && matches!(args.command, Some(cli::Command::Update { .. })) {
+        bail!("update is local-only; run kodade-cli update on the remote host directly");
+    }
 
     // Commands that never open a session socket run locally; `session` verbs
     // pass through to the host when `--remote` is set.
@@ -132,6 +141,60 @@ async fn main() -> Result<()> {
     // The config is only loaded where it is used, so `config validate` does not
     // print its warnings twice.
     match command {
+        Some(cli::Command::Update {
+            check,
+            channel,
+            show_channel,
+            install_to,
+        }) => {
+            if let Some(channel) = channel.as_deref() {
+                update::save_channel(channel)?;
+            }
+            let channel = channel.unwrap_or(update::saved_channel()?);
+            if show_channel {
+                println!("{channel}");
+                return Ok(());
+            }
+            let metadata = String::from_utf8(update::fetch(update::metadata_url(&channel))?)?;
+            let release = update::select_release(&channel, &metadata)?;
+            if check && install_to.is_none() {
+                println!(
+                    "channel: {channel}\ninstalled: {}\navailable: {}",
+                    env!("CARGO_PKG_VERSION"),
+                    release.tag_name
+                );
+                Ok(())
+            } else if install_to.is_none()
+                && !update::release_is_newer(&release.tag_name, env!("CARGO_PKG_VERSION"))
+            {
+                println!(
+                    "Ködade CLI {} is already current on the {channel} channel.",
+                    env!("CARGO_PKG_VERSION")
+                );
+                Ok(())
+            } else {
+                let explicit_destination = install_to.is_some();
+                let destination = install_to.unwrap_or(
+                    std::env::current_exe().context("find installed kodade-cli executable")?,
+                );
+                if !explicit_destination {
+                    if let Some(command) = update::package_upgrade_command(&destination) {
+                        println!("This Ködade installation is package-managed. Upgrade it with:\n  {command}");
+                        return Ok(());
+                    }
+                }
+                let version = release.tag_name.trim_start_matches('v');
+                let asset = update::platform_asset(version)?;
+                let sums = String::from_utf8(update::fetch(update::release_asset_url(
+                    &release,
+                    "SHA256SUMS",
+                )?)?)?;
+                let archive = update::fetch(update::release_asset_url(&release, &asset)?)?;
+                update::install_archive(&archive, &update::checksum(&sums, &asset)?, &destination)?;
+                println!("installed verified {version} to {}", destination.display());
+                Ok(())
+            }
+        }
         // No subcommand attaches the TUI to the session.
         None => attach(&socket, &session, &config::Config::load(), remote.is_some()).await,
         Some(cli::Command::Doctor { json }) => {
@@ -173,6 +236,7 @@ async fn main() -> Result<()> {
         Some(cli::Command::Session { command }) => {
             session_command(remote.as_deref(), &socket, &session, command).await
         }
+        Some(cli::Command::Machine { command }) => machine(command),
         Some(cli::Command::Worktree { command }) => worktree(&socket, command).await,
         Some(cli::Command::Ls { json }) => {
             let layout =
@@ -366,6 +430,57 @@ async fn main() -> Result<()> {
     }
 }
 
+fn machine(command: cli::MachineCommand) -> Result<()> {
+    let mut catalog = machines::load()?;
+    match command {
+        cli::MachineCommand::List { json } => {
+            if json {
+                println!("{}", serde_json::to_string_pretty(&catalog.machines)?);
+            } else {
+                for machine in &catalog.machines {
+                    println!(
+                        "{}\t{}\t{}\t{}",
+                        machine.id,
+                        if machine.enabled {
+                            "enabled"
+                        } else {
+                            "disabled"
+                        },
+                        machine.label,
+                        machine.target
+                    );
+                }
+            }
+        }
+        cli::MachineCommand::Add {
+            target,
+            label,
+            session,
+        } => {
+            let profile = catalog.add(label, target, session)?;
+            println!("{}", profile.id);
+            machines::save(&catalog)?;
+        }
+        cli::MachineCommand::Rename { id, label } => {
+            catalog.get_mut(&id)?.label = label;
+            machines::save(&catalog)?;
+        }
+        cli::MachineCommand::Enable { id } => {
+            catalog.get_mut(&id)?.enabled = true;
+            machines::save(&catalog)?;
+        }
+        cli::MachineCommand::Disable { id } => {
+            catalog.get_mut(&id)?.enabled = false;
+            machines::save(&catalog)?;
+        }
+        cli::MachineCommand::Remove { id } => {
+            catalog.remove(&id)?;
+            machines::save(&catalog)?;
+        }
+    }
+    Ok(())
+}
+
 /// `pane` subcommands. Pane-targeted actions the daemon only applies to the
 /// focused pane are prefixed with a `FocusPaneId`, which is also what the
 /// equivalent key binding would do.
@@ -401,6 +516,11 @@ async fn pane(socket: &Path, command: cli::PaneCommand) -> Result<()> {
             } else {
                 println!("{}", commands::format_panes(&layout));
             }
+            Ok(())
+        }
+        cli::PaneCommand::PasteImage { pane, path } => {
+            let path = image_paste::paste(socket, pane, path.as_deref()).await?;
+            println!("{}", path.display());
             Ok(())
         }
         cli::PaneCommand::SendKeys {
@@ -1091,7 +1211,12 @@ async fn attach(socket: &Path, session: &str, config: &config::Config, remote: b
     // differs from the local path and must not trigger a local daemon.
     let can_spawn = socket == kodade_cli_daemon::socket_path(session).as_path();
     let stream = connection::connect(socket, session, can_spawn).await?;
-    tui(stream, config, session, socket, remote).await
+    let profiles = if !remote {
+        machines::load()?.machines
+    } else {
+        Vec::new()
+    };
+    tui(stream, config, session, socket, remote, profiles).await
 }
 
 /// Sets up the terminal, hands the socket to `App`, and always restores it.
@@ -1101,6 +1226,7 @@ async fn tui(
     session: &str,
     socket: &Path,
     remote: bool,
+    profiles: Vec<machines::MachineProfile>,
 ) -> Result<()> {
     let (reader, mut writer) = stream.into_split();
     let mut lines = BufReader::new(reader).lines();
@@ -1122,37 +1248,50 @@ async fn tui(
     tokio::time::timeout(Duration::from_secs(10), handshake(&mut lines, &mut state))
         .await
         .context("daemon handshake timed out after 10s")??;
+    writer
+        .write_all(&encode(&ClientMessage::SetCompactView {
+            enabled: state.compact_enabled(cols),
+        })?)
+        .await?;
     // Subscribe so the TUI learns about session-level changes (a rename moves
     // the socket under it). Subscribed connections receive notifications as
     // `Event::Notification` instead of `ServerMessage::Notification`.
     writer
         .write_all(&encode(&ClientMessage::Subscribe)?)
         .await?;
-    let (tx, mut rx) = mpsc::channel(16);
-    tokio::spawn(async move {
-        while let Ok(Some(line)) = lines.next_line().await {
-            let update = match decode(line.as_bytes()) {
-                Ok(ServerMessage::Layout(layout)) => app::Update::Layout(layout),
-                Ok(ServerMessage::Welcome { session, .. }) => app::Update::Session(session),
-                Ok(ServerMessage::Notification(notification)) => {
-                    app::Update::Notification(notification)
-                }
-                Ok(ServerMessage::Event(Event::Notification(notification))) => {
-                    app::Update::Notification(notification)
-                }
-                Ok(ServerMessage::Event(Event::SessionRenamed { name, socket })) => {
-                    app::Update::SessionRenamed { name, socket }
-                }
-                _ => continue,
-            };
-            if tx.send(update).await.is_err() {
-                break;
-            }
-        }
-    });
+    let (tx, mut rx) = mpsc::channel(64);
+    let (command_tx, command_rx) = mpsc::channel(64);
+    let mut router = endpoints::Router::new(endpoints::EndpointId::Local);
+    router.register(endpoints::EndpointId::Local, command_tx);
+    router.mark_online(endpoints::EndpointId::Local);
+    state.configure_machines(&profiles);
+    for profile in profiles.into_iter().filter(|profile| profile.enabled) {
+        let (machine_tx, machine_rx) = mpsc::channel(64);
+        let id = endpoints::EndpointId::Machine(profile.id.clone());
+        router.register(id.clone(), machine_tx);
+        endpoints::spawn_machine(
+            profile,
+            session.to_string(),
+            state.pane_cols(cols),
+            rows,
+            router.updates(id.clone(), tx.clone()),
+            machine_rx,
+        );
+    }
+    local_endpoint::spawn(
+        local_endpoint::Connection { lines, writer },
+        socket.to_path_buf(),
+        local_endpoint::Viewport {
+            cols: state.pane_cols(cols),
+            rows,
+            compact: state.compact_enabled(cols),
+        },
+        router.updates(endpoints::EndpointId::Local, tx.clone()),
+        command_rx,
+    );
     let _modes = terminal::TerminalModes::enter(config.mouse)?;
     let mut term = Terminal::new(CrosstermBackend::new(std::io::stdout()))?;
-    state.run(&mut term, &mut writer, &mut rx).await
+    state.run(&mut term, &mut router, &mut rx, &tx).await
 }
 
 /// Read the daemon's opening `Welcome` and verify its protocol version before

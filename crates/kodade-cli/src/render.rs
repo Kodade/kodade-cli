@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::OnceLock;
 
 use kodade_cli_proto::{
@@ -16,6 +16,7 @@ use ratatui::{
 
 use crate::{
     config::{Config, StatusWidget, Theme},
+    endpoints::EndpointId,
     input::{tab_spans, TabSpan},
     mode::{menu_origin_x, CopyMode, Menu, MenuAction, MENU_WIDTH},
     overlay::{self, render_overlay, Overlay},
@@ -53,6 +54,9 @@ impl SidebarMode {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SidebarTarget {
+    Endpoint(EndpointId),
+    /// A daemon-local target qualified by the endpoint that owns its ids.
+    Scoped(EndpointId, Box<SidebarTarget>),
     Workspace(WorkspaceId),
     Tab(TabId),
     Pane(PaneId),
@@ -63,6 +67,7 @@ pub enum SidebarTarget {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SidebarKind {
     Heading,
+    Endpoint,
     Workspace,
     Tab,
     Pane,
@@ -106,6 +111,7 @@ impl SidebarModel {
 
 /// Per-frame UI state that is not part of the daemon layout snapshot.
 pub struct Ui<'a> {
+    pub compact: bool,
     pub sidebar_mode: SidebarMode,
     /// Effective sidebar width for the current mode + config.
     pub sidebar_width: u16,
@@ -152,10 +158,15 @@ pub struct Ui<'a> {
     pub picker: Option<&'a crate::picker::Picker>,
     /// Mutually-exclusive command center, attention inbox, or welcome overlay.
     pub center: Option<&'a Overlay>,
+    /// Client-side endpoint rows, retained even while a remote is offline.
+    pub machines: &'a [(EndpointId, String, String, bool)],
+    pub endpoint_layouts: &'a [(EndpointId, String, String, LayoutSnapshot)],
+    pub endpoint_collapsed: &'a BTreeMap<EndpointId, HashSet<WorkspaceId>>,
 }
 
 pub fn render(frame: &mut Frame, layout: &LayoutSnapshot, ui: &Ui, theme: &Theme) {
     let Ui {
+        compact,
         sidebar_mode,
         sidebar_width,
         collapsed,
@@ -182,6 +193,9 @@ pub fn render(frame: &mut Frame, layout: &LayoutSnapshot, ui: &Ui, theme: &Theme
         help,
         picker,
         center,
+        machines,
+        endpoint_layouts,
+        endpoint_collapsed,
     } = *ui;
     let areas = Layout::default()
         .direction(LayoutDirection::Horizontal)
@@ -195,6 +209,9 @@ pub fn render(frame: &mut Frame, layout: &LayoutSnapshot, ui: &Ui, theme: &Theme
             navigate,
             collapsed,
             agents_panel,
+            machines,
+            endpoint_layouts,
+            endpoint_collapsed,
             theme,
         ),
         SidebarMode::Compact => render_sidebar_rail(frame, layout, areas[0], theme),
@@ -217,7 +234,27 @@ pub fn render(frame: &mut Frame, layout: &LayoutSnapshot, ui: &Ui, theme: &Theme
         .find(|item| item.active)
         .map(|item| item.name.as_str())
         .unwrap_or("workspace");
-    render_tab_bar(frame, workspace, &layout.tabs, areas[0], theme);
+    if compact {
+        let controls = compact_controls(areas[0], machines.len() > 1);
+        for (area, label, _) in &controls {
+            frame.render_widget(
+                Paragraph::new(*label).style(Style::default().fg(theme.accent).bg(theme.bg)),
+                *area,
+            );
+        }
+        let start = controls
+            .last()
+            .map(|(area, _, _)| area.right() + 1)
+            .unwrap_or(areas[0].x);
+        if start < areas[0].right() {
+            frame.render_widget(
+                Paragraph::new(workspace).style(Style::default().fg(theme.dim)),
+                Rect::new(start, areas[0].y, areas[0].right() - start, 1),
+            );
+        }
+    } else {
+        render_tab_bar(frame, workspace, &layout.tabs, areas[0], theme);
+    }
 
     let mut rects = HashMap::new();
     rects_for(&layout.tree, areas[1], &mut rects);
@@ -241,6 +278,17 @@ pub fn render(frame: &mut Frame, layout: &LayoutSnapshot, ui: &Ui, theme: &Theme
                     *rect,
                 );
                 // The block cursor only makes sense on the live focused pane.
+                if !crate::graphics::supported()
+                    && !pane.screen.graphics.is_empty()
+                    && rect.width > 2
+                    && rect.height > 2
+                {
+                    frame.render_widget(
+                        Paragraph::new("[image · Kitty graphics required]")
+                            .style(Style::default().fg(theme.dim)),
+                        Rect::new(rect.x + 1, rect.y + 1, rect.width - 2, 1),
+                    );
+                }
                 if pane.focused && copy.is_none() && pane.scroll_offset == 0 {
                     render_cursor(frame, &pane.screen, *rect, theme);
                 }
@@ -722,8 +770,34 @@ pub fn tab_label(name: &str, active: bool, state: AgentStateKind) -> String {
     }
 }
 
-/// Draw the tab bar: a fixed wordmark + workspace name on the left, then the
-/// tabs in a scrolling sub-area so the active tab stays visible on overflow.
+/// One hit map for the compact header and its mouse controls.
+pub fn compact_controls(
+    area: Rect,
+    machines: bool,
+) -> Vec<(Rect, &'static str, crate::config::Action)> {
+    use crate::config::Action;
+    let mut x = area.x;
+    [
+        ("[<]", Action::PrevPane),
+        ("[Switch]", Action::Goto),
+        ("[>]", Action::NextPane),
+        ("[Hosts]", Action::NextMachine),
+    ]
+    .into_iter()
+    .filter(|(_, action)| machines || *action != Action::NextMachine)
+    .filter_map(|(label, action)| {
+        let width = label.len() as u16;
+        if x.saturating_add(width) > area.right() {
+            return None;
+        }
+        let rect = Rect::new(x, area.y, width, 1);
+        x += width + 1;
+        Some((rect, label, action))
+    })
+    .collect()
+}
+
+/// Draw the fixed workspace label and a scrolling strip of tabs.
 fn render_tab_bar(frame: &mut Frame, workspace: &str, tabs: &[TabInfo], area: Rect, theme: &Theme) {
     let base = Style::default().bg(theme.tabbar_bg);
     // Fixed prefix fills the whole row (background) and draws the wordmark.
@@ -910,6 +984,85 @@ pub fn sidebar_rows(
         Vec::new()
     };
     SidebarModel { workspaces, agents }
+}
+
+/// Client endpoint rows lead the same scrollable model as workspaces and
+/// agents. Endpoint identity is part of the target, so daemon-local ids may
+/// collide safely across machines.
+pub fn sidebar_rows_with_machines(
+    layout: &LayoutSnapshot,
+    collapsed: &HashSet<WorkspaceId>,
+    agents_panel: bool,
+    machines: &[(EndpointId, String, String, bool)],
+) -> SidebarModel {
+    let mut model = sidebar_rows(layout, collapsed, agents_panel);
+    if !machines.is_empty() {
+        let mut rows = vec![heading_row("machines")];
+        rows.extend(
+            machines
+                .iter()
+                .map(|(id, label, status, selected)| SidebarRow {
+                    kind: SidebarKind::Endpoint,
+                    target: Some(SidebarTarget::Endpoint(id.clone())),
+                    label: format!("{} {} · {status}", if *selected { "›" } else { " " }, label),
+                    state: if status == "online" {
+                        AgentStateKind::Working
+                    } else {
+                        AgentStateKind::Unknown
+                    },
+                    dim: !selected,
+                    color: None,
+                }),
+        );
+        rows.append(&mut model.workspaces);
+        model.workspaces = rows;
+    }
+    model
+}
+
+/// Build one scrollable tree from every cached endpoint. Each daemon-local id
+/// is wrapped in the owning endpoint before rows are concatenated.
+pub fn sidebar_rows_for_endpoints(
+    entries: &[(EndpointId, String, String, LayoutSnapshot)],
+    collapsed: &BTreeMap<EndpointId, HashSet<WorkspaceId>>,
+    agents_panel: bool,
+    machines: &[(EndpointId, String, String, bool)],
+) -> SidebarModel {
+    let mut model = SidebarModel {
+        workspaces: vec![heading_row("machines")],
+        agents: Vec::new(),
+    };
+    model.workspaces.extend(
+        machines
+            .iter()
+            .map(|(id, label, status, selected)| SidebarRow {
+                kind: SidebarKind::Endpoint,
+                target: Some(SidebarTarget::Endpoint(id.clone())),
+                label: format!("{} {} · {status}", if *selected { "›" } else { " " }, label),
+                state: AgentStateKind::Unknown,
+                dim: !selected,
+                color: None,
+            }),
+    );
+    for (endpoint, label, _status, layout) in entries {
+        model
+            .workspaces
+            .push(heading_row(&format!("{label} workspaces")));
+        let empty = HashSet::new();
+        let mut rows = sidebar_rows(
+            layout,
+            collapsed.get(endpoint).unwrap_or(&empty),
+            agents_panel,
+        )
+        .into_flat();
+        for row in &mut rows {
+            if let Some(target) = row.target.take() {
+                row.target = Some(SidebarTarget::Scoped(endpoint.clone(), Box::new(target)));
+            }
+        }
+        model.workspaces.extend(rows);
+    }
+    model
 }
 
 /// Workspaces in sidebar order: each top-level workspace followed by its
@@ -1112,6 +1265,7 @@ pub fn auto_color(name: &str) -> Color {
     Color::Indexed(PALETTE[(hash as usize) % PALETTE.len()])
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_sidebar(
     frame: &mut Frame,
     layout: &LayoutSnapshot,
@@ -1119,13 +1273,20 @@ fn render_sidebar(
     navigate: Option<usize>,
     collapsed: &HashSet<WorkspaceId>,
     agents_panel: bool,
+    machines: &[(EndpointId, String, String, bool)],
+    endpoint_layouts: &[(EndpointId, String, String, LayoutSnapshot)],
+    endpoint_collapsed: &BTreeMap<EndpointId, HashSet<WorkspaceId>>,
     theme: &Theme,
 ) {
     frame.render_widget(
         Block::default().style(Style::default().bg(theme.sidebar_bg)),
         area,
     );
-    let model = sidebar_rows(layout, collapsed, agents_panel);
+    let model = if endpoint_layouts.is_empty() {
+        sidebar_rows_with_machines(layout, collapsed, agents_panel, machines)
+    } else {
+        sidebar_rows_for_endpoints(endpoint_layouts, endpoint_collapsed, agents_panel, machines)
+    };
     let place = sidebar_layout(area.height, &model, navigate);
     // Workspaces list (scrolled to keep the selected row visible).
     for screen in 0..place.ws_height {
@@ -1538,6 +1699,109 @@ mod tests {
     }
 
     #[test]
+    fn machine_targets_do_not_collide_with_daemon_ids() {
+        let layout = snapshot();
+        let machines = vec![
+            (EndpointId::Local, "Local".into(), "online".into(), true),
+            (
+                EndpointId::Machine("m1".into()),
+                "Build".into(),
+                "online".into(),
+                false,
+            ),
+        ];
+        let model = sidebar_rows_with_machines(&layout, &no_collapse(), true, &machines);
+        assert_eq!(
+            model.workspaces[1].target,
+            Some(SidebarTarget::Endpoint(EndpointId::Local))
+        );
+        assert_eq!(
+            model.workspaces[2].target,
+            Some(SidebarTarget::Endpoint(EndpointId::Machine("m1".into())))
+        );
+        assert!(model
+            .into_flat()
+            .iter()
+            .any(|row| matches!(row.target, Some(SidebarTarget::Pane(_)))));
+    }
+
+    #[test]
+    fn cached_endpoint_rows_qualify_colliding_daemon_ids() {
+        let remote_id = EndpointId::Machine("m1".into());
+        let endpoints = vec![
+            (
+                EndpointId::Local,
+                "Local".into(),
+                "online".into(),
+                snapshot(),
+            ),
+            (
+                remote_id.clone(),
+                "Build".into(),
+                "online".into(),
+                snapshot(),
+            ),
+        ];
+        let machines = vec![
+            (EndpointId::Local, "Local".into(), "online".into(), true),
+            (remote_id.clone(), "Build".into(), "online".into(), false),
+        ];
+        let rows =
+            sidebar_rows_for_endpoints(&endpoints, &BTreeMap::new(), true, &machines).into_flat();
+
+        assert!(rows.iter().any(|row| {
+            row.target
+                == Some(SidebarTarget::Scoped(
+                    EndpointId::Local,
+                    Box::new(SidebarTarget::Pane(PaneId(3))),
+                ))
+        }));
+        assert!(rows.iter().any(|row| {
+            row.target
+                == Some(SidebarTarget::Scoped(
+                    remote_id.clone(),
+                    Box::new(SidebarTarget::Pane(PaneId(3))),
+                ))
+        }));
+    }
+
+    #[test]
+    fn cached_endpoint_collapse_does_not_hide_another_daemons_ids() {
+        let remote_id = EndpointId::Machine("m1".into());
+        let endpoints = vec![
+            (
+                EndpointId::Local,
+                "Local".into(),
+                "online".into(),
+                snapshot(),
+            ),
+            (
+                remote_id.clone(),
+                "Build".into(),
+                "online".into(),
+                snapshot(),
+            ),
+        ];
+        let collapsed = BTreeMap::from([(EndpointId::Local, HashSet::from([WorkspaceId(1)]))]);
+        let rows = sidebar_rows_for_endpoints(&endpoints, &collapsed, false, &[]).into_flat();
+
+        assert!(!rows.iter().any(|row| {
+            row.target
+                == Some(SidebarTarget::Scoped(
+                    EndpointId::Local,
+                    Box::new(SidebarTarget::Pane(PaneId(3))),
+                ))
+        }));
+        assert!(rows.iter().any(|row| {
+            row.target
+                == Some(SidebarTarget::Scoped(
+                    remote_id.clone(),
+                    Box::new(SidebarTarget::Pane(PaneId(3))),
+                ))
+        }));
+    }
+
+    #[test]
     fn worktree_workspaces_nest_under_their_parent_with_branch_labels() {
         let mut layout = snapshot();
         // The active workspace is a repo on `main`; add a worktree child of it.
@@ -1863,6 +2127,7 @@ mod tests {
                 )]],
                 bracketed_paste: false,
                 mouse_reporting: false,
+                graphics: Vec::new(),
             },
             agent: None,
             agent_generation: 0,
@@ -1874,6 +2139,7 @@ mod tests {
         }];
         let collapsed = no_collapse();
         let ui = Ui {
+            compact: false,
             sidebar_mode: SidebarMode::Hidden,
             sidebar_width: 1,
             collapsed: &collapsed,
@@ -1900,6 +2166,9 @@ mod tests {
             help: None,
             picker: None,
             center: None,
+            machines: &[],
+            endpoint_layouts: &[],
+            endpoint_collapsed: &BTreeMap::new(),
         };
         let mut terminal = Terminal::new(TestBackend::new(40, 10)).expect("test terminal");
         terminal
@@ -2019,6 +2288,7 @@ mod tests {
         let width = sidebar_width(SidebarMode::Full, &config);
         let collapsed = no_collapse();
         let ui = Ui {
+            compact: false,
             sidebar_mode: SidebarMode::Full,
             sidebar_width: width,
             collapsed: &collapsed,
@@ -2045,6 +2315,9 @@ mod tests {
             help: None,
             picker: None,
             center: None,
+            machines: &[],
+            endpoint_layouts: &[],
+            endpoint_collapsed: &BTreeMap::new(),
         };
         let mut terminal = Terminal::new(TestBackend::new(80, 12)).expect("test terminal");
         terminal

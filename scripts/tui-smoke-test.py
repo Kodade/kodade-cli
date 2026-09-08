@@ -101,6 +101,7 @@ with tempfile.TemporaryDirectory(prefix="kt-") as directory:
                 reader = connection.makefile("rb")
                 assert "Hello" in json.loads(reader.readline())
                 connection.sendall(b'{"Welcome":{"session":"failure","version":1}}\n')
+                assert json.loads(reader.readline()) == {"SetCompactView": {"enabled": False}}
                 assert json.loads(reader.readline()) == "Subscribe"
                 reader.close()
             deadline = time.monotonic() + 5
@@ -111,4 +112,58 @@ with tempfile.TemporaryDirectory(prefix="kt-") as directory:
 
         assert attached(env, ["--socket", str(endpoint)], disconnected) != 0
 
-print("TUI smoke passed: real PTY attach/detach, transport failure, restored terminal modes and cursor")
+    # A recoverable daemon Error must stay on the same connection. This catches
+    # clients that treat a rejected action as an endpoint failure and silently
+    # discard later interactive input.
+    endpoint = root / "rejected.sock"
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
+        listener.bind(str(endpoint))
+        listener.listen(1)
+        listener.settimeout(5)
+
+        def rejected_action(process, master, transcript, drain):
+            connection, _ = listener.accept()
+            with connection:
+                connection.settimeout(5)
+                reader = connection.makefile("rb")
+                assert "Hello" in json.loads(reader.readline())
+                connection.sendall(b'{"Welcome":{"session":"rejected","version":1}}\n')
+                assert json.loads(reader.readline()) == {"SetCompactView": {"enabled": False}}
+                assert json.loads(reader.readline()) == "Subscribe"
+                layout = {"Layout": {"active_workspace": 1, "active_tab": 2,
+                    "workspaces": [{"id": 1, "name": "main", "active": True, "state": "idle",
+                        "root": None, "color": None, "branch": None, "parent": None,
+                        "tabs": [{"id": 2, "name": "shell", "state": "idle", "agents": []}]}],
+                    "tabs": [{"id": 2, "name": "shell", "active": True, "state": "idle"}],
+                    "tree": {"Leaf": {"pane": 3}},
+                    "panes": [{"id": 3, "title": "shell", "focused": True, "scroll_offset": 0,
+                        "screen": {"contents": "ready", "cursor_row": 0, "cursor_col": 5,
+                            "cursor_visible": True, "rows": [], "bracketed_paste": False, "mouse_reporting": False},
+                        "agent": None, "agent_generation": 0, "activity_revision": 0, "state": "idle",
+                        "state_reason": "", "state_age_secs": 0, "cwd": None}], "zoomed": False, "restored": False}}
+                connection.sendall(json.dumps(layout).encode() + b"\n")
+                deadline = time.monotonic() + 5
+                while b"\x1b[?2004h" not in transcript:
+                    assert process.poll() is None and time.monotonic() < deadline, bytes(transcript)
+                    drain()
+                # Default prefix+x is ClosePane. Reject it, then prove the
+                # subsequent literal key reaches this exact socket.
+                os.write(master, b"\x02x")
+                assert json.loads(reader.readline()) == "ClosePane"
+                connection.sendall(b'{"Error":{"message":"close rejected"}}\n')
+                wait_until = time.monotonic() + 5
+                while b"close rejected" not in transcript:
+                    assert process.poll() is None and time.monotonic() < wait_until, bytes(transcript)
+                    drain()
+                os.write(master, b"z")
+                assert json.loads(reader.readline()) == {"Input": {"bytes": [122]}}
+                os.write(master, b"\x02d")
+                deadline = time.monotonic() + 5
+                while process.poll() is None:
+                    assert time.monotonic() < deadline, bytes(transcript)
+                    drain()
+                reader.close()
+
+        assert attached(env, ["--socket", str(endpoint)], rejected_action) == 0
+
+print("TUI smoke passed: real PTY attach/detach, transport failure, recoverable action error, restored terminal modes and cursor")

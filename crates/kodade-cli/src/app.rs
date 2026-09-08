@@ -4,7 +4,7 @@
 //! clap dispatcher. New modes hook in by adding a field plus a branch in
 //! `handle_key` / `handle_mouse`.
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use crossterm::{
     event::{
         self, Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
@@ -19,16 +19,18 @@ use ratatui::{backend::CrosstermBackend, layout::Rect, style::Color, Frame, Term
 #[cfg(test)]
 use ratatui::{TerminalOptions, Viewport};
 use std::{
-    collections::HashSet,
+    collections::{BTreeMap, HashSet},
     io::Write,
     path::{Path, PathBuf},
     process::{Command, Stdio},
     time::{Duration, Instant},
 };
-use tokio::{io::AsyncWriteExt, net::unix::OwnedWriteHalf, sync::mpsc};
+use tokio::sync::mpsc;
 
 use crate::{
-    attention, config, help, input, mode, notify,
+    attention, config,
+    endpoints::{EndpointId, Manager, Router},
+    help, input, mode, notify,
     overlay::{self, Overlay, OverlayEvent, OverlayRow, OverlayTarget},
     palette, paste,
     picker::{self, PickTarget},
@@ -73,6 +75,7 @@ type Term = Terminal<CrosstermBackend<std::io::Stdout>>;
 
 /// Server messages the attached client acts on; the reader task drops the rest.
 pub enum Update {
+    RequestError(String),
     Layout(LayoutSnapshot),
     Session(String),
     Notification(Notification),
@@ -80,6 +83,14 @@ pub enum Update {
     /// one-shot requests (copy mode's `ReadPane`) keep working (#16).
     SessionRenamed {
         name: String,
+        socket: PathBuf,
+    },
+    /// A background endpoint failed. The selected local endpoint stays live.
+    EndpointFailed {
+        reason: String,
+    },
+    EndpointConnected {
+        session: String,
         socket: PathBuf,
     },
 }
@@ -112,7 +123,20 @@ struct DragState {
 }
 
 pub struct App {
+    graphics: crate::graphics::Renderer,
+    image_clipboard: crate::image_paste::Clipboard,
     layout: Option<LayoutSnapshot>,
+    /// Per-machine snapshots stay available while a disconnected endpoint
+    /// reconnects. The canvas always renders the selected endpoint only.
+    endpoint_layouts: BTreeMap<EndpointId, LayoutSnapshot>,
+    endpoint_labels: BTreeMap<EndpointId, String>,
+    endpoints: Manager,
+    selected_endpoint: EndpointId,
+    view_needs_resize: bool,
+    endpoint_contexts: BTreeMap<EndpointId, (String, PathBuf)>,
+    machine_profiles: Vec<crate::machines::MachineProfile>,
+    local_session: String,
+    catalog_checked: Instant,
     prefix: bool,
     rename: bool,
     /// The `prefix W` workspace prompt reuses the rename text buffer (`name`).
@@ -128,6 +152,9 @@ pub struct App {
     sidebar_mode: SidebarMode,
     /// Workspaces the user collapsed in the sidebar list (#19).
     collapsed: HashSet<WorkspaceId>,
+    /// Collapse state is keyed by endpoint because daemon workspace ids are
+    /// only unique within one machine.
+    collapsed_by_endpoint: BTreeMap<EndpointId, HashSet<WorkspaceId>>,
     /// Persisted UI state (collapsed workspaces, help_seen); loaded once (#19).
     ui_state: state::State,
     /// The first layout made the onboarding decision for this client lifetime.
@@ -168,6 +195,11 @@ pub struct App {
     paste_buffer: String,
     /// Agent notifications: unread stack and effect computation (#10).
     notifier: notify::Notifier,
+    /// Unread notifications retained while another endpoint is selected.
+    endpoint_notifiers: BTreeMap<EndpointId, notify::Notifier>,
+    /// Notifications are keyed by endpoint so colliding pane ids can never
+    /// make `NotificationJump` target another daemon.
+    pending_notifications: BTreeMap<EndpointId, Vec<Notification>>,
     /// Session reported by the daemon's `Welcome`; shown in the status bar (#11).
     session_name: String,
     /// Socket the client is attached to (local or an SSH-forwarded one for
@@ -192,6 +224,7 @@ pub struct App {
     plugin_results: mpsc::UnboundedReceiver<String>,
     plugin_result_tx: mpsc::UnboundedSender<String>,
     remote_endpoint: bool,
+    primary_remote: bool,
 }
 
 /// How long the `prefix q` pane-id flash stays up.
@@ -247,6 +280,20 @@ impl App {
         let (plugin_result_tx, plugin_results) = mpsc::unbounded_channel();
         Self {
             layout: None,
+            endpoint_layouts: BTreeMap::new(),
+            endpoint_labels: BTreeMap::from([(EndpointId::Local, "Local".into())]),
+            endpoints: Manager::new(&[], Instant::now()),
+            selected_endpoint: EndpointId::Local,
+            endpoint_contexts: BTreeMap::from([(
+                EndpointId::Local,
+                (session.to_string(), socket.clone()),
+            )]),
+            machine_profiles: Vec::new(),
+            local_session: session.to_string(),
+            catalog_checked: Instant::now(),
+            view_needs_resize: false,
+            graphics: crate::graphics::Renderer::default(),
+            image_clipboard: crate::image_paste::Clipboard::default(),
             prefix: false,
             rename: false,
             new_workspace: false,
@@ -261,6 +308,7 @@ impl App {
                 config_collapsed_mode(config)
             },
             collapsed: HashSet::new(),
+            collapsed_by_endpoint: BTreeMap::from([(EndpointId::Local, HashSet::new())]),
             ui_state,
             onboarding_decided,
             seeded_ids: HashSet::new(),
@@ -280,6 +328,8 @@ impl App {
             note: None,
             paste_buffer: String::new(),
             notifier: notify::Notifier::new(config, jump_hint),
+            endpoint_notifiers: BTreeMap::new(),
+            pending_notifications: BTreeMap::new(),
             session_name: session.to_string(),
             socket,
             flash_until: None,
@@ -294,6 +344,7 @@ impl App {
             plugin_results,
             plugin_result_tx,
             remote_endpoint: false,
+            primary_remote: false,
         }
     }
 
@@ -301,6 +352,225 @@ impl App {
     /// must never make the palette execute one locally by accident.
     pub fn set_remote_endpoint(&mut self, remote: bool) {
         self.remote_endpoint = remote;
+        self.primary_remote = remote;
+    }
+
+    pub fn configure_machines(&mut self, machines: &[crate::machines::MachineProfile]) {
+        self.machine_profiles = machines.to_vec();
+        self.endpoint_labels.extend(machines.iter().map(|machine| {
+            (
+                EndpointId::Machine(machine.id.clone()),
+                machine.label.clone(),
+            )
+        }));
+        self.endpoints = Manager::new(machines, Instant::now());
+    }
+
+    async fn sync_machine_catalog(
+        &mut self,
+        router: &mut Router,
+        updates: &mpsc::Sender<crate::endpoints::UpdatePacket>,
+        term: &Term,
+    ) {
+        if self.primary_remote || self.catalog_checked.elapsed() < Duration::from_secs(1) {
+            return;
+        }
+        self.catalog_checked = Instant::now();
+        let Ok(catalog) = crate::machines::load() else {
+            return;
+        };
+        if catalog.machines == self.machine_profiles {
+            return;
+        }
+        let prior = std::mem::replace(&mut self.machine_profiles, catalog.machines);
+        let mut selection_restarted = false;
+        for profile in &prior {
+            let id = EndpointId::Machine(profile.id.clone());
+            if !self
+                .machine_profiles
+                .iter()
+                .any(|next| next.id == profile.id && next.enabled)
+            {
+                selection_restarted |= id == self.selected_endpoint;
+                router.unregister(&id);
+                self.endpoint_layouts.remove(&id);
+                self.endpoint_contexts.remove(&id);
+            }
+        }
+        for profile in self
+            .machine_profiles
+            .iter()
+            .filter(|profile| profile.enabled)
+        {
+            let id = EndpointId::Machine(profile.id.clone());
+            if prior.iter().any(|old| old == profile) {
+                continue;
+            }
+            selection_restarted |= id == self.selected_endpoint;
+            router.unregister(&id);
+            self.endpoint_layouts.remove(&id);
+            self.endpoint_contexts.remove(&id);
+            let (sender, receiver) = mpsc::channel(64);
+            router.register(id.clone(), sender);
+            let Ok(size) = term.size() else { continue };
+            crate::endpoints::spawn_machine(
+                profile.clone(),
+                self.local_session.clone(),
+                self.pane_cols(size.width),
+                size.height,
+                router.updates(id.clone(), updates.clone()),
+                receiver,
+            );
+        }
+        self.endpoints
+            .reconcile(&self.machine_profiles, Instant::now());
+        if !router.ids().contains(&self.selected_endpoint) {
+            self.select_endpoint(EndpointId::Local, router);
+        } else if selection_restarted {
+            self.select_endpoint(self.selected_endpoint.clone(), router);
+        }
+    }
+
+    fn select_next_endpoint(&mut self, router: &mut Router) {
+        let ids = router.ids();
+        let Some(index) = ids.iter().position(|id| id == router.selected()) else {
+            return;
+        };
+        let next = ids[(index + 1) % ids.len()].clone();
+        self.select_endpoint(next, router);
+    }
+
+    fn select_endpoint(&mut self, next: EndpointId, router: &mut Router) {
+        let previous = self.selected_endpoint.clone();
+        self.collapsed_by_endpoint
+            .insert(previous.clone(), self.collapsed.clone());
+        let replacement_notifier = self.new_notifier();
+        self.endpoint_notifiers.insert(
+            previous,
+            std::mem::replace(&mut self.notifier, replacement_notifier),
+        );
+        router.select(next.clone());
+        self.selected_endpoint = next.clone();
+        self.view_needs_resize = true;
+        self.remote_endpoint = self.primary_remote || next != EndpointId::Local;
+        self.notifier = self
+            .endpoint_notifiers
+            .remove(&next)
+            .unwrap_or_else(|| self.new_notifier());
+        self.copy = None;
+        self.confirm = None;
+        self.menu = None;
+        self.picker = None;
+        self.center = None;
+        self.rename = false;
+        self.rename_target = None;
+        self.new_workspace = false;
+        self.worktree_new = false;
+        self.worktree_confirm = None;
+        self.navigate = None;
+        self.clear_selection();
+        self.focused_pane = None;
+        self.last_pane = None;
+        self.collapsed = self
+            .collapsed_by_endpoint
+            .get(&next)
+            .cloned()
+            .unwrap_or_default();
+        self.seeded_ids.clear();
+        if let Some((session, socket)) = self.endpoint_contexts.get(&next).cloned() {
+            self.session_name = session;
+            self.socket = socket;
+        } else {
+            self.socket = PathBuf::new();
+        }
+        if let Some(layout) = self.endpoint_layouts.get(&next).cloned() {
+            self.handle_layout(layout);
+        } else {
+            self.layout = None;
+        }
+        let pending = self.replay_pending_notifications();
+        let label = self
+            .endpoints
+            .endpoint(&next)
+            .map(|endpoint| endpoint.label.clone())
+            .or_else(|| self.endpoint_labels.get(&next).cloned())
+            .unwrap_or_else(|| "endpoint".into());
+        self.set_note(format!("machine: {label}"));
+        if !pending.is_empty() {
+            self.set_note(format!(
+                "machine: {label} · {} pending notification(s)",
+                pending.len()
+            ));
+        }
+    }
+
+    fn machine_rows(&self) -> Vec<(EndpointId, String, String, bool)> {
+        self.endpoints
+            .sidebar_machines()
+            .into_iter()
+            .filter(|machine| machine.status != "disabled")
+            .map(|machine| {
+                (
+                    machine.id.clone(),
+                    machine.label,
+                    machine.status,
+                    machine.id == self.selected_endpoint,
+                )
+            })
+            .collect()
+    }
+
+    fn endpoint_layout_rows(&self) -> Vec<(EndpointId, String, String, LayoutSnapshot)> {
+        self.endpoint_layouts
+            .iter()
+            .map(|(id, layout)| {
+                let endpoint = self.endpoints.endpoint(id);
+                (
+                    id.clone(),
+                    endpoint
+                        .map(|item| item.label.clone())
+                        .unwrap_or_else(|| "endpoint".into()),
+                    endpoint
+                        .map(|item| format!("{:?}", item.status))
+                        .unwrap_or_default(),
+                    layout.clone(),
+                )
+            })
+            .collect()
+    }
+
+    fn new_notifier(&self) -> notify::Notifier {
+        let jump_hint = self
+            .config
+            .chords_for(config::Action::NotificationJump)
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| "N".into());
+        notify::Notifier::new(&self.config, jump_hint)
+    }
+
+    fn replay_pending_notifications(&mut self) -> Vec<Notification> {
+        if self.layout.is_none() {
+            return Vec::new();
+        }
+        let pending = self
+            .pending_notifications
+            .remove(&self.selected_endpoint)
+            .unwrap_or_default();
+        for notification in &pending {
+            self.notifier.record_unseen(notification);
+        }
+        if let Some(layout) = &self.layout {
+            self.notifier.reconcile(layout);
+        }
+        pending
+    }
+
+    fn collapse_state_key(&self) -> String {
+        match &self.selected_endpoint {
+            EndpointId::Local => self.session_name.clone(),
+            EndpointId::Machine(id) => format!("{}::machine:{id}", self.session_name),
+        }
     }
 
     /// Sets the status-bar note in the default color; clears after `NOTE_TTL`.
@@ -334,6 +604,12 @@ impl App {
     /// Collapse a full sidebar under the auto-hide column threshold, and restore
     /// it once the terminal is wide enough again (#19).
     pub fn apply_auto_hide(&mut self, cols: u16) {
+        if self.compact_enabled(cols) {
+            self.sidebar_mode = SidebarMode::Hidden;
+            self.auto_hidden = true;
+            self.sidebar_hidden_at = Some(Instant::now());
+            return;
+        }
         let below = cols < self.config.sidebar_auto_hide_below;
         if below && self.sidebar_mode == SidebarMode::Full {
             self.sidebar_mode = config_collapsed_mode(&self.config);
@@ -350,6 +626,16 @@ impl App {
     /// Pane width for the current sidebar state, used by `Hello` and `Resize`.
     pub fn pane_cols(&self, cols: u16) -> u16 {
         pane_cols(cols, self.sidebar_width())
+    }
+
+    /// A compact view is a daemon-side per-client projection, never a shared
+    /// zoom mutation. The threshold leaves enough room for a usable shell.
+    pub fn compact_enabled(&self, cols: u16) -> bool {
+        match self.config.compact_view {
+            config::CompactViewMode::Auto => cols < config::COMPACT_VIEW_AUTO_BELOW,
+            config::CompactViewMode::On => true,
+            config::CompactViewMode::Off => false,
+        }
     }
 
     /// Stores a new snapshot. Copy mode refreshes its full-history buffer
@@ -408,7 +694,7 @@ impl App {
     fn seed_collapsed(&mut self) {
         let Some(layout) = &self.layout else { return };
         let ids: HashSet<WorkspaceId> = layout.workspaces.iter().map(|w| w.id).collect();
-        let names = self.ui_state.collapsed_for(&self.session_name);
+        let names = self.ui_state.collapsed_for(&self.collapse_state_key());
         for workspace in &layout.workspaces {
             if self.seeded_ids.insert(workspace.id) && names.contains(&workspace.name) {
                 self.collapsed.insert(workspace.id);
@@ -417,6 +703,8 @@ impl App {
         // Drop bookkeeping for workspaces that have gone away.
         self.seeded_ids.retain(|id| ids.contains(id));
         self.collapsed.retain(|id| ids.contains(id));
+        self.collapsed_by_endpoint
+            .insert(self.selected_endpoint.clone(), self.collapsed.clone());
     }
 
     /// Persist the current collapsed set as workspace names for this session.
@@ -430,7 +718,10 @@ impl App {
             .collect();
         // Reload first so a concurrently written `help_seen` (#6) is preserved.
         self.ui_state = state::State::load();
-        self.ui_state.set_collapsed(&self.session_name, names);
+        self.ui_state
+            .set_collapsed(&self.collapse_state_key(), names);
+        self.collapsed_by_endpoint
+            .insert(self.selected_endpoint.clone(), self.collapsed.clone());
     }
 
     pub fn handle_session(&mut self, session: String) {
@@ -470,7 +761,7 @@ impl App {
 
     /// `prefix N`: focus the pane of the most recent unread notification and
     /// mark it read; an empty stack just says so.
-    async fn notification_jump(&mut self, writer: &mut OwnedWriteHalf) -> Result<()> {
+    async fn notification_jump(&mut self, writer: &mut Router) -> Result<()> {
         match self.notifier.pop_unread() {
             Some(notification) => {
                 write(
@@ -535,10 +826,13 @@ impl App {
         let confirm = worktree_prompt
             .as_deref()
             .or_else(|| self.confirm.as_ref().map(|c| c.message.as_str()));
+        let machines = self.machine_rows();
+        let endpoint_layouts = self.endpoint_layout_rows();
         render::render(
             frame,
             layout,
             &render::Ui {
+                compact: self.compact_enabled(frame.area().width),
                 sidebar_mode: self.sidebar_mode,
                 sidebar_width: self.sidebar_width(),
                 collapsed: &self.collapsed,
@@ -565,6 +859,9 @@ impl App {
                 help: self.help.as_ref().map(|state| &state.overlay),
                 picker: self.picker.as_ref(),
                 center: self.center.as_ref().map(CenterOverlay::overlay),
+                machines: &machines,
+                endpoint_layouts: &endpoint_layouts,
+                endpoint_collapsed: &self.collapsed_by_endpoint,
             },
             &self.theme,
         )
@@ -636,18 +933,107 @@ impl App {
     pub async fn run(
         &mut self,
         term: &mut Term,
-        writer: &mut OwnedWriteHalf,
-        rx: &mut mpsc::Receiver<Update>,
+        writer: &mut Router,
+        rx: &mut mpsc::Receiver<crate::endpoints::UpdatePacket>,
+        updates: &mpsc::Sender<crate::endpoints::UpdatePacket>,
+    ) -> Result<()> {
+        let result = self.run_loop(term, writer, rx, updates).await;
+        let cleanup = self.graphics.clear(term.backend_mut());
+        result.and(cleanup)
+    }
+
+    async fn run_loop(
+        &mut self,
+        term: &mut Term,
+        writer: &mut Router,
+        rx: &mut mpsc::Receiver<crate::endpoints::UpdatePacket>,
+        updates: &mpsc::Sender<crate::endpoints::UpdatePacket>,
     ) -> Result<()> {
         loop {
             while let Ok(note) = self.plugin_results.try_recv() {
                 self.set_note(note);
             }
+            self.sync_machine_catalog(writer, updates, term).await;
+            if let Some(notice) = writer.take_notice() {
+                self.set_note(notice);
+            }
+            if let Some(note) = self.image_clipboard.poll() {
+                self.set_note(note);
+            }
             let mut layout_changed = false;
-            while let Ok(update) = rx.try_recv() {
+            while let Ok(packet) = rx.try_recv() {
+                if !writer.accepts(&packet) {
+                    continue;
+                }
+                let crate::endpoints::UpdatePacket {
+                    endpoint, update, ..
+                } = packet;
+                if let Update::Layout(layout) = &update {
+                    self.endpoint_layouts
+                        .insert(endpoint.clone(), layout.clone());
+                    self.endpoints.update(&endpoint);
+                }
+                if let Update::EndpointFailed { reason } = &update {
+                    writer.mark_offline(&endpoint);
+                    self.endpoints
+                        .failed(&endpoint, Instant::now(), reason.clone());
+                    if endpoint == EndpointId::Local {
+                        if reason == "local endpoint shut down" {
+                            return Ok(());
+                        }
+                        if reason == "local endpoint disconnected" {
+                            return Err(anyhow!(reason.clone()));
+                        }
+                    }
+                }
+                if let Update::EndpointConnected { session, socket } = &update {
+                    writer.mark_online(endpoint.clone());
+                    let size = term.size()?;
+                    writer.send_to(
+                        &endpoint,
+                        ClientMessage::SetCompactView {
+                            enabled: self.compact_enabled(size.width),
+                        },
+                    )?;
+                    writer.send_to(
+                        &endpoint,
+                        ClientMessage::Resize {
+                            cols: self.pane_cols(size.width),
+                            rows: size.height,
+                        },
+                    )?;
+                    self.endpoint_contexts
+                        .insert(endpoint.clone(), (session.clone(), socket.clone()));
+                }
+                if endpoint == EndpointId::Local {
+                    if let Update::SessionRenamed { name, socket } = &update {
+                        self.local_session = name.clone();
+                        self.endpoint_contexts
+                            .insert(endpoint.clone(), (name.clone(), socket.clone()));
+                    }
+                }
+                if let Update::Notification(notification) = &update {
+                    if endpoint != *writer.selected() {
+                        let pending = self
+                            .pending_notifications
+                            .entry(endpoint.clone())
+                            .or_default();
+                        pending.retain(|item| item.pane != notification.pane);
+                        if pending.len() == 64 {
+                            pending.remove(0);
+                        }
+                        pending.push(notification.clone());
+                    }
+                }
+                // Background machines keep cached snapshots, but only the
+                // selected endpoint is allowed to alter the active canvas.
+                if &endpoint != writer.selected() {
+                    continue;
+                }
                 match update {
                     Update::Layout(layout) => {
                         self.handle_layout(layout);
+                        self.replay_pending_notifications();
                         layout_changed = true;
                     }
                     Update::Session(session) => self.handle_session(session),
@@ -656,6 +1042,17 @@ impl App {
                     }
                     Update::SessionRenamed { name, socket } => {
                         self.handle_session(name);
+                        // A saved machine's event carries its remote Unix
+                        // path. Its worker immediately reconnects and then
+                        // publishes the forwarded local socket instead.
+                        if endpoint == EndpointId::Local {
+                            self.socket = socket;
+                        }
+                    }
+                    Update::EndpointFailed { reason } => self.set_note(reason),
+                    Update::RequestError(message) => self.set_note(message),
+                    Update::EndpointConnected { session, socket } => {
+                        self.handle_session(session);
                         self.socket = socket;
                     }
                 }
@@ -665,16 +1062,43 @@ impl App {
             if layout_changed {
                 self.refresh_copy().await;
             }
+            if self.view_needs_resize {
+                self.send_resize(writer, term).await?;
+                self.view_needs_resize = false;
+            }
             self.sync_title(term)?;
             term.draw(|frame| self.draw(frame))?;
+            let area = self.content_area(term)?;
+            let hidden = self.center.is_some()
+                || self.help.is_some()
+                || self.settings.is_some()
+                || self.picker.is_some()
+                || self.menu.is_some()
+                || self.copy.is_some()
+                || self.flash_active();
+            let layout = self.layout.as_ref().filter(|_| !hidden);
+            let rects = layout
+                .map(|layout| render::pane_rects_for(layout, area))
+                .unwrap_or_default();
+            self.graphics
+                .draw(term.backend_mut(), &self.socket, layout, &rects)?;
             if !event::poll(Duration::from_millis(16))? {
                 continue;
             }
             match event::read()? {
                 Event::Resize(cols, rows) => {
                     self.apply_auto_hide(cols);
-                    let cols = self.pane_cols(cols);
-                    write(writer, &ClientMessage::Resize { cols, rows }).await?
+                    let compact = self.compact_enabled(cols);
+                    let pane_cols = self.pane_cols(cols);
+                    write(
+                        writer,
+                        &ClientMessage::Resize {
+                            cols: pane_cols,
+                            rows,
+                        },
+                    )
+                    .await?;
+                    write(writer, &ClientMessage::SetCompactView { enabled: compact }).await?
                 }
                 Event::Key(key) => {
                     if self.handle_key(key, writer, term).await? == Flow::Detach {
@@ -696,7 +1120,7 @@ impl App {
     pub async fn handle_key(
         &mut self,
         key: KeyEvent,
-        writer: &mut OwnedWriteHalf,
+        writer: &mut Router,
         term: &mut Term,
     ) -> Result<Flow> {
         // Any keystroke ends a mouse selection (#12).
@@ -741,11 +1165,7 @@ impl App {
     }
 
     // Rename mode: type a name, enter commits it to the stored target.
-    async fn handle_rename_key(
-        &mut self,
-        key: KeyEvent,
-        writer: &mut OwnedWriteHalf,
-    ) -> Result<()> {
+    async fn handle_rename_key(&mut self, key: KeyEvent, writer: &mut Router) -> Result<()> {
         match key.code {
             KeyCode::Enter => {
                 let name = std::mem::take(&mut self.name);
@@ -774,11 +1194,7 @@ impl App {
     }
 
     // Confirm prompt: `y` runs the pending message, anything else cancels.
-    async fn handle_confirm_key(
-        &mut self,
-        key: KeyEvent,
-        writer: &mut OwnedWriteHalf,
-    ) -> Result<()> {
+    async fn handle_confirm_key(&mut self, key: KeyEvent, writer: &mut Router) -> Result<()> {
         let confirm = self.confirm.take().expect("confirm exists");
         if matches!(key.code, KeyCode::Char('y') | KeyCode::Char('Y')) {
             write(writer, &confirm.on_yes).await?;
@@ -787,11 +1203,7 @@ impl App {
     }
 
     // Workspace prompt: type `NAME [PATH]`, enter creates it (reuses `name`).
-    async fn handle_new_workspace_key(
-        &mut self,
-        key: KeyEvent,
-        writer: &mut OwnedWriteHalf,
-    ) -> Result<()> {
+    async fn handle_new_workspace_key(&mut self, key: KeyEvent, writer: &mut Router) -> Result<()> {
         match key.code {
             KeyCode::Enter => {
                 let input = std::mem::take(&mut self.name);
@@ -823,11 +1235,7 @@ impl App {
 
     // Worktree prompt: type `BRANCH [FROM]`, enter opens a worktree workspace on
     // the active workspace's repo (#22).
-    async fn handle_worktree_new_key(
-        &mut self,
-        key: KeyEvent,
-        writer: &mut OwnedWriteHalf,
-    ) -> Result<()> {
+    async fn handle_worktree_new_key(&mut self, key: KeyEvent, writer: &mut Router) -> Result<()> {
         match key.code {
             KeyCode::Enter => {
                 let input = std::mem::take(&mut self.name);
@@ -874,7 +1282,7 @@ impl App {
     async fn handle_worktree_confirm_key(
         &mut self,
         key: KeyEvent,
-        writer: &mut OwnedWriteHalf,
+        writer: &mut Router,
     ) -> Result<()> {
         let (id, _) = self
             .worktree_confirm
@@ -901,11 +1309,7 @@ impl App {
     }
 
     // Resize mode: stays active until esc/enter; hjkl move 1 cell, HJKL move 5.
-    async fn handle_resize_key(
-        &mut self,
-        key: KeyEvent,
-        writer: &mut OwnedWriteHalf,
-    ) -> Result<()> {
+    async fn handle_resize_key(&mut self, key: KeyEvent, writer: &mut Router) -> Result<()> {
         let (direction, cells) = match key.code {
             KeyCode::Esc | KeyCode::Enter => {
                 self.resize = false;
@@ -929,7 +1333,7 @@ impl App {
     async fn handle_copy_key(
         &mut self,
         key: KeyEvent,
-        writer: &mut OwnedWriteHalf,
+        writer: &mut Router,
         term: &mut Term,
     ) -> Result<()> {
         let Some(mut cm) = self.copy.take() else {
@@ -1087,11 +1491,7 @@ impl App {
 
     /// Write the copy buffer to a temp file and open `$EDITOR` (fallback `vi`)
     /// in a new vertical split. Returns whether the editor pane was requested.
-    async fn open_in_editor(
-        &mut self,
-        cm: &mode::CopyMode,
-        writer: &mut OwnedWriteHalf,
-    ) -> Result<bool> {
+    async fn open_in_editor(&mut self, cm: &mode::CopyMode, writer: &mut Router) -> Result<bool> {
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -1117,7 +1517,7 @@ impl App {
     }
 
     // Context menu: move the selection or run the highlighted action.
-    async fn handle_menu_key(&mut self, key: KeyEvent, writer: &mut OwnedWriteHalf) -> Result<()> {
+    async fn handle_menu_key(&mut self, key: KeyEvent, writer: &mut Router) -> Result<()> {
         match key.code {
             KeyCode::Esc => self.menu = None,
             KeyCode::Up | KeyCode::Char('k') => {
@@ -1142,7 +1542,7 @@ impl App {
         &mut self,
         key: KeyEvent,
         current: usize,
-        writer: &mut OwnedWriteHalf,
+        writer: &mut Router,
         term: &mut Term,
     ) -> Result<()> {
         let rows = self.sidebar_flat();
@@ -1178,6 +1578,20 @@ impl App {
                         self.toggle_collapsed(id);
                         write(writer, &ClientMessage::SelectWorkspace { id }).await?;
                     }
+                    render::SidebarTarget::Endpoint(id) => {
+                        self.select_endpoint(id, writer);
+                        self.navigate = None;
+                    }
+                    render::SidebarTarget::Scoped(endpoint, inner)
+                        if matches!(*inner, render::SidebarTarget::Workspace(_)) =>
+                    {
+                        self.select_endpoint(endpoint, writer);
+                        let render::SidebarTarget::Workspace(id) = *inner else {
+                            unreachable!("guarded workspace target")
+                        };
+                        self.toggle_collapsed(id);
+                        write(writer, &ClientMessage::SelectWorkspace { id }).await?;
+                    }
                     other => {
                         self.activate_sidebar(writer, other).await?;
                         self.navigate = None;
@@ -1194,15 +1608,16 @@ impl App {
         Ok(())
     }
 
-    /// Flat sidebar rows (workspaces then agents) for the current layout.
+    /// Flat sidebar rows for every endpoint cache. The endpoint wraps all
+    /// daemon-local ids so collision-free input routing is preserved.
     fn sidebar_flat(&self) -> Vec<render::SidebarRow> {
-        match &self.layout {
-            Some(layout) => {
-                render::sidebar_rows(layout, &self.collapsed, self.config.sidebar_agents_panel)
-                    .into_flat()
-            }
-            None => Vec::new(),
-        }
+        render::sidebar_rows_for_endpoints(
+            &self.endpoint_layout_rows(),
+            &self.collapsed_by_endpoint,
+            self.config.sidebar_agents_panel,
+            &self.machine_rows(),
+        )
+        .into_flat()
     }
 
     /// First selectable (non-heading) row index, if any.
@@ -1252,7 +1667,7 @@ impl App {
     async fn handle_prefix_key(
         &mut self,
         key: KeyEvent,
-        writer: &mut OwnedWriteHalf,
+        writer: &mut Router,
         term: &mut Term,
     ) -> Result<Flow> {
         self.prefix = false;
@@ -1279,7 +1694,7 @@ impl App {
     async fn run_action(
         &mut self,
         action: config::Action,
-        writer: &mut OwnedWriteHalf,
+        writer: &mut Router,
         term: &mut Term,
     ) -> Result<Flow> {
         match action {
@@ -1459,7 +1874,15 @@ impl App {
                     self.send_paste(&text, writer).await?;
                 }
             }
+            config::Action::PasteImage => {
+                if let Some(pane) = self.focused_pane {
+                    if self.image_clipboard.start(self.socket.clone(), pane) {
+                        self.set_note(" reading clipboard image…");
+                    }
+                }
+            }
             config::Action::NotificationJump => self.notification_jump(writer).await?,
+            config::Action::NextMachine => self.select_next_endpoint(writer),
             other => {
                 if let Some(message) = other.message() {
                     write(writer, &message).await?
@@ -1500,7 +1923,7 @@ impl App {
     async fn handle_settings_key(
         &mut self,
         key: KeyEvent,
-        writer: &mut OwnedWriteHalf,
+        writer: &mut Router,
         term: &mut Term,
     ) -> Result<()> {
         let Some(mut menu) = self.settings.take() else {
@@ -1532,11 +1955,7 @@ impl App {
 
     // Picker overlay (`prefix w` / `prefix g`): esc closes, enter activates the
     // highlighted row, anything else filters the list.
-    async fn handle_picker_key(
-        &mut self,
-        key: KeyEvent,
-        writer: &mut OwnedWriteHalf,
-    ) -> Result<()> {
+    async fn handle_picker_key(&mut self, key: KeyEvent, writer: &mut Router) -> Result<()> {
         let Some(mut picker) = self.picker.take() else {
             return Ok(());
         };
@@ -1562,7 +1981,7 @@ impl App {
     async fn handle_center_key(
         &mut self,
         key: KeyEvent,
-        writer: &mut OwnedWriteHalf,
+        writer: &mut Router,
         term: &mut Term,
     ) -> Result<Flow> {
         let Some(mut center) = self.center.take() else {
@@ -1631,7 +2050,7 @@ impl App {
     async fn activate_palette(
         &mut self,
         target: palette::PaletteTarget,
-        writer: &mut OwnedWriteHalf,
+        writer: &mut Router,
         term: &mut Term,
     ) -> Result<Flow> {
         match target {
@@ -1764,11 +2183,7 @@ impl App {
 
     // Focuses the workspace, tab, or pane behind a picker row. A tab first
     // activates its owning workspace, since it may live in an inactive one.
-    async fn activate_pick(
-        &mut self,
-        target: PickTarget,
-        writer: &mut OwnedWriteHalf,
-    ) -> Result<()> {
+    async fn activate_pick(&mut self, target: PickTarget, writer: &mut Router) -> Result<()> {
         match target {
             PickTarget::Workspace(id) => {
                 write(writer, &ClientMessage::SelectWorkspace { id }).await?;
@@ -1808,7 +2223,7 @@ impl App {
     async fn apply_setting(
         &mut self,
         setting: settings::Setting,
-        writer: &mut OwnedWriteHalf,
+        writer: &mut Router,
         term: &mut Term,
     ) -> Result<()> {
         match setting {
@@ -1853,6 +2268,8 @@ impl App {
                     None => " config reloaded".into(),
                 };
                 self.config = config;
+                self.apply_auto_hide(term.size()?.width);
+                self.view_needs_resize = true;
                 self.set_note(note);
             }
             Err(error) => self.set_note(format!(" config error: {error} · previous config kept")),
@@ -1869,7 +2286,7 @@ impl App {
     }
 
     // Tells the daemon the pane area after the sidebar changed.
-    async fn send_resize(&self, writer: &mut OwnedWriteHalf, term: &mut Term) -> Result<()> {
+    async fn send_resize(&self, writer: &mut Router, term: &mut Term) -> Result<()> {
         let size = term.size()?;
         write(
             writer,
@@ -1878,11 +2295,18 @@ impl App {
                 rows: size.height,
             },
         )
+        .await?;
+        write(
+            writer,
+            &ClientMessage::SetCompactView {
+                enabled: self.compact_enabled(size.width),
+            },
+        )
         .await
     }
 
     // A bracketed-paste event: sanitize (when enabled), remember it, and send it.
-    async fn handle_paste(&mut self, text: String, writer: &mut OwnedWriteHalf) -> Result<()> {
+    async fn handle_paste(&mut self, text: String, writer: &mut Router) -> Result<()> {
         let text = if self.config.paste_sanitize {
             paste::sanitize(&text)
         } else {
@@ -1894,11 +2318,7 @@ impl App {
 
     /// A modal owns paste just as it owns keys. Only the command-center uses
     /// text input; every other center route deliberately consumes it.
-    async fn handle_paste_event(
-        &mut self,
-        text: String,
-        writer: &mut OwnedWriteHalf,
-    ) -> Result<()> {
+    async fn handle_paste_event(&mut self, text: String, writer: &mut Router) -> Result<()> {
         if let Some(CenterOverlay::Palette(palette)) = &mut self.center {
             if let Some(filter) = &mut palette.overlay.filter {
                 filter.push_str(&text);
@@ -1914,7 +2334,7 @@ impl App {
 
     // Frames text for the focused pane and sends it, pacing multi-chunk pastes.
     // Bracketed panes get the paste markers; the daemon writes the bytes as-is.
-    async fn send_paste(&self, text: &str, writer: &mut OwnedWriteHalf) -> Result<()> {
+    async fn send_paste(&self, text: &str, writer: &mut Router) -> Result<()> {
         let bracketed = self
             .layout
             .as_ref()
@@ -1937,7 +2357,7 @@ impl App {
     pub async fn handle_mouse(
         &mut self,
         mouse: MouseEvent,
-        writer: &mut OwnedWriteHalf,
+        writer: &mut Router,
         term: &mut Term,
     ) -> Result<Flow> {
         if !self.mouse_capture || self.layout.is_none() {
@@ -1970,6 +2390,25 @@ impl App {
                 }
             }
             return Ok(Flow::Continue);
+        }
+        let size = term.size()?;
+        if self.compact_enabled(size.width)
+            && self.menu.is_none()
+            && self.confirm.is_none()
+            && self.copy.is_none()
+            && !self.rename
+            && !self.new_workspace
+            && !self.worktree_new
+            && mouse.kind == MouseEventKind::Down(MouseButton::Left)
+        {
+            let area = self.content_area(term)?;
+            if let Some((_, _, action)) =
+                render::compact_controls(area, self.machine_rows().len() > 1)
+                    .into_iter()
+                    .find(|(rect, _, _)| rect.contains((mouse.column, mouse.row).into()))
+            {
+                return self.run_action(action, writer, term).await;
+            }
         }
         // Context menus own the wheel while open; do not scroll a pane behind
         // an actionable menu.
@@ -2041,7 +2480,7 @@ impl App {
     async fn center_mouse(
         &mut self,
         mouse: MouseEvent,
-        writer: &mut OwnedWriteHalf,
+        writer: &mut Router,
         term: &mut Term,
     ) -> Result<Flow> {
         if matches!(
@@ -2097,7 +2536,7 @@ impl App {
     async fn mouse_left_down(
         &mut self,
         mouse: MouseEvent,
-        writer: &mut OwnedWriteHalf,
+        writer: &mut Router,
         term: &mut Term,
     ) -> Result<()> {
         let area_width = term.size()?.width;
@@ -2117,16 +2556,16 @@ impl App {
         if mouse.column < content_area.x {
             match self.sidebar_mode {
                 SidebarMode::Full => {
-                    let layout = self.layout.as_ref().expect("layout present");
-                    let model = render::sidebar_rows(
-                        layout,
-                        &self.collapsed,
+                    let model = render::sidebar_rows_for_endpoints(
+                        &self.endpoint_layout_rows(),
+                        &self.collapsed_by_endpoint,
                         self.config.sidebar_agents_panel,
+                        &self.machine_rows(),
                     );
                     let place = render::sidebar_layout(size.height, &model, self.navigate);
                     if let Some((_, row)) = render::sidebar_row_at(&model, &place, mouse.row) {
                         if let Some(target) = row.target.clone() {
-                            write(writer, &sidebar_message(target)).await?;
+                            self.activate_sidebar(writer, target).await?;
                         }
                     }
                 }
@@ -2157,7 +2596,7 @@ impl App {
                     mouse.row
                 },
             });
-        } else if mouse.row == 0 {
+        } else if mouse.row == 0 && !self.compact_enabled(size.width) {
             if let Some(id) =
                 input::tab_at(&render::tab_spans_for(current, content_area), mouse.column)
             {
@@ -2196,7 +2635,7 @@ impl App {
     async fn passthrough(
         &mut self,
         mouse: MouseEvent,
-        writer: &mut OwnedWriteHalf,
+        writer: &mut Router,
         term: &mut Term,
     ) -> Result<bool> {
         if !self.config.passthrough
@@ -2353,7 +2792,7 @@ impl App {
     async fn settings_mouse(
         &mut self,
         mouse: MouseEvent,
-        writer: &mut OwnedWriteHalf,
+        writer: &mut Router,
         term: &mut Term,
     ) -> Result<()> {
         if !matches!(
@@ -2386,7 +2825,7 @@ impl App {
     async fn picker_mouse(
         &mut self,
         mouse: MouseEvent,
-        writer: &mut OwnedWriteHalf,
+        writer: &mut Router,
         term: &mut Term,
     ) -> Result<()> {
         if !matches!(
@@ -2425,16 +2864,22 @@ impl App {
         );
         let in_sidebar = mouse.column < content.x;
         let target = if in_sidebar && self.sidebar_mode == SidebarMode::Full {
-            let layout = self.layout.as_ref().expect("layout present");
-            let model =
-                render::sidebar_rows(layout, &self.collapsed, self.config.sidebar_agents_panel);
+            let model = render::sidebar_rows_for_endpoints(
+                &self.endpoint_layout_rows(),
+                &self.collapsed_by_endpoint,
+                self.config.sidebar_agents_panel,
+                &self.machine_rows(),
+            );
             let place = render::sidebar_layout(size.height, &model, self.navigate);
             render::sidebar_row_at(&model, &place, mouse.row)
                 .and_then(|(_, row)| row.target.clone())
-                .map(|target| match target {
-                    render::SidebarTarget::Workspace(id) => mode::MenuTarget::Workspace(id),
-                    render::SidebarTarget::Tab(id) => mode::MenuTarget::Tab(id),
-                    render::SidebarTarget::Pane(id) => mode::MenuTarget::Pane(id),
+                .and_then(|target| match target {
+                    render::SidebarTarget::Endpoint(_) | render::SidebarTarget::Scoped(_, _) => {
+                        None
+                    }
+                    render::SidebarTarget::Workspace(id) => Some(mode::MenuTarget::Workspace(id)),
+                    render::SidebarTarget::Tab(id) => Some(mode::MenuTarget::Tab(id)),
+                    render::SidebarTarget::Pane(id) => Some(mode::MenuTarget::Pane(id)),
                 })
         } else if in_sidebar && self.sidebar_mode == SidebarMode::Compact {
             let layout = self.layout.as_ref().expect("layout present");
@@ -2460,14 +2905,22 @@ impl App {
     // Focuses the workspace, tab, or pane behind a sidebar row.
     async fn activate_sidebar(
         &mut self,
-        writer: &mut OwnedWriteHalf,
+        writer: &mut Router,
         target: render::SidebarTarget,
     ) -> Result<()> {
-        write(writer, &sidebar_message(target)).await
+        match target {
+            render::SidebarTarget::Endpoint(id) => self.select_endpoint(id, writer),
+            render::SidebarTarget::Scoped(endpoint, inner) => {
+                self.select_endpoint(endpoint, writer);
+                write(writer, &sidebar_message(*inner)).await?;
+            }
+            target => write(writer, &sidebar_message(target)).await?,
+        }
+        Ok(())
     }
 
     // Runs the highlighted menu action and closes the menu.
-    async fn execute_menu(&mut self, writer: &mut OwnedWriteHalf) -> Result<()> {
+    async fn execute_menu(&mut self, writer: &mut Router) -> Result<()> {
         let menu = self.menu.take().expect("menu exists");
         if let mode::MenuTarget::Pane(id) = menu.target {
             write(writer, &ClientMessage::FocusPaneId { id }).await?;
@@ -2750,6 +3203,9 @@ fn expand_tilde(token: &str, home: Option<&Path>) -> PathBuf {
 // Selecting a sidebar row means focusing its workspace, tab, or pane.
 fn sidebar_message(target: render::SidebarTarget) -> ClientMessage {
     match target {
+        render::SidebarTarget::Endpoint(_) | render::SidebarTarget::Scoped(_, _) => {
+            unreachable!("endpoint targets are handled before encoding")
+        }
         render::SidebarTarget::Workspace(id) => ClientMessage::SelectWorkspace { id },
         render::SidebarTarget::Tab(id) => ClientMessage::SelectTab { id },
         render::SidebarTarget::Pane(id) => ClientMessage::FocusPaneId { id },
@@ -2757,11 +3213,8 @@ fn sidebar_message(target: render::SidebarTarget) -> ClientMessage {
 }
 
 // One encoded message per socket write keeps the framing newline-delimited.
-async fn write(writer: &mut OwnedWriteHalf, message: &ClientMessage) -> Result<()> {
-    writer
-        .write_all(&kodade_cli_proto::encode(message)?)
-        .await?;
-    Ok(())
+async fn write(writer: &mut Router, message: &ClientMessage) -> Result<()> {
+    writer.send(message.clone())
 }
 
 /// Status-bar color for a notification's state, matching the pane borders.
@@ -2806,7 +3259,6 @@ pub fn bytes(k: KeyEvent) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::io::AsyncReadExt;
 
     #[test]
     fn auto_hide_collapses_at_80_columns_and_restores_when_widened() {
@@ -2820,6 +3272,32 @@ mod tests {
         app.apply_auto_hide(120);
         assert_eq!(app.sidebar_mode, SidebarMode::Full);
         assert!(!app.auto_hidden);
+    }
+
+    #[test]
+    fn compact_view_auto_projects_only_narrow_terminals() {
+        let mut config = config::Config::default();
+        let app = App::new(
+            &config,
+            "compact-test",
+            PathBuf::from("/tmp/kodade-test.sock"),
+        );
+        assert!(app.compact_enabled(config::COMPACT_VIEW_AUTO_BELOW - 1));
+        assert!(!app.compact_enabled(config::COMPACT_VIEW_AUTO_BELOW));
+        config.compact_view = config::CompactViewMode::On;
+        let app = App::new(
+            &config,
+            "compact-test",
+            PathBuf::from("/tmp/kodade-test.sock"),
+        );
+        assert!(app.compact_enabled(200));
+        config.compact_view = config::CompactViewMode::Off;
+        let app = App::new(
+            &config,
+            "compact-test",
+            PathBuf::from("/tmp/kodade-test.sock"),
+        );
+        assert!(!app.compact_enabled(1));
     }
 
     #[test]
@@ -2919,8 +3397,7 @@ mod tests {
         )
         .unwrap();
 
-        let (client, mut daemon) = tokio::net::UnixStream::pair().unwrap();
-        let (_, mut writer) = client.into_split();
+        let (mut writer, mut daemon) = test_router();
         assert_eq!(
             app.activate_palette(
                 palette::PaletteTarget::Agent {
@@ -2934,22 +3411,20 @@ mod tests {
             .unwrap(),
             Flow::Continue
         );
-        let mut message = vec![0; 1024];
-        let count = daemon.read(&mut message).await.unwrap();
+        let message = daemon.recv().await.unwrap();
         assert!(matches!(
-            kodade_cli_proto::decode::<ClientMessage>(&message[..count - 1]).unwrap(),
+            message,
             ClientMessage::NewPane { command: Some(command), name: Some(name), .. }
                 if command == vec!["codex"] && name == "Codex"
         ));
 
-        let (client, mut daemon) = tokio::net::UnixStream::pair().unwrap();
-        let (_, mut writer) = client.into_split();
+        let (mut writer, mut daemon) = test_router();
         app.activate_palette(palette::PaletteTarget::Shell, &mut writer, &mut term)
             .await
             .unwrap();
-        let count = daemon.read(&mut message).await.unwrap();
+        let message = daemon.recv().await.unwrap();
         assert!(matches!(
-            kodade_cli_proto::decode::<ClientMessage>(&message[..count - 1]).unwrap(),
+            message,
             ClientMessage::NewPane {
                 command: None,
                 name: None,
@@ -2978,8 +3453,7 @@ mod tests {
             PathBuf::from("/tmp/kodade-test.sock"),
         );
         app.center = Some(CenterOverlay::Palette(palette::Palette::new(&config)));
-        let (client, daemon) = tokio::net::UnixStream::pair().unwrap();
-        let (_, mut writer) = client.into_split();
+        let (mut writer, mut daemon) = test_router();
 
         app.handle_paste_event("codex".into(), &mut writer)
             .await
@@ -2992,11 +3466,7 @@ mod tests {
             palette.current_target(),
             Some(palette::PaletteTarget::Agent { .. })
         ));
-        let mut bytes = [0; 1];
-        assert!(matches!(
-            daemon.try_read(&mut bytes),
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
-        ));
+        assert!(daemon.try_recv().is_err());
     }
 
     #[tokio::test]
@@ -3007,8 +3477,7 @@ mod tests {
         palette.overlay.filter = Some("detach".into());
         palette.apply_filter();
         app.center = Some(CenterOverlay::Palette(palette));
-        let (client, _daemon) = tokio::net::UnixStream::pair().unwrap();
-        let (_, mut writer) = client.into_split();
+        let (mut writer, _daemon) = test_router();
         let mut term = Terminal::with_options(
             CrosstermBackend::new(std::io::stdout()),
             ratatui::TerminalOptions {
@@ -3025,6 +3494,113 @@ mod tests {
         );
     }
 
+    fn test_router() -> (Router, mpsc::Receiver<ClientMessage>) {
+        let (tx, rx) = mpsc::channel(8);
+        let mut router = Router::new(EndpointId::Local);
+        router.register(EndpointId::Local, tx);
+        router.mark_online(EndpointId::Local);
+        (router, rx)
+    }
+
+    #[tokio::test]
+    async fn cached_sidebar_target_routes_colliding_pane_to_owning_endpoint() {
+        let config = config::Config::default();
+        let mut app = App::new(
+            &config,
+            "sidebar-route-test",
+            PathBuf::from("/tmp/kodade-test.sock"),
+        );
+        let (local_tx, mut local_rx) = mpsc::channel(8);
+        let (remote_tx, mut remote_rx) = mpsc::channel(8);
+        let remote = EndpointId::Machine("m1".into());
+        let mut router = Router::new(EndpointId::Local);
+        router.register(EndpointId::Local, local_tx);
+        router.register(remote.clone(), remote_tx);
+        router.mark_online(EndpointId::Local);
+        router.mark_online(remote.clone());
+
+        app.activate_sidebar(
+            &mut router,
+            render::SidebarTarget::Scoped(
+                remote.clone(),
+                Box::new(render::SidebarTarget::Pane(PaneId(1))),
+            ),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(router.selected(), &remote);
+        assert_eq!(
+            remote_rx.recv().await,
+            Some(ClientMessage::FocusPaneId { id: PaneId(1) })
+        );
+        assert!(local_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn background_notifications_with_colliding_panes_replay_per_endpoint() {
+        let config = config::Config::default();
+        let mut app = App::new(
+            &config,
+            "notification-route-test",
+            PathBuf::from("/tmp/kodade-test.sock"),
+        );
+        let remote = EndpointId::Machine("m1".into());
+        let mut live = layout_named(&["remote"]);
+        live.workspaces[0]
+            .tabs
+            .push(kodade_cli_proto::SidebarTabInfo {
+                id: kodade_cli_proto::TabId(1),
+                name: "agents".into(),
+                state: AgentStateKind::Blocked,
+                agents: vec![kodade_cli_proto::AgentInfo {
+                    pane: PaneId(1),
+                    name: "agent".into(),
+                    state: AgentStateKind::Blocked,
+                    state_age_secs: 0,
+                }],
+            });
+        app.endpoint_layouts.insert(remote.clone(), live);
+        app.endpoint_contexts.insert(
+            remote.clone(),
+            ("remote".into(), PathBuf::from("/tmp/remote.sock")),
+        );
+        let notification = Notification {
+            pane: PaneId(1),
+            workspace: WorkspaceId(1),
+            tab: kodade_cli_proto::TabId(1),
+            agent: "agent".into(),
+            state: AgentStateKind::Blocked,
+            seq: 1,
+        };
+        app.notifier.record_unseen(&notification);
+        app.pending_notifications
+            .insert(remote.clone(), vec![notification.clone()]);
+
+        let (local_tx, mut local_rx) = mpsc::channel(8);
+        let (remote_tx, mut remote_rx) = mpsc::channel(8);
+        let mut router = Router::new(EndpointId::Local);
+        router.register(EndpointId::Local, local_tx);
+        router.register(remote.clone(), remote_tx);
+        router.mark_online(EndpointId::Local);
+        router.mark_online(remote.clone());
+
+        app.select_endpoint(remote.clone(), &mut router);
+        app.notification_jump(&mut router).await.unwrap();
+        assert_eq!(
+            remote_rx.recv().await,
+            Some(ClientMessage::FocusPaneId { id: PaneId(1) })
+        );
+        assert!(local_rx.try_recv().is_err());
+
+        app.select_endpoint(EndpointId::Local, &mut router);
+        app.notification_jump(&mut router).await.unwrap();
+        assert_eq!(
+            local_rx.recv().await,
+            Some(ClientMessage::FocusPaneId { id: PaneId(1) })
+        );
+    }
+
     #[tokio::test]
     async fn remote_palette_plugin_action_is_explicitly_local_only() {
         let config = config::Config::default();
@@ -3037,8 +3613,7 @@ mod tests {
             },
         )
         .unwrap();
-        let (client, daemon) = tokio::net::UnixStream::pair().unwrap();
-        let (_, mut writer) = client.into_split();
+        let (mut writer, mut daemon) = test_router();
         app.activate_palette(
             palette::PaletteTarget::PluginAction {
                 plugin: "demo".into(),
@@ -3053,10 +3628,7 @@ mod tests {
         .await
         .unwrap();
         assert!(app.note().unwrap().0.contains("local-only"));
-        let mut bytes = [0; 1];
-        assert!(
-            matches!(daemon.try_read(&mut bytes), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
-        );
+        assert!(daemon.try_recv().is_err());
     }
 
     // A layout with the named workspaces; workspace i gets `WorkspaceId(i+1)`.

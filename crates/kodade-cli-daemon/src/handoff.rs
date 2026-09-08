@@ -93,7 +93,7 @@ impl MasterPty for ImportedMaster {
 pub(crate) const HANDOFF_VERSION: u32 = 1;
 pub(crate) const MAX_HANDOFF_FDS: usize = 64;
 const MAX_TOKEN_BYTES: usize = 256;
-const MAX_MANIFEST_BYTES: usize = 1024 * 1024;
+pub(crate) const MAX_MANIFEST_BYTES: usize = 128 * 1024 * 1024;
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Runtime data reconstructed beside a transferred PTY. `history_ansi` is
@@ -108,6 +108,8 @@ pub(crate) struct PaneRuntime {
     pub(crate) start_identity: Option<String>,
     #[serde(default)]
     pub(crate) title: String,
+    #[serde(default)]
+    pub(crate) terminal_title: String,
     #[serde(default)]
     pub(crate) spawn_command: Option<Vec<String>>,
     #[serde(default)]
@@ -125,6 +127,18 @@ pub(crate) struct PaneRuntime {
     pub(crate) screen_ansi: Vec<u8>,
     #[serde(default)]
     pub(crate) history_ansi: String,
+    #[serde(default)]
+    pub(crate) graphics: crate::graphics::HandoffState,
+    #[serde(default)]
+    pub(crate) agent_generation: u64,
+    #[serde(default)]
+    pub(crate) activity_revision: u64,
+    #[serde(default)]
+    pub(crate) output_age_ms: u64,
+    #[serde(default)]
+    pub(crate) hook_age_ms: u64,
+    #[serde(default)]
+    pub(crate) state_age_ms: u64,
 }
 
 /// Independently versioned handoff manifest.
@@ -134,6 +148,10 @@ pub(crate) struct HandoffManifest {
     pub(crate) protocol_version: u32,
     pub(crate) session: SessionFile,
     pub(crate) panes: Vec<PaneRuntime>,
+    #[serde(default)]
+    pub(crate) attachments: Option<crate::image_paste::Directory>,
+    #[serde(default)]
+    pub(crate) notify_seq: u64,
 }
 
 impl HandoffManifest {
@@ -146,6 +164,8 @@ impl HandoffManifest {
             protocol_version: PROTOCOL_VERSION,
             session,
             panes,
+            attachments: None,
+            notify_seq: 0,
         })
     }
 
@@ -158,6 +178,20 @@ impl HandoffManifest {
         }
         if self.panes.len() > MAX_HANDOFF_FDS {
             return Err(data("handoff contains too many PTYs"));
+        }
+        for pane in &self.panes {
+            if pane.rows == 0
+                || pane.cols == 0
+                || pane.rows > 512
+                || pane.cols > 512
+                || pane.screen_ansi.len() > 128 * 1024
+                || pane.history_ansi.len() > 64 * 1024
+            {
+                return Err(data("handoff pane exceeds terminal replay limits"));
+            }
+            pane.graphics
+                .validate()
+                .map_err(|error| data(&error.to_string()))?;
         }
         // Layout validation belongs to the importer, after it has accepted the
         // transport. Keeping it out of this boundary lets a new daemon report
@@ -176,9 +210,6 @@ pub(crate) struct ReceivedHandoff {
 /// Bind a temporary private endpoint. This must never be the public or hook
 /// socket alias; callers keep those paths until their final commit.
 pub(crate) fn bind_listener(path: &Path) -> io::Result<UnixListener> {
-    if path.exists() {
-        fs::remove_file(path)?;
-    }
     let listener = UnixListener::bind(path)?;
     fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
     listener.set_nonblocking(true)?;
@@ -261,6 +292,21 @@ pub(crate) fn wait_committed(stream: &mut UnixStream) -> io::Result<()> {
         Ok(())
     } else {
         Err(data("handoff importer did not commit"))
+    }
+}
+
+/// Final transfer of read and cleanup ownership. Until this succeeds, a
+/// prepared target remains paused and the source may roll the transaction back.
+pub(crate) fn release(stream: &mut UnixStream) -> io::Result<()> {
+    stream.write_all(b"released\n")?;
+    stream.flush()
+}
+
+pub(crate) fn wait_release(stream: &mut UnixStream) -> io::Result<()> {
+    if line(stream, 32)? == "released" {
+        Ok(())
+    } else {
+        Err(data("handoff source did not release ownership"))
     }
 }
 
@@ -364,7 +410,11 @@ pub(crate) fn recv_fds(stream: &UnixStream, expected: usize) -> io::Result<Vec<R
     message.msg_iovlen = 1;
     message.msg_control = control.as_mut_ptr() as *mut _;
     message.msg_controllen = control.len();
-    let read = unsafe { libc::recvmsg(stream.as_raw_fd(), &mut message, libc::MSG_CMSG_CLOEXEC) };
+    #[cfg(target_os = "linux")]
+    let flags = libc::MSG_CMSG_CLOEXEC;
+    #[cfg(not(target_os = "linux"))]
+    let flags = 0;
+    let read = unsafe { libc::recvmsg(stream.as_raw_fd(), &mut message, flags) };
     if read < 0 {
         return Err(io::Error::last_os_error());
     }
@@ -410,7 +460,7 @@ fn ancillary_fds(message: &libc::msghdr) -> Vec<RawFd> {
 fn manifest_bytes(manifest: &HandoffManifest) -> io::Result<Vec<u8>> {
     let bytes = serde_json::to_vec(manifest).map_err(io::Error::other)?;
     if bytes.len() > MAX_MANIFEST_BYTES {
-        return Err(input("handoff manifest exceeds 1 MiB"));
+        return Err(input("handoff manifest exceeds 128 MiB"));
     }
     Ok(bytes)
 }
@@ -425,7 +475,7 @@ fn read_frame(stream: &mut UnixStream) -> io::Result<Vec<u8>> {
     stream.read_exact(&mut prefix)?;
     let size = u32::from_be_bytes(prefix) as usize;
     if size > MAX_MANIFEST_BYTES {
-        return Err(data("handoff manifest exceeds 1 MiB"));
+        return Err(data("handoff manifest exceeds 128 MiB"));
     }
     let mut bytes = vec![0; size];
     stream.read_exact(&mut bytes)?;
