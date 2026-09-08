@@ -7,7 +7,7 @@ use std::{
     fs,
     io::{self, Read, Write},
     os::{
-        fd::{AsRawFd, RawFd},
+        fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
         unix::{
             fs::PermissionsExt,
             net::{UnixListener, UnixStream},
@@ -18,7 +18,77 @@ use std::{
 };
 
 use kodade_cli_proto::{SessionFile, PROTOCOL_VERSION};
+use portable_pty::{MasterPty, PtySize};
 use serde::{Deserialize, Serialize};
+
+/// Master adapter for a descriptor received over SCM_RIGHTS.
+pub(crate) struct ImportedMaster {
+    file: fs::File,
+    writer_taken: std::sync::atomic::AtomicBool,
+}
+
+impl ImportedMaster {
+    pub(crate) unsafe fn from_raw_fd(fd: RawFd) -> Self {
+        Self {
+            file: fs::File::from(OwnedFd::from_raw_fd(fd)),
+            writer_taken: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+}
+
+impl MasterPty for ImportedMaster {
+    fn resize(&self, size: PtySize) -> anyhow::Result<()> {
+        let size = libc::winsize {
+            ws_row: size.rows,
+            ws_col: size.cols,
+            ws_xpixel: size.pixel_width,
+            ws_ypixel: size.pixel_height,
+        };
+        if unsafe { libc::ioctl(self.file.as_raw_fd(), libc::TIOCSWINSZ, &size) } != 0 {
+            anyhow::bail!(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+    fn get_size(&self) -> anyhow::Result<PtySize> {
+        let mut size = libc::winsize {
+            ws_row: 0,
+            ws_col: 0,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        if unsafe { libc::ioctl(self.file.as_raw_fd(), libc::TIOCGWINSZ, &mut size) } != 0 {
+            anyhow::bail!(io::Error::last_os_error());
+        }
+        Ok(PtySize {
+            rows: size.ws_row,
+            cols: size.ws_col,
+            pixel_width: size.ws_xpixel,
+            pixel_height: size.ws_ypixel,
+        })
+    }
+    fn try_clone_reader(&self) -> anyhow::Result<Box<dyn Read + Send>> {
+        Ok(Box::new(self.file.try_clone()?))
+    }
+    fn take_writer(&self) -> anyhow::Result<Box<dyn Write + Send>> {
+        if self
+            .writer_taken
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            anyhow::bail!("cannot take PTY writer more than once");
+        }
+        Ok(Box::new(self.file.try_clone()?))
+    }
+    fn process_group_leader(&self) -> Option<libc::pid_t> {
+        let pid = unsafe { libc::tcgetpgrp(self.file.as_raw_fd()) };
+        (pid > 0).then_some(pid)
+    }
+    fn as_raw_fd(&self) -> Option<RawFd> {
+        Some(self.file.as_raw_fd())
+    }
+    fn tty_name(&self) -> Option<std::path::PathBuf> {
+        None
+    }
+}
 
 pub(crate) const HANDOFF_VERSION: u32 = 1;
 pub(crate) const MAX_HANDOFF_FDS: usize = 64;
@@ -34,6 +104,25 @@ pub(crate) struct PaneRuntime {
     pub(crate) child_pid: i32,
     pub(crate) rows: u16,
     pub(crate) cols: u16,
+    #[serde(default)]
+    pub(crate) start_identity: Option<String>,
+    #[serde(default)]
+    pub(crate) title: String,
+    #[serde(default)]
+    pub(crate) spawn_command: Option<Vec<String>>,
+    #[serde(default)]
+    pub(crate) cwd: Option<std::path::PathBuf>,
+    #[serde(default)]
+    pub(crate) agent_identity: Option<String>,
+    #[serde(default)]
+    pub(crate) hook_state: Option<kodade_cli_proto::AgentStateKind>,
+    #[serde(default)]
+    pub(crate) hook_source: Option<String>,
+    #[serde(default)]
+    pub(crate) state: Option<kodade_cli_proto::AgentStateKind>,
+    /// Bounded formatted active screen; this is replayed into a fresh parser.
+    #[serde(default)]
+    pub(crate) screen_ansi: Vec<u8>,
     #[serde(default)]
     pub(crate) history_ansi: String,
 }
@@ -213,7 +302,7 @@ pub(crate) fn close_fds(fds: impl IntoIterator<Item = RawFd>) {
     }
 }
 
-fn recv_fds(stream: &UnixStream, expected: usize) -> io::Result<Vec<RawFd>> {
+pub(crate) fn recv_fds(stream: &UnixStream, expected: usize) -> io::Result<Vec<RawFd>> {
     if expected > MAX_HANDOFF_FDS {
         return Err(data("handoff contains too many PTYs"));
     }

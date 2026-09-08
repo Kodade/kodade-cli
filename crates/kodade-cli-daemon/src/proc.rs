@@ -33,6 +33,24 @@ pub fn command_of(pid: i32) -> Option<String> {
     parse_ps_args(&String::from_utf8_lossy(&output.stdout))
 }
 
+/// Kernel start-time identity for a PID. A daemon that adopts a PTY cannot
+/// `waitpid` its original child, so later cleanup compares this value before
+/// signalling a potentially reused PID.
+pub fn start_identity(pid: i32) -> Option<String> {
+    #[cfg(target_os = "linux")]
+    {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        let end = stat.rfind(')')?;
+        let ticks = stat[end + 2..].split_whitespace().nth(19)?;
+        Some(ticks.to_owned())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
 /// Program basename for detection: strips the path and any login-shell `-`
 /// prefix (argv0 of a login shell is reported as `-zsh`).
 pub fn process_basename(command: &str) -> Option<String> {
