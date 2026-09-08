@@ -9,8 +9,6 @@ try {
     New-Item -ItemType Directory -Force -Path $package | Out-Null
     Copy-Item $Binary (Join-Path $package 'kodade-cli.exe')
     $zip = Join-Path $root $name; Compress-Archive -Path $package -DestinationPath $zip
-    Add-Type -AssemblyName System.IO.Compression.FileSystem
-    $diagnostic = [IO.Compression.ZipFile]::OpenRead($zip); try { Write-Host "fixture ZIP entries: $($diagnostic.Entries.FullName -join ', ')" } finally { $diagnostic.Dispose() }
     $sums = Join-Path $root SHA256SUMS
     "$(Get-FileHash -Algorithm SHA256 $zip | Select-Object -Expand Hash)  $name" | Set-Content $sums
     $metadata = @{ tag_name = "v$version"; prerelease = $false; assets = @(@{ name = $name; browser_download_url = 'https://fixture.test/zip' }, @{ name = 'SHA256SUMS'; browser_download_url = 'https://fixture.test/sums' }) }

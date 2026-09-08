@@ -40,10 +40,12 @@ try {
     $archive = [IO.Compression.ZipFile]::OpenRead($zipPath)
     try {
         if ($archive.Entries.Count -gt 5) { throw 'Release archive has too many entries.' }
-        $exe = @($archive.Entries | Where-Object { $_.FullName -eq "kodade-cli-$version-x86_64-pc-windows-msvc/kodade-cli.exe" })
+        $rootName = "kodade-cli-$version-x86_64-pc-windows-msvc"
+        $exe = @($archive.Entries | Where-Object { ($_.FullName -replace '\\', '/') -eq "$rootName/kodade-cli.exe" })
         if ($exe.Count -ne 1 -or $exe[0].Length -le 0 -or $exe[0].Length -gt 100MB) { throw 'Release archive does not contain one bounded kodade-cli.exe.' }
         foreach ($entry in $archive.Entries) {
-            if ($entry.FullName -match '(^|/|\\)\.\.($|/|\\)' -or $entry.FullName.StartsWith('/') -or $entry.FullName -match '^[A-Za-z]:' -or $entry.FullName -notmatch ('^kodade-cli-' + [regex]::Escape($version) + '-x86_64-pc-windows-msvc/(kodade-cli\.exe|LICENSE|NOTICE|README\.md)$')) { throw 'Release archive contains an unexpected or unsafe path.' }
+            $entryName = $entry.FullName -replace '\\', '/'
+            if ($entryName -match '(^|/)\.\.($|/)' -or $entryName.StartsWith('/') -or $entryName -match '^[A-Za-z]:' -or $entryName -notmatch ('^' + [regex]::Escape($rootName) + '/(kodade-cli\.exe|LICENSE|NOTICE|README\.md)$')) { throw 'Release archive contains an unexpected or unsafe path.' }
         }
         $candidate = Join-Path $temp 'kodade-cli.exe'
         $input = $exe[0].Open(); $output = [IO.File]::Create($candidate); $copied = 0; $buffer = New-Object byte[] 65536
