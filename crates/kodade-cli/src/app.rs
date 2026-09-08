@@ -2466,6 +2466,13 @@ impl App {
             settings::Setting::Theme => {
                 let config = self.config.clone();
                 self.apply_theme(&config);
+                write(
+                    writer,
+                    &ClientMessage::SetTerminalColors {
+                        colors: self.theme_colors(),
+                    },
+                )
+                .await?;
                 if config.theme == config::ThemeChoice::Auto {
                     self.set_note(" auto resolves on next start");
                 }
@@ -3559,7 +3566,12 @@ fn sidebar_message(target: render::SidebarTarget) -> ClientMessage {
 
 // One encoded message per socket write keeps the framing newline-delimited.
 async fn write(writer: &mut Router, message: &ClientMessage) -> Result<()> {
-    writer.send(message.clone())
+    if matches!(message, ClientMessage::SetTerminalColors { .. }) {
+        writer.broadcast(message.clone());
+        Ok(())
+    } else {
+        writer.send(message.clone())
+    }
 }
 
 /// Status-bar color for a notification's state, matching the pane borders.

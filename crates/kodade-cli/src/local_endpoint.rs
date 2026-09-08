@@ -26,6 +26,20 @@ pub struct Viewport {
     pub colors: Option<kodade_cli_proto::TerminalColors>,
 }
 
+impl Viewport {
+    pub(crate) fn apply(&mut self, message: &ClientMessage) {
+        match message {
+            ClientMessage::Resize { cols, rows } => {
+                self.cols = *cols;
+                self.rows = *rows;
+            }
+            ClientMessage::SetCompactView { enabled } => self.compact = *enabled,
+            ClientMessage::SetTerminalColors { colors } => self.colors = colors.clone(),
+            _ => {}
+        }
+    }
+}
+
 pub fn spawn(
     mut connection: Connection,
     mut socket: PathBuf,
@@ -40,11 +54,7 @@ pub fn spawn(
                 tokio::select! {
                     message = commands.recv() => {
                         let Some(message) = message else { return Ok(()); };
-                        match message {
-                            ClientMessage::Resize { cols, rows } => { viewport.cols = cols; viewport.rows = rows; }
-                            ClientMessage::SetCompactView { enabled } => viewport.compact = enabled,
-                            _ => {}
-                        }
+                        viewport.apply(&message);
                         tokio::time::timeout(Duration::from_secs(5), connection.writer.write_all(&encode(&message)?))
                             .await.context("local write timed out")??;
                     }
@@ -55,24 +65,16 @@ pub fn spawn(
                             ServerMessage::Upgrading => {
                                 updates.send(Update::EndpointFailed { reason: "daemon upgrading; reconnecting".into() }).await?;
                                 // Requests queued against the retired connection must never be
-                                // replayed into a newly selected pane. Retain only viewport state.
+                                // replayed into a newly selected pane. Retain viewport state.
                                 while let Ok(message) = commands.try_recv() {
-                                    match message {
-                                        ClientMessage::Resize { cols, rows } => { viewport.cols = cols; viewport.rows = rows; }
-                                        ClientMessage::SetCompactView { enabled } => viewport.compact = enabled,
-                                        _ => {}
-                                    }
+                                    viewport.apply(&message);
                                 }
                                 let (replacement, session) = reconnect(&socket, &viewport, &view).await?;
                                 connection = replacement;
                                 // The UI may have queued input before it processed the offline
-                                // notice. Discard it after reconnect too, retaining resize only.
+                                // notice. Discard it after reconnect too, retaining viewport state.
                                 while let Ok(message) = commands.try_recv() {
-                                    match message {
-                                        ClientMessage::Resize { cols, rows } => { viewport.cols = cols; viewport.rows = rows; }
-                                        ClientMessage::SetCompactView { enabled } => viewport.compact = enabled,
-                                        _ => {}
-                                    }
+                                    viewport.apply(&message);
                                 }
                                 connection.writer.write_all(&encode(&ClientMessage::Resize { cols: viewport.cols, rows: viewport.rows })?).await?;
                                 connection.writer.write_all(&encode(&ClientMessage::SetCompactView { enabled: viewport.compact })?).await?;
