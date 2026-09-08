@@ -42,6 +42,7 @@ with tempfile.TemporaryDirectory(prefix="kodade-smoke-") as directory:
         workspace = run("new", "-w", "smoke", str(root)).stdout.strip()
         assert workspace.isdigit()
         assert socket.exists()
+        assert json.loads(run("ls", "--json").stdout)["active_workspace"] == int(workspace)
         pane = run("run", "--name", "probe", "--", "sh", "-c",
                    "printf 'KODADE_SMOKE_OK\\n'; exec sleep 30").stdout.strip()
         deadline = time.monotonic() + 4
@@ -51,6 +52,12 @@ with tempfile.TemporaryDirectory(prefix="kodade-smoke-") as directory:
         report = json.loads(run("doctor", "--json").stdout)
         assert next(check for check in report["checks"] if check["name"] == "daemon")["status"] == "ok"
         assert run("-s", "../outside", "session", "path", success=False).returncode != 0
+
+        # Targeting across one-shot connections must preserve the CLI script selection.
+        other = run("run", "--name", "other", "--", "sh", "-c", "sleep 30").stdout.strip()
+        run("pane", "kill", pane)
+        run("pane", "read", other)
+        assert run("pane", "read", pane, success=False).returncode != 0
 
         # Agent start also creates a missing session, and `current` cannot cross sockets.
         cold = run("-s", "cold-agent", "agent", "start", "--name", "cold", "--",

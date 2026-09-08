@@ -24,6 +24,10 @@ the second.
 - The daemon answers every request on the same connection, in order. Most
   messages are answered with a `Layout` snapshot; the exceptions are listed
   below.
+- Each connection that sends `Hello` owns its selected workspace, selected tab, focused pane, and
+  scrollback offsets. These are transient client-view state: closing a socket
+  drops them and never changes another connection's view or the persisted
+  session default.
 - Unknown fields are ignored on read, so a newer daemon can add fields without
   breaking an older client. An unknown *variant* is a decode error and closes
   the connection.
@@ -119,6 +123,21 @@ payload is one ordered PTY submission and is capped at 64 KiB.
 The check uses a fresh foreground-process probe; a process may still exit in
 the kernel interval between that probe and the PTY write, so automation should
 surface the command's result and retry only after resolving the target again.
+
+Only `Hello` establishes an independent interactive view. Connections that
+have not sent `Hello` use the persisted script selection, so a CLI `FocusPaneId`
+followed by an action on a fresh socket preserves its targeting behavior.
+
+`Hello` and `Resize` record the connection's requested dimensions. A shared
+PTY has one physical size, so the client that most recently sends a
+view-changing request owns that PTY geometry until another client interacts.
+Read-only queries never resize PTYs. This is intentional last-interacting
+arbitration: clients retain independent selections and scrollback while an
+interactive terminal application sees one stable size at a time.
+
+An `Error` rejects that request without changing the session. Attached clients
+remain connected after recoverable command errors and may issue another
+request; one-shot command clients can still treat the `Error` reply as failure.
 
 ## Server messages
 
