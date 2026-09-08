@@ -72,6 +72,9 @@ try {
     if (-not ((Test-Path $resultPath) -and ((Get-Content -LiteralPath $resultPath -Raw).Trim() -eq "$expected"))) {
         throw "computed ConPTY result did not appear; pane contents: $lastScreen"
     }
+    Wait-Until 'computed ConPTY result rendered in the pane' {
+        (Invoke-Native $bin @('--session', $session, 'pane', 'read', $pane)) -match "$expected"
+    } 10
 
     Write-Host 'checking exited ConPTY child'
     $exitedPane = (Invoke-Native $bin @('--session', $session, 'run', '--', 'cmd.exe', '/C', 'echo KODADE_WINDOWS_CHILD_EXIT_OK')).Trim()
