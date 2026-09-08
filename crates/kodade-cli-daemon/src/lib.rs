@@ -3528,7 +3528,18 @@ impl Pane {
                     .unwrap_or("sh")
                     .to_owned()
             });
+        #[cfg(unix)]
         let mut command = CommandBuilder::new(&shell);
+        #[cfg(windows)]
+        let mut command = if let Some(args) = &run {
+            let mut command = CommandBuilder::new(&args[0]);
+            for arg in &args[1..] {
+                command.arg(arg);
+            }
+            command
+        } else {
+            CommandBuilder::new(&shell)
+        };
         #[cfg(unix)]
         command.arg("-l");
         // Commands run through the login shell so agent CLIs keep their env and
@@ -3538,11 +3549,6 @@ impl Pane {
             {
                 command.arg("-c");
                 command.arg(format!("exec {}", proc::shell_command(args)));
-            }
-            #[cfg(windows)]
-            {
-                command.arg("/C");
-                command.arg(proc::shell_command(args));
             }
         }
         if let Some(dir) = &cwd {
