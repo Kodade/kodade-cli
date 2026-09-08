@@ -230,6 +230,9 @@ impl HandoffManifest {
             {
                 return Err(data("handoff pane exceeds terminal replay limits"));
             }
+            pane.terminal_colors
+                .validate()
+                .map_err(|error| data(&error.to_string()))?;
             pane.graphics
                 .validate()
                 .map_err(|error| data(&error.to_string()))?;
