@@ -9,6 +9,7 @@ import pty
 import select
 import shlex
 import shutil
+import signal
 import struct
 import subprocess
 import sys
@@ -87,11 +88,14 @@ finally:
     def raw(path):
         return path.read_bytes() if path.exists() else b""
 
-    def expect_bytes(label, path, expected):
+    def expect_bytes(label, path, expected, context=None):
         try:
             wait_for(label, lambda: raw(path) == expected)
         except RuntimeError as error:
-            raise RuntimeError(f"{error}: got {raw(path).hex()}, expected {expected.hex()}") from error
+            details = f"{error}: got {raw(path).hex()}, expected {expected.hex()}"
+            if context is not None:
+                details += f"; {context()}"
+            raise RuntimeError(details) from error
         assert path.with_suffix(".hex").read_text() == expected.hex()
 
     master = slave = None
@@ -139,16 +143,35 @@ finally:
             os.write(master, sequence)
             drain()
 
+        def keyboard_context():
+            try:
+                state = [
+                    {
+                        "id": pane["id"],
+                        "focused": pane["focused"],
+                        "keyboard": pane["screen"]["keyboard"],
+                    }
+                    for pane in panes()
+                ]
+            except Exception as error:
+                state = f"pane query failed: {error}"
+            return f"transcript tail={transcript[-1024:].hex()}, panes={state}"
+
         wait_for("Crossterm keyboard query", lambda: (drain() is None) and replied[0])
         wait_for("Crossterm enhanced push", lambda: (drain() is None) and b"\x1b[>11u" in transcript)
         wait_for("TUI attach", lambda: (drain() is None) and b"?2004h" in transcript)
+        # TerminalModes enters raw mode before App::run receives the opening
+        # daemon layout. On macOS the first host input can arrive in that gap.
+        # The rendered status bar proves the client has both attached and drawn
+        # the session it is about to drive.
+        wait_for("initial TUI frame", lambda: (drain() is None) and b"keyboard-tui \xc2\xb7 main" in transcript)
 
         # Ctrl character, repeat, and release cross host -> TUI -> daemon -> real child once.
         host_key(b"\x1b[99;5u")
         host_key(b"\x1b[99;5:2u")
         host_key(b"\x1b[99;5:3u")
         expect_bytes("Ctrl-c press/repeat/release", first_raw,
-                     b"\x1b[99;5u\x1b[99;5:2u\x1b[99;5:3u")
+                     b"\x1b[99;5u\x1b[99;5:2u\x1b[99;5:3u", keyboard_context)
 
         # Unmodified text and Shift+Enter retain their documented flag-3 behavior:
         # text is plain, neither text nor Enter gets a release without flag 8.
@@ -227,8 +250,26 @@ finally:
     finally:
         (root / "stop").touch()
         if tui is not None and tui.poll() is None:
-            tui.kill()
-            tui.wait(timeout=3)
+            # The controlling-terminal process owns its own session. End that
+            # process group so a failed smoke never leaves the CI job's PTY
+            # owner behind; escalate instead of extending an arbitrary wait.
+            try:
+                os.killpg(tui.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            try:
+                tui.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(tui.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                try:
+                    tui.wait(timeout=3)
+                except subprocess.TimeoutExpired as error:
+                    if sys.exc_info()[0] is None:
+                        raise RuntimeError("could not terminate keyboard TUI process group") from error
+                    print("keyboard TUI cleanup timed out after TERM/KILL", file=sys.stderr)
         if master is not None:
             os.close(master)
         if slave is not None:
