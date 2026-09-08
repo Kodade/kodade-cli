@@ -710,6 +710,16 @@ pub struct ImagePlacement {
 /// Persisted-session file version understood by this build (#9).
 pub const SESSION_FILE_VERSION: u32 = 1;
 
+/// Settings shared by the client and daemon from `[session]` in config.toml.
+/// Both features are opt-in because they can retain terminal data.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionSettings {
+    #[serde(default)]
+    pub resume_agents: bool,
+    #[serde(default)]
+    pub pane_history: bool,
+}
+
 /// A persisted session layout. Lives in the proto crate because it travels on
 /// the wire too (`layout export` / `layout apply`, #16). Unknown fields are
 /// ignored and every field has a default so a partially written or older file

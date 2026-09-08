@@ -3,6 +3,7 @@
 mod agent;
 mod git;
 mod graphics;
+mod history;
 mod image_paste;
 pub use image_paste::{validate_png, MAX_IMAGE_BYTES};
 mod layout;
@@ -56,6 +57,9 @@ struct Session {
     /// Kept on `Session` (not `SessionState`) so `notify` can bump it without
     /// re-locking state — several handlers call `notify` while holding the lock.
     layout_generation: AtomicU64,
+    /// Bumped by PTY output. Only the opt-in history loop observes this.
+    output_generation: Arc<AtomicU64>,
+    pane_history: bool,
     /// True from a cold restore until the first client `Hello`; surfaced as
     /// `LayoutSnapshot.restored` so `ls` can print `(restored)`.
     restored: AtomicBool,
@@ -358,6 +362,11 @@ pub async fn run(session_name: String) -> Result<()> {
     let mut shutdown = session.shutdown.subscribe();
     // Debounced layout persistence runs alongside the accept loop.
     tokio::spawn(persist_loop(Arc::clone(&session)));
+    if session.pane_history {
+        tokio::spawn(history_loop(Arc::clone(&session)));
+    } else {
+        history::remove_for_session(&session.session_name());
+    }
     // Keeps agent detection running for event subscribers with no TUI attached.
     tokio::spawn(subscriber_tick(Arc::clone(&session)));
     // Flush state on SIGTERM so a stopped daemon (e.g. logout) can be restored.
@@ -442,6 +451,27 @@ async fn persist_loop(session: Arc<Session>) {
     }
 }
 
+/// Persist a bounded replay at most every two seconds after output or layout
+/// changes. Layout persistence remains independent and never writes terminal
+/// text by default.
+async fn history_loop(session: Arc<Session>) {
+    let mut saved = (0, 0);
+    loop {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let current = (
+            session.output_generation.load(Ordering::Relaxed),
+            session.layout_generation.load(Ordering::Relaxed),
+        );
+        if current == saved {
+            continue;
+        }
+        match session.save_history() {
+            Ok(()) => saved = current,
+            Err(error) => eprintln!("Ködade CLI could not persist pane history: {error:#}"),
+        }
+    }
+}
+
 async fn remove_stale_socket(socket: &Path) -> Result<()> {
     if let Ok(Ok(_)) =
         tokio::time::timeout(Duration::from_millis(250), UnixStream::connect(socket)).await
@@ -487,6 +517,8 @@ impl Session {
             size: Mutex::new((cols, rows)),
             manifests: Mutex::new(manifest::load()?),
             layout_generation: AtomicU64::new(0),
+            output_generation: Arc::new(AtomicU64::new(0)),
+            pane_history: persist::session_settings().pane_history,
             restored: AtomicBool::new(false),
             notifications: Mutex::new(Vec::new()),
             notify_seq: AtomicU64::new(0),
@@ -546,6 +578,8 @@ impl Session {
             size: Mutex::new((80, 24)),
             manifests: Mutex::new(manifest::load()?),
             layout_generation: AtomicU64::new(0),
+            output_generation: Arc::new(AtomicU64::new(0)),
+            pane_history: persist::session_settings().pane_history,
             restored: AtomicBool::new(true),
             notifications: Mutex::new(Vec::new()),
             notify_seq: AtomicU64::new(0),
@@ -556,6 +590,20 @@ impl Session {
             view_dispatch: Mutex::new(()),
         };
         let mut resumed_native_sessions = HashSet::new();
+        let replay = if session.pane_history {
+            persist::session_file_path(&file.name)
+                .and_then(|path| {
+                    history::read(&history::path_for(&path), &file)
+                        .ok()
+                        .flatten()
+                })
+                .unwrap_or_default()
+                .into_iter()
+                .map(|entry| (entry.pane, entry))
+                .collect::<HashMap<_, _>>()
+        } else {
+            HashMap::new()
+        };
         let mut workspaces = Vec::new();
         let mut workspace_ids: HashMap<u64, WorkspaceId> = HashMap::new();
         for saved in &file.workspaces {
@@ -573,7 +621,14 @@ impl Session {
                         .as_ref()
                         .and(saved_pane.native_session.as_ref())
                         .cloned();
-                    let new_id = session.new_pane(&saved_pane.title, cwd, command)?;
+                    // A native resume owns its pane's first output; replay only
+                    // plain-shell restorations so it can never overwrite it.
+                    let replay = command
+                        .is_none()
+                        .then(|| replay.get(&saved_pane.id).cloned())
+                        .flatten();
+                    let new_id =
+                        session.new_pane_with_replay(&saved_pane.title, cwd, command, replay)?;
                     if let Some(native) = resumed_native {
                         session
                             .panes
@@ -723,6 +778,38 @@ impl Session {
         }
     }
 
+    fn save_history(&self) -> Result<()> {
+        let _dispatch = self
+            .view_dispatch
+            .lock()
+            .map_err(|_| anyhow!("view dispatch lock poisoned"))?;
+        let file = self.build_file();
+        let Some(state_path) = persist::session_file_path(&file.name) else {
+            return Ok(());
+        };
+        // Output can change cwd/title without a layout mutation. Publish this
+        // exact identity first; a crash between writes safely rejects old replay.
+        persist::write_session_file(&state_path, &file)?;
+        let panes = self
+            .panes
+            .lock()
+            .expect("pane lock poisoned")
+            .iter()
+            .map(|(id, pane)| {
+                let mut parser = pane.parser.lock().expect("PTY parser lock poisoned");
+                let text = read_history(&mut parser).join("\n");
+                let text = utf8_tail(&text, history::MAX_PANE_TEXT);
+                parser.screen_mut().set_scrollback(0);
+                history::PaneHistory {
+                    pane: id.0,
+                    text,
+                    screen: snapshot(&parser),
+                }
+            })
+            .collect();
+        history::write(&history::path_for(&state_path), file, panes)
+    }
+
     fn next_id(&self) -> u64 {
         let mut state = self.state.lock().expect("state lock poisoned");
         state.next_id += 1;
@@ -786,6 +873,16 @@ impl Session {
         self.new_pane_with_id(self.pane_id(), title, cwd, command)
     }
 
+    fn new_pane_with_replay(
+        &self,
+        title: &str,
+        cwd: Option<PathBuf>,
+        command: Option<Vec<String>>,
+        replay: Option<history::PaneHistory>,
+    ) -> Result<PaneId> {
+        self.new_pane_with_id_replay(self.pane_id(), title, cwd, command, replay)
+    }
+
     /// Spawn a pane under a caller-chosen id, used by `layout apply` so a pane
     /// that is already alive keeps its id.
     fn new_pane_with_id(
@@ -795,7 +892,20 @@ impl Session {
         cwd: Option<PathBuf>,
         command: Option<Vec<String>>,
     ) -> Result<PaneId> {
-        let (cols, rows) = *self.size.lock().expect("size lock poisoned");
+        self.new_pane_with_id_replay(id, title, cwd, command, None)
+    }
+    fn new_pane_with_id_replay(
+        &self,
+        id: PaneId,
+        title: &str,
+        cwd: Option<PathBuf>,
+        command: Option<Vec<String>>,
+        replay: Option<history::PaneHistory>,
+    ) -> Result<PaneId> {
+        let (cols, rows) = replay
+            .as_ref()
+            .and_then(|entry| history::dimensions(&entry.screen))
+            .unwrap_or_else(|| *self.size.lock().expect("size lock poisoned"));
         let pane = Arc::new(Pane::spawn(
             id,
             title,
@@ -804,8 +914,10 @@ impl Session {
             self.session_name(),
             self.hook_socket(),
             self.updates.clone(),
+            Arc::clone(&self.output_generation),
             cwd,
             command,
+            replay,
         )?);
         self.panes
             .lock()
@@ -1156,6 +1268,21 @@ impl Session {
         let _ = self.updates.send(());
     }
 
+    fn track_pane_agent(
+        &self,
+        pane: &Pane,
+        agent: &Option<String>,
+        process: &ProcessEvidence,
+    ) -> u64 {
+        let (generation, cleared_native) = pane.track_agent_identity(agent, process);
+        if cleared_native {
+            // Retiring a conversation is a persistence mutation even when its
+            // pane is hidden and terminal-output persistence is disabled.
+            self.notify();
+        }
+        generation
+    }
+
     /// Clear the restored flag once a client has attached (`Hello`).
     fn clear_restored(&self) {
         self.restored.store(false, Ordering::Relaxed);
@@ -1308,6 +1435,7 @@ impl Session {
         let mut ages = HashMap::new();
         for (id, pane) in panes.iter() {
             let detection = &detections[id];
+            self.track_pane_agent(pane, &detection.agent, &pane.process_evidence(now, false));
             let (previous, age) = pane.transition_state(detection.state, now);
             ages.insert(*id, age);
             // The `track_state` write above makes this fire once per real
@@ -1350,10 +1478,7 @@ impl Session {
                         scroll_offset,
                         screen,
                         agent: detections[&id].agent.clone(),
-                        agent_generation: pane.track_agent_identity(
-                            &detections[&id].agent,
-                            &pane.process_evidence(now, false),
-                        ),
+                        agent_generation: pane.agent_generation.load(Ordering::Relaxed),
                         activity_revision: pane.activity_revision.load(Ordering::Relaxed),
                         state: detections[&id].state,
                         state_reason: detections[&id].reason.clone(),
@@ -1455,8 +1580,11 @@ impl Session {
             scroll_offset,
             screen,
             agent: detection.agent.clone(),
-            agent_generation: pane
-                .track_agent_identity(&detection.agent, &pane.process_evidence(now, false)),
+            agent_generation: self.track_pane_agent(
+                &pane,
+                &detection.agent,
+                &pane.process_evidence(now, false),
+            ),
             activity_revision: pane.activity_revision.load(Ordering::Relaxed),
             state: detection.state,
             state_reason: detection.reason.clone(),
@@ -1494,7 +1622,7 @@ impl Session {
             .lock()
             .map_err(|_| anyhow!("manifest lock poisoned"))?;
         let (detection, process) = pane.detect_fresh(&manifests, now);
-        let generation = pane.track_agent_identity(&detection.agent, &process);
+        let generation = self.track_pane_agent(&pane, &detection.agent, &process);
         if detection.agent.as_deref() != Some(expected_agent) || generation != expected_generation {
             bail!("agent pane {} was replaced; resolve the target again", id.0);
         }
@@ -2646,7 +2774,10 @@ impl Session {
         fs::remove_file(&old_socket).context("remove the old session socket")?;
         *self.socket.lock().expect("socket lock poisoned") = new_socket.clone();
         *self.name.lock().expect("name lock poisoned") = new_name.to_owned();
-        persist::remove_session_file(&old_name);
+        if let Some(path) = persist::session_file_path(&old_name) {
+            let _ = fs::remove_file(path);
+        }
+        history::rename_for_session(&old_name, new_name);
         self.emit(Event::SessionRenamed {
             name: new_name.to_owned(),
             socket: new_socket,
@@ -3073,8 +3204,10 @@ impl Pane {
         session: String,
         hook_socket: PathBuf,
         updates: broadcast::Sender<()>,
+        output_generation: Arc<AtomicU64>,
         cwd: Option<PathBuf>,
         run: Option<Vec<String>>,
+        replay: Option<history::PaneHistory>,
     ) -> Result<Self> {
         let pty_system = native_pty_system();
         let pair = pty_system.openpty(PtySize {
@@ -3121,12 +3254,12 @@ impl Pane {
             .context("spawn login shell in PTY")?;
         let writer = Arc::new(Mutex::new(pair.master.take_writer()?));
         let reader = pair.master.try_clone_reader()?;
-        let parser = Arc::new(Mutex::new(PtyParser::new_with_callbacks(
-            rows,
-            cols,
-            10_000,
-            PtyCallbacks::default(),
-        )));
+        let mut restored_parser =
+            PtyParser::new_with_callbacks(rows, cols, 10_000, PtyCallbacks::default());
+        if let Some(replay) = replay.as_ref() {
+            restore_screen(&mut restored_parser, &replay.screen, &replay.text);
+        }
+        let parser = Arc::new(Mutex::new(restored_parser));
         let last_output = Arc::new(Mutex::new(Instant::now()));
         read_pty(
             reader,
@@ -3134,6 +3267,7 @@ impl Pane {
             Arc::clone(&last_output),
             Arc::clone(&writer),
             updates,
+            output_generation,
         );
         Ok(Self {
             title: Mutex::new(title.into()),
@@ -3323,7 +3457,11 @@ impl Pane {
     /// Return the generation associated with this detection. The first known
     /// agent receives generation 1; a shell/replacement then a new agent always
     /// receives a later value, which makes stale prompt guards fail closed.
-    fn track_agent_identity(&self, agent: &Option<String>, process: &ProcessEvidence) -> u64 {
+    fn track_agent_identity(
+        &self,
+        agent: &Option<String>,
+        process: &ProcessEvidence,
+    ) -> (u64, bool) {
         let mut identity = self
             .agent_identity
             .lock()
@@ -3340,19 +3478,25 @@ impl Pane {
                 process.name.as_deref().unwrap_or("unknown")
             )
         });
+        let mut cleared_native = false;
         if *identity != next {
             // A native session belongs to the foreground agent process. Once it
             // exits or is replaced, do not let its old conversation resurrect.
             if identity.is_some() {
-                *self
+                cleared_native = self
                     .native_session
                     .lock()
-                    .expect("native session lock poisoned") = None;
+                    .expect("native session lock poisoned")
+                    .take()
+                    .is_some();
             }
             *identity = next;
             self.agent_generation.fetch_add(1, Ordering::Relaxed);
         }
-        self.agent_generation.load(Ordering::Relaxed)
+        (
+            self.agent_generation.load(Ordering::Relaxed),
+            cleared_native,
+        )
     }
 
     /// Record one detection atomically and return the preceding state plus age.
@@ -3631,6 +3775,7 @@ fn read_pty(
     last_output: Arc<Mutex<Instant>>,
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
     updates: broadcast::Sender<()>,
+    output_generation: Arc<AtomicU64>,
 ) {
     tokio::task::spawn_blocking(move || {
         let mut decoder = graphics::Decoder::default();
@@ -3679,6 +3824,7 @@ fn read_pty(
                 }
             }
             *last_output.lock().expect("output lock poisoned") = Instant::now();
+            output_generation.fetch_add(1, Ordering::Relaxed);
             let _ = updates.send(());
         }
     });
@@ -3743,6 +3889,19 @@ fn live_screen_contents(parser: &mut PtyParser) -> String {
     parser.screen_mut().set_scrollback(offset);
     contents
 }
+
+/// Keep the newest complete UTF-8 suffix; terminal text never cuts a scalar in
+/// half when it is written to the private history record.
+fn utf8_tail(text: &str, limit: usize) -> String {
+    if text.len() <= limit {
+        return text.to_owned();
+    }
+    let mut start = text.len() - limit;
+    while !text.is_char_boundary(start) {
+        start += 1;
+    }
+    text[start..].to_owned()
+}
 /// Build a wire `Screen` from the pane's terminal state: plain `contents` for
 /// copy mode plus one styled run list per visible row (#7).
 fn snapshot(parser: &PtyParser) -> Screen {
@@ -3761,6 +3920,69 @@ fn snapshot(parser: &PtyParser) -> Screen {
             .callbacks()
             .graphics
             .placements(screen.alternate_screen(), screen.scrollback()),
+    }
+}
+
+/// Rebuild recent text and the saved visible grid before the PTY reader starts.
+fn restore_screen(parser: &mut PtyParser, screen: &Screen, history: &str) {
+    let (rows, cols) = parser.screen().size();
+    if screen.rows.len() > usize::from(rows)
+        || screen.rows.iter().any(|row| row.len() > usize::from(cols))
+    {
+        return;
+    }
+    parser.process(b"\x1b[2J\x1b[H");
+    // Populate scrollback first, then redraw the formatted active frame.
+    parser.process(history.replace('\n', "\r\n").as_bytes());
+    parser.process(b"\x1b[H");
+    for (row, runs) in screen.rows.iter().enumerate() {
+        for run in runs {
+            let mut sgr = String::from("\x1b[0");
+            if run.attrs & ATTR_BOLD != 0 {
+                sgr.push_str(";1");
+            }
+            if run.attrs & ATTR_DIM != 0 {
+                sgr.push_str(";2");
+            }
+            if run.attrs & ATTR_ITALIC != 0 {
+                sgr.push_str(";3");
+            }
+            if run.attrs & ATTR_UNDERLINE != 0 {
+                sgr.push_str(";4");
+            }
+            if run.attrs & ATTR_INVERSE != 0 {
+                sgr.push_str(";7");
+            }
+            append_sgr_color(&mut sgr, &run.fg, true);
+            append_sgr_color(&mut sgr, &run.bg, false);
+            sgr.push('m');
+            parser.process(sgr.as_bytes());
+            parser.process(run.text.as_bytes());
+        }
+        if row + 1 < screen.rows.len() {
+            parser.process(b"\r\n");
+        }
+    }
+    parser.process(b"\x1b[0m");
+    let cursor_row = screen.cursor_row.min(rows.saturating_sub(1)) + 1;
+    let cursor_col = screen.cursor_col.min(cols.saturating_sub(1)) + 1;
+    parser.process(format!("\x1b[{cursor_row};{cursor_col}H").as_bytes());
+    if !screen.cursor_visible {
+        parser.process(b"\x1b[?25l");
+    }
+}
+
+fn append_sgr_color(out: &mut String, color: &CellColor, foreground: bool) {
+    match color {
+        CellColor::Default => out.push_str(if foreground { ";39" } else { ";49" }),
+        CellColor::Indexed(value) => {
+            out.push_str(if foreground { ";38;5;" } else { ";48;5;" });
+            out.push_str(&value.to_string());
+        }
+        CellColor::Rgb(red, green, blue) => {
+            out.push_str(if foreground { ";38;2;" } else { ";48;2;" });
+            out.push_str(&format!("{red};{green};{blue}"));
+        }
     }
 }
 
@@ -4505,6 +4727,20 @@ mod tests {
         assert_eq!(scroll_offset_after_delta(1, -99, 2), 0);
     }
 
+    #[test]
+    fn cold_history_replay_restores_formatted_active_screen() {
+        let mut source = PtyParser::new_with_callbacks(3, 20, 100, PtyCallbacks::default());
+        source.process(b"\x1b[31mred ready\x1b[0m");
+        let saved = snapshot(&source);
+        let mut restored = PtyParser::new_with_callbacks(3, 20, 100, PtyCallbacks::default());
+        restore_screen(
+            &mut restored,
+            &saved,
+            "earlier one\nearlier two\nearlier three\nearlier four\n",
+        );
+        assert!(restored.screen().contents().contains("red ready"));
+    }
+
     #[tokio::test]
     async fn pane_snapshot_keeps_history_anchored_while_output_arrives() {
         let (updates, _) = broadcast::channel(1);
@@ -4518,8 +4754,10 @@ mod tests {
             "scroll-test".into(),
             hook_socket_path(),
             updates,
+            Arc::new(AtomicU64::new(0)),
             None,
             Some(vec!["sleep".into(), "60".into()]),
+            None,
         )
         .expect("test pane");
         // The reader keeps the original parser, so shell profile output cannot
@@ -4925,6 +5163,25 @@ mod tests {
             .collect();
         assert!(commands.contains(&vec!["codex".into(), "resume".into(), "first".into()]));
         assert!(commands.contains(&vec!["codex".into(), "resume".into(), "second".into()]));
+    }
+
+    #[tokio::test]
+    async fn retiring_hidden_native_conversations_marks_persistence_dirty() {
+        let session = Session::spawn(80, 24, "native-retirement".into()).unwrap();
+        let id = session.snapshot().unwrap().panes[0].id;
+        let pane = Arc::clone(&session.panes.lock().unwrap()[&id]);
+        session.handle(ClientMessage::NewTab).unwrap();
+        *pane.agent_identity.lock().unwrap() = Some("previous-agent".into());
+        *pane.native_session.lock().unwrap() = Some(NativeSession {
+            source: "kodade:codex".into(),
+            agent: "codex".into(),
+            id: Some("old-conversation".into()),
+            path: None,
+        });
+        let before = session.layout_generation.load(Ordering::Relaxed);
+        session.snapshot().unwrap();
+        assert!(pane.native_session.lock().unwrap().is_none());
+        assert!(session.layout_generation.load(Ordering::Relaxed) > before);
     }
 
     #[tokio::test]

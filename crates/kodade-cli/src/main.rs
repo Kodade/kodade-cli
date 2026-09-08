@@ -1404,7 +1404,7 @@ fn init_config() -> Result<()> {
                 path.display()
             )
         })?;
-    file.write_all(b"# K\xc3\xb6dade CLI configuration. Unspecified settings keep their defaults.\n# Run kodade-cli keys to inspect live bindings; prefix space opens the command center.\ntheme = \"auto\"\n\n[sidebar]\nwidth = 24\n\n[notify]\nonly_when_unfocused = true\n")?;
+    file.write_all(b"# K\xc3\xb6dade CLI configuration. Unspecified settings keep their defaults.\n# Run kodade-cli keys to inspect live bindings; prefix space opens the command center.\ntheme = \"auto\"\n\n# Off by default: retain a bounded private screen replay after a cold restart.\n[session]\npane_history = false\n\n[sidebar]\nwidth = 24\n\n[notify]\nonly_when_unfocused = true\n")?;
     println!("created {}", path.display());
     Ok(())
 }

@@ -133,7 +133,7 @@ this ledger does not claim complete Kitty protocol coverage.
 - Remove the stale README implementation-milestone table. Put current behavior
   and shortcuts in front of users, with detailed engineering status here.
 
-Remote bootstrap (#45) is integrated for review with 220 client, 93 daemon,
+Remote bootstrap (#45) merged through PR #54 after Linux/macOS CI, with 220 client, 93 daemon,
 7 protocol tests and the agent automation integration test passing. A real
 isolated SSH fixture installs a checksum-verified binary into a home path with
 spaces and proves checksum refusal, incompatible-release refusal and truncated
@@ -144,3 +144,16 @@ A fresh code comparison additionally tracks verified lifecycle adapter coverage
 (#49), structured extension context and URL handlers (#50), configured commands
 (#51), workspace environment and existing-worktree open (#52), and a discoverable
 local agent guide (#53). These are required follow-up work, not completed parity.
+
+Exact conversation restore (#46) and optional screen history (#47) are integrated
+for review. Full workspace gates and both real daemon restart smokes pass.
+Native restore runs the generated hook reporter, preserves two distinct IDs in
+one directory across two restarts, and clears disabled/duplicate/retired references.
+Retiring an agent in a hidden pane marks the persisted layout dirty.
+
+Screen replay is off by default. The smoke restores a frame taller and wider than
+the daemon's initial 80x24 size and proves rename/disable/kill cleanup and default
+output privacy. Review also fixed long Unicode history discarding the active
+frame, metadata/history identity drift, per-pane/total encoding budgets, and
+terminal-control validation. History and layout now share one atomic private-file
+writer; a failed publish is retried.
