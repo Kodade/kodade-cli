@@ -240,7 +240,8 @@ for the installed version. The scripting commands are:
 - `kodade-cli tab ls|new|close|rename|select` — tabs of the active workspace
   (TAB is a name or an id).
 - `kodade-cli workspace ls|new|close|rename|select|color WS HEX|off` —
-  workspaces (WS is a name or an id); `new` is the same as the top-level `new`,
+  workspaces (WS is a name or an id); `workspace new NAME [PATH] --env KEY=VALUE`
+  persists explicit environment for every future pane in that workspace.
   and `color` sets the sidebar swatch.
 - `kodade-cli session ls|path|kill [NAME]|rename NAME` — every session on this
   machine; `ls` probes each socket and marks it `(restored)` or `(dead)`, and
@@ -249,11 +250,13 @@ for the installed version. The scripting commands are:
 - `kodade-cli layout export [FILE]|apply FILE` — save and restore a layout.
   **`apply` runs the commands saved in the file** (through the login shell, in
   each pane's saved directory), so only apply layout files you trust.
-- `kodade-cli worktree add BRANCH [--from REF] [-w NAME]` — `git worktree add`
+- `kodade-cli worktree add BRANCH [--from REF|--base REF] [--path PATH] [-w NAME]` — `git worktree add`
   a branch on the workspace's repo and open a `repo:branch` workspace rooted in
   it (prints the new workspace id). `worktree list` shows every branch workspace
   with its root and parent; `worktree remove WS|BRANCH [--keep]` closes it and
-  removes the worktree unless `--keep`.
+  removes the worktree unless `--keep`. `worktree open PATH [-w NAME]` opens an
+  existing linked checkout after verifying its owning repository; it never copies
+  or deletes that checkout.
 - `kodade-cli events [--json]` — stream session events until interrupted.
 - `kodade-cli completion zsh|bash|fish` — print a completion script.
 - `kodade-cli agent ls` — list recognized agents and states.

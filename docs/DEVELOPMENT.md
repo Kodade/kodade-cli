@@ -58,6 +58,12 @@ or otherwise unremovable checkout therefore stays open with its panes intact.
 Removal is only attempted when `main_worktree_root` resolves, so nothing
 outside a registered worktree is ever deleted.
 
+Each workspace can also persist explicit `KEY=VALUE` environment metadata.
+The daemon copies it only when spawning future panes in that workspace; it does
+not alter a login profile, global environment, or already-running pane.
+`OpenWorktreeWorkspace` accepts only a linked worktree registered to the selected
+main repository, so it has no create/copy/delete side effects.
+
 ## Session persistence and restore
 
 The daemon persists a session's layout so a restart (logout, crash, or

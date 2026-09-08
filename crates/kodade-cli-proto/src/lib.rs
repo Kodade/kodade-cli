@@ -3,7 +3,7 @@
 //! Each JSON message is UTF-8 and terminated by one newline. Message payloads
 //! that contain byte streams use serde's JSON byte-array representation.
 
-use std::path::PathBuf;
+use std::{collections::HashMap, path::PathBuf};
 
 use anyhow::{anyhow, bail, Result};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -249,6 +249,10 @@ pub enum ClientMessage {
         name: String,
         /// Root directory new panes in this workspace start in.
         root: Option<PathBuf>,
+        /// Explicit environment inherited by every pane subsequently created
+        /// in this workspace. It is deliberately per-workspace, never global.
+        #[serde(default)]
+        env: HashMap<String, String>,
     },
     /// Create a pane; `split: None` opens a new tab, otherwise it splits the
     /// focused pane. The new pane becomes focused so the reply snapshot names it.
@@ -319,6 +323,16 @@ pub enum ClientMessage {
         repo_root: PathBuf,
         branch: String,
         from: Option<String>,
+        /// Explicit destination. When absent the configured worktree directory
+        /// is used.
+        #[serde(default)]
+        path: Option<PathBuf>,
+    },
+    /// Open a worktree that Git has already registered. This never creates,
+    /// copies, or removes a checkout.
+    OpenWorktreeWorkspace {
+        repo_root: PathBuf,
+        path: PathBuf,
     },
     /// Close a worktree workspace; unless `keep`, also `git worktree remove` its
     /// directory (#22).
@@ -720,6 +734,9 @@ pub struct WorkspaceFile {
     /// Sidebar swatch color as `#rrggbb`, if the user set one (#19).
     #[serde(default)]
     pub color: Option<String>,
+    /// Explicit environment inherited by panes created in this workspace.
+    #[serde(default)]
+    pub env: HashMap<String, String>,
     #[serde(default)]
     pub active_tab: u64,
     #[serde(default)]
@@ -887,6 +904,7 @@ pub const CLIENT_MESSAGE_NAMES: &[&str] = &[
     "AgentState",
     "SetWorkspaceColor",
     "NewWorktreeWorkspace",
+    "OpenWorktreeWorkspace",
     "RemoveWorktreeWorkspace",
     "ReloadManifests",
 ];
@@ -960,6 +978,7 @@ pub fn client_message_name(message: &ClientMessage) -> &'static str {
         ClientMessage::AgentState { .. } => "AgentState",
         ClientMessage::SetWorkspaceColor { .. } => "SetWorkspaceColor",
         ClientMessage::NewWorktreeWorkspace { .. } => "NewWorktreeWorkspace",
+        ClientMessage::OpenWorktreeWorkspace { .. } => "OpenWorktreeWorkspace",
         ClientMessage::RemoveWorktreeWorkspace { .. } => "RemoveWorktreeWorkspace",
         ClientMessage::ReloadManifests => "ReloadManifests",
     }
@@ -1191,6 +1210,7 @@ mod tests {
             ClientMessage::NewWorkspace {
                 name: "a".into(),
                 root: None,
+                env: HashMap::new(),
             },
             ClientMessage::NewPane {
                 workspace: None,
@@ -1227,6 +1247,11 @@ mod tests {
                 repo_root: PathBuf::from("/tmp/repo"),
                 branch: "feat-a".into(),
                 from: Some("main".into()),
+                path: None,
+            },
+            ClientMessage::OpenWorktreeWorkspace {
+                repo_root: PathBuf::from("/tmp/repo"),
+                path: PathBuf::from("/tmp/repo-worktree"),
             },
             ClientMessage::RemoveWorktreeWorkspace {
                 id: workspace,
@@ -1365,6 +1390,7 @@ mod tests {
                 name: "one".into(),
                 root: None,
                 color: None,
+                env: HashMap::new(),
                 active_tab: 2,
                 tabs: vec![TabFile {
                     id: 2,
