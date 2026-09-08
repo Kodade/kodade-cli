@@ -20,3 +20,4 @@ vt100.workspace = true
 vte.workspace = true
 unicode-width.workspace = true
 png.workspace = true
+getrandom.workspace = true

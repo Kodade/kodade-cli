@@ -63,9 +63,10 @@ impl Inbox {
         validate_png(&bytes)?;
         let mut state = self.0.lock().expect("image inbox lock");
         if state.is_none() {
-            let nonce = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)?
-                .as_nanos();
+            let mut random = [0_u8; 16];
+            getrandom::getrandom(&mut random)
+                .map_err(|error| anyhow::anyhow!("image directory nonce: {error}"))?;
+            let nonce: String = random.iter().map(|byte| format!("{byte:02x}")).collect();
             let path =
                 std::env::temp_dir().join(format!("kodade-images-{}-{nonce}", std::process::id()));
             fs::DirBuilder::new()

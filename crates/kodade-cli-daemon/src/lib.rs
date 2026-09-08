@@ -579,6 +579,15 @@ impl Drop for Pane {
             }
             if proc::start_identity(*pid).as_deref() == Some(start) {
                 let _ = unsafe { libc::kill(*pid, libc::SIGTERM) };
+                let (pid, start) = (*pid, start.clone());
+                // An adopted child has no wait handle in this daemon. Recheck
+                // its kernel identity before escalating an ignored signal.
+                std::thread::spawn(move || {
+                    std::thread::sleep(CHILD_EXIT_GRACE);
+                    if proc::start_identity(pid).as_deref() == Some(start.as_str()) {
+                        let _ = unsafe { libc::kill(pid, libc::SIGKILL) };
+                    }
+                });
             }
         }
     }
@@ -7484,6 +7493,58 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert!(imported.snapshot().0.contents.contains("after-handoff"));
         source.reader.resume();
+    }
+
+    #[tokio::test]
+    async fn closing_an_adopted_pane_terminates_a_signal_ignoring_child() {
+        let (updates, _) = broadcast::channel(8);
+        let source = Pane::spawn(
+            PaneId(1),
+            "adopted",
+            40,
+            4,
+            "adopted-close".into(),
+            hook_socket_path(),
+            updates.clone(),
+            Arc::new(AtomicU64::new(0)),
+            None,
+            Some(vec![
+                "sh".into(),
+                "-c".into(),
+                "trap '' HUP TERM; printf 'ready'; while :; do read -r line || :; done".into(),
+            ]),
+            None,
+            None,
+            HashMap::new(),
+        )
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !source.snapshot().0.contents.contains("ready") {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("child installed signal handlers");
+        let (runtime, fd) = source.capture_handoff().unwrap();
+        assert!(runtime.start_identity.is_some());
+        let duplicate = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
+        assert!(duplicate >= 0);
+        let imported = unsafe {
+            Pane::import_handoff(runtime, duplicate, updates, Arc::new(AtomicU64::new(0)))
+        }
+        .unwrap();
+        // Retain the original master and wait handle: closing the imported
+        // master alone cannot end this process, so this proves explicit cleanup.
+        source.reader.shutdown();
+        let mut child = source.child.lock().unwrap().take().unwrap();
+        imported.adopted_child_owned.store(true, Ordering::Release);
+        drop(imported);
+        let exited = child_exited_within(&mut *child, Duration::from_secs(3));
+        terminate_owned_child(child);
+        assert!(
+            exited,
+            "closing a committed imported pane left its child running"
+        );
     }
 
     #[test]

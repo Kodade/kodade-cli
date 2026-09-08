@@ -44,7 +44,29 @@ pub fn start_identity(pid: i32) -> Option<String> {
         let ticks = stat[end + 2..].split_whitespace().nth(19)?;
         Some(ticks.to_owned())
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    {
+        let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::uninit();
+        let size = std::mem::size_of::<libc::proc_bsdinfo>() as i32;
+        let read = unsafe {
+            libc::proc_pidinfo(
+                pid,
+                libc::PROC_PIDTBSDINFO,
+                0,
+                info.as_mut_ptr().cast(),
+                size,
+            )
+        };
+        if read != size {
+            return None;
+        }
+        let info = unsafe { info.assume_init() };
+        Some(format!(
+            "{}:{}",
+            info.pbi_start_tvsec, info.pbi_start_tvusec
+        ))
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         let _ = pid;
         None
@@ -92,6 +114,15 @@ fn parse_ps_args(output: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn current_process_has_a_stable_kernel_start_identity() {
+        let pid = std::process::id() as i32;
+        let first = start_identity(pid).expect("kernel process identity");
+        assert!(!first.is_empty());
+        assert_eq!(start_identity(pid).as_deref(), Some(first.as_str()));
+        assert!(start_identity(-1).is_none());
+    }
 
     #[test]
     fn parses_lsof_cwd_field() {
