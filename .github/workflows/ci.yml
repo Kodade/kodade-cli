@@ -30,3 +30,6 @@ jobs:
       - run: cargo test
       - name: Exercise terminal links and synchronized pane frames
         run: python3 scripts/terminal-links-tui-smoke.py target/debug/kodade-cli
+      - name: Exercise terminal keyboard input through a real TUI
+        if: runner.os != 'Windows'
+        run: python3 scripts/terminal-keyboard-tui-smoke.py target/debug/kodade-cli

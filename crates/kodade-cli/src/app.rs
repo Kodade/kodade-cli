@@ -3592,10 +3592,9 @@ pub fn bytes_for_mode(k: KeyEvent, modes: KeyboardModes) -> Option<Vec<u8>> {
     // Event types alone do not change legacy encodings; only emit releases for
     // keys that the negotiated disambiguation mode represents as CSI sequences.
     if k.kind == KeyEventKind::Release
-        && matches!(
-            k.code,
-            KeyCode::Char(_) | KeyCode::Enter | KeyCode::Tab | KeyCode::Backspace
-        )
+        && (modes.kitty_flags & 2 == 0
+            || matches!(k.code, KeyCode::Char(_)) && k.modifiers.is_empty()
+            || matches!(k.code, KeyCode::Enter | KeyCode::Tab | KeyCode::Backspace))
     {
         return None;
     }
@@ -3706,6 +3705,25 @@ mod tests {
         let release =
             KeyEvent::new_with_kind(KeyCode::Enter, KeyModifiers::SHIFT, KeyEventKind::Release);
         assert_eq!(bytes_for_mode(release, modes), None);
+        let ctrl_release = KeyEvent::new_with_kind(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL,
+            KeyEventKind::Release,
+        );
+        assert_eq!(
+            bytes_for_mode(ctrl_release, modes),
+            Some(b"\x1b[99;5:3u".to_vec())
+        );
+        assert_eq!(
+            bytes_for_mode(
+                ctrl_release,
+                KeyboardModes {
+                    kitty_flags: 1,
+                    modify_other_keys: 0,
+                },
+            ),
+            None
+        );
         assert_eq!(
             bytes_for_mode(
                 release,
