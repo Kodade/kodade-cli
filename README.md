@@ -208,11 +208,15 @@ writes your choices back to `config.toml` without disturbing comments. See
 [docs/CONFIG.md](docs/CONFIG.md) for all bindings and configuration.
 
 Sessions survive a daemon restart: the layout (workspaces, tabs, pane trees,
-names, cwds, and zoom — never scrollback) is saved under
+names, cwds, and zoom) is saved under
 `~/.local/state/kodade-cli/sessions/` (macOS: `~/Library/Application Support/…`)
 and rebuilt with fresh panes on the next cold start; a corrupt file degrades to
 a clean start and `kodade-cli ls` marks a restored session `(restored)`. Set
-`[session] resume_agents = true` to re-run an agent's resume command on restore.
+`[session] resume_agents = true` to resume panes that reported an exact native
+conversation identity; panes without one restore as shells.
+`[session] pane_history = true` additionally retains a bounded local screen replay
+after a cold restart; it is off by default and does not imply that the original
+process survived.
 
 The CLI's dark theme uses charcoal backgrounds and off-white text with the
 Ködade orange accent `#E7A33B` and a purple-free ANSI palette. `theme = "auto"`

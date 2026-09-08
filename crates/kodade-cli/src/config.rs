@@ -1,7 +1,7 @@
 use std::{collections::HashMap, fmt::Write as _, fs, io::Write, path::PathBuf};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use kodade_cli_proto::{AgentStateKind, ClientMessage, Direction};
+use kodade_cli_proto::{AgentStateKind, ClientMessage, Direction, SessionSettings};
 use ratatui::style::Color;
 use serde::Deserialize;
 
@@ -9,6 +9,8 @@ const CONFIG_DIR: &str = ".config/kodade-cli";
 
 #[derive(Debug, Clone)]
 pub struct Config {
+    /// Shared daemon settings. The client preserves them in validation/show.
+    pub session: SessionSettings,
     pub theme: ThemeChoice,
     pub mouse: bool,
     /// `[sidebar] show` (alias: top-level `sidebar = true`): show the sidebar
@@ -452,6 +454,8 @@ impl Action {
 
 #[derive(Debug, Deserialize, Default)]
 struct FileConfig {
+    #[serde(default)]
+    session: Option<SessionSettings>,
     theme: Option<String>,
     mouse: Option<Section<MouseTable>>,
     /// Bare `sidebar = true` (0.1 shape) or a `[sidebar]` table (#19).
@@ -637,6 +641,7 @@ impl Default for Config {
             );
         }
         Self {
+            session: SessionSettings::default(),
             theme: ThemeChoice::Auto,
             mouse: true,
             sidebar: true,
@@ -700,6 +705,9 @@ impl Config {
 
     fn from_file(file: FileConfig) -> Self {
         let mut config = Self::default();
+        if let Some(session) = file.session {
+            config.session = session;
+        }
         if let Some(theme) = file.theme {
             config.set_theme(&theme);
         }
@@ -958,6 +966,9 @@ impl Config {
     pub fn to_toml(&self) -> String {
         let mut out = String::new();
         let _ = writeln!(out, "theme = {}", toml_string(self.theme_name()));
+        let _ = writeln!(out, "\n[session]");
+        let _ = writeln!(out, "resume_agents = {}", self.session.resume_agents);
+        let _ = writeln!(out, "pane_history = {}", self.session.pane_history);
         let _ = writeln!(out, "\n[sidebar]");
         let _ = writeln!(out, "show = {}", self.sidebar);
         let _ = writeln!(out, "width = {}", self.sidebar_width);

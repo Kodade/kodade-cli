@@ -606,6 +606,19 @@ pub enum AgentCommand {
         /// Name recorded as the source of the report.
         #[arg(long, value_name = "NAME", default_value = "cli")]
         source: String,
+        /// Canonical agent name associated with a native conversation id.
+        #[arg(long, value_name = "AGENT")]
+        native_agent: Option<String>,
+        /// Agent-native conversation id reported by an integration hook.
+        #[arg(long, value_name = "ID", conflicts_with = "native_session_path")]
+        native_session_id: Option<String>,
+        /// Agent-native session path reported by an integration hook.
+        #[arg(long, value_name = "PATH", conflicts_with = "native_session_id")]
+        native_session_path: Option<PathBuf>,
+        /// Read one bounded JSON hook payload from a pipe and extract this
+        /// integration's documented native session field.
+        #[arg(long)]
+        hook_json: bool,
     },
 }
 
@@ -845,6 +858,10 @@ mod tests {
                     pane: PaneId(7),
                     state: AgentStateKind::Working,
                     source: "hook".into(),
+                    native_agent: None,
+                    native_session_id: None,
+                    native_session_path: None,
+                    hook_json: false,
                 }
             })
         );
@@ -862,6 +879,41 @@ mod tests {
                     pane: PaneId(7),
                     state: AgentStateKind::Idle,
                     source: "cli".into(),
+                    native_agent: None,
+                    native_session_id: None,
+                    native_session_path: None,
+                    hook_json: false,
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn report_accepts_native_conversation_identity() {
+        let cli = parse(&[
+            "kodade-cli",
+            "agent",
+            "report",
+            "7",
+            "working",
+            "--source",
+            "kodade:codex",
+            "--native-agent",
+            "codex",
+            "--native-session-id",
+            "thread-7",
+        ]);
+        assert_eq!(
+            cli.command,
+            Some(Command::Agent {
+                command: AgentCommand::Report {
+                    pane: PaneId(7),
+                    state: AgentStateKind::Working,
+                    source: "kodade:codex".into(),
+                    native_agent: Some("codex".into()),
+                    native_session_id: Some("thread-7".into()),
+                    native_session_path: None,
+                    hook_json: false,
                 }
             })
         );

@@ -1057,14 +1057,29 @@ async fn agent(
             pane,
             state,
             source,
+            native_agent,
+            native_session_id,
+            native_session_path,
+            hook_json,
         } => {
+            let native_session_id = if hook_json {
+                hook_session_id(&source, native_agent.as_deref())?
+            } else {
+                native_session_id
+            };
             commands::layout(
                 commands::request(
                     socket,
                     ClientMessage::AgentState {
                         pane,
                         state,
-                        source,
+                        source: source.clone(),
+                        native_session: native_agent.map(|agent| kodade_cli_proto::NativeSession {
+                            source: source.clone(),
+                            agent,
+                            id: native_session_id,
+                            path: native_session_path,
+                        }),
                     },
                 )
                 .await?,
@@ -1072,6 +1087,34 @@ async fn agent(
             Ok(())
         }
     }
+}
+
+fn hook_session_id(source: &str, agent: Option<&str>) -> Result<Option<String>> {
+    use std::io::{IsTerminal, Read};
+    if std::io::stdin().is_terminal() {
+        return Ok(None);
+    }
+    let mut payload = Vec::with_capacity(4096);
+    std::io::stdin()
+        .take(65_537)
+        .read_to_end(&mut payload)
+        .context("read hook payload")?;
+    if payload.len() > 65_536 {
+        bail!("hook payload exceeds 64 KiB");
+    }
+    let value: serde_json::Value =
+        serde_json::from_slice(&payload).context("parse hook payload")?;
+    let key = match (source, agent) {
+        ("kodade:codex", Some("codex")) => "session_id",
+        ("kodade:claude-code", Some("claude")) | ("kodade:gemini-cli", Some("gemini")) => {
+            "session_id"
+        }
+        _ => return Ok(None),
+    };
+    Ok(value
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned))
 }
 
 fn print_manifests(message: ServerMessage, json: bool) -> Result<()> {
@@ -1361,7 +1404,7 @@ fn init_config() -> Result<()> {
                 path.display()
             )
         })?;
-    file.write_all(b"# K\xc3\xb6dade CLI configuration. Unspecified settings keep their defaults.\n# Run kodade-cli keys to inspect live bindings; prefix space opens the command center.\ntheme = \"auto\"\n\n[sidebar]\nwidth = 24\n\n[notify]\nonly_when_unfocused = true\n")?;
+    file.write_all(b"# K\xc3\xb6dade CLI configuration. Unspecified settings keep their defaults.\n# Run kodade-cli keys to inspect live bindings; prefix space opens the command center.\ntheme = \"auto\"\n\n# Off by default: retain a bounded private screen replay after a cold restart.\n[session]\npane_history = false\n\n[sidebar]\nwidth = 24\n\n[notify]\nonly_when_unfocused = true\n")?;
     println!("created {}", path.display());
     Ok(())
 }

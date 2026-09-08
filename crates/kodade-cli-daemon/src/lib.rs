@@ -3,6 +3,7 @@
 mod agent;
 mod git;
 mod graphics;
+mod history;
 mod image_paste;
 pub use image_paste::{validate_png, MAX_IMAGE_BYTES};
 mod layout;
@@ -12,7 +13,7 @@ mod plugins;
 mod proc;
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     env, fs,
     io::{Read, Write},
     os::unix::fs::FileTypeExt,
@@ -27,9 +28,9 @@ use std::{
 use anyhow::{anyhow, bail, Context, Result};
 use kodade_cli_proto::{
     decode, encode, schema_message, AgentInfo, AgentStateKind, CellColor, ClientMessage, Direction,
-    Event, LayoutSnapshot, LayoutTree, ManifestInfo, Notification, PaneId, PaneSnapshot, QueryKind,
-    Run, Screen, ServerMessage, SidebarTabInfo, SplitAxis, TabId, TabInfo, WorkspaceId,
-    WorkspaceInfo, ATTR_BOLD, ATTR_DIM, ATTR_INVERSE, ATTR_ITALIC, ATTR_UNDERLINE,
+    Event, LayoutSnapshot, LayoutTree, ManifestInfo, NativeSession, Notification, PaneId,
+    PaneSnapshot, QueryKind, Run, Screen, ServerMessage, SidebarTabInfo, SplitAxis, TabId, TabInfo,
+    WorkspaceId, WorkspaceInfo, ATTR_BOLD, ATTR_DIM, ATTR_INVERSE, ATTR_ITALIC, ATTR_UNDERLINE,
     PROTOCOL_VERSION,
 };
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
@@ -56,6 +57,9 @@ struct Session {
     /// Kept on `Session` (not `SessionState`) so `notify` can bump it without
     /// re-locking state — several handlers call `notify` while holding the lock.
     layout_generation: AtomicU64,
+    /// Bumped by PTY output. Only the opt-in history loop observes this.
+    output_generation: Arc<AtomicU64>,
+    pane_history: bool,
     /// True from a cold restore until the first client `Hello`; surfaced as
     /// `LayoutSnapshot.restored` so `ls` can print `(restored)`.
     restored: AtomicBool,
@@ -186,6 +190,7 @@ struct Pane {
     /// kept so persistence can record them without inspecting the live process.
     spawn_command: Option<Vec<String>>,
     spawn_cwd: Option<PathBuf>,
+    native_session: Mutex<Option<NativeSession>>,
     /// Kept so dropping the pane ends its process; otherwise the PTY reader
     /// thread never sees EOF (the daemon and the test runtime would wait forever).
     child: Mutex<Box<dyn portable_pty::Child + Send>>,
@@ -357,6 +362,11 @@ pub async fn run(session_name: String) -> Result<()> {
     let mut shutdown = session.shutdown.subscribe();
     // Debounced layout persistence runs alongside the accept loop.
     tokio::spawn(persist_loop(Arc::clone(&session)));
+    if session.pane_history {
+        tokio::spawn(history_loop(Arc::clone(&session)));
+    } else {
+        history::remove_for_session(&session.session_name());
+    }
     // Keeps agent detection running for event subscribers with no TUI attached.
     tokio::spawn(subscriber_tick(Arc::clone(&session)));
     // Flush state on SIGTERM so a stopped daemon (e.g. logout) can be restored.
@@ -441,6 +451,27 @@ async fn persist_loop(session: Arc<Session>) {
     }
 }
 
+/// Persist a bounded replay at most every two seconds after output or layout
+/// changes. Layout persistence remains independent and never writes terminal
+/// text by default.
+async fn history_loop(session: Arc<Session>) {
+    let mut saved = (0, 0);
+    loop {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let current = (
+            session.output_generation.load(Ordering::Relaxed),
+            session.layout_generation.load(Ordering::Relaxed),
+        );
+        if current == saved {
+            continue;
+        }
+        match session.save_history() {
+            Ok(()) => saved = current,
+            Err(error) => eprintln!("Ködade CLI could not persist pane history: {error:#}"),
+        }
+    }
+}
+
 async fn remove_stale_socket(socket: &Path) -> Result<()> {
     if let Ok(Ok(_)) =
         tokio::time::timeout(Duration::from_millis(250), UnixStream::connect(socket)).await
@@ -486,6 +517,8 @@ impl Session {
             size: Mutex::new((cols, rows)),
             manifests: Mutex::new(manifest::load()?),
             layout_generation: AtomicU64::new(0),
+            output_generation: Arc::new(AtomicU64::new(0)),
+            pane_history: persist::session_settings().pane_history,
             restored: AtomicBool::new(false),
             notifications: Mutex::new(Vec::new()),
             notify_seq: AtomicU64::new(0),
@@ -545,6 +578,8 @@ impl Session {
             size: Mutex::new((80, 24)),
             manifests: Mutex::new(manifest::load()?),
             layout_generation: AtomicU64::new(0),
+            output_generation: Arc::new(AtomicU64::new(0)),
+            pane_history: persist::session_settings().pane_history,
             restored: AtomicBool::new(true),
             notifications: Mutex::new(Vec::new()),
             notify_seq: AtomicU64::new(0),
@@ -554,10 +589,21 @@ impl Session {
             hook_socket: hook_socket_path(),
             view_dispatch: Mutex::new(()),
         };
-        let manifests = session
-            .manifests
-            .lock()
-            .map_err(|_| anyhow!("manifest lock poisoned"))?;
+        let mut resumed_native_sessions = HashSet::new();
+        let replay = if session.pane_history {
+            persist::session_file_path(&file.name)
+                .and_then(|path| {
+                    history::read(&history::path_for(&path), &file)
+                        .ok()
+                        .flatten()
+                })
+                .unwrap_or_default()
+                .into_iter()
+                .map(|entry| (entry.pane, entry))
+                .collect::<HashMap<_, _>>()
+        } else {
+            HashMap::new()
+        };
         let mut workspaces = Vec::new();
         let mut workspace_ids: HashMap<u64, WorkspaceId> = HashMap::new();
         for saved in &file.workspaces {
@@ -569,8 +615,32 @@ impl Session {
                 let mut pane_ids: HashMap<PaneId, PaneId> = HashMap::new();
                 for saved_pane in &saved_tab.panes {
                     let cwd = restore_cwd(saved_pane.cwd.clone(), saved.root.clone());
-                    let command = resume_command(saved_pane, resume_agents, &manifests);
-                    let new_id = session.new_pane(&saved_pane.title, cwd, command)?;
+                    let command =
+                        resume_command(saved_pane, resume_agents, &mut resumed_native_sessions);
+                    let resumed_native = command
+                        .as_ref()
+                        .and(saved_pane.native_session.as_ref())
+                        .cloned();
+                    // A native resume owns its pane's first output; replay only
+                    // plain-shell restorations so it can never overwrite it.
+                    let replay = command
+                        .is_none()
+                        .then(|| replay.get(&saved_pane.id).cloned())
+                        .flatten();
+                    let new_id =
+                        session.new_pane_with_replay(&saved_pane.title, cwd, command, replay)?;
+                    if let Some(native) = resumed_native {
+                        session
+                            .panes
+                            .lock()
+                            .expect("panes lock poisoned")
+                            .get(&new_id)
+                            .expect("new pane exists")
+                            .native_session
+                            .lock()
+                            .expect("native session lock poisoned")
+                            .replace(native);
+                    }
                     pane_ids.insert(PaneId(saved_pane.id), new_id);
                 }
                 let tree = remap_tree(&saved_tab.tree, &pane_ids);
@@ -618,7 +688,6 @@ impl Session {
             state.workspaces = workspaces;
             state.active_workspace = active_workspace;
         }
-        drop(manifests);
         Ok(session)
     }
 
@@ -650,6 +719,11 @@ impl Session {
                                     title: pane.title.lock().expect("title lock poisoned").clone(),
                                     cwd: pane.saved_cwd(),
                                     command: pane.spawn_command.clone(),
+                                    native_session: pane
+                                        .native_session
+                                        .lock()
+                                        .expect("native session lock poisoned")
+                                        .clone(),
                                 })
                             })
                             .collect();
@@ -702,6 +776,38 @@ impl Session {
                 file.name
             );
         }
+    }
+
+    fn save_history(&self) -> Result<()> {
+        let _dispatch = self
+            .view_dispatch
+            .lock()
+            .map_err(|_| anyhow!("view dispatch lock poisoned"))?;
+        let file = self.build_file();
+        let Some(state_path) = persist::session_file_path(&file.name) else {
+            return Ok(());
+        };
+        // Output can change cwd/title without a layout mutation. Publish this
+        // exact identity first; a crash between writes safely rejects old replay.
+        persist::write_session_file(&state_path, &file)?;
+        let panes = self
+            .panes
+            .lock()
+            .expect("pane lock poisoned")
+            .iter()
+            .map(|(id, pane)| {
+                let mut parser = pane.parser.lock().expect("PTY parser lock poisoned");
+                let text = read_history(&mut parser).join("\n");
+                let text = utf8_tail(&text, history::MAX_PANE_TEXT);
+                parser.screen_mut().set_scrollback(0);
+                history::PaneHistory {
+                    pane: id.0,
+                    text,
+                    screen: snapshot(&parser),
+                }
+            })
+            .collect();
+        history::write(&history::path_for(&state_path), file, panes)
     }
 
     fn next_id(&self) -> u64 {
@@ -767,6 +873,16 @@ impl Session {
         self.new_pane_with_id(self.pane_id(), title, cwd, command)
     }
 
+    fn new_pane_with_replay(
+        &self,
+        title: &str,
+        cwd: Option<PathBuf>,
+        command: Option<Vec<String>>,
+        replay: Option<history::PaneHistory>,
+    ) -> Result<PaneId> {
+        self.new_pane_with_id_replay(self.pane_id(), title, cwd, command, replay)
+    }
+
     /// Spawn a pane under a caller-chosen id, used by `layout apply` so a pane
     /// that is already alive keeps its id.
     fn new_pane_with_id(
@@ -776,7 +892,20 @@ impl Session {
         cwd: Option<PathBuf>,
         command: Option<Vec<String>>,
     ) -> Result<PaneId> {
-        let (cols, rows) = *self.size.lock().expect("size lock poisoned");
+        self.new_pane_with_id_replay(id, title, cwd, command, None)
+    }
+    fn new_pane_with_id_replay(
+        &self,
+        id: PaneId,
+        title: &str,
+        cwd: Option<PathBuf>,
+        command: Option<Vec<String>>,
+        replay: Option<history::PaneHistory>,
+    ) -> Result<PaneId> {
+        let (cols, rows) = replay
+            .as_ref()
+            .and_then(|entry| history::dimensions(&entry.screen))
+            .unwrap_or_else(|| *self.size.lock().expect("size lock poisoned"));
         let pane = Arc::new(Pane::spawn(
             id,
             title,
@@ -785,8 +914,10 @@ impl Session {
             self.session_name(),
             self.hook_socket(),
             self.updates.clone(),
+            Arc::clone(&self.output_generation),
             cwd,
             command,
+            replay,
         )?);
         self.panes
             .lock()
@@ -1137,6 +1268,21 @@ impl Session {
         let _ = self.updates.send(());
     }
 
+    fn track_pane_agent(
+        &self,
+        pane: &Pane,
+        agent: &Option<String>,
+        process: &ProcessEvidence,
+    ) -> u64 {
+        let (generation, cleared_native) = pane.track_agent_identity(agent, process);
+        if cleared_native {
+            // Retiring a conversation is a persistence mutation even when its
+            // pane is hidden and terminal-output persistence is disabled.
+            self.notify();
+        }
+        generation
+    }
+
     /// Clear the restored flag once a client has attached (`Hello`).
     fn clear_restored(&self) {
         self.restored.store(false, Ordering::Relaxed);
@@ -1289,6 +1435,7 @@ impl Session {
         let mut ages = HashMap::new();
         for (id, pane) in panes.iter() {
             let detection = &detections[id];
+            self.track_pane_agent(pane, &detection.agent, &pane.process_evidence(now, false));
             let (previous, age) = pane.transition_state(detection.state, now);
             ages.insert(*id, age);
             // The `track_state` write above makes this fire once per real
@@ -1331,10 +1478,7 @@ impl Session {
                         scroll_offset,
                         screen,
                         agent: detections[&id].agent.clone(),
-                        agent_generation: pane.track_agent_identity(
-                            &detections[&id].agent,
-                            &pane.process_evidence(now, false),
-                        ),
+                        agent_generation: pane.agent_generation.load(Ordering::Relaxed),
                         activity_revision: pane.activity_revision.load(Ordering::Relaxed),
                         state: detections[&id].state,
                         state_reason: detections[&id].reason.clone(),
@@ -1436,8 +1580,11 @@ impl Session {
             scroll_offset,
             screen,
             agent: detection.agent.clone(),
-            agent_generation: pane
-                .track_agent_identity(&detection.agent, &pane.process_evidence(now, false)),
+            agent_generation: self.track_pane_agent(
+                &pane,
+                &detection.agent,
+                &pane.process_evidence(now, false),
+            ),
             activity_revision: pane.activity_revision.load(Ordering::Relaxed),
             state: detection.state,
             state_reason: detection.reason.clone(),
@@ -1475,7 +1622,7 @@ impl Session {
             .lock()
             .map_err(|_| anyhow!("manifest lock poisoned"))?;
         let (detection, process) = pane.detect_fresh(&manifests, now);
-        let generation = pane.track_agent_identity(&detection.agent, &process);
+        let generation = self.track_pane_agent(&pane, &detection.agent, &process);
         if detection.agent.as_deref() != Some(expected_agent) || generation != expected_generation {
             bail!("agent pane {} was replaced; resolve the target again", id.0);
         }
@@ -2143,6 +2290,7 @@ impl Session {
                 pane,
                 state,
                 source,
+                native_session,
             } => {
                 let panes = self
                     .panes
@@ -2158,6 +2306,20 @@ impl Session {
                     source,
                     reported_at: Instant::now(),
                 });
+                drop(hook);
+                let pane = Arc::clone(pane);
+                drop(panes);
+                if let Some(native_session) = native_session.filter(valid_native_session) {
+                    // Retire the previous foreground identity before assigning
+                    // this report, so its next detection cannot erase a new ID.
+                    let manifests = self.manifests.lock().expect("manifest lock poisoned");
+                    let (detection, process) = pane.detect_fresh(&manifests, Instant::now());
+                    pane.track_agent_identity(&detection.agent, &process);
+                    *pane
+                        .native_session
+                        .lock()
+                        .expect("native session lock poisoned") = Some(native_session);
+                }
                 if changed && matches!(state, AgentStateKind::Working | AgentStateKind::Blocked) {
                     // Hook reports are authoritative lifecycle transitions even
                     // before the next snapshot updates sidebar state.
@@ -2612,7 +2774,10 @@ impl Session {
         fs::remove_file(&old_socket).context("remove the old session socket")?;
         *self.socket.lock().expect("socket lock poisoned") = new_socket.clone();
         *self.name.lock().expect("name lock poisoned") = new_name.to_owned();
-        persist::remove_session_file(&old_name);
+        if let Some(path) = persist::session_file_path(&old_name) {
+            let _ = fs::remove_file(path);
+        }
+        history::rename_for_session(&old_name, new_name);
         self.emit(Event::SessionRenamed {
             name: new_name.to_owned(),
             socket: new_socket,
@@ -3039,8 +3204,10 @@ impl Pane {
         session: String,
         hook_socket: PathBuf,
         updates: broadcast::Sender<()>,
+        output_generation: Arc<AtomicU64>,
         cwd: Option<PathBuf>,
         run: Option<Vec<String>>,
+        replay: Option<history::PaneHistory>,
     ) -> Result<Self> {
         let pty_system = native_pty_system();
         let pair = pty_system.openpty(PtySize {
@@ -3087,12 +3254,12 @@ impl Pane {
             .context("spawn login shell in PTY")?;
         let writer = Arc::new(Mutex::new(pair.master.take_writer()?));
         let reader = pair.master.try_clone_reader()?;
-        let parser = Arc::new(Mutex::new(PtyParser::new_with_callbacks(
-            rows,
-            cols,
-            10_000,
-            PtyCallbacks::default(),
-        )));
+        let mut restored_parser =
+            PtyParser::new_with_callbacks(rows, cols, 10_000, PtyCallbacks::default());
+        if let Some(replay) = replay.as_ref() {
+            restore_screen(&mut restored_parser, &replay.screen, &replay.text);
+        }
+        let parser = Arc::new(Mutex::new(restored_parser));
         let last_output = Arc::new(Mutex::new(Instant::now()));
         read_pty(
             reader,
@@ -3100,6 +3267,7 @@ impl Pane {
             Arc::clone(&last_output),
             Arc::clone(&writer),
             updates,
+            output_generation,
         );
         Ok(Self {
             title: Mutex::new(title.into()),
@@ -3111,6 +3279,7 @@ impl Pane {
             spawn_process,
             spawn_command: run,
             spawn_cwd: cwd,
+            native_session: Mutex::new(None),
             child: Mutex::new(child),
             process: Mutex::new(ProcessEvidence {
                 pid: None,
@@ -3288,7 +3457,11 @@ impl Pane {
     /// Return the generation associated with this detection. The first known
     /// agent receives generation 1; a shell/replacement then a new agent always
     /// receives a later value, which makes stale prompt guards fail closed.
-    fn track_agent_identity(&self, agent: &Option<String>, process: &ProcessEvidence) -> u64 {
+    fn track_agent_identity(
+        &self,
+        agent: &Option<String>,
+        process: &ProcessEvidence,
+    ) -> (u64, bool) {
         let mut identity = self
             .agent_identity
             .lock()
@@ -3305,11 +3478,25 @@ impl Pane {
                 process.name.as_deref().unwrap_or("unknown")
             )
         });
+        let mut cleared_native = false;
         if *identity != next {
+            // A native session belongs to the foreground agent process. Once it
+            // exits or is replaced, do not let its old conversation resurrect.
+            if identity.is_some() {
+                cleared_native = self
+                    .native_session
+                    .lock()
+                    .expect("native session lock poisoned")
+                    .take()
+                    .is_some();
+            }
             *identity = next;
             self.agent_generation.fetch_add(1, Ordering::Relaxed);
         }
-        self.agent_generation.load(Ordering::Relaxed)
+        (
+            self.agent_generation.load(Ordering::Relaxed),
+            cleared_native,
+        )
     }
 
     /// Record one detection atomically and return the preceding state plus age.
@@ -3385,26 +3572,104 @@ fn restore_cwd(saved: Option<PathBuf>, root: Option<PathBuf>) -> Option<PathBuf>
         .or_else(|| root.filter(|path| path.is_dir()))
 }
 
-/// The command a restored pane should run. Only when `resume_agents` is on and
-/// the saved command's program matches a manifest that defines a `resume` string
-/// do we relaunch it — with the manifest's resume command, not the raw one.
-/// Everything else restores as a plain shell (no command re-run).
+/// The command a restored pane should run. Native conversation references are
+/// explicit per pane; the old manifest `--last` fallback is deliberately not
+/// used because two agents in one cwd would otherwise restore the same session.
 fn resume_command(
     pane: &persist::PaneFile,
     resume_agents: bool,
-    manifests: &[manifest::Manifest],
+    resumed: &mut HashSet<String>,
 ) -> Option<Vec<String>> {
     if !resume_agents {
         return None;
     }
-    let command = pane.command.as_ref()?;
-    let process = command.first().and_then(|arg| proc::process_basename(arg));
-    let manifest = manifests.iter().find(|manifest| {
-        manifest.resume.is_some() && manifest.identifies(process.as_deref(), "")
-    })?;
-    let resume = manifest.resume.as_ref()?;
-    // Resume strings are simple shell words (e.g. `codex resume --last`).
-    Some(resume.split_whitespace().map(str::to_owned).collect())
+    let native = pane
+        .native_session
+        .as_ref()
+        .filter(|native| valid_native_session(native))?;
+    let argv = native_resume_argv(native)?;
+    let key = native_session_key(native);
+    resumed.insert(key).then_some(argv)
+}
+
+fn native_session_key(native: &NativeSession) -> String {
+    format!(
+        "{}\0{}\0{}",
+        native.agent,
+        native.id.as_deref().unwrap_or_default(),
+        native
+            .path
+            .as_deref()
+            .and_then(Path::to_str)
+            .unwrap_or_default()
+    )
+}
+
+fn valid_native_session(native: &NativeSession) -> bool {
+    const MAX_VALUE: usize = 4096;
+    let valid_text = |value: &str| {
+        !value.is_empty()
+            && value.len() <= MAX_VALUE
+            && !value.starts_with('-')
+            && !value
+                .chars()
+                .any(|ch| ch.is_whitespace() || ch.is_control())
+    };
+    let valid_id = native.id.as_deref().is_some_and(valid_text);
+    let valid_path = native.path.as_ref().is_some_and(|path| {
+        path.is_absolute()
+            && path.is_file()
+            && path.as_os_str().len() <= MAX_VALUE
+            && !path.to_string_lossy().chars().any(char::is_control)
+    });
+    matches!(
+        (
+            native.source.as_str(),
+            native.agent.as_str(),
+            valid_id,
+            valid_path
+        ),
+        ("kodade:claude-code", "claude", true, false)
+            | ("kodade:codex", "codex", true, false)
+            | ("kodade:gemini-cli", "gemini", true, false)
+            | ("kodade:opencode", "opencode", true, false)
+            | ("kodade:pi", "pi", true, false)
+            | ("kodade:pi", "pi", false, true)
+    )
+}
+
+fn native_resume_argv(native: &NativeSession) -> Option<Vec<String>> {
+    let id = native.id.as_ref();
+    match (
+        native.source.as_str(),
+        native.agent.as_str(),
+        id,
+        native.path.as_ref(),
+    ) {
+        ("kodade:claude-code", "claude", Some(id), None) => {
+            Some(vec!["claude".into(), "--resume".into(), id.clone()])
+        }
+        // `codex resume ID` launches the interactive TUI. `codex exec resume`
+        // is a non-interactive command and must never be used for a pane.
+        ("kodade:codex", "codex", Some(id), None) => {
+            Some(vec!["codex".into(), "resume".into(), id.clone()])
+        }
+        ("kodade:gemini-cli", "gemini", Some(id), None) => {
+            Some(vec!["gemini".into(), "--resume".into(), id.clone()])
+        }
+        ("kodade:opencode", "opencode", Some(id), None) => {
+            Some(vec!["opencode".into(), "--session".into(), id.clone()])
+        }
+        ("kodade:pi", "pi", Some(id), None) => {
+            Some(vec!["pi".into(), "--session".into(), id.clone()])
+        }
+        ("kodade:pi", "pi", None, Some(path)) => Some(vec![
+            "pi".into(),
+            "--session".into(),
+            path.to_string_lossy().into_owned(),
+        ]),
+        _ => None,
+    }
 }
 
 /// Rebuild a layout tree with re-allocated pane ids. The caller validated that
@@ -3510,6 +3775,7 @@ fn read_pty(
     last_output: Arc<Mutex<Instant>>,
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
     updates: broadcast::Sender<()>,
+    output_generation: Arc<AtomicU64>,
 ) {
     tokio::task::spawn_blocking(move || {
         let mut decoder = graphics::Decoder::default();
@@ -3558,6 +3824,7 @@ fn read_pty(
                 }
             }
             *last_output.lock().expect("output lock poisoned") = Instant::now();
+            output_generation.fetch_add(1, Ordering::Relaxed);
             let _ = updates.send(());
         }
     });
@@ -3622,6 +3889,19 @@ fn live_screen_contents(parser: &mut PtyParser) -> String {
     parser.screen_mut().set_scrollback(offset);
     contents
 }
+
+/// Keep the newest complete UTF-8 suffix; terminal text never cuts a scalar in
+/// half when it is written to the private history record.
+fn utf8_tail(text: &str, limit: usize) -> String {
+    if text.len() <= limit {
+        return text.to_owned();
+    }
+    let mut start = text.len() - limit;
+    while !text.is_char_boundary(start) {
+        start += 1;
+    }
+    text[start..].to_owned()
+}
 /// Build a wire `Screen` from the pane's terminal state: plain `contents` for
 /// copy mode plus one styled run list per visible row (#7).
 fn snapshot(parser: &PtyParser) -> Screen {
@@ -3640,6 +3920,69 @@ fn snapshot(parser: &PtyParser) -> Screen {
             .callbacks()
             .graphics
             .placements(screen.alternate_screen(), screen.scrollback()),
+    }
+}
+
+/// Rebuild recent text and the saved visible grid before the PTY reader starts.
+fn restore_screen(parser: &mut PtyParser, screen: &Screen, history: &str) {
+    let (rows, cols) = parser.screen().size();
+    if screen.rows.len() > usize::from(rows)
+        || screen.rows.iter().any(|row| row.len() > usize::from(cols))
+    {
+        return;
+    }
+    parser.process(b"\x1b[2J\x1b[H");
+    // Populate scrollback first, then redraw the formatted active frame.
+    parser.process(history.replace('\n', "\r\n").as_bytes());
+    parser.process(b"\x1b[H");
+    for (row, runs) in screen.rows.iter().enumerate() {
+        for run in runs {
+            let mut sgr = String::from("\x1b[0");
+            if run.attrs & ATTR_BOLD != 0 {
+                sgr.push_str(";1");
+            }
+            if run.attrs & ATTR_DIM != 0 {
+                sgr.push_str(";2");
+            }
+            if run.attrs & ATTR_ITALIC != 0 {
+                sgr.push_str(";3");
+            }
+            if run.attrs & ATTR_UNDERLINE != 0 {
+                sgr.push_str(";4");
+            }
+            if run.attrs & ATTR_INVERSE != 0 {
+                sgr.push_str(";7");
+            }
+            append_sgr_color(&mut sgr, &run.fg, true);
+            append_sgr_color(&mut sgr, &run.bg, false);
+            sgr.push('m');
+            parser.process(sgr.as_bytes());
+            parser.process(run.text.as_bytes());
+        }
+        if row + 1 < screen.rows.len() {
+            parser.process(b"\r\n");
+        }
+    }
+    parser.process(b"\x1b[0m");
+    let cursor_row = screen.cursor_row.min(rows.saturating_sub(1)) + 1;
+    let cursor_col = screen.cursor_col.min(cols.saturating_sub(1)) + 1;
+    parser.process(format!("\x1b[{cursor_row};{cursor_col}H").as_bytes());
+    if !screen.cursor_visible {
+        parser.process(b"\x1b[?25l");
+    }
+}
+
+fn append_sgr_color(out: &mut String, color: &CellColor, foreground: bool) {
+    match color {
+        CellColor::Default => out.push_str(if foreground { ";39" } else { ";49" }),
+        CellColor::Indexed(value) => {
+            out.push_str(if foreground { ";38;5;" } else { ";48;5;" });
+            out.push_str(&value.to_string());
+        }
+        CellColor::Rgb(red, green, blue) => {
+            out.push_str(if foreground { ";38;2;" } else { ";48;2;" });
+            out.push_str(&format!("{red};{green};{blue}"));
+        }
     }
 }
 
@@ -4342,6 +4685,7 @@ mod tests {
                 pane,
                 state: AgentStateKind::Working,
                 source: "test".into(),
+                native_session: None,
             })
             .expect("report working");
         session.snapshot().expect("settle working state");
@@ -4351,6 +4695,7 @@ mod tests {
                 pane,
                 state: AgentStateKind::Blocked,
                 source: "test".into(),
+                native_session: None,
             })
             .expect("report blocked");
 
@@ -4382,6 +4727,20 @@ mod tests {
         assert_eq!(scroll_offset_after_delta(1, -99, 2), 0);
     }
 
+    #[test]
+    fn cold_history_replay_restores_formatted_active_screen() {
+        let mut source = PtyParser::new_with_callbacks(3, 20, 100, PtyCallbacks::default());
+        source.process(b"\x1b[31mred ready\x1b[0m");
+        let saved = snapshot(&source);
+        let mut restored = PtyParser::new_with_callbacks(3, 20, 100, PtyCallbacks::default());
+        restore_screen(
+            &mut restored,
+            &saved,
+            "earlier one\nearlier two\nearlier three\nearlier four\n",
+        );
+        assert!(restored.screen().contents().contains("red ready"));
+    }
+
     #[tokio::test]
     async fn pane_snapshot_keeps_history_anchored_while_output_arrives() {
         let (updates, _) = broadcast::channel(1);
@@ -4395,8 +4754,10 @@ mod tests {
             "scroll-test".into(),
             hook_socket_path(),
             updates,
+            Arc::new(AtomicU64::new(0)),
             None,
             Some(vec!["sleep".into(), "60".into()]),
+            None,
         )
         .expect("test pane");
         // The reader keeps the original parser, so shell profile output cannot
@@ -4601,12 +4962,14 @@ mod tests {
                                     title: "codex".into(),
                                     cwd: Some(PathBuf::from("/tmp")),
                                     command: Some(vec!["codex".into()]),
+                                    native_session: None,
                                 },
                                 persist::PaneFile {
                                     id: 31,
                                     title: "root".into(),
                                     cwd: Some(PathBuf::from("/")),
                                     command: None,
+                                    native_session: None,
                                 },
                             ],
                         },
@@ -4621,6 +4984,7 @@ mod tests {
                                 title: "tail".into(),
                                 cwd: None,
                                 command: None,
+                                native_session: None,
                             }],
                         },
                     ],
@@ -4642,6 +5006,7 @@ mod tests {
                             title: "shell".into(),
                             cwd: Some(PathBuf::from("/tmp")),
                             command: None,
+                            native_session: None,
                         }],
                     }],
                 },
@@ -4699,53 +5064,172 @@ mod tests {
     }
 
     #[test]
-    fn resume_command_uses_manifest_resume_only_when_enabled() {
-        let manifests = vec![manifest::Manifest {
-            name: "codex".into(),
-            display: "Codex".into(),
-            process: vec!["codex".into()],
-            title: Vec::new(),
-            resume: Some("codex resume --last".into()),
-            rules: Vec::new(),
-            source: manifest::ManifestSource::Builtin,
-        }];
-        let agent = persist::PaneFile {
+    fn resume_command_uses_unique_explicit_native_sessions() {
+        let native = |id: &str| NativeSession {
+            source: "kodade:codex".into(),
+            agent: "codex".into(),
+            id: Some(id.into()),
+            path: None,
+        };
+        let agent = |id: &str| persist::PaneFile {
             id: 1,
             title: "codex".into(),
             cwd: None,
             command: Some(vec!["codex".into()]),
+            native_session: Some(native(id)),
         };
-        // resume_agents off: never re-run.
-        assert_eq!(resume_command(&agent, false, &manifests), None);
-        // On, and a manifest with a resume matches: use the resume command.
+        let mut resumed = HashSet::new();
+        assert_eq!(resume_command(&agent("one"), false, &mut resumed), None);
         assert_eq!(
-            resume_command(&agent, true, &manifests),
-            Some(vec!["codex".into(), "resume".into(), "--last".into()])
+            resume_command(&agent("one"), true, &mut resumed),
+            Some(vec!["codex".into(), "resume".into(), "one".into()])
         );
-        // A plain shell pane has no command to resume.
-        let shell = persist::PaneFile {
-            id: 2,
-            title: "shell".into(),
+        assert_eq!(
+            resume_command(&agent("two"), true, &mut resumed),
+            Some(vec!["codex".into(), "resume".into(), "two".into()])
+        );
+        // A duplicate or foreign native reference deliberately becomes a shell,
+        // never the ambiguous old manifest `resume --last` command.
+        assert_eq!(resume_command(&agent("one"), true, &mut resumed), None);
+        let invalid = persist::PaneFile {
+            id: 4,
+            title: "codex".into(),
             cwd: None,
-            command: None,
+            command: Some(vec!["codex".into()]),
+            native_session: Some(NativeSession {
+                source: "untrusted".into(),
+                agent: "codex".into(),
+                id: Some("one".into()),
+                path: None,
+            }),
         };
-        assert_eq!(resume_command(&shell, true, &manifests), None);
-        // A command with no matching manifest is left as a plain shell.
-        let unknown = persist::PaneFile {
-            id: 3,
-            title: "make".into(),
-            cwd: None,
-            command: Some(vec!["make".into()]),
-        };
-        assert_eq!(resume_command(&unknown, true, &manifests), None);
+        assert_eq!(resume_command(&invalid, true, &mut resumed), None);
+    }
+
+    #[tokio::test]
+    async fn hook_report_persists_native_identity_for_interactive_agents() {
+        let session = Session::spawn(80, 24, "native-report".into()).expect("spawn session");
+        let pane = session.snapshot().expect("snapshot").panes[0].id;
+        *session.panes.lock().expect("panes")[&pane]
+            .agent_identity
+            .lock()
+            .expect("identity") = Some("previous-agent-process".into());
+        session
+            .handle(ClientMessage::AgentState {
+                pane,
+                state: AgentStateKind::Working,
+                source: "kodade:codex".into(),
+                native_session: Some(NativeSession {
+                    source: "kodade:codex".into(),
+                    agent: "codex".into(),
+                    id: Some("thread-123".into()),
+                    path: None,
+                }),
+            })
+            .expect("report native session");
+        session
+            .snapshot()
+            .expect("next detection preserves new report");
+        let file = session.build_file();
+        assert_eq!(
+            file.workspaces[0].tabs[0].panes[0]
+                .native_session
+                .as_ref()
+                .and_then(|native| native.id.as_deref()),
+            Some("thread-123")
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_uses_each_explicit_native_session_in_the_same_cwd() {
+        let mut file = restore_fixture();
+        let panes = &mut file.workspaces[0].tabs[0].panes;
+        for (pane, id) in panes.iter_mut().take(2).zip(["first", "second"]) {
+            pane.native_session = Some(NativeSession {
+                source: "kodade:codex".into(),
+                agent: "codex".into(),
+                id: Some(id.into()),
+                path: None,
+            });
+            pane.cwd = Some(PathBuf::from("/tmp"));
+        }
+        let session = Session::restore(file, true).expect("restore");
+        let commands: Vec<_> = session
+            .panes
+            .lock()
+            .expect("panes")
+            .values()
+            .filter_map(|pane| pane.spawn_command.clone())
+            .collect();
+        assert!(commands.contains(&vec!["codex".into(), "resume".into(), "first".into()]));
+        assert!(commands.contains(&vec!["codex".into(), "resume".into(), "second".into()]));
+    }
+
+    #[tokio::test]
+    async fn retiring_hidden_native_conversations_marks_persistence_dirty() {
+        let session = Session::spawn(80, 24, "native-retirement".into()).unwrap();
+        let id = session.snapshot().unwrap().panes[0].id;
+        let pane = Arc::clone(&session.panes.lock().unwrap()[&id]);
+        session.handle(ClientMessage::NewTab).unwrap();
+        *pane.agent_identity.lock().unwrap() = Some("previous-agent".into());
+        *pane.native_session.lock().unwrap() = Some(NativeSession {
+            source: "kodade:codex".into(),
+            agent: "codex".into(),
+            id: Some("old-conversation".into()),
+            path: None,
+        });
+        let before = session.layout_generation.load(Ordering::Relaxed);
+        session.snapshot().unwrap();
+        assert!(pane.native_session.lock().unwrap().is_none());
+        assert!(session.layout_generation.load(Ordering::Relaxed) > before);
     }
 
     #[tokio::test]
     async fn restore_without_resume_agents_starts_plain_shells() {
-        // resume_agents=false: the saved `codex` command is not re-run.
-        let session = Session::restore(restore_fixture(), false).expect("restore");
+        let mut file = restore_fixture();
+        file.workspaces[0].tabs[0].panes[0].native_session = Some(NativeSession {
+            source: "kodade:codex".into(),
+            agent: "codex".into(),
+            id: Some("previous-conversation".into()),
+            path: None,
+        });
+        let session = Session::restore(file, false).expect("restore");
         let panes = session.panes.lock().expect("pane lock");
         assert!(panes.values().all(|pane| pane.spawn_command.is_none()));
+        assert!(panes.values().all(|pane| pane
+            .native_session
+            .lock()
+            .expect("native session")
+            .is_none()));
+    }
+
+    #[tokio::test]
+    async fn duplicate_restore_does_not_leave_a_native_session_on_the_shell() {
+        let mut file = restore_fixture();
+        for pane in &mut file.workspaces[0].tabs[0].panes {
+            pane.native_session = Some(NativeSession {
+                source: "kodade:codex".into(),
+                agent: "codex".into(),
+                id: Some("same-conversation".into()),
+                path: None,
+            });
+        }
+        let session = Session::restore(file, true).expect("restore");
+        let panes = session.panes.lock().expect("panes");
+        assert_eq!(
+            panes
+                .values()
+                .filter(|pane| pane.spawn_command.is_some())
+                .count(),
+            1
+        );
+        for pane in panes.values().filter(|pane| pane.spawn_command.is_none()) {
+            assert!(pane
+                .native_session
+                .lock()
+                .expect("native session")
+                .is_none());
+        }
     }
 
     #[tokio::test]
@@ -5401,6 +5885,7 @@ mod tests {
                     pane,
                     state: AgentStateKind::Blocked,
                     source: "test".into(),
+                    native_session: None,
                 })
                 .unwrap(),
             )
@@ -5543,6 +6028,7 @@ mod tests {
                     pane,
                     state: AgentStateKind::Blocked,
                     source: "test".into(),
+                    native_session: None,
                 })
                 .unwrap(),
             )
@@ -5857,6 +6343,7 @@ mod tests {
                 pane,
                 state: AgentStateKind::Blocked,
                 source: "test".into(),
+                native_session: None,
             })
             .expect("report blocked");
         tokio::spawn(subscriber_tick(Arc::clone(&session)));
