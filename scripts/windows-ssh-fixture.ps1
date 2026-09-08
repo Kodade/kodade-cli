@@ -1,11 +1,11 @@
-$ErrorActionPreference = 'Stop'
-
 param(
     [Parameter(Mandatory = $true)]
     [string]$WindowsBinary,
     [Parameter(Mandatory = $true)]
     [string]$LinuxBinary
 )
+
+$ErrorActionPreference = 'Stop'
 
 function Join-NativeArguments([string[]]$Arguments) {
     (($Arguments | ForEach-Object {
