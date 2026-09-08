@@ -48,7 +48,7 @@ jobs:
           cp "target/${{ matrix.target }}/release/kodade-cli" "$STAGING/kodade-cli"
           cp LICENSE NOTICE README.md "$STAGING/"
           tar -czf "$ARCHIVE" -C package "kodade-cli-${VERSION}-${{ matrix.target }}"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: kodade-cli-${{ matrix.target }}
           path: kodade-cli-*.tar.gz
