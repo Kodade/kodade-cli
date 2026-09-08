@@ -1,6 +1,6 @@
 //! A bounded Kitty graphics store. Escape commands never reach the host terminal.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 use anyhow::{bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD, Engine};
@@ -12,6 +12,108 @@ const MAX_STORE: usize = 32 * 1024 * 1024;
 const MAX_IMAGES: usize = 16;
 const MAX_PLACEMENTS: usize = 64;
 const MAX_FRAME: usize = 8192;
+const KITTY_UNICODE_PLACEHOLDER: &[u8] = "\u{10eeee}".as_bytes();
+const PLACEHOLDER_CELL: u8 = b' ';
+
+pub struct NormalizedByte {
+    pub byte: u8,
+    pub placeholder: bool,
+}
+
+/// vt100 treats Kitty's dedicated placeholder as a combining character. Keep
+/// its style but substitute a blank one-cell glyph so its grid position stays
+/// observable by the renderer.
+pub fn normalize_unicode_placeholders(pending: &mut Vec<u8>, text: &[u8]) -> Vec<NormalizedByte> {
+    let mut normalized = Vec::with_capacity(text.len());
+    for &byte in text {
+        pending.push(byte);
+        while !KITTY_UNICODE_PLACEHOLDER.starts_with(pending) {
+            normalized.push(NormalizedByte {
+                byte: pending.remove(0),
+                placeholder: false,
+            });
+        }
+        if pending.as_slice() == KITTY_UNICODE_PLACEHOLDER {
+            normalized.push(NormalizedByte {
+                byte: PLACEHOLDER_CELL,
+                placeholder: true,
+            });
+            pending.clear();
+        }
+    }
+    normalized
+}
+
+#[derive(Default)]
+pub struct VirtualStyle {
+    parser: vte::Parser,
+    foreground: Option<u32>,
+    underline: Option<u32>,
+}
+
+impl VirtualStyle {
+    pub fn feed(&mut self, byte: u8) {
+        let mut parser = std::mem::take(&mut self.parser);
+        parser.advance(self, &[byte]);
+        self.parser = parser;
+    }
+    pub fn ids(&self) -> Option<(u32, u32)> {
+        self.foreground
+            .map(|image| (image, self.underline.unwrap_or(0)))
+    }
+}
+
+impl vte::Perform for VirtualStyle {
+    fn csi_dispatch(&mut self, params: &vte::Params, _: &[u8], ignore: bool, command: char) {
+        if ignore || command != 'm' {
+            return;
+        }
+        let values: Vec<u16> = params
+            .iter()
+            .flat_map(|value| value.iter().copied())
+            .collect();
+        let mut index = 0;
+        while index < values.len() {
+            match values[index] {
+                0 => {
+                    self.foreground = None;
+                    self.underline = None;
+                }
+                39 => self.foreground = None,
+                59 => self.underline = None,
+                38 | 58 => {
+                    let target = values[index];
+                    let Some(mode) = values.get(index + 1).copied() else {
+                        break;
+                    };
+                    let color = match mode {
+                        5 => values.get(index + 2).copied().map(u32::from),
+                        2 => match (
+                            values.get(index + 2),
+                            values.get(index + 3),
+                            values.get(index + 4),
+                        ) {
+                            (Some(r), Some(g), Some(b)) => {
+                                Some((u32::from(*r) << 16) | (u32::from(*g) << 8) | u32::from(*b))
+                            }
+                            _ => None,
+                        },
+                        _ => None,
+                    };
+                    if target == 38 {
+                        self.foreground = color;
+                    } else {
+                        self.underline = color;
+                    }
+                    index += if mode == 2 { 5 } else { 3 };
+                    continue;
+                }
+                _ => {}
+            }
+            index += 1;
+        }
+    }
+}
 
 pub enum Token {
     Text(Vec<u8>),
@@ -90,11 +192,22 @@ struct Transfer {
 #[derive(Default)]
 pub struct Store {
     images: BTreeMap<u32, ImageData>,
-    placements: Vec<(bool, ImagePlacement)>,
+    placements: Vec<StoredPlacement>,
     transfer: Option<Transfer>,
     revision: u64,
     next_image: u32,
     next_placement: u32,
+    virtual_cells: BTreeMap<(bool, u16, u16), (u32, u32)>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct StoredPlacement {
+    alternate: bool,
+    placement: ImagePlacement,
+    /// A virtual placement gets its visible geometry from Unicode placeholders.
+    virtual_placement: bool,
+    parent: Option<(u32, u32)>,
+    relative_offset: (i32, i32),
 }
 
 pub struct Outcome {
@@ -167,12 +280,13 @@ impl vte::Perform for Controls {
 }
 
 impl Tracker {
-    pub fn feed(&mut self, byte: u8, screen: &vt100::Screen, store: &mut Store) {
+    pub fn feed(&mut self, byte: u8, screen: &vt100::Screen, store: &mut Store) -> bool {
         self.events.0 = None;
         self.parser.advance(&mut self.events, &[byte]);
         let Some(event) = self.events.0.take() else {
-            return;
+            return false;
         };
+        let printed = matches!(event, Control::Print(_));
         let alternate = screen.alternate_screen();
         let (height, width) = screen.size();
         let (height, width) = (height.get(), width.get());
@@ -190,17 +304,17 @@ impl Tracker {
                     (end - 1).min(height - 1)
                 };
                 *margin = (start < end).then_some((start, end));
-                return;
+                return false;
             }
             Control::Reset => {
                 self.margins = [None, None];
                 store.clear(false);
                 store.clear(true);
-                return;
+                return false;
             }
             Control::Clear => {
                 store.clear(alternate);
-                return;
+                return false;
             }
             Control::Index if row == bottom => 1,
             Control::ReverseIndex if row == top => -1,
@@ -227,10 +341,74 @@ impl Tracker {
                 store.scroll_region(alternate, top, bottom, shift);
             }
         }
+        printed
     }
 }
 
 impl Store {
+    fn delete_matching(&mut self, mut matches: impl FnMut(&ImagePlacement) -> bool) {
+        let mut deleted = HashSet::new();
+        loop {
+            let before = self.placements.len();
+            self.placements.retain(|entry| {
+                let remove = matches(&entry.placement)
+                    || entry.parent.is_some_and(|parent| deleted.contains(&parent));
+                if remove {
+                    deleted.insert((entry.placement.image, entry.placement.placement));
+                }
+                !remove
+            });
+            if self.placements.len() == before {
+                break;
+            }
+        }
+    }
+
+    fn remove_unused_images(&mut self) {
+        self.images.retain(|image, _| {
+            self.placements
+                .iter()
+                .any(|entry| entry.placement.image == *image)
+        });
+    }
+
+    pub fn clear_virtual_cell(&mut self, alternate: bool, row: u16, col: u16) {
+        self.virtual_cells.remove(&(alternate, row, col));
+    }
+
+    pub fn record_virtual_cell(
+        &mut self,
+        alternate: bool,
+        row: u16,
+        col: u16,
+        ids: Option<(u32, u32)>,
+    ) {
+        if let Some(ids) = ids.filter(|(image, _)| *image != 0) {
+            self.virtual_cells.insert((alternate, row, col), ids);
+        }
+    }
+
+    fn validate_relative(&self, key: (u32, u32), parent: (u32, u32)) -> Result<()> {
+        let mut current = parent;
+        for _ in 0..8 {
+            if current == key {
+                bail!("ECYCLE: relative placement cycle");
+            }
+            let Some(entry) = self
+                .placements
+                .iter()
+                .find(|entry| (entry.placement.image, entry.placement.placement) == current)
+            else {
+                bail!("ENOPARENT: parent placement not found");
+            };
+            let Some(next) = entry.parent else {
+                return Ok(());
+            };
+            current = next;
+        }
+        bail!("ETOODEEP: relative placement chain exceeds 8");
+    }
+
     pub fn cancel_transfer(&mut self) {
         self.transfer = None;
     }
@@ -243,36 +421,149 @@ impl Store {
         Ok(image.clone())
     }
 
+    #[cfg(test)]
     pub fn placements(&self, alternate: bool, scroll: usize) -> Vec<ImagePlacement> {
-        self.placements
+        self.placements_with_screen(alternate, scroll, None)
+    }
+
+    pub fn placements_with_screen(
+        &self,
+        alternate: bool,
+        scroll: usize,
+        screen: Option<&vt100::Screen>,
+    ) -> Vec<ImagePlacement> {
+        let mut placements: Vec<_> = self
+            .placements
             .iter()
-            .filter(|(alt, _)| *alt == alternate)
-            .map(|(_, p)| {
-                let mut p = p.clone();
+            .filter(|entry| entry.alternate == alternate && !entry.virtual_placement)
+            .map(|entry| {
+                let mut p = entry.placement.clone();
                 p.row = p.row.saturating_add(scroll.min(i32::MAX as usize) as i32);
                 p
             })
-            .collect()
+            .collect();
+        if let Some(screen) = screen {
+            placements.extend(self.virtual_placements(alternate, scroll, screen));
+        }
+        self.resolve_relative(placements)
+    }
+
+    fn virtual_placements(
+        &self,
+        alternate: bool,
+        scroll: usize,
+        screen: &vt100::Screen,
+    ) -> Vec<ImagePlacement> {
+        let (rows, cols) = screen.size();
+        let mut visible = Vec::new();
+        for row in 0..rows.get() {
+            for col in 0..cols.get() {
+                let Some(&(image, placement_id)) = self.virtual_cells.get(&(alternate, row, col))
+                else {
+                    continue;
+                };
+                let Some(entry) = self.placements.iter().find(|entry| {
+                    entry.alternate == alternate
+                        && entry.virtual_placement
+                        && entry.placement.image == image
+                        && (placement_id == 0 || entry.placement.placement == placement_id)
+                }) else {
+                    continue;
+                };
+                let mut p = entry.placement.clone();
+                let grid_cols = u32::from(p.cols.max(1));
+                let grid_rows = u32::from(p.rows.max(1));
+                if u32::from(col) >= grid_cols || u32::from(row) >= grid_rows {
+                    continue;
+                }
+                let source_x = u64::from(p.source_width) * u64::from(col) / u64::from(grid_cols);
+                let source_y = u64::from(p.source_height) * u64::from(row) / u64::from(grid_rows);
+                p.source_x += source_x as u32;
+                p.source_y += source_y as u32;
+                p.source_width = (u64::from(p.source_width) * u64::from(col + 1)
+                    / u64::from(grid_cols)) as u32
+                    - source_x as u32;
+                p.source_height = (u64::from(p.source_height) * u64::from(row + 1)
+                    / u64::from(grid_rows)) as u32
+                    - source_y as u32;
+                p.row = i32::from(row).saturating_add(scroll.min(i32::MAX as usize) as i32);
+                p.col = col;
+                p.cols = 1;
+                p.rows = 1;
+                visible.push(p);
+            }
+        }
+        visible
+    }
+
+    fn resolve_relative(&self, mut visible: Vec<ImagePlacement>) -> Vec<ImagePlacement> {
+        let mut resolved: BTreeMap<(u32, u32), ImagePlacement> = visible
+            .iter()
+            .map(|p| ((p.image, p.placement), p.clone()))
+            .collect();
+        for entry in &self.placements {
+            let Some(parent) = entry.parent else { continue };
+            let Some(mut p) = resolved.get(&parent).cloned() else {
+                continue;
+            };
+            p.image = entry.placement.image;
+            p.revision = entry.placement.revision;
+            p.placement = entry.placement.placement;
+            p.cols = entry.placement.cols;
+            p.rows = entry.placement.rows;
+            p.source_x = entry.placement.source_x;
+            p.source_y = entry.placement.source_y;
+            p.source_width = entry.placement.source_width;
+            p.source_height = entry.placement.source_height;
+            p.x_offset = entry.placement.x_offset;
+            p.y_offset = entry.placement.y_offset;
+            p.z = entry.placement.z;
+            p.col = (i32::from(p.col).saturating_add(entry.relative_offset.0))
+                .clamp(0, i32::from(u16::MAX)) as u16;
+            p.row = p.row.saturating_add(entry.relative_offset.1);
+            resolved.insert((p.image, p.placement), p);
+        }
+        visible = resolved.into_values().collect();
+        visible
     }
 
     pub fn clear(&mut self, alternate: bool) {
-        self.placements.retain(|(alt, _)| *alt != alternate);
+        self.placements.retain(|entry| entry.alternate != alternate);
+        self.virtual_cells
+            .retain(|(alt, _, _), _| *alt != alternate);
     }
 
     pub fn scroll(&mut self, alternate: bool, rows: i32) {
-        for (alt, placement) in &mut self.placements {
-            if *alt == alternate {
-                placement.row = placement.row.saturating_sub(rows);
+        for entry in &mut self.placements {
+            if entry.alternate == alternate && !entry.virtual_placement {
+                entry.placement.row = entry.placement.row.saturating_sub(rows);
             }
         }
-        self.placements.retain(|(_, p)| p.row > -10_000);
+        self.placements
+            .retain(|entry| entry.virtual_placement || entry.placement.row > -10_000);
+        self.virtual_cells = self
+            .virtual_cells
+            .iter()
+            .filter_map(|(&(alt, row, col), &ids)| {
+                if alt != alternate {
+                    return Some(((alt, row, col), ids));
+                }
+                let row = i32::from(row).saturating_sub(rows);
+                (row >= 0 && row <= i32::from(u16::MAX)).then_some(((alt, row as u16, col), ids))
+            })
+            .collect();
     }
 
     fn scroll_region(&mut self, alternate: bool, top: u16, bottom: u16, shift: i32) {
         let top = i32::from(top);
         let end = i32::from(bottom) + 1;
-        for (alt, p) in &mut self.placements {
-            if *alt != alternate || p.row < top || p.row + i32::from(p.rows) > end {
+        for entry in &mut self.placements {
+            let p = &mut entry.placement;
+            if entry.alternate != alternate
+                || entry.virtual_placement
+                || p.row < top
+                || p.row + i32::from(p.rows) > end
+            {
                 continue;
             }
             p.row -= shift;
@@ -288,8 +579,10 @@ impl Store {
             p.rows -= removed;
             p.row += i32::from(clipped_top);
         }
-        self.placements
-            .retain(|(_, p)| p.rows > 0 && p.source_height > 0);
+        self.placements.retain(|entry| {
+            entry.virtual_placement
+                || (entry.placement.rows > 0 && entry.placement.source_height > 0)
+        });
     }
 
     pub fn command(&mut self, frame: &[u8], cursor: (u16, u16), alternate: bool) -> Outcome {
@@ -363,22 +656,43 @@ impl Store {
         let mut id = number(&params, "i", 0)?;
         if action == "d" {
             let mode = params.get("d").map(String::as_str).unwrap_or("a");
+            let placement = number(&params, "p", 0)?;
             match mode {
                 "a" | "A" => self.clear(alternate),
-                "i" | "I" => self.placements.retain(|(_, p)| p.image != id),
+                "i" | "I" => self.delete_matching(|p| {
+                    p.image == id && (placement == 0 || p.placement == placement)
+                }),
+                "p" | "P" | "q" | "Q" | "c" | "C" | "x" | "X" | "y" | "Y" | "z" | "Z" => {
+                    let cell_col = number(&params, "x", 0)?;
+                    let cell_row = number(&params, "y", 0)?;
+                    let z = signed_number(&params, "z", 0)?;
+                    let cursor_col = u32::from(cursor.1) + 1;
+                    let cursor_row = u32::from(cursor.0) + 1;
+                    self.delete_matching(|p| match mode.to_ascii_lowercase().as_str() {
+                        "c" => intersects(p, cursor_col, cursor_row),
+                        "p" => intersects(p, cell_col, cell_row),
+                        "q" => intersects(p, cell_col, cell_row) && p.z == z,
+                        "x" => intersects_column(p, cell_col),
+                        "y" => intersects_row(p, cell_row),
+                        "z" => p.z == z,
+                        _ => false,
+                    });
+                }
+                "r" | "R" => {
+                    let first = number(&params, "x", 0)?;
+                    let last = number(&params, "y", 0)?;
+                    if first == 0 || first > last {
+                        bail!("invalid image id range");
+                    }
+                    self.delete_matching(|p| (first..=last).contains(&p.image));
+                }
+                "n" | "N" | "f" | "F" => bail!("unsupported delete selector"),
                 _ => bail!("unsupported delete selector"),
             }
-            if mode == "A" {
-                self.images.clear();
-                self.placements.clear();
-            }
-            if mode == "I" {
-                self.images.remove(&id);
+            if mode.as_bytes().first().is_some_and(u8::is_ascii_uppercase) {
+                self.remove_unused_images();
             }
             return Ok(None);
-        }
-        if params.get("U").is_some_and(|v| v != "0") || params.contains_key("P") {
-            bail!("virtual and relative placements are unsupported");
         }
         if !matches!(action, "t" | "T" | "p" | "q") {
             bail!("unsupported graphics action");
@@ -396,22 +710,6 @@ impl Store {
             if action == "q" {
                 return Ok(None);
             }
-            // `a=T` transfers and places in one command. Validate every
-            // placement failure before replacing image data so a rejected
-            // crop/quota request is atomic from the pane's perspective.
-            if action == "T" {
-                PlacementSpec::parse(&params, width, height)?;
-                number(&params, "p", 0)?;
-                if self
-                    .placements
-                    .iter()
-                    .filter(|(_, p)| p.image != id)
-                    .count()
-                    >= MAX_PLACEMENTS
-                {
-                    bail!("pane placement quota exceeded");
-                }
-            }
             if id == 0 {
                 self.next_image = self.next_image.saturating_add(1).max(1);
                 while self.images.contains_key(&self.next_image) {
@@ -421,6 +719,25 @@ impl Store {
                         .context("image id space exhausted")?;
                 }
                 id = self.next_image;
+            }
+            // `a=T` transfers and places in one command. Validate every
+            // placement failure before replacing image data so a rejected
+            // crop/quota request is atomic from the pane's perspective.
+            if action == "T" {
+                let spec = PlacementSpec::parse(&params, width, height)?;
+                let placement = number(&params, "p", 0)?;
+                if let Some(parent) = spec.parent {
+                    self.validate_relative((id, placement), parent)?;
+                }
+                if self
+                    .placements
+                    .iter()
+                    .filter(|entry| entry.placement.image != id)
+                    .count()
+                    >= MAX_PLACEMENTS
+                {
+                    bail!("pane placement quota exceeded");
+                }
             }
             let stored = self
                 .images
@@ -445,7 +762,7 @@ impl Store {
                     data: STANDARD.encode(bytes),
                 },
             );
-            self.placements.retain(|(_, p)| p.image != id);
+            self.placements.retain(|entry| entry.placement.image != id);
         }
         if matches!(action, "p" | "T") {
             let image = self.images.get(&id).context("image not found")?;
@@ -455,18 +772,22 @@ impl Store {
                 self.next_placement = self.next_placement.wrapping_add(1).max(1);
                 placement = self.next_placement;
             }
+            if let Some(parent) = spec.parent {
+                self.validate_relative((id, placement), parent)?;
+            }
             let replaces = self
                 .placements
                 .iter()
-                .any(|(_, p)| p.image == id && p.placement == placement);
+                .any(|entry| entry.placement.image == id && entry.placement.placement == placement);
             if !replaces && self.placements.len() >= MAX_PLACEMENTS {
                 bail!("pane placement quota exceeded");
             }
-            self.placements
-                .retain(|(_, p)| p.image != id || p.placement != placement);
-            self.placements.push((
+            self.placements.retain(|entry| {
+                entry.placement.image != id || entry.placement.placement != placement
+            });
+            self.placements.push(StoredPlacement {
                 alternate,
-                ImagePlacement {
+                placement: ImagePlacement {
                     image: id,
                     revision: image.revision,
                     placement,
@@ -478,9 +799,14 @@ impl Store {
                     source_y: spec.y,
                     source_width: spec.width,
                     source_height: spec.height,
+                    x_offset: spec.x_offset,
+                    y_offset: spec.y_offset,
                     z: spec.z,
                 },
-            ));
+                virtual_placement: spec.virtual_placement,
+                parent: spec.parent,
+                relative_offset: spec.relative_offset,
+            });
             if spec.advance {
                 return Ok(Some((spec.rows, spec.cols)));
             }
@@ -497,13 +823,20 @@ struct PlacementSpec {
     y: u32,
     width: u32,
     height: u32,
+    x_offset: u32,
+    y_offset: u32,
     z: i32,
     advance: bool,
+    virtual_placement: bool,
+    parent: Option<(u32, u32)>,
+    relative_offset: (i32, i32),
 }
 impl PlacementSpec {
     fn parse(params: &BTreeMap<String, String>, width: u32, height: u32) -> Result<Self> {
-        if number(params, "X", 0)? != 0 || number(params, "Y", 0)? != 0 {
-            bail!("pixel placement offsets are unsupported; use cell-aligned placements");
+        let x_offset = number(params, "X", 0)?;
+        let y_offset = number(params, "Y", 0)?;
+        if x_offset >= 8 || y_offset >= 16 {
+            bail!("pixel placement offsets must fit within a cell");
         }
         let x = number(params, "x", 0)?.min(width);
         let y = number(params, "y", 0)?.min(height);
@@ -538,6 +871,16 @@ impl PlacementSpec {
             ),
             (cols, rows) => (u64::from(cols), u64::from(rows)),
         };
+        let virtual_placement = number(params, "U", 0)? != 0;
+        let parent = if params.contains_key("P") {
+            let parent = (number(params, "P", 0)?, number(params, "Q", 0)?);
+            (parent.0 != 0).then_some(parent)
+        } else {
+            None
+        };
+        if virtual_placement && parent.is_some() {
+            bail!("virtual placement cannot refer to a parent");
+        }
         Ok(Self {
             cols: cols.clamp(1, u64::from(u16::MAX)) as u16,
             rows: rows.clamp(1, u64::from(u16::MAX)) as u16,
@@ -545,13 +888,21 @@ impl PlacementSpec {
             y,
             width,
             height,
+            x_offset,
+            y_offset,
             z: params
                 .get("z")
                 .map(|value| value.parse())
                 .transpose()
                 .context("invalid z index")?
                 .unwrap_or(0),
-            advance: number(params, "C", 0)? == 0,
+            advance: !virtual_placement && number(params, "C", 0)? == 0,
+            virtual_placement,
+            parent,
+            relative_offset: (
+                signed_number(params, "H", 0)?,
+                signed_number(params, "V", 0)?,
+            ),
         })
     }
 }
@@ -561,6 +912,28 @@ fn number(params: &BTreeMap<String, String>, key: &str, default: u32) -> Result<
         .get(key)
         .map(|value| value.parse().with_context(|| format!("invalid {key}")))
         .unwrap_or(Ok(default))
+}
+
+fn signed_number(params: &BTreeMap<String, String>, key: &str, default: i32) -> Result<i32> {
+    params
+        .get(key)
+        .map(|value| value.parse().with_context(|| format!("invalid {key}")))
+        .unwrap_or(Ok(default))
+}
+
+fn intersects(p: &ImagePlacement, col: u32, row: u32) -> bool {
+    col > 0
+        && row > 0
+        && (i32::from(p.col)..i32::from(p.col) + i32::from(p.cols)).contains(&(col as i32 - 1))
+        && (p.row..p.row + i32::from(p.rows)).contains(&(row as i32 - 1))
+}
+
+fn intersects_column(p: &ImagePlacement, col: u32) -> bool {
+    col > 0 && (i32::from(p.col)..i32::from(p.col) + i32::from(p.cols)).contains(&(col as i32 - 1))
+}
+
+fn intersects_row(p: &ImagePlacement, row: u32) -> bool {
+    row > 0 && (p.row..p.row + i32::from(p.rows)).contains(&(row as i32 - 1))
 }
 
 fn dimensions(format: u32, params: &BTreeMap<String, String>, bytes: &[u8]) -> Result<(u32, u32)> {
@@ -674,16 +1047,22 @@ mod tests {
             false,
         );
         assert_eq!(
-            (store.placements[0].1.cols, store.placements[0].1.rows),
+            (
+                store.placements[0].placement.cols,
+                store.placements[0].placement.rows
+            ),
             (8, 2)
         );
         store.command(b"a=p,i=7,p=1,c=4,r=0", (0, 0), false);
         assert_eq!(
-            (store.placements[0].1.cols, store.placements[0].1.rows),
+            (
+                store.placements[0].placement.cols,
+                store.placements[0].placement.rows
+            ),
             (4, 1)
         );
         let before = store.placements.clone();
-        for invalid in ["z=bad", "C=bad", "X=1"] {
+        for invalid in ["z=bad", "C=bad", "X=8"] {
             let result = store.command(format!("a=p,i=7,p=1,{invalid}").as_bytes(), (3, 3), false);
             assert!(String::from_utf8_lossy(&result.reply).contains("EINVAL"));
             assert_eq!(store.placements, before);
@@ -706,5 +1085,93 @@ mod tests {
         assert!(String::from_utf8_lossy(&quota.reply).contains("EINVAL"));
         assert!(!store.images.contains_key(&9));
         assert_eq!(store.placements.len(), MAX_PLACEMENTS);
+    }
+
+    #[test]
+    fn placements_keep_pixel_offsets_and_relative_geometry() {
+        let mut store = Store::default();
+        store.command(b"a=t,f=24,s=2,v=1,i=7;AAAAAAAA", (1, 2), false);
+        store.command(b"a=p,i=7,p=3,c=1,r=1,X=3,Y=4,C=1", (1, 2), false);
+        store.command(b"a=t,f=24,s=1,v=1,i=8;AAAA", (0, 0), false);
+        let relative = store.command(b"a=p,i=8,p=4,P=7,Q=3,H=2,V=-1", (9, 9), false);
+        assert!(String::from_utf8_lossy(&relative.reply).contains("OK"));
+        let placements = store.placements(false, 0);
+        let base = placements.iter().find(|p| p.image == 7).unwrap();
+        assert_eq!((base.x_offset, base.y_offset), (3, 4));
+        let child = placements.iter().find(|p| p.image == 8).unwrap();
+        assert_eq!((child.col, child.row), (4, 0));
+        assert_eq!(
+            store.command(b"a=p,i=8,p=5,P=99,Q=1", (0, 0), false).reply,
+            b"\x1b_Gi=8,p=5;EINVAL:ENOPARENT: parent placement not found\x1b\\"
+        );
+    }
+
+    #[test]
+    fn unicode_placeholder_activates_virtual_placement_without_cursor_movement() {
+        let mut store = Store::default();
+        store.command(b"a=t,f=24,s=2,v=1,i=7;AAAAAAAA", (0, 0), false);
+        let created = store.command(b"a=p,i=7,p=3,U=1,c=2,r=1", (4, 4), false);
+        assert_eq!(created.advance, None);
+        store.command(b"a=p,i=7,p=4,U=1,c=2,r=1", (4, 4), false);
+        let mut parser = vt100::Parser::new(
+            std::num::NonZeroU16::new(1).unwrap(),
+            std::num::NonZeroU16::new(2).unwrap(),
+            0,
+        );
+        let mut pending = Vec::new();
+        let normalized = normalize_unicode_placeholders(
+            &mut pending,
+            "\x1b[1;1H\u{10eeee}\x1b[1;2H\u{10eeee}".as_bytes(),
+        );
+        parser.process(&normalized.iter().map(|item| item.byte).collect::<Vec<_>>());
+        store.record_virtual_cell(false, 0, 0, Some((7, 3)));
+        store.record_virtual_cell(false, 0, 1, Some((7, 4)));
+        let placements = store.placements_with_screen(false, 0, Some(parser.screen()));
+        assert_eq!(placements.len(), 2);
+        assert_eq!(
+            (placements[0].source_width, placements[1].source_width),
+            (1, 1)
+        );
+        assert_ne!(placements[0].placement, placements[1].placement);
+        assert!(String::from_utf8_lossy(
+            &store
+                .command(b"a=p,i=7,p=4,U=1,P=7,Q=3", (0, 0), false)
+                .reply
+        )
+        .contains("EINVAL"));
+    }
+
+    #[test]
+    fn virtual_style_tracks_underline_color_and_sgr_reset() {
+        let mut style = VirtualStyle::default();
+        for byte in b"\x1b[38;2;0;0;7;58;2;0;0;3m" {
+            style.feed(*byte);
+        }
+        assert_eq!(style.ids(), Some((7, 3)));
+        for byte in b"\x1b[59m" {
+            style.feed(*byte);
+        }
+        assert_eq!(style.ids(), Some((7, 0)));
+    }
+
+    #[test]
+    fn virtual_cells_scroll_and_clear_when_text_overwrites_them() {
+        let mut store = Store::default();
+        store.record_virtual_cell(false, 3, 2, Some((7, 4)));
+        store.scroll(false, 2);
+        assert_eq!(store.virtual_cells.get(&(false, 1, 2)), Some(&(7, 4)));
+        store.clear_virtual_cell(false, 1, 2);
+        assert!(store.virtual_cells.is_empty());
+    }
+
+    #[test]
+    fn delete_selectors_remove_intersecting_placements_and_unused_images() {
+        let mut store = Store::default();
+        store.command(b"a=T,f=24,s=1,v=1,i=7,p=1,c=2,r=2,z=-1;AAAA", (2, 3), false);
+        store.command(b"a=T,f=24,s=1,v=1,i=8,p=2,c=1,r=1,z=2;AAAA", (0, 0), false);
+        store.command(b"a=d,d=q,x=4,y=3,z=-1", (0, 0), false);
+        assert!(store.placements(false, 0).iter().all(|p| p.image != 7));
+        store.command(b"a=d,d=Z,z=2", (0, 0), false);
+        assert!(store.image(8, 1).is_err());
     }
 }

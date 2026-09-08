@@ -175,6 +175,8 @@ struct PtyCallbacks {
     title: String,
     graphics: graphics::Store,
     graphics_tracker: graphics::Tracker,
+    graphics_placeholder: Vec<u8>,
+    graphics_virtual_style: graphics::VirtualStyle,
     hyperlinks: hyperlinks::Tracker,
 }
 impl vt100::Callbacks for PtyCallbacks {
@@ -4155,19 +4157,33 @@ fn graphics_text(parser: &mut PtyParser, text: &[u8]) {
     let mut tracker = std::mem::take(&mut parser.callbacks_mut().graphics_tracker);
     let mut store = std::mem::take(&mut parser.callbacks_mut().graphics);
     let mut hyperlinks = std::mem::take(&mut parser.callbacks_mut().hyperlinks);
-    for &byte in text {
-        let before_alt = parser.screen().alternate_screen();
-        tracker.feed(byte, parser.screen(), &mut store);
-        hyperlinks.feed(byte, parser.screen());
-        parser.process(&[byte]);
-        let alternate = parser.screen().alternate_screen();
-        if alternate && !before_alt {
-            store.clear(true);
-            hyperlinks.clear_alternate();
+    let mut style = std::mem::take(&mut parser.callbacks_mut().graphics_virtual_style);
+    let mut placeholder = std::mem::take(&mut parser.callbacks_mut().graphics_placeholder);
+    for &raw in text {
+        style.feed(raw);
+        for normalized in graphics::normalize_unicode_placeholders(&mut placeholder, &[raw]) {
+            let before_alt = parser.screen().alternate_screen();
+            let (row, col) = parser.screen().cursor_position();
+            let printed = tracker.feed(normalized.byte, parser.screen(), &mut store);
+            if printed {
+                store.clear_virtual_cell(before_alt, row, col);
+            }
+            hyperlinks.feed(normalized.byte, parser.screen());
+            parser.process(&[normalized.byte]);
+            if normalized.placeholder {
+                store.record_virtual_cell(before_alt, row, col, style.ids());
+            }
+            let alternate = parser.screen().alternate_screen();
+            if alternate && !before_alt {
+                store.clear(true);
+                hyperlinks.clear_alternate();
+            }
         }
     }
     parser.callbacks_mut().graphics_tracker = tracker;
     parser.callbacks_mut().graphics = store;
+    parser.callbacks_mut().graphics_virtual_style = style;
+    parser.callbacks_mut().graphics_placeholder = placeholder;
     parser.callbacks_mut().hyperlinks = hyperlinks;
 }
 
@@ -4242,10 +4258,11 @@ fn snapshot(parser: &PtyParser) -> Screen {
         rows: (0..rows).map(|row| screen_row(screen, row, cols)).collect(),
         bracketed_paste: screen.bracketed_paste(),
         mouse_reporting: screen.mouse_protocol_mode() != vt100::MouseProtocolMode::None,
-        graphics: parser
-            .callbacks()
-            .graphics
-            .placements(screen.alternate_screen(), screen.scrollback()),
+        graphics: parser.callbacks().graphics.placements_with_screen(
+            screen.alternate_screen(),
+            screen.scrollback(),
+            Some(screen),
+        ),
         links: parser
             .callbacks()
             .hyperlinks
@@ -4753,6 +4770,31 @@ mod tests {
         assert_eq!(parser.callbacks().graphics.placements(false, 0)[0].row, 1);
         graphics_text(&mut parser, b"\x1b[2J");
         assert!(parser.callbacks().graphics.placements(false, 0).is_empty());
+    }
+
+    #[test]
+    fn unicode_placeholders_keep_distinct_underline_placement_ids() {
+        let mut parser = pty_parser(1, 3, 0, PtyCallbacks::default());
+        parser.callbacks_mut().graphics.command(
+            b"a=t,f=24,s=3,v=1,i=7;AAAAAAAAAAAA",
+            (0, 0),
+            false,
+        );
+        for placement in [3, 4] {
+            parser.callbacks_mut().graphics.command(
+                format!("a=p,i=7,p={placement},U=1,c=3,r=1").as_bytes(),
+                (0, 0),
+                false,
+            );
+        }
+        graphics_text(
+            &mut parser,
+            b"\x1b[38;2;0;0;7;58;2;0;0;3m\xf4\x8e\xbb\xae\x1b[58;2;0;0;4m\xf4\x8e\xbb\xae",
+        );
+        let placements = snapshot(&parser).graphics;
+        assert_eq!(placements.len(), 2);
+        assert_eq!(placements[0].placement, 3);
+        assert_eq!(placements[1].placement, 4);
     }
     use super::*;
 

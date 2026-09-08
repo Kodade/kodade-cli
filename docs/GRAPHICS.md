@@ -31,7 +31,7 @@ A forced process kill can leave them for the OS's temporary-file cleanup.
 
 ## Protocol support and limits
 
-Supported Kitty actions are direct, uncompressed RGB (`f=24`), RGBA (`f=32`),
+Supported Kitty actions are direct RGB (`f=24`), RGBA (`f=32`),
 and PNG (`f=100`) transmission (`a=t`), transmit and place (`a=T`), place
 (`a=p`), query (`a=q`), and all/image deletion (`a=d,d=a/A/i/I`). Image IDs,
 revisions, chunking, quiet responses, cell-sized placements, source cropping,
@@ -47,8 +47,10 @@ image and byte limits too. Layouts carry placement metadata; pixel data travels
 through `Query(Image)`. Daemon JSON requests are capped at 16 MiB before
 deserialization, while partial uploads survive concurrent screen updates.
 
-File/shared-memory transfers, compression, animation, virtual Unicode and
-relative placements, pixel placement offsets, and the remaining delete selectors are not implemented.
+File/shared-memory transfers and animation are not implemented. Virtual Unicode
+placements, relative placements (up to eight parents), pixel placement offsets,
+and visible-cell, column, row, z-index, image-range, and image-id delete selectors
+are retained and rendered by native and SSH clients.
 Unsupported transmission modes return an error. Ködade never reads a path
 supplied by a graphics escape sequence. This is bounded Kitty support, not
 the full protocol.
