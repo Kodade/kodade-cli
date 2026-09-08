@@ -5,9 +5,9 @@ Ködade CLI is a Rust workspace with three crates:
 - `kodade-cli-proto` owns the shared client and server message types and JSON
   encoding/decoding (a single `lib.rs`).
 - `kodade-cli-daemon` owns sessions, PTYs, terminal parsing, screen state,
-  agent detection, and the Unix socket server. Its modules are `lib.rs` (the
-  session and socket server), `agent.rs`, `manifest.rs`, `layout.rs`,
-  `proc.rs`, `git.rs`, and `persist.rs`.
+  agent detection, and the Unix socket server. The session and socket server
+  live in `lib.rs`; graphics, hyperlinks, terminal modes/replay, live handoff,
+  PTY writes, history, process identity, and persistence have dedicated modules.
 - `kodade-cli` owns the `kodade-cli` binary and its thin ratatui/crossterm TUI.
   Its modules are `main.rs`, `cli.rs`, `app.rs`, `config.rs`, `mode.rs`,
   `render.rs`, `input.rs`, `commands.rs`, `help.rs`, `keys.rs`, `notify.rs`,
@@ -76,8 +76,9 @@ The daemon persists a session's layout so a restart (logout, crash, or
 
 The file records `"version": 1`, the active workspace, and every workspace →
 tab → pane: names, roots, zoom, the pane tree, each pane's title, its live cwd,
-and the command it was spawned with. **Scrollback is never persisted** (secrets
-risk); only layout and metadata are.
+and the command it was spawned with. Terminal output is not persisted by
+default. Explicitly enabling `[session] pane_history = true` adds bounded,
+private screen replay; see [configuration](CONFIG.md#session-persistence).
 
 Writes are debounced ~500 ms and driven by a `layout_generation` counter that
 only layout-changing mutations advance — PTY output never triggers a write. The
