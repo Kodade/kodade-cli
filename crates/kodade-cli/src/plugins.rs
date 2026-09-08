@@ -157,7 +157,7 @@ pub async fn command(
                             &focused_pane,
                         )),
                         name: Some(format!("{} · {}", plugin.manifest.name, pane.name)),
-                        context: Box::new(Some(InvocationContext {
+                        context: Some(Box::new(InvocationContext {
                             endpoint: "local".into(),
                             workspace: Some(workspace.to_string()),
                             workspace_id: Some(layout.active_workspace.0.to_string()),
@@ -235,7 +235,7 @@ pub async fn command(
                                 &focused_pane,
                             )),
                             name: Some(format!("{} · {}", plugin.manifest.name, action.name)),
-                            context: Box::new(Some(context)),
+                            context: Some(Box::new(context)),
                         },
                     )
                     .await?,

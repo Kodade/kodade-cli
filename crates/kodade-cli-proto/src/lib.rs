@@ -333,7 +333,7 @@ pub enum ClientMessage {
         name: Option<String>,
         /// Extension context whose private file is created and held by the
         /// daemon only after this request is accepted.
-        context: Box<Option<InvocationContext>>,
+        context: Option<Box<InvocationContext>>,
     },
     SelectWorkspace {
         id: WorkspaceId,
@@ -1273,7 +1273,7 @@ mod tests {
                 split: None,
                 command: None,
                 name: None,
-                context: Box::new(None),
+                context: None,
             },
             ClientMessage::SelectWorkspace { id: workspace },
             ClientMessage::RenamePane { name: "a".into() },

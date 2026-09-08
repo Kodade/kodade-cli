@@ -227,8 +227,9 @@ impl ContextFile {
             options.mode(0o600);
         }
         let mut file = options.open(&path)?;
+        let context_file = Self(path);
         file.write_all(&json)?;
-        Ok(Self(path))
+        Ok(context_file)
     }
 }
 
@@ -1864,7 +1865,14 @@ impl Session {
                 command,
                 name,
                 context,
-            } => self.new_pane_message(workspace, tab, split, command, name, *context)?,
+            } => self.new_pane_message(
+                workspace,
+                tab,
+                split,
+                command,
+                name,
+                context.map(|context| *context),
+            )?,
             ClientMessage::NextTab | ClientMessage::PrevTab => {
                 let next = matches!(message, ClientMessage::NextTab);
                 let mut state = self
@@ -4159,7 +4167,7 @@ mod tests {
                 split: None,
                 command: Some(vec!["sleep".into(), "60".into()]),
                 name: Some("context".into()),
-                context: Box::new(Some(InvocationContext {
+                context: Some(Box::new(InvocationContext {
                     selected_text: Some("selection is data".into()),
                     ..Default::default()
                 })),
@@ -4198,7 +4206,7 @@ mod tests {
             split: None,
             command: Some(vec!["sleep".into(), "60".into()]),
             name: Some("too-large".into()),
-            context: Box::new(Some(InvocationContext {
+            context: Some(Box::new(InvocationContext {
                 selected_text: Some("x".repeat(MAX_CONTEXT_BYTES)),
                 ..Default::default()
             })),

@@ -1514,7 +1514,7 @@ impl App {
                 split: Some(SplitAxis::Vertical),
                 command: Some(vec![editor, path.to_string_lossy().into_owned()]),
                 name: Some("editor".into()),
-                context: Box::new(None),
+                context: None,
             },
         )
         .await?;
@@ -2081,7 +2081,7 @@ impl App {
                         split: None,
                         command: Some(command),
                         name: Some(name),
-                        context: Box::new(None),
+                        context: None,
                     },
                 )
                 .await?;
@@ -2095,7 +2095,7 @@ impl App {
                         split: None,
                         command: None,
                         name: None,
-                        context: Box::new(None),
+                        context: None,
                     },
                 )
                 .await?;
@@ -2152,7 +2152,7 @@ impl App {
                                 &focused_pane,
                             )),
                             name: Some(format!("plugin · {plugin} · {action}")),
-                            context: Box::new(Some(context)),
+                            context: Some(Box::new(context)),
                         },
                     )
                     .await?;
@@ -2806,7 +2806,7 @@ impl App {
                                         "plugin · {} · {}",
                                         plugin.manifest.id, action.name
                                     )),
-                                    context: Box::new(Some(context)),
+                                    context: Some(Box::new(context)),
                                 },
                             )
                             .await?;
