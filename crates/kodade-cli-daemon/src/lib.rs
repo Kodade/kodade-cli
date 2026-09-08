@@ -618,19 +618,21 @@ impl Session {
     /// Persist the current layout to this session's state file. Best-effort:
     /// errors are logged, never propagated to the client-facing loop.
     fn save(&self) {
-        let name = self.session_name();
-        let Some(path) = persist::session_file_path(&name) else {
+        // Keep publication inside dispatch so rename cannot delete the old
+        // state file while an earlier save is still about to publish it.
+        let Ok(_dispatch) = self.view_dispatch.lock() else {
+            eprintln!("Ködade CLI could not persist: view dispatch lock poisoned");
             return;
         };
-        let file = match self.build_file_stable() {
-            Ok(file) => file,
-            Err(error) => {
-                eprintln!("Ködade CLI could not read session '{name}' for persistence: {error:#}");
-                return;
-            }
+        let file = self.build_file();
+        let Some(path) = persist::session_file_path(&file.name) else {
+            return;
         };
         if let Err(error) = persist::write_session_file(&path, &file) {
-            eprintln!("Ködade CLI could not persist session '{name}': {error:#}");
+            eprintln!(
+                "Ködade CLI could not persist session '{}': {error:#}",
+                file.name
+            );
         }
     }
 
@@ -925,7 +927,13 @@ impl Session {
             .view_dispatch
             .lock()
             .map_err(|_| anyhow!("view dispatch lock poisoned"))?;
-        self.handle(message)
+        let renamed = matches!(message, ClientMessage::RenameSession { .. });
+        let result = self.handle(message);
+        drop(_dispatch);
+        if renamed && result.is_ok() {
+            self.save();
+        }
+        result
     }
 
     /// Dispatch one connection-scoped request through the legacy global
@@ -992,6 +1000,11 @@ impl Session {
             {
                 view.scroll.remove(pane);
             }
+        }
+        drop(state);
+        drop(_dispatch);
+        if matches!(message, ClientMessage::RenameSession { .. }) && result.is_ok() {
+            self.save();
         }
         result
     }
@@ -2388,7 +2401,6 @@ impl Session {
         *self.socket.lock().expect("socket lock poisoned") = new_socket.clone();
         *self.name.lock().expect("name lock poisoned") = new_name.to_owned();
         persist::remove_session_file(&old_name);
-        self.save();
         self.emit(Event::SessionRenamed {
             name: new_name.to_owned(),
             socket: new_socket,
