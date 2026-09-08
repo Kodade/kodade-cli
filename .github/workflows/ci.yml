@@ -8,7 +8,8 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  RUST_TEST_THREADS: 4
+  RUST_TEST_THREADS: 2
+  CARGO_BUILD_JOBS: 2
 
 jobs:
   check:
@@ -32,3 +33,6 @@ jobs:
         run: python3 scripts/graphics-media-smoke.py target/debug/kodade-cli
       - name: Exercise terminal links and synchronized pane frames
         run: python3 scripts/terminal-links-tui-smoke.py target/debug/kodade-cli
+      - name: Exercise terminal keyboard input through a real TUI
+        if: runner.os != 'Windows'
+        run: python3 scripts/terminal-keyboard-tui-smoke.py target/debug/kodade-cli
