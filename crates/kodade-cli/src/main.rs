@@ -207,6 +207,12 @@ async fn main() -> Result<()> {
                 )?)?)?;
                 let archive = update::fetch(update::release_asset_url(&release, &asset)?)?;
                 update::install_archive(&archive, &update::checksum(&sums, &asset)?, &destination)?;
+                #[cfg(windows)]
+                println!(
+                    "scheduled verified update {version} to {} after this process exits; rerun --version",
+                    destination.display()
+                );
+                #[cfg(not(windows))]
                 println!("installed verified {version} to {}", destination.display());
                 Ok(())
             }

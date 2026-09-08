@@ -50,6 +50,10 @@ $distroRoot = Join-Path $fixture 'distro'
 $rootfs = Join-Path $fixture 'alpine.tar.gz'
 $clientHome = Join-Path $fixture 'client-home'
 $sshProcess = $null
+$sshConfig = $null
+$sshConfigBackup = $null
+$sshConfigExisted = $false
+$sshConfigCreated = $false
 
 function Invoke-Wsl([string[]]$Arguments) {
     Invoke-Native 'wsl.exe' (@('-d', $distro, '--') + $Arguments) 45 | Out-Null
@@ -88,8 +92,18 @@ try {
     $publicKey = (Get-Content -LiteralPath "$key.pub" -Raw).Trim()
     Invoke-Wsl @('sh', '-lc', "printf '%s\n' '$publicKey' > /root/.ssh/authorized_keys && chmod 600 /root/.ssh/authorized_keys")
     $keyForConfig = $key.Replace('\', '/')
+    # Windows OpenSSH discovers its per-user config from the actual runner
+    # profile; it ignores HOME and USERPROFILE overrides inherited by a child.
+    # Append one PID-scoped host entry and restore the original file in cleanup.
+    $sshAlias = "kodade-unix-fixture-$PID"
+    $actualSshDirectory = Join-Path ([Environment]::GetFolderPath([Environment+SpecialFolder]::UserProfile)) '.ssh'
+    New-Item -ItemType Directory -Force -Path $actualSshDirectory | Out-Null
+    $sshConfig = Join-Path $actualSshDirectory 'config'
+    $sshConfigBackup = Join-Path $fixture 'runner-ssh-config.backup'
+    $sshConfigExisted = Test-Path -LiteralPath $sshConfig
+    if ($sshConfigExisted) { Copy-Item -LiteralPath $sshConfig -Destination $sshConfigBackup -Force }
     @"
-Host kodade-unix-fixture
+Host $sshAlias
   HostName 127.0.0.1
   Port 2222
   User root
@@ -97,7 +111,8 @@ Host kodade-unix-fixture
   IdentitiesOnly yes
   StrictHostKeyChecking no
   UserKnownHostsFile NUL
-"@ | Set-Content -LiteralPath (Join-Path $sshDirectory 'config') -NoNewline
+"@ | Add-Content -LiteralPath $sshConfig -NoNewline
+    $sshConfigCreated = $true
 
     Write-Host 'starting Unix OpenSSH server'
     $sshProcess = Start-Process -FilePath 'wsl.exe' -ArgumentList (Join-NativeArguments @(
@@ -115,46 +130,44 @@ Host kodade-unix-fixture
     }
     if (-not $ready) { throw 'Unix SSH fixture did not listen on localhost:2222' }
 
-    $previousHome = $env:USERPROFILE
-    $previousUnixHome = $env:HOME
-    $env:USERPROFILE = $clientHome
-    $env:HOME = $clientHome
-    try {
-        Write-Host 'running Windows client through the Unix SSH bridge'
-        # Both commands create a Windows authenticated loopback bridge, then
-        # send daemon protocol through the Windows OpenSSH client into the Unix
-        # hidden `bridge` command. The marker originates in a Unix PTY.
-        $session = "ssh-fixture-$PID"
-        $pane = (Invoke-Native $WindowsBinary @('--remote', 'kodade-unix-fixture', '--session', $session, 'run', '--', 'sh', '-c', 'echo KODADE_WINDOWS_SSH_BRIDGE_OK') 45).Trim()
-        if ($pane -notmatch '^\d+$') { throw "remote run did not return a pane id: $pane" }
-        $seen = $false
-        for ($attempt = 0; $attempt -lt 40; $attempt++) {
-            $screen = Invoke-Native $WindowsBinary @('--remote', 'kodade-unix-fixture', '--session', $session, 'pane', 'read', $pane) 45
-            if ($screen -match 'KODADE_WINDOWS_SSH_BRIDGE_OK') {
-                $seen = $true
-                break
-            }
-            Start-Sleep -Milliseconds 100
+    Write-Host 'running Windows client through the Unix SSH bridge'
+    # Both commands create a Windows authenticated loopback bridge, then
+    # send daemon protocol through the Windows OpenSSH client into the Unix
+    # hidden `bridge` command. The marker originates in a Unix PTY.
+    $session = "ssh-fixture-$PID"
+    $pane = (Invoke-Native $WindowsBinary @('--remote', $sshAlias, '--session', $session, 'run', '--', 'sh', '-c', 'echo KODADE_WINDOWS_SSH_BRIDGE_OK') 45).Trim()
+    if ($pane -notmatch '^\d+$') { throw "remote run did not return a pane id: $pane" }
+    $seen = $false
+    for ($attempt = 0; $attempt -lt 40; $attempt++) {
+        $screen = Invoke-Native $WindowsBinary @('--remote', $sshAlias, '--session', $session, 'pane', 'read', $pane) 45
+        if ($screen -match 'KODADE_WINDOWS_SSH_BRIDGE_OK') {
+            $seen = $true
+            break
         }
-        if (-not $seen) { throw 'Unix PTY output did not return through the Windows SSH bridge' }
-
-        # `agent wait` polls the pane until its hook changes it back to idle.
-        # One Windows Tunnel therefore has to accept several sequential daemon
-        # connections, rather than only the initial command connection.
-        $waitPane = (Invoke-Native $WindowsBinary @('--remote', 'kodade-unix-fixture', '--session', $session, 'run', '--', 'sh', '-c', 'sleep 1; "$KODADE_BIN" agent report "$KODADE_PANE" working --source windows-ssh-fixture; sleep 1; "$KODADE_BIN" agent report "$KODADE_PANE" idle --source windows-ssh-fixture') 45).Trim()
-        if ($waitPane -notmatch '^\d+$') { throw "remote wait fixture did not return a pane id: $waitPane" }
-        Start-Sleep -Milliseconds 1300
-        Invoke-Native $WindowsBinary @('--remote', 'kodade-unix-fixture', '--session', $session, 'agent', 'wait', $waitPane, '--state', 'idle', '--timeout', '10') 45 | Out-Null
-        Invoke-Native $WindowsBinary @('--remote', 'kodade-unix-fixture', '--session', $session, 'kill-session') 45 | Out-Null
-    } finally {
-        $env:USERPROFILE = $previousHome
-        $env:HOME = $previousUnixHome
+        Start-Sleep -Milliseconds 100
     }
+    if (-not $seen) { throw 'Unix PTY output did not return through the Windows SSH bridge' }
+
+    # `agent wait` polls the pane until its hook changes it back to idle.
+    # One Windows Tunnel therefore has to accept several sequential daemon
+    # connections, rather than only the initial command connection.
+    $waitPane = (Invoke-Native $WindowsBinary @('--remote', $sshAlias, '--session', $session, 'run', '--', 'sh', '-c', 'sleep 1; "$KODADE_BIN" agent report "$KODADE_PANE" working --source windows-ssh-fixture; sleep 1; "$KODADE_BIN" agent report "$KODADE_PANE" idle --source windows-ssh-fixture') 45).Trim()
+    if ($waitPane -notmatch '^\d+$') { throw "remote wait fixture did not return a pane id: $waitPane" }
+    Start-Sleep -Milliseconds 1300
+    Invoke-Native $WindowsBinary @('--remote', $sshAlias, '--session', $session, 'agent', 'wait', $waitPane, '--state', 'idle', '--timeout', '10') 45 | Out-Null
+    Invoke-Native $WindowsBinary @('--remote', $sshAlias, '--session', $session, 'kill-session') 45 | Out-Null
 } finally {
     if ($null -ne $sshProcess -and -not $sshProcess.HasExited) {
         Stop-Process -Id $sshProcess.Id -Force -ErrorAction SilentlyContinue
         $sshProcess.WaitForExit(5000) | Out-Null
     }
     try { Invoke-Native 'wsl.exe' @('--unregister', $distro) 30 | Out-Null } catch { }
+    if ($sshConfigCreated) {
+        if ($sshConfigExisted) {
+            Copy-Item -LiteralPath $sshConfigBackup -Destination $sshConfig -Force
+        } else {
+            Remove-Item -LiteralPath $sshConfig -Force -ErrorAction SilentlyContinue
+        }
+    }
     Remove-Item -Force -Recurse -ErrorAction SilentlyContinue $fixture
 }
