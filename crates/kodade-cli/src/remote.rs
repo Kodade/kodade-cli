@@ -339,6 +339,13 @@ where
     let metadata = String::from_utf8(fetch(update::metadata_url("stable"))?)?;
     let release = update::select_release("stable", &metadata)?;
     let version = release.tag_name.trim_start_matches('v').to_owned();
+    if version != env!("CARGO_PKG_VERSION") {
+        bail!(
+            "published release {} does not match local kodade-cli {}",
+            release.tag_name,
+            env!("CARGO_PKG_VERSION")
+        );
+    }
     let asset = update::platform_asset_for(&version, os_to_target(os)?, arch_to_target(arch)?)?;
     let sums = String::from_utf8(fetch(update::release_asset_url(&release, "SHA256SUMS")?)?)?;
     let archive_url = update::release_asset_url(&release, &asset)
@@ -398,10 +405,10 @@ fn remote_version_is_compatible(stdout: &[u8]) -> bool {
     let Ok(text) = std::str::from_utf8(stdout) else {
         return false;
     };
-    let Some(remote) = text
-        .split_whitespace()
-        .find_map(|word| semver::Version::parse(word.trim_start_matches('v')).ok())
-    else {
+    let Some(remote) = text.trim().strip_prefix("kodade-cli ") else {
+        return false;
+    };
+    let Ok(remote) = semver::Version::parse(remote) else {
         return false;
     };
     let local =
@@ -671,11 +678,38 @@ mod tests {
     }
 
     #[test]
-    fn remote_version_requires_the_current_major_protocol_generation() {
-        assert!(remote_version_is_compatible(b"kodade-cli 0.2.1\n"));
-        assert!(!remote_version_is_compatible(b"kodade-cli 0.2.9\n"));
-        assert!(!remote_version_is_compatible(b"kodade-cli 1.0.0\n"));
-        assert!(!remote_version_is_compatible(b"unparseable\n"));
+    fn remote_version_requires_exact_local_cli_version() {
+        let local = env!("CARGO_PKG_VERSION");
+        assert!(remote_version_is_compatible(
+            format!("kodade-cli {local}\n").as_bytes()
+        ));
+        assert!(!remote_version_is_compatible(b"foreign-tool 0.2.1\n"));
+        assert!(!remote_version_is_compatible(
+            format!("kodade-cli {local}\nextra output\n").as_bytes()
+        ));
+        assert!(!remote_version_is_compatible(b"kodade-cli unparseable\n"));
+    }
+
+    #[test]
+    fn fixture_release_version_mismatch_stops_before_artifact_fetch() {
+        use std::cell::Cell;
+
+        let other = if env!("CARGO_PKG_VERSION") == "0.0.0" {
+            "0.0.1"
+        } else {
+            "0.0.0"
+        };
+        let calls = Cell::new(0);
+        let error = verified_release_binary("Linux", "x86_64", |url| {
+            calls.set(calls.get() + 1);
+            assert_eq!(url, update::metadata_url("stable"));
+            Ok(format!(r#"{{"tag_name":"v{other}"}}"#).into_bytes())
+        })
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("does not match local kodade-cli"));
+        assert_eq!(calls.get(), 1);
     }
 
     #[test]

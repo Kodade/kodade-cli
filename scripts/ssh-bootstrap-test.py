@@ -2,7 +2,7 @@
 """Prove remote bootstrap against a disposable localhost OpenSSH server.
 
 This deliberately uses the shipped CLI.  A private ``curl`` shim serves a
-signed fixture archive to the local updater; SSH, sshd, shell commands, and
+checksum-verified fixture archive to the local updater; SSH, sshd, shell commands, and
 the installed binary are all real.  The temporary remote HOME has spaces to
 exercise the quoted remote install path.
 """
@@ -204,8 +204,26 @@ def main() -> None:
             if failed.returncode == 0 or remote_binary.read_text() != "#!/bin/sh\necho old remote binary\n":
                 raise RuntimeError("bad checksum uploaded or replaced the prior remote binary")
 
+            # A latest stable release that does not match the local exact
+            # compatibility contract must fail before artifact retrieval/upload.
+            mismatch = "0.0.0" if version != "0.0.0" else "0.0.1"
+            metadata.write_text(json.dumps({"tag_name": f"v{mismatch}", "assets": []}))
+            mismatched = subprocess.run(
+                [str(BINARY), "machine", "prepare", profile, "--install"],
+                env=env,
+                text=True,
+                capture_output=True,
+                timeout=45,
+            )
+            if mismatched.returncode == 0 or remote_binary.read_text() != "#!/bin/sh\necho old remote binary\n":
+                raise RuntimeError("incompatible release replaced the prior remote binary")
+
             # Restore a valid checksum then have the real remote shell read one
             # byte. Its staged validation fails, and mv never replaces old.
+            metadata.write_text(json.dumps({"tag_name": f"v{version}", "assets": [
+                {"name": "SHA256SUMS", "browser_download_url": "fixture://sums"},
+                {"name": asset, "browser_download_url": "fixture://archive"},
+            ]}))
             sums.write_text(f"{digest}  {asset}\n")
             env["KODADE_BOOTSTRAP_TRUNCATE"] = "1"
             truncated = subprocess.run(
@@ -217,7 +235,10 @@ def main() -> None:
             )
             if truncated.returncode == 0 or remote_binary.read_text() != "#!/bin/sh\necho old remote binary\n":
                 raise RuntimeError("truncated upload replaced the prior remote binary")
-            print("SSH bootstrap passed: missing binary, verified install, checksum refusal, truncated upload, spaced HOME")
+            print(
+                "SSH bootstrap passed: missing binary, verified install, checksum and version refusal, "
+                "truncated upload, spaced HOME"
+            )
         finally:
             if sshd.poll() is None:
                 sshd.terminate()
