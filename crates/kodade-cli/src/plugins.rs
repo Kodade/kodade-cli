@@ -3,9 +3,12 @@
 use crate::commands;
 use anyhow::{anyhow, bail, Context, Result};
 use kodade_cli_proto::{
-    ClientMessage, PluginAction, PluginActionContext, PluginLinkHandler, PluginManifest, PluginPane,
+    ClientMessage, PluginAction, PluginLinkHandler, PluginManifest, PluginPane,
 };
 use serde::{Deserialize, Serialize};
+
+#[cfg(test)]
+use kodade_cli_proto::PluginActionContext;
 
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
@@ -52,34 +55,7 @@ pub struct PaletteAction {
 
 /// Data supplied to an extension command. It is serialized to a private file,
 /// never expanded into the plugin's shell command.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct InvocationContext {
-    pub endpoint: String,
-    pub workspace: Option<String>,
-    pub workspace_id: Option<String>,
-    pub tab: Option<String>,
-    pub tab_id: Option<String>,
-    pub pane: Option<String>,
-    pub cwd: Option<PathBuf>,
-    pub selected_text: Option<String>,
-    pub clicked_url: Option<String>,
-}
-
-impl InvocationContext {
-    pub fn supports(&self, action: &PluginAction) -> bool {
-        action.contexts.is_empty()
-            || action.contexts.iter().all(|scope| match scope {
-                PluginActionContext::Global => true,
-                PluginActionContext::Workspace => self.workspace_id.is_some(),
-                PluginActionContext::Tab => self.tab_id.is_some(),
-                PluginActionContext::Pane => self.pane.is_some(),
-                PluginActionContext::Selection => self
-                    .selected_text
-                    .as_ref()
-                    .is_some_and(|text| !text.is_empty()),
-            })
-    }
-}
+pub use kodade_cli_proto::InvocationContext;
 
 pub async fn command(
     socket: &Path,
@@ -181,6 +157,24 @@ pub async fn command(
                             &focused_pane,
                         )),
                         name: Some(format!("{} · {}", plugin.manifest.name, pane.name)),
+                        context: Box::new(Some(InvocationContext {
+                            endpoint: "local".into(),
+                            workspace: Some(workspace.to_string()),
+                            workspace_id: Some(layout.active_workspace.0.to_string()),
+                            tab: layout
+                                .tabs
+                                .iter()
+                                .find(|tab| tab.id == layout.active_tab)
+                                .map(|tab| tab.name.clone()),
+                            tab_id: Some(layout.active_tab.0.to_string()),
+                            pane: Some(focused_pane),
+                            cwd: layout
+                                .panes
+                                .iter()
+                                .find(|item| item.focused)
+                                .and_then(|item| item.cwd.clone()),
+                            ..Default::default()
+                        })),
                     },
                 )
                 .await?,
@@ -207,6 +201,24 @@ pub async fn command(
                     .find(|item| item.focused)
                     .map(|item| item.id.0.to_string())
                     .unwrap_or_default();
+                let context = InvocationContext {
+                    endpoint: "local".into(),
+                    workspace: Some(workspace.to_string()),
+                    workspace_id: Some(layout.active_workspace.0.to_string()),
+                    tab: layout
+                        .tabs
+                        .iter()
+                        .find(|tab| tab.id == layout.active_tab)
+                        .map(|tab| tab.name.clone()),
+                    tab_id: Some(layout.active_tab.0.to_string()),
+                    pane: Some(focused_pane.clone()),
+                    cwd: layout
+                        .panes
+                        .iter()
+                        .find(|item| item.focused)
+                        .and_then(|item| item.cwd.clone()),
+                    ..Default::default()
+                };
                 commands::layout(
                     commands::request(
                         socket,
@@ -223,6 +235,7 @@ pub async fn command(
                                 &focused_pane,
                             )),
                             name: Some(format!("{} · {}", plugin.manifest.name, action.name)),
+                            context: Box::new(Some(context)),
                         },
                     )
                     .await?,
@@ -552,14 +565,6 @@ impl Drop for ContextFile {
     }
 }
 
-impl ContextFile {
-    fn persist(self) -> PathBuf {
-        let path = self.0.clone();
-        std::mem::forget(self);
-        path
-    }
-}
-
 /// Stable execution seam shared by the palette, CLI, and future command work.
 pub async fn run_action_with_context(
     plugin: &LoadedPlugin,
@@ -631,30 +636,6 @@ pub fn pane_command(
         "cd \"$KODADE_PLUGIN_DIR\" && sh -lc \"$KODADE_PLUGIN_COMMAND\"".into(),
     ]);
     args
-}
-
-/// Creates a pane command with the same private context contract as a
-/// background action. The fixed wrapper removes the file when the pane command
-/// exits, including a non-zero exit.
-pub fn pane_command_with_context(
-    plugin: &str,
-    directory: &Path,
-    command: &str,
-    action: Option<&str>,
-    workspace: &str,
-    pane: &str,
-    context: &InvocationContext,
-) -> Result<Vec<String>> {
-    let path = ContextFile::create(context)?.persist();
-    let mut args = pane_command(plugin, directory, command, action, workspace, pane);
-    let shell = args.pop().expect("pane wrapper has shell source");
-    let insert = args.len() - 2;
-    args.insert(insert, format!("KODADE_PLUGIN_CONTEXT={}", path.display()));
-    args.insert(insert + 1, "KODADE_PLUGIN_CONTEXT_FORMAT=json".into());
-    args.push(format!(
-        "{shell}; status=$?; rm -f \"$KODADE_PLUGIN_CONTEXT\"; exit $status"
-    ));
-    Ok(args)
 }
 
 struct ManagedStaging {
@@ -959,7 +940,7 @@ mod tests {
             id: "slow".into(),
             name: "Slow".into(),
             command: format!(
-                "printf '%s' \"$KODADE_PLUGIN_CONTEXT\" > {}; sleep 1",
+                "printf '%s' \"$KODADE_PLUGIN_CONTEXT\" > {}; sleep 2",
                 marker.display()
             ),
             description: String::new(),
@@ -973,7 +954,7 @@ mod tests {
             &InvocationContext::default(),
             "session",
             Path::new("/tmp/socket"),
-            Duration::from_millis(100)
+            Duration::from_millis(500)
         )
         .await
         .is_err());

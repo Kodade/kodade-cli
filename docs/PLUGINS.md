@@ -78,8 +78,9 @@ Actions appear in the command center (`prefix space`). A pane action opens a
 new terminal pane; other actions run locally for at most 30 seconds. Commands
 receive `KODADE_PLUGIN`, `KODADE_ACTION` (actions), `KODADE_EVENT` (hooks),
 `KODADE_SESSION`, `KODADE_SOCKET`, `KODADE_WORKSPACE`, and `KODADE_PANE` when
-that context exists. Context-aware actions also receive a private,
-job-lifetime JSON path in `KODADE_PLUGIN_CONTEXT` (`KODADE_PLUGIN_CONTEXT_FORMAT=json`).
+that context exists. Context-aware actions receive a private JSON path in
+`KODADE_PLUGIN_CONTEXT` (`KODADE_PLUGIN_CONTEXT_FORMAT=json`) for the background
+job or pane lifetime.
 It contains endpoint, workspace/tab/pane ids, cwd, selected text, and clicked
 URL as data; read the file rather than interpolating values into shell source.
 Pane actions also receive `KODADE_TARGET_PANE`, the pane that was focused

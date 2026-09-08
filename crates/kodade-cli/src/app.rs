@@ -1514,6 +1514,7 @@ impl App {
                 split: Some(SplitAxis::Vertical),
                 command: Some(vec![editor, path.to_string_lossy().into_owned()]),
                 name: Some("editor".into()),
+                context: Box::new(None),
             },
         )
         .await?;
@@ -2080,6 +2081,7 @@ impl App {
                         split: None,
                         command: Some(command),
                         name: Some(name),
+                        context: Box::new(None),
                     },
                 )
                 .await?;
@@ -2093,6 +2095,7 @@ impl App {
                         split: None,
                         command: None,
                         name: None,
+                        context: Box::new(None),
                     },
                 )
                 .await?;
@@ -2140,16 +2143,16 @@ impl App {
                             workspace: None,
                             tab: None,
                             split: None,
-                            command: Some(crate::plugins::pane_command_with_context(
+                            command: Some(crate::plugins::pane_command(
                                 &plugin,
                                 &directory,
                                 &command,
                                 Some(&action),
                                 &workspace,
                                 &focused_pane,
-                                &context,
-                            )?),
+                            )),
                             name: Some(format!("plugin · {plugin} · {action}")),
+                            context: Box::new(Some(context)),
                         },
                     )
                     .await?;
@@ -2784,15 +2787,14 @@ impl App {
                         if action.pane {
                             let workspace = context.workspace.clone().unwrap_or_default();
                             let focused = context.pane.clone().unwrap_or_default();
-                            let command = crate::plugins::pane_command_with_context(
+                            let command = crate::plugins::pane_command(
                                 &plugin.manifest.id,
                                 &plugin.installed.path,
                                 &action.command,
                                 Some(&action.id),
                                 &workspace,
                                 &focused,
-                                &context,
-                            )?;
+                            );
                             write(
                                 writer,
                                 &ClientMessage::NewPane {
@@ -2804,6 +2806,7 @@ impl App {
                                         "plugin · {} · {}",
                                         plugin.manifest.id, action.name
                                     )),
+                                    context: Box::new(Some(context)),
                                 },
                             )
                             .await?;

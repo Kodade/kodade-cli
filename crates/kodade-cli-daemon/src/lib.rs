@@ -27,9 +27,9 @@ use std::{
 use anyhow::{anyhow, bail, Context, Result};
 use kodade_cli_proto::{
     decode, encode, schema_message, AgentInfo, AgentStateKind, CellColor, ClientMessage, Direction,
-    Event, LayoutSnapshot, LayoutTree, ManifestInfo, Notification, PaneId, PaneSnapshot, QueryKind,
-    Run, Screen, ServerMessage, SidebarTabInfo, SplitAxis, TabId, TabInfo, WorkspaceId,
-    WorkspaceInfo, ATTR_BOLD, ATTR_DIM, ATTR_INVERSE, ATTR_ITALIC, ATTR_UNDERLINE,
+    Event, InvocationContext, LayoutSnapshot, LayoutTree, ManifestInfo, Notification, PaneId,
+    PaneSnapshot, QueryKind, Run, Screen, ServerMessage, SidebarTabInfo, SplitAxis, TabId, TabInfo,
+    WorkspaceId, WorkspaceInfo, ATTR_BOLD, ATTR_DIM, ATTR_INVERSE, ATTR_ITALIC, ATTR_UNDERLINE,
     PROTOCOL_VERSION,
 };
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
@@ -198,6 +198,44 @@ struct Pane {
     agent_generation: AtomicU64,
     agent_identity: Mutex<Option<String>>,
     activity_revision: AtomicU64,
+    /// The daemon owns this file until the pane and its PTY child are gone.
+    _context_file: Option<ContextFile>,
+}
+
+const MAX_CONTEXT_BYTES: usize = 64 * 1024;
+
+struct ContextFile(PathBuf);
+
+impl ContextFile {
+    fn create(context: &InvocationContext) -> Result<Self> {
+        let json = serde_json::to_vec(context)?;
+        if json.len() > MAX_CONTEXT_BYTES {
+            bail!("plugin context exceeds {} KiB", MAX_CONTEXT_BYTES / 1024);
+        }
+        let path = std::env::temp_dir().join(format!(
+            "kodade-plugin-context-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_nanos()
+        ));
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&path)?;
+        file.write_all(&json)?;
+        Ok(Self(path))
+    }
+}
+
+impl Drop for ContextFile {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
 }
 
 /// Closing a pane terminates its process so the PTY reader thread exits.
@@ -764,7 +802,17 @@ impl Session {
         cwd: Option<PathBuf>,
         command: Option<Vec<String>>,
     ) -> Result<PaneId> {
-        self.new_pane_with_id(self.pane_id(), title, cwd, command)
+        self.new_pane_with_id(self.pane_id(), title, cwd, command, None)
+    }
+
+    fn new_pane_with_context(
+        &self,
+        title: &str,
+        cwd: Option<PathBuf>,
+        command: Option<Vec<String>>,
+        context_file: Option<ContextFile>,
+    ) -> Result<PaneId> {
+        self.new_pane_with_id(self.pane_id(), title, cwd, command, context_file)
     }
 
     /// Spawn a pane under a caller-chosen id, used by `layout apply` so a pane
@@ -775,6 +823,7 @@ impl Session {
         title: &str,
         cwd: Option<PathBuf>,
         command: Option<Vec<String>>,
+        context_file: Option<ContextFile>,
     ) -> Result<PaneId> {
         let (cols, rows) = *self.size.lock().expect("size lock poisoned");
         let pane = Arc::new(Pane::spawn(
@@ -787,6 +836,7 @@ impl Session {
             self.updates.clone(),
             cwd,
             command,
+            context_file,
         )?);
         self.panes
             .lock()
@@ -841,6 +891,7 @@ impl Session {
         split: Option<SplitAxis>,
         command: Option<Vec<String>>,
         name: Option<String>,
+        context: Option<InvocationContext>,
     ) -> Result<()> {
         let target = {
             let state = self
@@ -855,7 +906,10 @@ impl Session {
         };
         let cwd = self.inherit_cwd(target, tab, None);
         let title = pane_title(name.as_deref(), command.as_deref());
-        let pane = self.new_pane(&title, cwd, command)?;
+        let context_file = context
+            .map(|context| ContextFile::create(&context))
+            .transpose()?;
+        let pane = self.new_pane_with_context(&title, cwd, command, context_file)?;
         // Allocate the tab id up front; `tab_id` locks state and must not be
         // called while the guard below is held.
         let new_tab_id = self.tab_id();
@@ -1809,7 +1863,8 @@ impl Session {
                 split,
                 command,
                 name,
-            } => self.new_pane_message(workspace, tab, split, command, name)?,
+                context,
+            } => self.new_pane_message(workspace, tab, split, command, name, *context)?,
             ClientMessage::NextTab | ClientMessage::PrevTab => {
                 let next = matches!(message, ClientMessage::NextTab);
                 let mut state = self
@@ -2794,7 +2849,13 @@ impl Session {
                             anyhow!("tab {} has no entry for pane {}", saved_tab.id, id.0)
                         })?;
                     let cwd = restore_cwd(saved_pane.cwd.clone(), saved.root.clone());
-                    self.new_pane_with_id(*id, &saved_pane.title, cwd, saved_pane.command.clone())?;
+                    self.new_pane_with_id(
+                        *id,
+                        &saved_pane.title,
+                        cwd,
+                        saved_pane.command.clone(),
+                        None,
+                    )?;
                     spawned.push(*id);
                 }
                 let focused = if leaves.contains(&PaneId(saved_tab.focused)) {
@@ -3041,6 +3102,7 @@ impl Pane {
         updates: broadcast::Sender<()>,
         cwd: Option<PathBuf>,
         run: Option<Vec<String>>,
+        context_file: Option<ContextFile>,
     ) -> Result<Self> {
         let pty_system = native_pty_system();
         let pair = pty_system.openpty(PtySize {
@@ -3077,6 +3139,10 @@ impl Pane {
         command.env("KODADE_PANE", id.0.to_string());
         command.env("KODADE_SOCKET", hook_socket);
         command.env("KODADE_SESSION", session);
+        if let Some(context_file) = &context_file {
+            command.env("KODADE_PLUGIN_CONTEXT", &context_file.0);
+            command.env("KODADE_PLUGIN_CONTEXT_FORMAT", "json");
+        }
         // Scripts inside a pane call the same binary that hosts them.
         if let Ok(exe) = env::current_exe() {
             command.env("KODADE_BIN", exe);
@@ -3125,6 +3191,7 @@ impl Pane {
             agent_generation: AtomicU64::new(0),
             agent_identity: Mutex::new(None),
             activity_revision: AtomicU64::new(0),
+            _context_file: context_file,
         })
     }
     fn snapshot(&self) -> (Screen, usize) {
@@ -4083,6 +4150,64 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn pane_context_is_created_after_acceptance_and_removed_with_the_pane() {
+        let session = Session::spawn(80, 24, "pane-context-lifetime".into()).expect("session");
+        session
+            .handle(ClientMessage::NewPane {
+                workspace: None,
+                tab: None,
+                split: None,
+                command: Some(vec!["sleep".into(), "60".into()]),
+                name: Some("context".into()),
+                context: Box::new(Some(InvocationContext {
+                    selected_text: Some("selection is data".into()),
+                    ..Default::default()
+                })),
+            })
+            .expect("accept context pane");
+        let pane = session
+            .snapshot()
+            .expect("snapshot")
+            .panes
+            .into_iter()
+            .find(|pane| pane.focused)
+            .expect("focused pane")
+            .id;
+        let path = session
+            .panes
+            .lock()
+            .expect("panes")
+            .get(&pane)
+            .and_then(|pane| pane._context_file.as_ref())
+            .map(|file| file.0.clone())
+            .expect("daemon context file");
+        assert!(path.exists());
+        session
+            .handle(ClientMessage::ClosePane)
+            .expect("close pane");
+        assert!(!path.exists(), "closing a pane releases its context file");
+    }
+
+    #[tokio::test]
+    async fn rejected_pane_context_never_spawns_or_persists_a_file() {
+        let session = Session::spawn(80, 24, "reject-pane-context".into()).expect("session");
+        let before = session.panes.lock().expect("panes").len();
+        let result = session.handle(ClientMessage::NewPane {
+            workspace: None,
+            tab: None,
+            split: None,
+            command: Some(vec!["sleep".into(), "60".into()]),
+            name: Some("too-large".into()),
+            context: Box::new(Some(InvocationContext {
+                selected_text: Some("x".repeat(MAX_CONTEXT_BYTES)),
+                ..Default::default()
+            })),
+        });
+        assert!(result.is_err());
+        assert_eq!(session.panes.lock().expect("panes").len(), before);
+    }
+
+    #[tokio::test]
     async fn client_line_reader_accepts_empty_and_rejects_oversized_requests() {
         let (mut write, read) = tokio::io::duplex(MAX_CLIENT_LINE + 2);
         write.write_all(b"\n").await.unwrap();
@@ -4397,6 +4522,7 @@ mod tests {
             updates,
             None,
             Some(vec!["sleep".into(), "60".into()]),
+            None,
         )
         .expect("test pane");
         // The reader keeps the original parser, so shell profile output cannot
