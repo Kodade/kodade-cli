@@ -26,6 +26,24 @@ with tempfile.TemporaryDirectory(prefix="kodade-smoke-") as directory:
             assert result.returncode == 0, (args, result.stdout, result.stderr)
         return result
 
+    def daemon_pid(session):
+        deadline = time.monotonic() + 3
+        while True:
+            matches = []
+            for proc in Path("/proc").glob("[0-9]*"):
+                try:
+                    environ = (proc / "environ").read_bytes()
+                    command = (proc / "cmdline").read_bytes().replace(b"\0", b" ")
+                except OSError:
+                    continue
+                if f"XDG_RUNTIME_DIR={env['XDG_RUNTIME_DIR']}".encode() in environ and \
+                        f"kodade-cli daemon {session}".encode() in command:
+                    matches.append(proc.name)
+            if len(matches) == 1:
+                return int(matches[0])
+            assert time.monotonic() < deadline, (session, matches)
+            time.sleep(0.05)
+
     try:
         # Read-only diagnostics must not start a daemon or initialize user config.
         report = json.loads(run("doctor", "--json").stdout)
@@ -55,6 +73,24 @@ with tempfile.TemporaryDirectory(prefix="kodade-smoke-") as directory:
 
         # Targeting across one-shot connections must preserve the CLI script selection.
         other = run("run", "--name", "other", "--", "sh", "-c", "sleep 30").stdout.strip()
+        old_daemon = daemon_pid("default")
+        child = int(subprocess.check_output(["pgrep", "-P", str(old_daemon)], text=True).splitlines()[0])
+        # A failed replacement leaves the source usable; successful replacements
+        # preserve the original PTY process through two daemon PID changes.
+        assert run("session", "upgrade", "--binary", "/no/such/kodade", success=False).returncode != 0
+        run("ls", "--json")
+        run("session", "upgrade")
+        first_target = daemon_pid("default")
+        assert first_target != old_daemon
+        os.kill(child, 0)
+        run("session", "upgrade")
+        assert daemon_pid("default") not in (old_daemon, first_target)
+        os.kill(child, 0)
+        run("send", other, "echo UPGRADE_SMOKE_OK")
+        deadline = time.monotonic() + 4
+        while "UPGRADE_SMOKE_OK" not in run("pane", "read", other).stdout:
+            assert time.monotonic() < deadline, "pane did not survive upgrade"
+            time.sleep(0.05)
         run("pane", "kill", pane)
         run("pane", "read", other)
         assert run("pane", "read", pane, success=False).returncode != 0
@@ -88,4 +124,4 @@ with tempfile.TemporaryDirectory(prefix="kodade-smoke-") as directory:
         for session in ("default", "renamed", "cold-agent"):
             run("-s", session, "kill-session", success=False)
 
-print("CLI smoke passed: cold start, real PTY output, diagnostics, config preservation, session context, rename, shutdown")
+print("CLI smoke passed: cold start, PTY output, live daemon handoff, diagnostics, config preservation, session context, rename, shutdown")

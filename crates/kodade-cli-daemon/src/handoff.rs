@@ -251,6 +251,19 @@ pub(crate) fn wait_commit(stream: &mut UnixStream) -> io::Result<()> {
     }
 }
 
+pub(crate) fn committed(stream: &mut UnixStream) -> io::Result<()> {
+    stream.write_all(b"committed\n")?;
+    stream.flush()
+}
+
+pub(crate) fn wait_committed(stream: &mut UnixStream) -> io::Result<()> {
+    if line(stream, 32)? == "committed" {
+        Ok(())
+    } else {
+        Err(data("handoff importer did not commit"))
+    }
+}
+
 fn receive_with_timeout(
     path: &Path,
     token: &str,

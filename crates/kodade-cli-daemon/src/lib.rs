@@ -89,6 +89,8 @@ struct Session {
     view_dispatch: Mutex<()>,
     upgraded: AtomicBool,
     upgrading: broadcast::Sender<()>,
+    upgrade_lock: Mutex<()>,
+    handoff_active: AtomicBool,
 }
 
 /// Source-side staging guard. Dropping it on any validation, transfer, or
@@ -99,13 +101,24 @@ struct CapturedHandoff {
     #[allow(dead_code)] // SCM_RIGHTS duplicates these while the source retains ownership.
     fds: Vec<RawFd>,
     paused: Vec<Arc<Pane>>,
+    committed: bool,
 }
 
 impl Drop for CapturedHandoff {
     fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
         for pane in &self.paused {
             pane.reader.resume();
         }
+    }
+}
+
+struct HandoffActive<'a>(&'a AtomicBool);
+impl Drop for HandoffActive<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
     }
 }
 
@@ -539,18 +552,34 @@ pub async fn run_import(
         .context("receive live handoff")?;
     let session = unsafe { Session::import_handoff(received.manifest, received.fds) }?;
     let session = Arc::new(session);
-    let listener = handoff::bind_listener(&staged_socket).context("bind staged daemon socket")?;
-    if staged_hook.exists() {
-        fs::remove_file(&staged_hook).context("remove stale staged hook")?;
-    }
-    fs::hard_link(&staged_socket, &staged_hook).context("link staged hook socket")?;
+    let staged = (|| -> Result<_> {
+        let listener =
+            handoff::bind_listener(&staged_socket).context("bind staged daemon socket")?;
+        if staged_hook.exists() {
+            fs::remove_file(&staged_hook).context("remove stale staged hook")?;
+        }
+        fs::hard_link(&staged_socket, &staged_hook).context("link staged hook socket")?;
+        Ok(listener)
+    })();
+    let listener = match staged {
+        Ok(listener) => listener,
+        Err(error) => {
+            std::mem::forget(session);
+            return Err(error);
+        }
+    };
     let mut control = received.stream;
-    tokio::task::spawn_blocking(move || {
+    let committed = tokio::task::spawn_blocking(move || {
         handoff::ready(&mut control)?;
-        handoff::wait_commit(&mut control)
+        handoff::wait_commit(&mut control)?;
+        handoff::committed(&mut control)
     })
     .await
-    .context("join handoff commit")??;
+    .context("join handoff commit")?;
+    if let Err(error) = committed {
+        std::mem::forget(session);
+        return Err(error.into());
+    }
     for pane in session.panes.lock().expect("pane lock poisoned").values() {
         pane.reader.resume();
     }
@@ -572,6 +601,9 @@ async fn serve_imported_listener(listener: UnixListener, session: Arc<Session>) 
     loop {
         tokio::select! {
             _ = shutdown.recv() => {
+                if session.upgraded.load(Ordering::Acquire) {
+                    std::process::exit(0);
+                }
                 persist::remove_session_file(&session.session_name());
                 drop(listener);
                 let _ = fs::remove_file(session.socket_path());
@@ -687,6 +719,8 @@ impl Session {
             view_dispatch: Mutex::new(()),
             upgraded: AtomicBool::new(false),
             upgrading: broadcast::channel(16).0,
+            upgrade_lock: Mutex::new(()),
+            handoff_active: AtomicBool::new(false),
         };
         let pane = session.new_pane("shell", None, None)?;
         let tab = Tab {
@@ -747,6 +781,8 @@ impl Session {
             view_dispatch: Mutex::new(()),
             upgraded: AtomicBool::new(false),
             upgrading: broadcast::channel(16).0,
+            upgrade_lock: Mutex::new(()),
+            handoff_active: AtomicBool::new(false),
         };
         let manifests = session
             .manifests
@@ -913,20 +949,27 @@ impl Session {
             manifest: handoff::HandoffManifest::new(file, runtimes).map_err(anyhow::Error::from)?,
             fds,
             paused,
+            committed: false,
         })
     }
 
     /// Perform the source half of an all-or-nothing daemon replacement.
     fn upgrade(&self, binary: Option<PathBuf>) -> Result<()> {
+        let _upgrade_lock = self
+            .upgrade_lock
+            .lock()
+            .map_err(|_| anyhow!("upgrade lock poisoned"))?;
+        if self.handoff_active.swap(true, Ordering::AcqRel) {
+            bail!("a live upgrade is already in progress");
+        }
+        let _active = HandoffActive(&self.handoff_active);
         let binary =
             binary.unwrap_or(std::env::current_exe().context("find current kodade-cli binary")?);
         let public = self.socket_path();
         let hook = self.hook_socket();
-        let nonce = format!(
-            "{}-{}",
-            std::process::id(),
-            Instant::now().elapsed().as_nanos()
-        );
+        let mut entropy = [0_u8; 24];
+        fs::File::open("/dev/urandom")?.read_exact(&mut entropy)?;
+        let nonce: String = entropy.iter().map(|byte| format!("{byte:02x}")).collect();
         let handoff_path = socket_dir().join(format!(".handoff-{nonce}.sock"));
         let staged_socket = socket_dir().join(format!(".upgrade-{nonce}.sock"));
         let staged_hook = socket_dir()
@@ -939,14 +982,13 @@ impl Session {
         fs::create_dir_all(hook.parent().expect("hook parent"))?;
         let listener =
             handoff::bind_listener(&handoff_path).context("bind private handoff socket")?;
-        let token = format!("{nonce}-{}", std::process::id());
+        let token = nonce.clone();
         let mut child = Command::new(&binary)
             .arg("daemon")
             .arg(self.session_name())
             .arg("--import")
             .arg(&handoff_path)
-            .arg("--handoff-token")
-            .arg(&token)
+            .env("KODADE_HANDOFF_TOKEN", &token)
             .arg("--staged-socket")
             .arg(&staged_socket)
             .arg("--staged-hook")
@@ -955,8 +997,8 @@ impl Session {
             .arg(&hook)
             .spawn()
             .with_context(|| format!("start replacement daemon {}", binary.display()))?;
-        let captured = self.capture_handoff()?;
         let result = (|| -> Result<()> {
+            let mut captured = self.capture_handoff()?;
             let mut control = handoff::accept_and_validate(&listener, &token, &captured.manifest)
                 .context("validate replacement daemon")?;
             handoff::send_fds(&control, &captured.fds).context("transfer PTY masters")?;
@@ -972,7 +1014,14 @@ impl Session {
                 let _ = fs::rename(&hook_backup, &hook);
                 return Err(error).context("publish replacement socket aliases");
             }
-            handoff::commit(&mut control).context("commit replacement daemon")?;
+            if let Err(error) =
+                handoff::commit(&mut control).and_then(|_| handoff::wait_committed(&mut control))
+            {
+                let _ = fs::rename(&public_backup, &public);
+                let _ = fs::rename(&hook_backup, &hook);
+                return Err(error).context("commit replacement daemon");
+            }
+            captured.committed = true;
             let _ = fs::remove_file(&public_backup);
             let _ = fs::remove_file(&hook_backup);
             Ok(())
@@ -1021,6 +1070,8 @@ impl Session {
             view_dispatch: Mutex::new(()),
             upgraded: AtomicBool::new(false),
             upgrading: broadcast::channel(16).0,
+            upgrade_lock: Mutex::new(()),
+            handoff_active: AtomicBool::new(false),
         };
         let mut runtimes: HashMap<u64, (handoff::PaneRuntime, RawFd)> = manifest
             .panes
@@ -1997,6 +2048,9 @@ impl Session {
     }
 
     fn handle(&self, message: ClientMessage) -> Result<()> {
+        if self.handoff_active.load(Ordering::Acquire) {
+            bail!("daemon upgrade in progress");
+        }
         match message {
             // `Version` / `Session` / `Schema` queries, `Subscribe`, and
             // `ReadPane` are answered by `serve_client`; no state changes here.
@@ -4287,6 +4341,10 @@ async fn serve_client(stream: UnixStream, session: Arc<Session>) -> Result<()> {
                         continue;
                     }
                     ClientMessage::ReloadManifests => {
+                        if session.handoff_active.load(Ordering::Acquire) {
+                            write_server(&mut writer, &ServerMessage::Error { message: "daemon upgrade in progress".into() }).await?;
+                            continue;
+                        }
                         match session.reload_manifests() {
                             Ok(manifests) => {
                                 write_server(&mut writer, &ServerMessage::Manifests(manifests)).await?;
@@ -4305,13 +4363,16 @@ async fn serve_client(stream: UnixStream, session: Arc<Session>) -> Result<()> {
                             .context("join live upgrade")?;
                         match result {
                             Ok(()) => {
-                                write_server(&mut writer, &ServerMessage::Upgrading).await?;
                                 session.upgraded.store(true, Ordering::Release);
                                 let _ = session.upgrading.send(());
-                                // Give every attached client a scheduling turn to receive its
-                                // explicit reconnect marker before the old process exits.
-                                tokio::time::sleep(Duration::from_millis(50)).await;
-                                let _ = session.shutdown.send(());
+                                let shutdown = session.shutdown.clone();
+                                // This must outlive the requesting socket: a client can vanish
+                                // immediately after committing a valid replacement.
+                                tokio::spawn(async move {
+                                    tokio::time::sleep(Duration::from_millis(50)).await;
+                                    let _ = shutdown.send(());
+                                });
+                                let _ = write_server(&mut writer, &ServerMessage::Upgrading).await;
                                 return Ok(());
                             }
                             Err(error) => {

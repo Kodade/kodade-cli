@@ -153,6 +153,8 @@ async fn main() -> Result<()> {
             hook_socket,
         }) => {
             let name = name.unwrap_or(session);
+            let handoff_token =
+                handoff_token.or_else(|| std::env::var("KODADE_HANDOFF_TOKEN").ok());
             match (
                 import,
                 handoff_token,
