@@ -126,14 +126,40 @@ Socket paths are selected in this order:
 
 Session names are 1–64 bytes and cannot be `.` or `..`, or contain `/`, `\`,
 or control characters. The CLI and daemon share the same validator. The daemon removes a socket file only when it cannot connect to a
-live daemon at that path. `session rename` renames the socket file in place: the
-listener stays bound, so the same daemon and its PTYs answer on the new path.
+live daemon at that path. `session rename` renames the public socket file in
+place: the listener stays bound, so the same daemon and its PTYs answer on the
+new path. Each daemon also creates a private per-process socket link under the
+socket directory's `hooks/` subdirectory for pane hooks; it is injected as
+`KODADE_SOCKET`, survives a rename, and is removed on shutdown. Hook reporters
+must use that inherited socket and must not override it with `--session`.
 
 Every message, its JSON shape, the `Subscribe` event stream, the schema query,
 and the environment variables a pane receives are documented in
 [SOCKET-API.md](SOCKET-API.md) — that file is the contract for any other client
 (the desktop app included), so update it in the same change as a protocol
 change.
+
+## Agent manifests and lifecycle integrations
+
+Bundled detection manifests are compiled into the daemon. Users can override a
+manifest by name in `~/.config/kodade-cli/agent-detection/NAME.toml`; an
+override replaces that one bundled entry. `kodade-cli agent manifests` shows
+the active cache and its source, `agent validate-manifest PATH` checks a file
+without installing it, and `agent manifests --reload` atomically applies a
+complete valid replacement set to a running daemon. `agent update-manifests`
+downloads validated overrides and then performs that reload.
+
+`integrate claude-code|codex|gemini-cli|pi|opencode --write` installs only the
+documented hook/plugin surface for that agent. Every generated reporter uses
+the `KODADE_BIN`, `KODADE_SOCKET`, `KODADE_SESSION`, and `KODADE_PANE`
+environment inherited by panes, exits quietly outside that context, and sends
+no hook output into the agent terminal. Reporters use the inherited socket
+instead of deriving one from the session name, so a renamed session keeps
+working in existing panes. `--remove` removes only Ködade-owned
+entries or files. Claude, Gemini, Codex, and Pi adapter event names are backed
+by their official documentation (Pi was also inspected locally at 0.85.1);
+the OpenCode plugin is documentation-backed and fixture-tested, not yet run
+against a live OpenCode plugin host.
 
 ## Protocol versioning (#23)
 

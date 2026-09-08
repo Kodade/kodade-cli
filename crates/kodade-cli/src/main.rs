@@ -77,7 +77,23 @@ async fn main() -> Result<()> {
                 }
                 | cli::Command::KillSession
         )
+    ) && !matches!(
+        args.command,
+        Some(cli::Command::Agent {
+            command: cli::AgentCommand::UpdateManifests
+                | cli::AgentCommand::ValidateManifest { .. }
+        })
     );
+    if remote.is_some()
+        && matches!(
+            args.command,
+            Some(cli::Command::Agent {
+                command: cli::AgentCommand::UpdateManifests
+            })
+        )
+    {
+        bail!("agent update-manifests is local-only; run it on the remote host directly");
+    }
     // `--remote` sets up the SSH forward once; `_tunnel` must outlive every
     // request below so the forward stays open (dropping it removes the socket).
     let (socket, _tunnel) = if needs_socket {
@@ -270,14 +286,44 @@ async fn main() -> Result<()> {
         }
         Some(cli::Command::Integrate { target }) => match target {
             cli::IntegrateCommand::List => integrations::integrate_list(),
-            cli::IntegrateCommand::ClaudeCode { write } => {
-                integrations::integrate_claude_code(write)
+            cli::IntegrateCommand::ClaudeCode { write, remove } => {
+                if remove {
+                    integrations::unintegrate_claude_code()
+                } else {
+                    integrations::integrate_claude_code(write)
+                }
             }
-            cli::IntegrateCommand::GeminiCli { write } => {
-                integrations::integrate_gemini(write, false)
+            cli::IntegrateCommand::GeminiCli { write, remove } => {
+                if remove {
+                    integrations::unintegrate_gemini()
+                } else {
+                    integrations::integrate_gemini(write, false)
+                }
             }
-            cli::IntegrateCommand::Codex { write, force } => {
-                integrations::integrate_codex(write, force)
+            cli::IntegrateCommand::Codex {
+                write,
+                force,
+                remove,
+            } => {
+                if remove {
+                    integrations::unintegrate_codex()
+                } else {
+                    integrations::integrate_codex(write, force)
+                }
+            }
+            cli::IntegrateCommand::OpenCode { write, remove } => {
+                if remove {
+                    integrations::unintegrate_opencode()
+                } else {
+                    integrations::integrate_opencode(write)
+                }
+            }
+            cli::IntegrateCommand::Pi { write, remove } => {
+                if remove {
+                    integrations::unintegrate_pi()
+                } else {
+                    integrations::integrate_pi(write)
+                }
             }
         },
         Some(cli::Command::Tab { command }) => tab(&socket, command).await,
@@ -846,7 +892,33 @@ async fn agent(
             }
             Ok(())
         }
-        cli::AgentCommand::UpdateManifests => integrations::update_manifests(),
+        cli::AgentCommand::UpdateManifests => {
+            integrations::update_manifests()?;
+            if socket.exists() {
+                print_manifests(
+                    commands::request(socket, ClientMessage::ReloadManifests).await?,
+                    false,
+                )
+            } else {
+                println!("updated manifests; reload them when the daemon is running");
+                Ok(())
+            }
+        }
+        cli::AgentCommand::Manifests { reload, json } => {
+            let request = if reload {
+                ClientMessage::ReloadManifests
+            } else {
+                ClientMessage::Query(QueryKind::Manifests)
+            };
+            print_manifests(commands::request(socket, request).await?, json)
+        }
+        cli::AgentCommand::ValidateManifest { path } => {
+            let source = std::fs::read_to_string(&path)
+                .with_context(|| format!("read {}", path.display()))?;
+            let name = kodade_cli_daemon::validate_agent_manifest(&source)?;
+            println!("valid manifest: {name}");
+            Ok(())
+        }
         cli::AgentCommand::Report {
             pane,
             state,
@@ -866,6 +938,23 @@ async fn agent(
             Ok(())
         }
     }
+}
+
+fn print_manifests(message: ServerMessage, json: bool) -> Result<()> {
+    let ServerMessage::Manifests(manifests) = message else {
+        return commands::layout(message).map(|_| ());
+    };
+    if json {
+        println!("{}", serde_json::to_string_pretty(&manifests)?);
+    } else {
+        for manifest in manifests {
+            println!(
+                "{:<16} {:<16} {:<13} {} rules",
+                manifest.name, manifest.display, manifest.source, manifest.rules
+            );
+        }
+    }
+    Ok(())
 }
 
 /// `current` is only meaningful inside a pane Ködade spawned. Reading its

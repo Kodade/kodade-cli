@@ -316,6 +316,9 @@ pub enum ClientMessage {
         id: WorkspaceId,
         keep: bool,
     },
+    /// Re-read bundled and user override detection manifests without restarting
+    /// the daemon. The old set remains active when the replacement is invalid.
+    ReloadManifests,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -332,6 +335,20 @@ pub enum QueryKind {
     Session,
     /// The protocol schema: version plus the message names this daemon knows.
     Schema,
+    /// The active manifest set, including whether each entry is bundled or a
+    /// user override. This is intentionally metadata, not screen rules.
+    Manifests,
+}
+
+/// Inspectable metadata for one active agent detection manifest.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManifestInfo {
+    pub name: String,
+    pub display: String,
+    pub process: Vec<String>,
+    pub title: Vec<String>,
+    pub rules: usize,
+    pub source: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -371,6 +388,8 @@ pub enum ServerMessage {
         client_messages: Vec<String>,
         server_messages: Vec<String>,
     },
+    /// Reply to `Query(Manifests)` and `ReloadManifests`.
+    Manifests(Vec<ManifestInfo>),
     Error {
         message: String,
     },
@@ -814,6 +833,7 @@ pub const CLIENT_MESSAGE_NAMES: &[&str] = &[
     "SetWorkspaceColor",
     "NewWorktreeWorkspace",
     "RemoveWorktreeWorkspace",
+    "ReloadManifests",
 ];
 
 /// Every `ServerMessage` variant name (see [`CLIENT_MESSAGE_NAMES`]).
@@ -827,6 +847,7 @@ pub const SERVER_MESSAGE_NAMES: &[&str] = &[
     "Event",
     "Session",
     "Schema",
+    "Manifests",
     "Error",
     "Shutdown",
 ];
@@ -881,6 +902,7 @@ pub fn client_message_name(message: &ClientMessage) -> &'static str {
         ClientMessage::SetWorkspaceColor { .. } => "SetWorkspaceColor",
         ClientMessage::NewWorktreeWorkspace { .. } => "NewWorktreeWorkspace",
         ClientMessage::RemoveWorktreeWorkspace { .. } => "RemoveWorktreeWorkspace",
+        ClientMessage::ReloadManifests => "ReloadManifests",
     }
 }
 
@@ -896,6 +918,7 @@ pub fn server_message_name(message: &ServerMessage) -> &'static str {
         ServerMessage::Event(_) => "Event",
         ServerMessage::Session(_) => "Session",
         ServerMessage::Schema { .. } => "Schema",
+        ServerMessage::Manifests(_) => "Manifests",
         ServerMessage::Error { .. } => "Error",
         ServerMessage::Shutdown => "Shutdown",
     }
@@ -1142,6 +1165,7 @@ mod tests {
                 id: workspace,
                 keep: false,
             },
+            ClientMessage::ReloadManifests,
         ]
     }
 
@@ -1200,6 +1224,14 @@ mod tests {
                 workspaces: Vec::new(),
             }),
             schema_message(),
+            ServerMessage::Manifests(vec![ManifestInfo {
+                name: "codex".into(),
+                display: "Codex".into(),
+                process: vec!["codex".into()],
+                title: vec!["Codex".into()],
+                rules: 2,
+                source: "builtin".into(),
+            }]),
             ServerMessage::Error {
                 message: "boom".into(),
             },

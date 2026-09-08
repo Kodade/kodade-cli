@@ -86,6 +86,8 @@ printf '%s\n' '{"Query":"Layout"}' | nc -U /tmp/kodade-cli-$UID/default.sock
 | `ReadPane` | `{"ReadPane":{"id":3,"scrollback":true,"lines":50}}` | `PaneText` |
 | `ZoomPane` | `"ZoomPane"` | `Layout` |
 | `AgentState` | `{"AgentState":{"pane":3,"state":"blocked","source":"hook"}}` | `Layout` |
+| `Query(Manifests)` | `{"Query":"Manifests"}` | `Manifests` |
+| `ReloadManifests` | `"ReloadManifests"` | `Manifests` |
 
 `MovePaneToTab` accepts a tab in any workspace (tab ids are global). A
 cross-workspace move follows the pane: the target workspace and tab become
@@ -123,6 +125,12 @@ payload is one ordered PTY submission and is capped at 64 KiB.
 The check uses a fresh foreground-process probe; a process may still exit in
 the kernel interval between that probe and the PTY write, so automation should
 surface the command's result and retry only after resolving the target again.
+
+`Query(Manifests)` returns the active detection manifest metadata (name,
+display label, process/title matchers, rule count, and `builtin` or `user
+override` source). `ReloadManifests` parses every bundled and local override
+before swapping the running cache. A parse failure returns `Error` and keeps
+the prior cache active; no daemon restart is needed after fixing the file.
 
 Only `Hello` establishes an independent interactive view. Connections that
 have not sent `Hello` use the persisted script selection, so a CLI `FocusPaneId`
@@ -165,6 +173,7 @@ request; one-shot command clients can still treat the `Error` reply as failure.
 - `Session` — `{"Session":{"version":1,…}}`. The persisted-layout view of the
   session; the same JSON `layout export` writes and `ApplyLayout` accepts.
 - `Schema` — `{"Schema":{"version":1,"client_messages":[…],"server_messages":[…]}}`.
+- `Manifests` — `{"Manifests":[{"name":"codex","source":"builtin",…}]}`.
 - `Error` — `{"Error":{"message":"pane 9 not found"}}`. The daemon closes the
   connection after an error reply.
 - `Shutdown` — `"Shutdown"`. The session is going away.
@@ -258,9 +267,10 @@ the new one.
 
 Two caveats worth passing to users:
 
-- `KODADE_SESSION` and `KODADE_SOCKET` in shells that were already running are
-  **stale** — they still name the old session and socket. A hook that reports
-  state with the old `-s` value will fail until the pane restarts.
+- `KODADE_SESSION` in shells that were already running is **stale**. Generated
+  hooks use their inherited private `KODADE_SOCKET` endpoint instead of `-s`,
+  so they continue to report to the renamed daemon. Scripts that derive a
+  public path from the old session name must update it themselves.
 - Nothing answers at the old path anymore. Attaching with the old `-s NAME`
   starts a brand-new empty daemon rather than reattaching.
 
