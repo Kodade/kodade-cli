@@ -238,6 +238,36 @@ state, so detection does not depend on screen strings alone.
   working, `Stop` → done, and `PermissionRequest` → blocked into
   `~/.qwen/settings.json`. Qwen documents the hook event/payload contract and
   `qwen --resume ID` in its [hooks](https://github.com/QwenLM/qwen-code/blob/main/docs/users/features/hooks.md) and [headless reference](https://github.com/QwenLM/qwen-code/blob/main/docs/users/features/headless.md).
+- `integrate omp [--write]` — writes a Pi-compatible extension below OMP's
+  configured agent directory (normally `~/.omp/agent/extensions`). It reports
+  `session_start` → done and `agent_start`/`agent_settled` → working/done with
+  the session ID or session file. OMP's local CLI help documents
+  `--resume=<id-or-path>`; the installed extension is fixture-tested here.
+- `integrate kilo [--write]` — writes an auto-loaded global plugin at
+  `~/.config/kilo/plugin/`. It reports Kilo's documented session and
+  permission events as working/done/blocked. Kilo documents the global plugin
+  location and lifecycle events in its [plugin reference](https://github.com/Kilo-Org/kilocode/blob/main/packages/kilo-docs/pages/automate/extending/plugins.md).
+  Its public CLI documentation only guarantees workspace-level `--continue`,
+  so Ködade intentionally does not persist a Kilo native ID for restore.
+- `integrate hermes [--write]` — writes a Python plugin under
+  `~/.hermes/plugins/kodade_cli_agent_state/`. It reports documented
+  `session_id` lifecycle callbacks and restores an exact conversation with
+  `hermes --resume ID`, as specified in Hermes' [hooks](https://github.com/NousResearch/hermes-agent/blob/main/website/docs/user-guide/features/hooks.md)
+  and [sessions](https://github.com/NousResearch/hermes-agent/blob/main/website/docs/user-guide/sessions.md) references.
+
+
+The remaining registry names are not installed as lifecycle integrations yet.
+Devin's public docs describe hosted integrations but no local CLI hook/session
+contract. Antigravity documents configurable hooks, but does not publish a
+session-identity or ID-resume contract in its [CLI codelab](https://codelabs.developers.google.com/genai-for-dev-antigravity-cli?hl=en).
+Grok documents hook discovery under `~/.grok/hooks`, but this release's public
+hook page was not available as a stable payload contract; its documented
+[status line](https://docs.x.ai/build/features/status-line) does expose a
+`session_id`, but is a display callback and cannot author `blocked` state.
+Mastra Code exposes `/hooks` and project configuration, but its public site
+currently does not specify a hook JSON payload or thread-resume CLI argument.
+No Ködade adapter is written for those tools until their vendors publish those
+contracts.
 
 Merges are idempotent and never remove unrelated keys or hooks. A previously
 installed Ködade report hook for the same event is upgraded in place (matched

@@ -748,6 +748,27 @@ pub enum IntegrateCommand {
         #[arg(long, conflicts_with = "write")]
         remove: bool,
     },
+    /// Oh My Pi global extension.
+    Omp {
+        #[arg(long)]
+        write: bool,
+        #[arg(long, conflicts_with = "write")]
+        remove: bool,
+    },
+    /// Kilo global lifecycle plugin.
+    Kilo {
+        #[arg(long)]
+        write: bool,
+        #[arg(long, conflicts_with = "write")]
+        remove: bool,
+    },
+    /// Hermes global lifecycle plugin.
+    Hermes {
+        #[arg(long)]
+        write: bool,
+        #[arg(long, conflicts_with = "write")]
+        remove: bool,
+    },
 }
 
 #[derive(Debug, Subcommand, PartialEq, Eq)]

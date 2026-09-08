@@ -3633,6 +3633,8 @@ fn valid_native_session(native: &NativeSession) -> bool {
             | ("kodade:codex", "codex", true, false)
             | ("kodade:gemini-cli", "gemini", true, false)
             | ("kodade:opencode", "opencode", true, false)
+            | ("kodade:omp", "omp", true, false)
+            | ("kodade:omp", "omp", false, true)
             | ("kodade:copilot", "copilot", true, false)
             | ("kodade:cursor", "cursor", true, false)
             | ("kodade:droid", "droid", true, false)
@@ -3640,6 +3642,7 @@ fn valid_native_session(native: &NativeSession) -> bool {
             | ("kodade:qwen", "qwen", true, false)
             | ("kodade:pi", "pi", true, false)
             | ("kodade:pi", "pi", false, true)
+            | ("kodade:hermes", "hermes", true, false)
     )
 }
 
@@ -3665,6 +3668,11 @@ fn native_resume_argv(native: &NativeSession) -> Option<Vec<String>> {
         ("kodade:opencode", "opencode", Some(id), None) => {
             Some(vec!["opencode".into(), "--session".into(), id.clone()])
         }
+        ("kodade:omp", "omp", Some(id), None) => Some(vec!["omp".into(), format!("--resume={id}")]),
+        ("kodade:omp", "omp", None, Some(path)) => Some(vec![
+            "omp".into(),
+            format!("--resume={}", path.to_string_lossy()),
+        ]),
         ("kodade:copilot", "copilot", Some(id), None) => {
             Some(vec!["copilot".into(), format!("--resume={id}")])
         }
@@ -3682,6 +3690,9 @@ fn native_resume_argv(native: &NativeSession) -> Option<Vec<String>> {
         }
         ("kodade:pi", "pi", Some(id), None) => {
             Some(vec!["pi".into(), "--session".into(), id.clone()])
+        }
+        ("kodade:hermes", "hermes", Some(id), None) => {
+            Some(vec!["hermes".into(), "--resume".into(), id.clone()])
         }
         ("kodade:pi", "pi", None, Some(path)) => Some(vec![
             "pi".into(),

@@ -14,6 +14,9 @@ pub const INTEGRATIONS: &[&str] = &[
     "droid",
     "kimi",
     "qwen",
+    "omp",
+    "kilo",
+    "hermes",
     "opencode",
     "pi",
 ];
@@ -47,6 +50,15 @@ pub fn integrate_list() -> Result<()> {
             "droid" => (".factory/hooks.json", "hooks"),
             "kimi" => (".kimi-code/config.toml", "hooks"),
             "qwen" => (".qwen/settings.json", "hooks"),
+            "omp" => (
+                ".omp/agent/extensions/kodade-cli-agent-state.ts",
+                "extension",
+            ),
+            "kilo" => (".config/kilo/plugin/kodade-cli-agent-state.ts", "plugin"),
+            "hermes" => (
+                ".hermes/plugins/kodade_cli_agent_state/__init__.py",
+                "plugin",
+            ),
             "opencode" => (
                 ".config/opencode/plugins/kodade-cli-agent-state.js",
                 "plugin (official docs; fixture-tested)",
@@ -77,7 +89,7 @@ fn copilot_hooks() -> Value {
     let command = |state| {
         json!({
             "type": "command",
-            "command": report_command(state, "kodade:copilot", "copilot", "sessionId"),
+            "command": report_command(state, "kodade:copilot", "copilot"),
             "timeoutSec": 5
         })
     };
@@ -113,10 +125,10 @@ pub fn unintegrate_copilot() -> Result<()> {
 
 fn cursor_hooks() -> Value {
     json!({
-        "sessionStart": [{ "command": report_command("working", "kodade:cursor", "cursor", "session_id") }],
-        "beforeSubmitPrompt": [{ "command": report_command("working", "kodade:cursor", "cursor", "session_id") }],
-        "stop": [{ "command": report_command("done", "kodade:cursor", "cursor", "session_id") }],
-        "sessionEnd": [{ "command": report_command("done", "kodade:cursor", "cursor", "session_id") }]
+        "sessionStart": [{ "command": report_command("working", "kodade:cursor", "cursor") }],
+        "beforeSubmitPrompt": [{ "command": report_command("working", "kodade:cursor", "cursor") }],
+        "stop": [{ "command": report_command("done", "kodade:cursor", "cursor") }],
+        "sessionEnd": [{ "command": report_command("done", "kodade:cursor", "cursor") }]
     })
 }
 
@@ -142,10 +154,10 @@ pub fn unintegrate_cursor() -> Result<()> {
 
 fn droid_hooks() -> Value {
     json!({
-        "SessionStart": [{ "hooks": [{ "type": "command", "command": report_command("working", "kodade:droid", "droid", "session_id"), "timeout": 5 }] }],
-        "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": report_command("working", "kodade:droid", "droid", "session_id"), "timeout": 5 }] }],
-        "Stop": [{ "hooks": [{ "type": "command", "command": report_command("done", "kodade:droid", "droid", "session_id"), "timeout": 5 }] }],
-        "Notification": [{ "matcher": "permission_prompt|elicitation_dialog", "hooks": [{ "type": "command", "command": report_command("blocked", "kodade:droid", "droid", "session_id"), "timeout": 5 }] }]
+        "SessionStart": [{ "hooks": [{ "type": "command", "command": report_command("working", "kodade:droid", "droid"), "timeout": 5 }] }],
+        "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": report_command("working", "kodade:droid", "droid"), "timeout": 5 }] }],
+        "Stop": [{ "hooks": [{ "type": "command", "command": report_command("done", "kodade:droid", "droid"), "timeout": 5 }] }],
+        "Notification": [{ "matcher": "permission_prompt|elicitation_dialog", "hooks": [{ "type": "command", "command": report_command("blocked", "kodade:droid", "droid"), "timeout": 5 }] }]
     })
 }
 
@@ -168,10 +180,10 @@ pub fn unintegrate_droid() -> Result<()> {
 
 fn qwen_hooks() -> Value {
     json!({
-        "SessionStart": [{ "hooks": [{ "type": "command", "command": report_command("working", "kodade:qwen", "qwen", "session_id") }] }],
-        "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": report_command("working", "kodade:qwen", "qwen", "session_id") }] }],
-        "Stop": [{ "hooks": [{ "type": "command", "command": report_command("done", "kodade:qwen", "qwen", "session_id") }] }],
-        "PermissionRequest": [{ "hooks": [{ "type": "command", "command": report_command("blocked", "kodade:qwen", "qwen", "session_id") }] }]
+        "SessionStart": [{ "hooks": [{ "type": "command", "command": report_command("working", "kodade:qwen", "qwen") }] }],
+        "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": report_command("working", "kodade:qwen", "qwen") }] }],
+        "Stop": [{ "hooks": [{ "type": "command", "command": report_command("done", "kodade:qwen", "qwen") }] }],
+        "PermissionRequest": [{ "hooks": [{ "type": "command", "command": report_command("blocked", "kodade:qwen", "qwen") }] }]
     })
 }
 
@@ -199,9 +211,8 @@ const KIMI_HOOKS_BEGIN: &str = "# KODADE CLI managed hooks: begin";
 const KIMI_HOOKS_END: &str = "# KODADE CLI managed hooks: end";
 
 fn kimi_hooks_toml() -> String {
-    let command = |state| {
-        toml::Value::String(report_command(state, "kodade:kimi", "kimi", "session_id")).to_string()
-    };
+    let command =
+        |state| toml::Value::String(report_command(state, "kodade:kimi", "kimi")).to_string();
     [
         KIMI_HOOKS_BEGIN.to_owned(),
         format!("[[hooks]]\nevent = \"SessionStart\"\ncommand = {}\ntimeout = 5", command("working")),
@@ -384,6 +395,101 @@ pub fn unintegrate_pi() -> Result<()> {
     Ok(())
 }
 
+/// OMP keeps its Pi-compatible agent resources below its own config directory.
+/// `omp config path` reports `~/.omp/agent` by default; PI_CONFIG_DIR selects
+/// a different relative config directory.
+fn omp_agent_dir(home: &Path) -> std::path::PathBuf {
+    let config = std::env::var_os("PI_CONFIG_DIR").unwrap_or_else(|| ".omp".into());
+    let config = std::path::PathBuf::from(config);
+    let base = if config.is_absolute() {
+        config
+    } else {
+        home.join(config)
+    };
+    base.join("agent")
+}
+
+pub fn integrate_omp(write: bool) -> Result<()> {
+    let home = dirs::home_dir().ok_or_else(|| anyhow!("home directory unavailable"))?;
+    let root = omp_agent_dir(&home);
+    let path = root.join("extensions/kodade-cli-agent-state.ts");
+    if !write {
+        println!("{}", omp_extension());
+        return Ok(());
+    }
+    if !root.exists() {
+        bail!("OMP agent directory {} does not exist", root.display());
+    }
+    write_owned_file(&path, omp_extension())?;
+    println!("installed OMP extension in {}", path.display());
+    Ok(())
+}
+
+pub fn unintegrate_omp() -> Result<()> {
+    let home = dirs::home_dir().ok_or_else(|| anyhow!("home directory unavailable"))?;
+    remove_owned_file(&omp_agent_dir(&home).join("extensions/kodade-cli-agent-state.ts"))
+}
+
+/// Kilo auto-loads TypeScript plugins from its global `plugin/` directory.
+/// Kilo documents session lifecycle events, but not a CLI flag that resumes a
+/// specific session ID, so this adapter deliberately reports lifecycle only.
+pub fn integrate_kilo(write: bool) -> Result<()> {
+    let home = dirs::home_dir().ok_or_else(|| anyhow!("home directory unavailable"))?;
+    let path = home.join(".config/kilo/plugin/kodade-cli-agent-state.ts");
+    if !write {
+        println!("{}", kilo_plugin());
+        return Ok(());
+    }
+    if !path
+        .parent()
+        .and_then(Path::parent)
+        .is_some_and(Path::exists)
+    {
+        bail!(
+            "Kilo config directory {} does not exist",
+            path.parent().unwrap().parent().unwrap().display()
+        );
+    }
+    write_owned_file(&path, kilo_plugin())?;
+    println!("installed Kilo plugin in {}", path.display());
+    Ok(())
+}
+
+pub fn unintegrate_kilo() -> Result<()> {
+    let home = dirs::home_dir().ok_or_else(|| anyhow!("home directory unavailable"))?;
+    remove_owned_file(&home.join(".config/kilo/plugin/kodade-cli-agent-state.ts"))
+}
+
+/// Hermes discovers Python plugins in `~/.hermes/plugins/`. The callbacks use
+/// its documented session ID and lifecycle arguments without parsing payloads.
+pub fn integrate_hermes(write: bool) -> Result<()> {
+    let home = dirs::home_dir().ok_or_else(|| anyhow!("home directory unavailable"))?;
+    let path = home.join(".hermes/plugins/kodade_cli_agent_state/__init__.py");
+    if !write {
+        println!("{}", hermes_plugin());
+        return Ok(());
+    }
+    if !path
+        .parent()
+        .and_then(Path::parent)
+        .and_then(Path::parent)
+        .is_some_and(Path::exists)
+    {
+        bail!(
+            "Hermes config directory {} does not exist",
+            path.parent().unwrap().parent().unwrap().display()
+        );
+    }
+    write_owned_file(&path, hermes_plugin())?;
+    println!("installed Hermes plugin in {}", path.display());
+    Ok(())
+}
+
+pub fn unintegrate_hermes() -> Result<()> {
+    let home = dirs::home_dir().ok_or_else(|| anyhow!("home directory unavailable"))?;
+    remove_owned_file(&home.join(".hermes/plugins/kodade_cli_agent_state/__init__.py"))
+}
+
 pub fn integrate_opencode(write: bool) -> Result<()> {
     let home = dirs::home_dir().ok_or_else(|| anyhow!("home directory unavailable"))?;
     let path = home.join(".config/opencode/plugins/kodade-cli-agent-state.js");
@@ -438,21 +544,105 @@ function report(state, session, path) {
   if (typeof path === "string" && path.startsWith("/")) args.push("--native-session-path", path);
   else if (typeof session === "string" && session.length) args.push("--native-session-id", session);
   const child = spawn(process.env.KODADE_BIN || "kodade-cli", args, { detached: true, stdio: "ignore" });
-  child.on("error", () => {});
-  child.unref();
+  child.on("error", () => {}); child.unref();
 }
 export default function (pi) {
   if (!enabled()) return;
-  let tui = false;
-  let session, path;
-  function updateSession(ctx) {
-    try { session = ctx?.sessionManager?.getSessionId?.(); } catch { session = undefined; }
-    try { path = ctx?.sessionManager?.getSessionFile?.(); } catch { path = undefined; }
-  }
-  pi.on("session_start", (_event, ctx) => { tui = ctx?.mode === "tui"; updateSession(ctx); if (tui) report("idle", session, path); });
-  pi.on("agent_start", (_event, ctx) => { updateSession(ctx); if (tui) report("working", session, path); });
-  pi.on("agent_settled", (_event, ctx) => { updateSession(ctx); if (tui) report("done", session, path); });
+  let tui = false, session, path;
+  const update = (ctx) => { try { session = ctx?.sessionManager?.getSessionId?.(); } catch {} try { path = ctx?.sessionManager?.getSessionFile?.(); } catch {} };
+  pi.on("session_start", (_event, ctx) => { tui = ctx?.mode === "tui"; update(ctx); if (tui) report("idle", session, path); });
+  pi.on("agent_start", (_event, ctx) => { update(ctx); if (tui) report("working", session, path); });
+  pi.on("agent_settled", (_event, ctx) => { update(ctx); if (tui) report("done", session, path); });
 }
+"#
+}
+
+fn omp_extension() -> &'static str {
+    r#"// Installed by Ködade CLI. OMP uses the Pi extension API.
+import { spawn } from "node:child_process";
+const enabled = () => process.env.KODADE_PANE && process.env.KODADE_SOCKET;
+function report(state, session, path) {
+  if (!enabled()) return;
+  const args = ["agent", "report", process.env.KODADE_PANE, state, "--source", "kodade:omp", "--native-agent", "omp"];
+  if (typeof path === "string" && path.startsWith("/")) args.push("--native-session-path", path);
+  else if (typeof session === "string" && session.length) args.push("--native-session-id", session);
+  const child = spawn(process.env.KODADE_BIN || "kodade-cli", args, { detached: true, stdio: "ignore" });
+  child.on("error", () => {}); child.unref();
+}
+export default function (pi) {
+  if (!enabled()) return;
+  let tui = false, session, path;
+  const update = (ctx) => { try { session = ctx?.sessionManager?.getSessionId?.(); } catch {} try { path = ctx?.sessionManager?.getSessionFile?.(); } catch {} };
+  pi.on("session_start", (_event, ctx) => { tui = ctx?.mode === "tui"; update(ctx); if (tui) report("idle", session, path); });
+  pi.on("agent_start", (_event, ctx) => { update(ctx); if (tui) report("working", session, path); });
+  pi.on("agent_settled", (_event, ctx) => { update(ctx); if (tui) report("done", session, path); });
+}
+"#
+}
+
+/// Kilo's plugin API supplies session lifecycle events. Its public CLI
+/// documentation does not expose an ID-based resume flag, so omit native ID.
+fn kilo_plugin() -> &'static str {
+    r#"// Installed by Ködade CLI. Kilo plugin API.
+import { spawn } from "node:child_process";
+const enabled = () => process.env.KODADE_PANE && process.env.KODADE_SOCKET;
+function report(state) {
+  if (!enabled()) return;
+  const args = ["agent", "report", process.env.KODADE_PANE, state, "--source", "kodade:kilo", "--native-agent", "kilo"];
+  const child = spawn(process.env.KODADE_BIN || "kodade-cli", args, { detached: true, stdio: "ignore" });
+  child.on("error", () => {}); child.unref();
+}
+const server = async () => ({
+  "chat.message": async () => report("working"),
+  event: async ({ event }) => {
+    switch (event?.type) {
+      case "session.created": case "session.updated": report("working"); break;
+      case "session.status":
+        if (event?.properties?.status?.type === "idle") report("done");
+        else if (event?.properties?.status?.type === "busy" || event?.properties?.status?.type === "retry") report("working");
+        break;
+      case "session.idle": report("done"); break;
+      case "session.error": case "permission.asked": report("blocked"); break;
+    }
+  },
+});
+export default { id: "kodade-cli-agent-state", server };
+"#
+}
+
+/// Hermes' documented plugin callbacks include `session_id`, session start/end,
+/// LLM start/end, and approval lifecycle. Spawn preserves the interactive TUI.
+fn hermes_plugin() -> &'static str {
+    r#"# Installed by Ködade CLI. Hermes plugin API.
+import os
+import subprocess
+
+
+def _report(state, session_id=None):
+    pane = os.environ.get("KODADE_PANE")
+    if not pane or not os.environ.get("KODADE_SOCKET"):
+        return
+    args = [os.environ.get("KODADE_BIN", "kodade-cli"), "agent", "report", pane, state,
+            "--source", "kodade:hermes", "--native-agent", "hermes"]
+    if isinstance(session_id, str) and session_id:
+        args.extend(["--native-session-id", session_id])
+    try:
+        subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True)
+    except OSError:
+        pass
+
+
+def _start(session_id=None, **_kwargs): _report("working", session_id)
+def _done(session_id=None, **_kwargs): _report("done", session_id)
+def _blocked(session_id=None, **_kwargs): _report("blocked", session_id)
+
+def register(ctx):
+    ctx.register_hook("on_session_start", _start)
+    ctx.register_hook("pre_llm_call", _start)
+    ctx.register_hook("post_llm_call", _done)
+    ctx.register_hook("on_session_end", _done)
+    ctx.register_hook("pre_approval_request", _blocked)
 "#
 }
 

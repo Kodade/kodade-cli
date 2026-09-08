@@ -423,6 +423,27 @@ async fn main() -> Result<()> {
                     integrations::integrate_pi(write)
                 }
             }
+            cli::IntegrateCommand::Omp { write, remove } => {
+                if remove {
+                    integrations::unintegrate_omp()
+                } else {
+                    integrations::integrate_omp(write)
+                }
+            }
+            cli::IntegrateCommand::Kilo { write, remove } => {
+                if remove {
+                    integrations::unintegrate_kilo()
+                } else {
+                    integrations::integrate_kilo(write)
+                }
+            }
+            cli::IntegrateCommand::Hermes { write, remove } => {
+                if remove {
+                    integrations::unintegrate_hermes()
+                } else {
+                    integrations::integrate_hermes(write)
+                }
+            }
         },
         Some(cli::Command::Tab { command }) => tab(&socket, command).await,
         Some(cli::Command::Workspace { command }) => workspace(&socket, command).await,
