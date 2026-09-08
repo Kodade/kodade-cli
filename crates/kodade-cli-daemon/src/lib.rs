@@ -4481,7 +4481,12 @@ impl Pane {
                         &parser.callbacks().graphics_decoder,
                         &parser.callbacks().graphics_tracker,
                     )?,
-                    hyperlinks: Some(parser.callbacks().hyperlinks.capture_handoff()),
+                    hyperlinks: Some(parser.callbacks().hyperlinks.capture_handoff()?),
+                    graphics_unicode: parser.callbacks().graphics_unicode.capture_handoff()?,
+                    graphics_virtual_style: parser
+                        .callbacks()
+                        .graphics_virtual_style
+                        .capture_handoff()?,
                     clipboard: parser.callbacks().clipboard.clone(),
                     graphics_placeholder: parser.callbacks().graphics_placeholder.clone(),
                     sync_tail: parser.callbacks().sync_tail.clone(),
@@ -4535,6 +4540,10 @@ impl Pane {
             .hyperlinks
             .map(hyperlinks::Tracker::restore_handoff)
             .unwrap_or_default();
+        parser.callbacks_mut().graphics_unicode =
+            graphics::UnicodeTracker::restore_handoff(runtime.graphics_unicode);
+        parser.callbacks_mut().graphics_virtual_style =
+            graphics::VirtualStyle::restore_handoff(runtime.graphics_virtual_style);
         parser.callbacks_mut().clipboard = runtime.clipboard;
         parser.callbacks_mut().graphics_placeholder = runtime.graphics_placeholder;
         parser.callbacks_mut().sync_tail = runtime.sync_tail;
@@ -7282,6 +7291,13 @@ mod tests {
         source.agent_generation.store(9, Ordering::Relaxed);
         source.activity_revision.store(4, Ordering::Relaxed);
         source.parser.lock().unwrap().callbacks_mut().title = "editor status".into();
+        {
+            let mut parser = source.parser.lock().unwrap();
+            graphics_text(
+                &mut parser,
+                b"\x1b]8;;https://handoff.test\x1b\\link\x1b]8;;\x1b\\\x1b[38;5;42m",
+            );
+        }
         let (runtime, fd) = source.capture_handoff().expect("pause and capture source");
         let (sender, receiver) = std::os::unix::net::UnixStream::pair().expect("socket pair");
         let transfer =
@@ -7299,6 +7315,19 @@ mod tests {
             imported.parser.lock().unwrap().callbacks().title,
             "editor status"
         );
+        {
+            let parser = imported.parser.lock().unwrap();
+            assert_eq!(
+                parser.callbacks().graphics_virtual_style.ids(),
+                Some((42, 0))
+            );
+            assert!(parser
+                .callbacks()
+                .hyperlinks
+                .ranges(false, 0)
+                .iter()
+                .any(|link| link.uri == "https://handoff.test"));
+        }
         let frozen = imported.snapshot().0.contents;
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert_eq!(

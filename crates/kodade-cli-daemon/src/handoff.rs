@@ -142,6 +142,10 @@ pub(crate) struct PaneRuntime {
     #[serde(default)]
     pub(crate) hyperlinks: Option<crate::hyperlinks::HandoffState>,
     #[serde(default)]
+    pub(crate) graphics_unicode: crate::graphics::UnicodeHandoff,
+    #[serde(default)]
+    pub(crate) graphics_virtual_style: crate::graphics::VirtualStyleHandoff,
+    #[serde(default)]
     pub(crate) clipboard: Option<(u64, Vec<u8>, Vec<u8>)>,
     #[serde(default)]
     pub(crate) graphics_placeholder: Vec<u8>,

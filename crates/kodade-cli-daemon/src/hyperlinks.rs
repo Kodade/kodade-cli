@@ -9,6 +9,7 @@ use unicode_width::UnicodeWidthChar;
 const MAX_URI_BYTES: usize = 2048;
 const MAX_URIS: usize = 128;
 const MAX_LINK_SNAPSHOT_BYTES: usize = 32 * 1024;
+const MAX_PENDING_BYTES: usize = 8192;
 
 #[derive(Default)]
 pub struct Tracker {
@@ -23,6 +24,7 @@ pub struct Tracker {
     history: VecDeque<Vec<Option<u16>>>,
     history_capacity: usize,
     margins: [Option<(u16, u16)>; 2],
+    pending: Vec<u8>,
 }
 
 #[derive(Default, Debug, Clone, Serialize, Deserialize)]
@@ -41,6 +43,7 @@ pub(crate) struct HandoffState {
     history: VecDeque<Vec<Option<u16>>>,
     history_capacity: usize,
     margins: [Option<(u16, u16)>; 2],
+    pending: Vec<u8>,
 }
 
 #[derive(Default)]
@@ -221,10 +224,12 @@ impl Tracker {
         let top = margin.0.min(rows - 1);
         let bottom = margin.1.min(rows - 1).max(top);
         self.events.0 = None;
+        self.pending.push(byte);
         self.parser.advance(&mut self.events, &[byte]);
         let Some(event) = self.events.0.take() else {
             return;
         };
+        self.pending.clear();
         match event {
             Event::Osc(uri) => {
                 self.active = uri.and_then(|uri| {
@@ -463,8 +468,11 @@ impl Tracker {
             self.history.pop_front();
         }
     }
-    pub(crate) fn capture_handoff(&self) -> HandoffState {
-        HandoffState {
+    pub(crate) fn capture_handoff(&self) -> anyhow::Result<HandoffState> {
+        if self.pending.len() > MAX_PENDING_BYTES {
+            anyhow::bail!("unfinished hyperlink sequence exceeds handoff limit");
+        }
+        Ok(HandoffState {
             active: self.active,
             uris: self.uris.clone(),
             normal: self.normal.clone(),
@@ -472,10 +480,11 @@ impl Tracker {
             history: self.history.clone(),
             history_capacity: self.history_capacity,
             margins: self.margins,
-        }
+            pending: self.pending.clone(),
+        })
     }
     pub(crate) fn restore_handoff(state: HandoffState) -> Self {
-        Self {
+        let mut result = Self {
             active: state.active,
             uris: state.uris,
             normal: state.normal,
@@ -483,8 +492,13 @@ impl Tracker {
             history: state.history,
             history_capacity: state.history_capacity,
             margins: state.margins,
+            pending: state.pending,
             ..Default::default()
-        }
+        };
+        let pending = result.pending.clone();
+        result.parser.advance(&mut result.events, &pending);
+        result.events.0 = None;
+        result
     }
 }
 
@@ -591,5 +605,29 @@ mod tests {
             b"\x1b]8;;https://wide\x1b\\\xe7\x95\x8c\x1b]8;;\x1b\\\rX",
         );
         assert!(tracker.ranges(false, 0).is_empty());
+    }
+
+    #[test]
+    fn handoff_rebuilds_every_partial_osc8_byte() {
+        let input = b"\x1b]8;;https://example.test/path\x1b\\label\x1b]8;;\x1b\\";
+        for split in 0..input.len() {
+            let (mut source, mut source_screen) = (Tracker::default(), parser());
+            feed(&mut source, &mut source_screen, &input[..split]);
+            let state: HandoffState = serde_json::from_slice(
+                &serde_json::to_vec(&source.capture_handoff().unwrap()).unwrap(),
+            )
+            .unwrap();
+            let mut restored = Tracker::restore_handoff(state);
+            for &byte in &input[split..] {
+                source.feed(byte, source_screen.screen());
+                restored.feed(byte, source_screen.screen());
+                source_screen.process(&[byte]);
+            }
+            assert_eq!(
+                source.ranges(false, 0),
+                restored.ranges(false, 0),
+                "split {split}"
+            );
+        }
     }
 }
