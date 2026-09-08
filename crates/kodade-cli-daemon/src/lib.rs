@@ -5,6 +5,7 @@ mod git;
 mod layout;
 mod manifest;
 mod persist;
+mod plugins;
 mod proc;
 
 use std::{
@@ -303,6 +304,7 @@ pub async fn run(session_name: String) -> Result<()> {
     // been renamed or copied), so `save` and teardown stay on this path.
     *session.name.lock().expect("name lock poisoned") = session_name.clone();
     *session.socket.lock().expect("socket lock poisoned") = socket.clone();
+    session.run_plugin_hooks("startup", None);
     let mut shutdown = session.shutdown.subscribe();
     // Debounced layout persistence runs alongside the accept loop.
     tokio::spawn(persist_loop(Arc::clone(&session)));
@@ -659,7 +661,31 @@ impl Session {
     /// Publish a session event to subscribed connections. Never fails: with no
     /// subscribers the send is a no-op.
     fn emit(&self, event: Event) {
+        let name = match &event {
+            Event::PaneOpened { .. } => "pane_opened",
+            Event::PaneClosed { .. } => "pane_closed",
+            Event::TabOpened { .. } => "tab_opened",
+            Event::TabClosed { .. } => "tab_closed",
+            Event::TabRenamed { .. } => "tab_renamed",
+            Event::WorkspaceOpened { .. } => "workspace_opened",
+            Event::WorkspaceClosed { .. } => "workspace_closed",
+            Event::WorkspaceRenamed { .. } => "workspace_renamed",
+            Event::AgentStateChanged { .. } => "agent_state_changed",
+            Event::Notification(_) => "notification",
+            Event::SessionRenamed { .. } => "session_renamed",
+        };
+        let pane = match &event {
+            Event::PaneOpened { pane } | Event::PaneClosed { pane } => Some(pane.0),
+            Event::AgentStateChanged { pane, .. } => Some(pane.0),
+            Event::Notification(notification) => Some(notification.pane.0),
+            _ => None,
+        };
+        self.run_plugin_hooks(name, pane);
         let _ = self.events.send(event);
+    }
+
+    fn run_plugin_hooks(&self, event: &str, pane: Option<u64>) {
+        plugins::run(event, self.session_name(), self.socket_path(), pane);
     }
 
     fn new_pane(
