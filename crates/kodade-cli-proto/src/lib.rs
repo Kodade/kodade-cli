@@ -469,6 +469,12 @@ pub struct ManifestInfo {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ServerMessage {
+    /// A pane requested an OSC 52 clipboard write. This is delivered only to
+    /// the attached client currently viewing that pane.
+    Clipboard {
+        pane: PaneId,
+        text: String,
+    },
     ImagePasted {
         pane: PaneId,
         path: PathBuf,
@@ -776,6 +782,18 @@ pub struct Screen {
     pub mouse_reporting: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub graphics: Vec<ImagePlacement>,
+    /// OSC 8 targets attached to visible terminal cells. Older daemons omit it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub links: Vec<LinkRange>,
+}
+
+/// An exclusive horizontal OSC 8 link range in one visible terminal row.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LinkRange {
+    pub row: u16,
+    pub start_col: u16,
+    pub end_col: u16,
+    pub uri: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -802,6 +820,9 @@ pub struct ImagePlacement {
     pub source_y: u32,
     pub source_width: u32,
     pub source_height: u32,
+    /// Pixel displacement from the placement cell's upper-left corner.
+    pub x_offset: u32,
+    pub y_offset: u32,
     pub z: i32,
 }
 
@@ -1025,6 +1046,7 @@ pub const CLIENT_MESSAGE_NAMES: &[&str] = &[
 
 /// Every `ServerMessage` variant name (see [`CLIENT_MESSAGE_NAMES`]).
 pub const SERVER_MESSAGE_NAMES: &[&str] = &[
+    "Clipboard",
     "ImagePasted",
     "Welcome",
     "Layout",
@@ -1103,6 +1125,7 @@ pub fn client_message_name(message: &ClientMessage) -> &'static str {
 /// Variant name of a server message (see [`client_message_name`]).
 pub fn server_message_name(message: &ServerMessage) -> &'static str {
     match message {
+        ServerMessage::Clipboard { .. } => "Clipboard",
         ServerMessage::ImagePasted { .. } => "ImagePasted",
         ServerMessage::Welcome { .. } => "Welcome",
         ServerMessage::Layout(_) => "Layout",
@@ -1196,6 +1219,7 @@ mod tests {
                     bracketed_paste: true,
                     mouse_reporting: false,
                     graphics: Vec::new(),
+                    links: Vec::new(),
                 },
                 agent: None,
                 agent_generation: 0,
@@ -1391,6 +1415,10 @@ mod tests {
             seq: 1,
         };
         vec![
+            ServerMessage::Clipboard {
+                pane: PaneId(1),
+                text: "copied".into(),
+            },
             ServerMessage::ImagePasted {
                 pane: PaneId(1),
                 path: "/tmp/image.png".into(),

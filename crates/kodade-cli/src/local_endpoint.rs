@@ -78,6 +78,7 @@ pub fn spawn(
                                 Update::EndpointConnected { session, socket: socket.clone() }
                             }
                             ServerMessage::Layout(layout) => { view.observe(&layout); Update::Layout(layout) },
+                            ServerMessage::Clipboard { pane, text } => Update::Clipboard { pane, text },
                             ServerMessage::Welcome { session, .. } => Update::Session(session),
                             ServerMessage::Notification(notification)
                             | ServerMessage::Event(Event::Notification(notification)) => Update::Notification(notification),

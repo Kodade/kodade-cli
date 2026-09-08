@@ -6,6 +6,7 @@ mod graphics;
 #[cfg(unix)]
 mod handoff;
 mod history;
+mod hyperlinks;
 mod image_paste;
 pub use image_paste::{validate_png, MAX_IMAGE_BYTES};
 mod layout;
@@ -20,6 +21,7 @@ use std::{
     collections::{HashMap, HashSet},
     env, fs,
     io::{Read, Write},
+    num::NonZeroU16,
     os::{
         fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd},
         unix::{ffi::OsStrExt, fs::FileTypeExt},
@@ -34,6 +36,7 @@ use std::{
 };
 
 use anyhow::{anyhow, bail, Context, Result};
+use base64::{engine::general_purpose::STANDARD, Engine};
 use kodade_cli_proto::{
     decode, encode, schema_message, AgentInfo, AgentStateKind, CellColor, ClientMessage, Direction,
     Event, InvocationContext, LayoutSnapshot, LayoutTree, ManifestInfo, NativeSession,
@@ -346,16 +349,51 @@ struct StoredSelection {
 #[derive(Default)]
 struct PtyCallbacks {
     title: String,
+    clipboard: Option<(u64, Vec<u8>, Vec<u8>)>,
     graphics: graphics::Store,
     graphics_tracker: graphics::Tracker,
     graphics_decoder: graphics::Decoder,
+    graphics_placeholder: Vec<u8>,
+    graphics_unicode: graphics::UnicodeTracker,
+    graphics_virtual_style: graphics::VirtualStyle,
+    hyperlinks: hyperlinks::Tracker,
+    sync_tail: Vec<u8>,
+    sync_frozen: Option<(Instant, Screen)>,
 }
 impl vt100::Callbacks for PtyCallbacks {
     fn set_window_title(&mut self, _: &mut vt100::Screen, title: &[u8]) {
         self.title = String::from_utf8_lossy(title).into_owned();
     }
+    fn copy_to_clipboard(&mut self, _: &mut vt100::Screen, ty: &[u8], data: &[u8]) {
+        self.record_clipboard(ty, data);
+    }
+}
+impl PtyCallbacks {
+    fn record_clipboard(&mut self, ty: &[u8], data: &[u8]) {
+        if data.len() <= 140_000 {
+            static NEXT: AtomicU64 = AtomicU64::new(1);
+            self.clipboard = Some((
+                NEXT.fetch_add(1, Ordering::Relaxed),
+                ty.to_vec(),
+                data.to_vec(),
+            ));
+        }
+    }
 }
 type PtyParser = vt100::Parser<PtyCallbacks>;
+
+fn terminal_size(rows: u16, cols: u16) -> (NonZeroU16, NonZeroU16) {
+    (
+        NonZeroU16::new(rows.max(1)).expect("clamped rows"),
+        NonZeroU16::new(cols.max(1)).expect("clamped cols"),
+    )
+}
+
+fn pty_parser(rows: u16, cols: u16, scrollback: usize, mut callbacks: PtyCallbacks) -> PtyParser {
+    let (rows, cols) = terminal_size(rows, cols);
+    callbacks.hyperlinks.set_history_capacity(scrollback);
+    PtyParser::new_with_callbacks(rows, cols, scrollback, callbacks)
+}
 
 struct Pane {
     title: Mutex<String>,
@@ -2457,6 +2495,68 @@ impl Session {
         self.pane_snapshot(id)
     }
 
+    /// Consume one OSC 52 write only for this attached connection's focused
+    /// pane. Clipboard data is neither replayed nor exposed through queries.
+    fn view_clipboard(
+        &self,
+        view: &ClientView,
+        seen: &mut HashMap<PaneId, u64>,
+    ) -> Option<ServerMessage> {
+        let focused = {
+            let state = self.state.lock().ok()?;
+            Self::view_selection(&state, Some(view)).2
+        };
+        let panes = self.panes.lock().ok()?;
+        // Advance this connection's cursor for every pane now. A hidden-pane
+        // request is intentionally dropped, never delivered after a later focus.
+        seen.retain(|id, _| panes.contains_key(id));
+        let mut current = None;
+        for (id, pane) in panes.iter() {
+            let parser = pane.parser.lock().ok()?;
+            let Some((seq, selection, encoded)) = &parser.callbacks().clipboard else {
+                continue;
+            };
+            if *seq <= seen.get(id).copied().unwrap_or(0) {
+                continue;
+            }
+            seen.insert(*id, *seq);
+            if *id == focused {
+                current = Some((selection.clone(), encoded.clone()));
+            }
+        }
+        let (selection, encoded) = current?;
+        if selection.as_slice() != b"c" {
+            return None;
+        }
+        let bytes = STANDARD.decode(encoded).ok()?;
+        if bytes.len() > 100_000 {
+            return None;
+        }
+        let text = String::from_utf8(bytes).ok()?;
+        Some(ServerMessage::Clipboard {
+            pane: focused,
+            text,
+        })
+    }
+
+    fn clipboard_cursor(&self) -> HashMap<PaneId, u64> {
+        let Ok(panes) = self.panes.lock() else {
+            return HashMap::new();
+        };
+        panes
+            .iter()
+            .filter_map(|(id, pane)| {
+                pane.parser
+                    .lock()
+                    .ok()?
+                    .callbacks()
+                    .clipboard
+                    .as_ref()
+                    .map(|(seq, _, _)| (*id, *seq))
+            })
+            .collect()
+    }
+
     /// Queues a notification with the next sequence number, capping the ring at
     /// 64 so a long-lived session never grows the queue without bound.
     fn push_notification(
@@ -4224,8 +4324,7 @@ impl Pane {
             .slave
             .spawn_command(command)
             .context("spawn login shell in PTY")?;
-        let mut restored_parser =
-            PtyParser::new_with_callbacks(rows, cols, 10_000, PtyCallbacks::default());
+        let mut restored_parser = pty_parser(rows, cols, 10_000, PtyCallbacks::default());
         if let Some(replay) = replay.as_ref() {
             restore_screen(&mut restored_parser, &replay.screen, &replay.text);
         }
@@ -4273,8 +4372,11 @@ impl Pane {
         })
     }
     fn snapshot(&self) -> (Screen, usize) {
-        let parser = self.parser.lock().expect("PTY parser lock poisoned");
-        (snapshot(&parser), parser.screen().scrollback())
+        let mut parser = self.parser.lock().expect("PTY parser lock poisoned");
+        (
+            snapshot_for_client(&mut parser),
+            parser.screen().scrollback(),
+        )
     }
 
     /// Freeze this pane's reader and capture only bounded, replayable terminal
@@ -4329,8 +4431,8 @@ impl Pane {
                 handoff::PaneRuntime {
                     pane_id: 0,
                     child_pid: child_pid.unwrap_or_default(),
-                    rows: parser.screen().size().0,
-                    cols: parser.screen().size().1,
+                    rows: parser.screen().size().0.get(),
+                    cols: parser.screen().size().1.get(),
                     start_identity: child_pid.and_then(proc::start_identity),
                     terminal_title: parser.callbacks().title.clone(),
                     title: self
@@ -4379,6 +4481,23 @@ impl Pane {
                         &parser.callbacks().graphics_decoder,
                         &parser.callbacks().graphics_tracker,
                     )?,
+                    hyperlinks: Some(parser.callbacks().hyperlinks.capture_handoff()),
+                    clipboard: parser.callbacks().clipboard.clone(),
+                    graphics_placeholder: parser.callbacks().graphics_placeholder.clone(),
+                    sync_tail: parser.callbacks().sync_tail.clone(),
+                    sync_frozen: parser
+                        .callbacks()
+                        .sync_frozen
+                        .as_ref()
+                        .map(|(started, frame)| {
+                            (
+                                now.saturating_duration_since(*started)
+                                    .as_millis()
+                                    .min(u128::from(u64::MAX))
+                                    as u64,
+                                frame.clone(),
+                            )
+                        }),
                 },
                 fd,
             ))
@@ -4403,12 +4522,7 @@ impl Pane {
             .ok_or_else(|| anyhow!("imported master has no fd"))?;
         let (reader, writer) = pty_io::pair(master_fd)?;
         let writer = Arc::new(Mutex::new(writer));
-        let mut parser = PtyParser::new_with_callbacks(
-            runtime.rows,
-            runtime.cols,
-            10_000,
-            PtyCallbacks::default(),
-        );
+        let mut parser = pty_parser(runtime.rows, runtime.cols, 10_000, PtyCallbacks::default());
         parser.process(runtime.history_ansi.as_bytes());
         parser.process(&runtime.screen_ansi);
         parser.process(runtime.graphics.pending_text());
@@ -4417,6 +4531,21 @@ impl Pane {
         parser.callbacks_mut().graphics_decoder = decoder;
         parser.callbacks_mut().graphics_tracker = tracker;
         parser.callbacks_mut().title = runtime.terminal_title;
+        parser.callbacks_mut().hyperlinks = runtime
+            .hyperlinks
+            .map(hyperlinks::Tracker::restore_handoff)
+            .unwrap_or_default();
+        parser.callbacks_mut().clipboard = runtime.clipboard;
+        parser.callbacks_mut().graphics_placeholder = runtime.graphics_placeholder;
+        parser.callbacks_mut().sync_tail = runtime.sync_tail;
+        parser.callbacks_mut().sync_frozen = runtime.sync_frozen.map(|(age, frame)| {
+            (
+                Instant::now()
+                    .checked_sub(Duration::from_millis(age))
+                    .unwrap_or_else(Instant::now),
+                frame,
+            )
+        });
         let parser = Arc::new(Mutex::new(parser));
         let last_output = Arc::new(Mutex::new(
             Instant::now()
@@ -4494,7 +4623,7 @@ impl Pane {
         let mut parser = self.parser.lock().expect("PTY parser lock poisoned");
         parser.screen_mut().set_scrollback(offset);
         let actual = parser.screen().scrollback();
-        let screen = snapshot(&parser);
+        let screen = snapshot_for_client(&mut parser);
         parser.screen_mut().set_scrollback(0);
         (screen, actual)
     }
@@ -4538,7 +4667,7 @@ impl Pane {
             .map_err(|_| anyhow!("PTY parser lock poisoned"))?
             .screen()
             .size()
-            == (rows, cols)
+            == terminal_size(rows, cols)
         {
             return Ok(());
         }
@@ -4551,11 +4680,11 @@ impl Pane {
                 pixel_width: 0,
                 pixel_height: 0,
             })?;
-        self.parser
+        let mut parser = self
+            .parser
             .lock()
-            .map_err(|_| anyhow!("PTY parser lock poisoned"))?
-            .screen_mut()
-            .set_size(rows, cols);
+            .map_err(|_| anyhow!("PTY parser lock poisoned"))?;
+        resize_parser(&mut parser, rows, cols);
         Ok(())
     }
     fn write(&self, bytes: &[u8]) -> Result<()> {
@@ -5142,19 +5271,26 @@ fn read_pty(
                         graphics::Token::Graphics(frame) => {
                             let cursor = parser.screen().cursor_position();
                             let alternate = parser.screen().alternate_screen();
-                            let result = parser
-                                .callbacks_mut()
-                                .graphics
-                                .command(&frame, cursor, alternate);
+                            let mut graphics = std::mem::take(&mut parser.callbacks_mut().graphics);
+                            let result = graphics.command_with_screen(
+                                &frame,
+                                cursor,
+                                alternate,
+                                Some(parser.screen()),
+                            );
+                            parser.callbacks_mut().graphics = graphics;
                             replies.extend(result.reply);
                             if let Some((rows, cols)) = result.advance {
                                 let (height, width) = parser.screen().size();
-                                let rows = rows.min(height);
+                                let rows = rows.min(height.get());
                                 graphics_text(&mut parser, &vec![b'\n'; usize::from(rows)]);
                                 parser.process(
                                     format!(
                                         "\x1b[{}G",
-                                        cursor.1.saturating_add(cols).min(width.saturating_sub(1))
+                                        cursor
+                                            .1
+                                            .saturating_add(cols)
+                                            .min(width.get().saturating_sub(1))
                                             + 1
                                     )
                                     .as_bytes(),
@@ -5180,17 +5316,89 @@ fn read_pty(
 fn graphics_text(parser: &mut PtyParser, text: &[u8]) {
     let mut tracker = std::mem::take(&mut parser.callbacks_mut().graphics_tracker);
     let mut store = std::mem::take(&mut parser.callbacks_mut().graphics);
-    for &byte in text {
-        let before_alt = parser.screen().alternate_screen();
-        tracker.feed(byte, parser.screen(), &mut store);
-        parser.process(&[byte]);
-        let alternate = parser.screen().alternate_screen();
-        if alternate && !before_alt {
-            store.clear(true);
+    let mut hyperlinks = std::mem::take(&mut parser.callbacks_mut().hyperlinks);
+    let mut style = std::mem::take(&mut parser.callbacks_mut().graphics_virtual_style);
+    let mut placeholder = std::mem::take(&mut parser.callbacks_mut().graphics_placeholder);
+    let mut unicode = std::mem::take(&mut parser.callbacks_mut().graphics_unicode);
+    for &raw in text {
+        style.feed(raw);
+        let chars = unicode.feed(raw);
+        let mut placeholder_cell = None;
+        for c in chars {
+            if c == '\u{10eeee}' {
+                placeholder_cell = Some(());
+            } else if let Some(index) = graphics::kitty_diacritic_index(c) {
+                store.add_virtual_diacritic(index);
+            } else {
+                store.end_virtual_sequence();
+            }
+        }
+        for normalized in graphics::normalize_unicode_placeholders(&mut placeholder, &[raw]) {
+            let before_alt = parser.screen().alternate_screen();
+            let printed = tracker.feed(normalized.byte, parser.screen(), &mut store);
+            hyperlinks.feed(normalized.byte, parser.screen());
+            let tail = &mut parser.callbacks_mut().sync_tail;
+            tail.push(normalized.byte);
+            if tail.len() > 8 {
+                tail.remove(0);
+            }
+            if tail.ends_with(b"\x1b[?2026h") {
+                // `snapshot` reads callback-owned metadata. Put the state borrowed
+                // for byte-by-byte tracking back before freezing the complete frame.
+                parser.callbacks_mut().graphics = store;
+                parser.callbacks_mut().hyperlinks = hyperlinks;
+                let frame = snapshot(parser);
+                parser.callbacks_mut().sync_frozen = Some((Instant::now(), frame));
+                store = std::mem::take(&mut parser.callbacks_mut().graphics);
+                hyperlinks = std::mem::take(&mut parser.callbacks_mut().hyperlinks);
+            } else if tail.ends_with(b"\x1b[?2026l") {
+                parser.callbacks_mut().sync_frozen = None;
+            }
+            parser.process(&[normalized.byte]);
+            let alternate = parser.screen().alternate_screen();
+            if printed > 0 {
+                let (row, end) = parser.screen().cursor_position();
+                for col in end.saturating_sub(printed)..end {
+                    store.clear_virtual_cell(alternate, row, col);
+                }
+            }
+            if alternate && !before_alt {
+                store.clear_screen(true);
+                hyperlinks.clear_alternate();
+            }
+        }
+        if placeholder_cell.is_some() {
+            let alternate = parser.screen().alternate_screen();
+            let (row, col) = parser.screen().cursor_position();
+            store.record_virtual_cell(alternate, row, col.saturating_sub(1), style.ids());
         }
     }
     parser.callbacks_mut().graphics_tracker = tracker;
     parser.callbacks_mut().graphics = store;
+    parser.callbacks_mut().graphics_virtual_style = style;
+    parser.callbacks_mut().graphics_placeholder = placeholder;
+    parser.callbacks_mut().graphics_unicode = unicode;
+    parser.callbacks_mut().hyperlinks = hyperlinks;
+}
+
+fn resize_parser(parser: &mut PtyParser, rows: u16, cols: u16) {
+    let active = parser.screen().alternate_screen();
+    let before_row = parser.screen().cursor_position().0;
+    parser
+        .screen_mut()
+        .set_size(terminal_size(rows, cols).0, terminal_size(rows, cols).1);
+    let after_row = parser.screen().cursor_position().0;
+    let mut graphics = std::mem::take(&mut parser.callbacks_mut().graphics);
+    graphics.resize_virtual_cells(
+        active,
+        i32::from(after_row) - i32::from(before_row),
+        rows.max(1),
+        cols.max(1),
+    );
+    let callbacks = parser.callbacks_mut();
+    callbacks.graphics = graphics;
+    callbacks.graphics_tracker.reset_resize();
+    callbacks.hyperlinks.resize(rows, cols);
 }
 
 /// Inspect cloned grids so capturing an editor's alternate screen cannot
@@ -5205,6 +5413,7 @@ fn terminal_handoff(parser: &PtyParser) -> Result<(Vec<u8>, String)> {
 /// parser so it can be unit-tested on a synthetic buffer.
 fn read_history(parser: &mut PtyParser) -> Vec<String> {
     let (rows, cols) = parser.screen().size();
+    let (rows, cols) = (rows.get(), cols.get());
     let rows = rows as usize;
     parser.screen_mut().set_scrollback(usize::MAX);
     let max = parser.screen().scrollback();
@@ -5260,6 +5469,7 @@ fn snapshot(parser: &PtyParser) -> Screen {
     let screen = parser.screen();
     let (cursor_row, cursor_col) = screen.cursor_position();
     let (rows, cols) = screen.size();
+    let (rows, cols) = (rows.get(), cols.get());
     Screen {
         contents: screen.contents(),
         cursor_row,
@@ -5268,16 +5478,34 @@ fn snapshot(parser: &PtyParser) -> Screen {
         rows: (0..rows).map(|row| screen_row(screen, row, cols)).collect(),
         bracketed_paste: screen.bracketed_paste(),
         mouse_reporting: screen.mouse_protocol_mode() != vt100::MouseProtocolMode::None,
-        graphics: parser
+        graphics: parser.callbacks().graphics.placements_with_screen(
+            screen.alternate_screen(),
+            screen.scrollback(),
+            Some(screen),
+        ),
+        links: parser
             .callbacks()
-            .graphics
-            .placements(screen.alternate_screen(), screen.scrollback()),
+            .hyperlinks
+            .ranges(screen.alternate_screen(), screen.scrollback()),
     }
+}
+
+/// A pane's synchronized output is atomic for clients, but never indefinitely:
+/// a malformed producer is released after one second while parsing continues.
+fn snapshot_for_client(parser: &mut PtyParser) -> Screen {
+    if let Some((started, frame)) = parser.callbacks().sync_frozen.as_ref() {
+        if started.elapsed() < Duration::from_secs(1) {
+            return frame.clone();
+        }
+    }
+    parser.callbacks_mut().sync_frozen = None;
+    snapshot(parser)
 }
 
 /// Rebuild recent text and the saved visible grid before the PTY reader starts.
 fn restore_screen(parser: &mut PtyParser, screen: &Screen, history: &str) {
     let (rows, cols) = parser.screen().size();
+    let (rows, cols) = (rows.get(), cols.get());
     if screen.rows.len() > usize::from(rows)
         || screen.rows.iter().any(|row| row.len() > usize::from(cols))
     {
@@ -5498,6 +5726,7 @@ async fn serve_client(stream: UnixStream, session: Arc<Session>) -> Result<()> {
     let mut last_snapshot = Instant::now() - Duration::from_millis(16);
     let mut initialized = false;
     let mut view = session.new_client_view()?;
+    let mut clipboard_seen = session.clipboard_cursor();
     // A fresh client only hears about transitions raised after it attached, so
     // the spawn-time backlog never replays.
     let mut last_notify_seq = session.notify_high_water();
@@ -5650,6 +5879,14 @@ async fn serve_client(stream: UnixStream, session: Arc<Session>) -> Result<()> {
                     }
                     _ => {}
                 }
+                // Observe pending copies under the old focus before applying a
+                // client focus change. Hidden writes must not become visible
+                // just because the input message wins the tick race.
+                if initialized {
+                    if let Some(clipboard) = session.view_clipboard(&view, &mut clipboard_seen) {
+                        write_server(&mut writer, &clipboard).await?;
+                    }
+                }
                 let hello = matches!(message, ClientMessage::Hello { .. });
                 let kill = matches!(message, ClientMessage::KillSession);
                 let result = if initialized || hello {
@@ -5660,6 +5897,7 @@ async fn serve_client(stream: UnixStream, session: Arc<Session>) -> Result<()> {
                 match result {
                     Ok(()) if hello => {
                         initialized = true;
+                        clipboard_seen = session.clipboard_cursor();
                         write_server(&mut writer, &ServerMessage::Welcome { session: session.session_name(), version: PROTOCOL_VERSION }).await?;
                         // The first client attach sees `restored: true`; clear it
                         // afterward so later snapshots (and `ls`) report normally.
@@ -5699,6 +5937,9 @@ async fn serve_client(stream: UnixStream, session: Arc<Session>) -> Result<()> {
                     if !remaining.is_zero() { tokio::time::sleep(remaining).await; }
                     write_server(&mut writer, &ServerMessage::Layout(session.snapshot_for_client(&view)?)).await?;
                     send_notifications(&mut writer, &session, &mut last_notify_seq, subscribed).await?;
+                    if let Some(clipboard) = session.view_clipboard(&view, &mut clipboard_seen) {
+                        write_server(&mut writer, &clipboard).await?;
+                    }
                     last_snapshot = Instant::now();
                 }
                 Err(broadcast::error::RecvError::Closed) => return Ok(()),
@@ -5707,6 +5948,9 @@ async fn serve_client(stream: UnixStream, session: Arc<Session>) -> Result<()> {
                 if initialized {
                     write_server(&mut writer, &ServerMessage::Layout(session.snapshot_for_client(&view)?)).await?;
                     send_notifications(&mut writer, &session, &mut last_notify_seq, subscribed).await?;
+                    if let Some(clipboard) = session.view_clipboard(&view, &mut clipboard_seen) {
+                        write_server(&mut writer, &clipboard).await?;
+                    }
                     last_snapshot = Instant::now();
                 }
             }
@@ -5792,9 +6036,254 @@ async fn send_notifications(
 
 #[cfg(test)]
 mod tests {
+    use base64::Engine;
+
+    #[test]
+    fn osc52_callback_keeps_only_bounded_copy_requests() {
+        let mut parser = pty_parser(2, 10, 10, PtyCallbacks::default());
+        parser.process(b"\x1b]52;c;aGk=\x07");
+        assert_eq!(
+            parser
+                .callbacks()
+                .clipboard
+                .as_ref()
+                .map(|(_, _, data)| data),
+            Some(&b"aGk=".to_vec())
+        );
+        // OSC 52 queries invoke the separate paste callback and never replace
+        // the pending copy request.
+        parser.process(b"\x1b]52;c;?\x07");
+        assert_eq!(
+            parser
+                .callbacks()
+                .clipboard
+                .as_ref()
+                .map(|(_, _, data)| data),
+            Some(&b"aGk=".to_vec())
+        );
+        parser
+            .callbacks_mut()
+            .record_clipboard(b"c", &vec![b'a'; 140_001]);
+        assert_eq!(
+            parser
+                .callbacks()
+                .clipboard
+                .as_ref()
+                .map(|(_, _, data)| data),
+            Some(&b"aGk=".to_vec())
+        );
+    }
+
+    #[tokio::test]
+    async fn pane_clipboard_is_one_shot_and_validated_for_the_attached_view() {
+        let session = Session::spawn(80, 24, "clipboard-view".into()).expect("session");
+        let view = session.new_client_view().expect("view");
+        let focused = Session::view_selection(&session.state.lock().unwrap(), Some(&view)).2;
+        let pane = session.panes.lock().unwrap()[&focused].clone();
+        pane.parser
+            .lock()
+            .unwrap()
+            .process(b"\x1b]52;c;aGVsbG8=\x07");
+        let mut seen = HashMap::new();
+        assert!(matches!(
+            session.view_clipboard(&view, &mut seen),
+            Some(ServerMessage::Clipboard { pane, text }) if pane == focused && text == "hello"
+        ));
+        assert!(session.view_clipboard(&view, &mut seen).is_none());
+        pane.parser
+            .lock()
+            .unwrap()
+            .process(b"\x1b]52;c;not-base64!\x07");
+        assert!(session.view_clipboard(&view, &mut seen).is_none());
+    }
+
+    #[tokio::test]
+    async fn real_pty_osc52_reaches_only_the_live_focused_client() {
+        let session = Arc::new(Session::spawn(80, 24, "clipboard-pty".into()).expect("session"));
+        let (client, server) = UnixStream::pair().expect("socket pair");
+        let server_task = tokio::spawn(serve_client(server, Arc::clone(&session)));
+        let (reader, mut writer) = client.into_split();
+        let mut lines = BufReader::new(reader).lines();
+        writer
+            .write_all(
+                &encode(&ClientMessage::Hello {
+                    cols: 80,
+                    rows: 24,
+                    version: PROTOCOL_VERSION,
+                })
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            next_server_message(&mut lines).await,
+            ServerMessage::Welcome { .. }
+        ));
+        assert!(matches!(
+            next_server_message(&mut lines).await,
+            ServerMessage::Layout(_)
+        ));
+        // This command executes inside the pane's actual PTY; the parser sees
+        // its OSC 52 output and the attached socket receives one copy request.
+        writer
+            .write_all(
+                &encode(&ClientMessage::Input {
+                    bytes: b"printf '\\033]52;c;aGk=\\007'\n".to_vec(),
+                })
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let clipboard = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let ServerMessage::Clipboard { text, .. } = next_server_message(&mut lines).await
+                {
+                    break text;
+                }
+            }
+        })
+        .await
+        .expect("OSC 52 delivery");
+        assert_eq!(clipboard, "hi");
+        drop(writer);
+        server_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn osc52_is_delivered_to_each_clients_currently_viewed_pane_only() {
+        let session =
+            Arc::new(Session::spawn(80, 24, "clipboard-clients".into()).expect("session"));
+        session
+            .handle(ClientMessage::SplitRight)
+            .expect("split pane");
+        let panes = session.snapshot().expect("snapshot").panes;
+        let first = panes[0].id;
+        let second = panes[1].id;
+        let (a_client, a_server) = UnixStream::pair().expect("client A socket");
+        let (b_client, b_server) = UnixStream::pair().expect("client B socket");
+        let a_task = tokio::spawn(serve_client(a_server, Arc::clone(&session)));
+        let b_task = tokio::spawn(serve_client(b_server, Arc::clone(&session)));
+        let (a_reader, mut a_writer) = a_client.into_split();
+        let (b_reader, mut b_writer) = b_client.into_split();
+        let mut a = BufReader::new(a_reader).lines();
+        let mut b = BufReader::new(b_reader).lines();
+        for writer in [&mut a_writer, &mut b_writer] {
+            writer
+                .write_all(
+                    &encode(&ClientMessage::Hello {
+                        cols: 80,
+                        rows: 24,
+                        version: PROTOCOL_VERSION,
+                    })
+                    .unwrap(),
+                )
+                .await
+                .expect("hello");
+        }
+        for reader in [&mut a, &mut b] {
+            assert!(matches!(
+                next_server_message(reader).await,
+                ServerMessage::Welcome { .. }
+            ));
+            assert!(matches!(
+                next_server_message(reader).await,
+                ServerMessage::Layout(_)
+            ));
+        }
+        // The same session is attached twice, but each connection selects a
+        // different pane. This guards against a session-global clipboard read.
+        for (writer, pane) in [(&mut a_writer, first), (&mut b_writer, second)] {
+            writer
+                .write_all(&encode(&ClientMessage::FocusPaneId { id: pane }).unwrap())
+                .await
+                .expect("focus pane");
+        }
+        assert!(matches!(
+            next_server_message(&mut a).await,
+            ServerMessage::Layout(_)
+        ));
+        assert!(matches!(
+            next_server_message(&mut b).await,
+            ServerMessage::Layout(_)
+        ));
+        a_writer
+            .write_all(
+                &encode(&ClientMessage::Input {
+                    bytes: b"printf '\\033]52;c;Y2xpZW50LWE=\\007'\n".to_vec(),
+                })
+                .unwrap(),
+            )
+            .await
+            .expect("write pane A");
+        let delivered_to_a = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let ServerMessage::Clipboard { pane, text } = next_server_message(&mut a).await {
+                    break (pane, text);
+                }
+            }
+        })
+        .await
+        .expect("clipboard for client A");
+        assert_eq!(delivered_to_a, (first, "client-a".into()));
+        let b_received_clipboard = tokio::time::timeout(Duration::from_millis(300), async {
+            loop {
+                if matches!(
+                    next_server_message(&mut b).await,
+                    ServerMessage::Clipboard { .. }
+                ) {
+                    return true;
+                }
+            }
+        })
+        .await
+        .is_ok();
+        assert!(
+            !b_received_clipboard,
+            "client B received client A's clipboard write"
+        );
+        drop(a_writer);
+        drop(b_writer);
+        a_task.await.unwrap().unwrap();
+        b_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn hidden_pane_clipboard_is_dropped_before_later_focus() {
+        let session = Session::spawn(80, 24, "clipboard-focus".into()).expect("session");
+        let first = session.snapshot().unwrap().panes[0].id;
+        session.handle(ClientMessage::SplitRight).unwrap();
+        let mut view = session.new_client_view().unwrap();
+        let (_, _, focused) = Session::view_selection(&session.state.lock().unwrap(), Some(&view));
+        let hidden = session
+            .snapshot()
+            .unwrap()
+            .panes
+            .into_iter()
+            .map(|pane| pane.id)
+            .find(|id| *id != focused)
+            .expect("second pane");
+        let pane = session.panes.lock().unwrap()[&hidden].clone();
+        pane.parser
+            .lock()
+            .unwrap()
+            .process(b"\x1b]52;c;aGlkZGVu\x07");
+        let mut seen = HashMap::new();
+        assert!(session.view_clipboard(&view, &mut seen).is_none());
+        view.focused.insert(view.tabs[&view.workspace], hidden);
+        assert!(session.view_clipboard(&view, &mut seen).is_none());
+        let first_pane = session.panes.lock().unwrap()[&first].clone();
+        first_pane
+            .parser
+            .lock()
+            .unwrap()
+            .process(b"\x1b]52;c;Y29sZA==\x07");
+        let mut cold_attach = session.clipboard_cursor();
+        assert!(session.view_clipboard(&view, &mut cold_attach).is_none());
+    }
+
     #[test]
     fn graphics_follow_bottom_row_autowrap_and_scroll_commands() {
-        let mut parser = PtyParser::new_with_callbacks(4, 10, 100, PtyCallbacks::default());
+        let mut parser = pty_parser(4, 10, 100, PtyCallbacks::default());
         parser.callbacks_mut().graphics.command(
             b"a=T,f=24,s=1,v=1,i=7,c=1,r=1,C=1;AAAA",
             (2, 0),
@@ -5809,6 +6298,199 @@ mod tests {
         graphics_text(&mut parser, b"\x1b[2J");
         assert!(parser.callbacks().graphics.placements(false, 0).is_empty());
     }
+
+    #[test]
+    fn graphics_follow_escape_index_at_the_bottom_margin() {
+        let mut parser = pty_parser(4, 10, 100, PtyCallbacks::default());
+        parser.callbacks_mut().graphics.command(
+            b"a=T,f=24,s=1,v=1,i=7,c=1,r=1,C=1;AAAA",
+            (2, 0),
+            false,
+        );
+
+        graphics_text(&mut parser, b"\x1b[4;1H\x1bD");
+
+        assert_eq!(parser.callbacks().graphics.placements(false, 0)[0].row, 1);
+    }
+
+    #[test]
+    fn unicode_placeholders_keep_distinct_underline_placement_ids() {
+        let mut parser = pty_parser(1, 3, 0, PtyCallbacks::default());
+        parser.callbacks_mut().graphics.command(
+            b"a=t,f=24,s=3,v=1,i=7;AAAAAAAAAAAA",
+            (0, 0),
+            false,
+        );
+        for placement in [3, 4] {
+            parser.callbacks_mut().graphics.command(
+                format!("a=p,i=7,p={placement},U=1,c=3,r=1").as_bytes(),
+                (0, 0),
+                false,
+            );
+        }
+        graphics_text(
+            &mut parser,
+            b"\x1b[38;2;0;0;7;58;2;0;0;3m\xf4\x8e\xbb\xae\x1b[58;2;0;0;4m\xf4\x8e\xbb\xae",
+        );
+        let placements = snapshot(&parser).graphics;
+        assert_eq!(placements.len(), 2);
+        assert_eq!(placements[0].placement, 3);
+        assert_eq!(placements[1].placement, 4);
+    }
+
+    #[test]
+    fn unicode_placeholder_uses_diacritic_source_coordinates_across_pty_reads() {
+        let mut parser = pty_parser(4, 12, 0, PtyCallbacks::default());
+        let pixels = base64::engine::general_purpose::STANDARD.encode(vec![0; 100 * 80 * 3]);
+        parser.callbacks_mut().graphics.command(
+            format!("a=t,f=24,s=100,v=80,i=16777223;{pixels}").as_bytes(),
+            (0, 0),
+            false,
+        );
+        parser.callbacks_mut().graphics.command(
+            b"a=p,i=16777223,p=3,U=1,c=4,r=2,x=10,y=20,w=80,h=40",
+            (0, 0),
+            false,
+        );
+
+        // The placeholder is on screen row 3/column 9, but its source cell
+        // is row 1/column 2. Feed every UTF-8 byte through the real PTY path.
+        let text = "\x1b[3;9H\x1b[38;2;0;0;7;58;2;0;0;3m\u{10eeee}\u{030d}\u{030e}\u{030d}\x1b[0m";
+        for chunk in text.as_bytes().chunks(1) {
+            graphics_text(&mut parser, chunk);
+        }
+        let placement = snapshot(&parser).graphics.remove(0);
+        assert_eq!(placement.image, 16_777_223);
+        assert_eq!(placement.placement, 3);
+        assert_eq!((placement.col, placement.row), (8, 2));
+        assert_eq!(
+            (
+                placement.source_x,
+                placement.source_y,
+                placement.source_width,
+                placement.source_height,
+            ),
+            (50, 40, 20, 20)
+        );
+    }
+
+    #[test]
+    fn virtual_image_source_crop_survives_normal_scrollback() {
+        let mut parser = pty_parser(2, 12, 10, PtyCallbacks::default());
+        let pixels = base64::engine::general_purpose::STANDARD.encode(vec![0; 100 * 80 * 3]);
+        parser.callbacks_mut().graphics.command(
+            format!("a=t,f=24,s=100,v=80,i=7;{pixels}").as_bytes(),
+            (0, 0),
+            false,
+        );
+        parser.callbacks_mut().graphics.command(
+            b"a=p,i=7,p=3,U=1,c=4,r=2,x=10,y=20,w=80,h=40",
+            (0, 0),
+            false,
+        );
+
+        graphics_text(
+            &mut parser,
+            "\x1b[1;1H\x1b[38;2;0;0;7;58;2;0;0;3m\u{10eeee}\u{030d}\u{030e}\x1b[0m\x1b[2;1Hlive\n"
+                .as_bytes(),
+        );
+        assert!(snapshot(&parser).graphics.is_empty());
+
+        parser.screen_mut().set_scrollback(1);
+        let placement = snapshot(&parser).graphics.remove(0);
+        assert_eq!((placement.row, placement.col), (0, 0));
+        assert_eq!(
+            (
+                placement.source_x,
+                placement.source_y,
+                placement.source_width,
+                placement.source_height,
+            ),
+            (50, 40, 20, 20)
+        );
+        parser.screen_mut().set_scrollback(0);
+        graphics_text(&mut parser, b"\x1b[2J");
+        parser.screen_mut().set_scrollback(1);
+        assert_eq!(
+            snapshot(&parser).graphics.len(),
+            1,
+            "ED2 preserves history images"
+        );
+        parser.screen_mut().set_scrollback(0);
+        graphics_text(&mut parser, b"\x1b[3J");
+        parser.screen_mut().set_scrollback(1);
+        assert!(
+            snapshot(&parser).graphics.is_empty(),
+            "ED3 clears history images"
+        );
+    }
+
+    #[test]
+    fn shrinking_a_virtual_image_column_cannot_revive_it_on_expand() {
+        let mut parser = pty_parser(2, 4, 10, PtyCallbacks::default());
+        parser
+            .callbacks_mut()
+            .graphics
+            .command(b"a=t,f=24,s=2,v=1,i=7;AAAAAAAA", (0, 0), false);
+        parser
+            .callbacks_mut()
+            .graphics
+            .command(b"a=p,i=7,p=3,U=1,c=2,r=1", (0, 0), false);
+        graphics_text(
+            &mut parser,
+            "\x1b[1;4H\x1b[38;2;0;0;7;58;2;0;0;3m\u{10eeee}\x1b[0m".as_bytes(),
+        );
+        assert_eq!(snapshot(&parser).graphics.len(), 1);
+
+        resize_parser(&mut parser, 2, 2);
+        resize_parser(&mut parser, 2, 4);
+        assert!(snapshot(&parser).graphics.is_empty());
+    }
+
+    #[test]
+    fn growing_normal_history_moves_virtual_cells_with_vt100() {
+        let mut parser = pty_parser(2, 4, 10, PtyCallbacks::default());
+        parser
+            .callbacks_mut()
+            .graphics
+            .command(b"a=t,f=24,s=2,v=1,i=7;AAAAAAAA", (0, 0), false);
+        parser
+            .callbacks_mut()
+            .graphics
+            .command(b"a=p,i=7,p=3,U=1,c=2,r=1", (0, 0), false);
+        graphics_text(
+            &mut parser,
+            "\x1b[1;1H\x1b[38;2;0;0;7;58;2;0;0;3m\u{10eeee}\x1b[0m\x1b[2;1Hx\n".as_bytes(),
+        );
+        assert!(snapshot(&parser).graphics.is_empty());
+
+        resize_parser(&mut parser, 3, 4);
+        let placement = snapshot(&parser).graphics.remove(0);
+        assert_eq!((placement.row, placement.col), (0, 0));
+    }
+
+    #[test]
+    fn virtual_placeholders_follow_wrap_and_wide_overwrite() {
+        let mut parser = pty_parser(2, 2, 10, PtyCallbacks::default());
+        parser
+            .callbacks_mut()
+            .graphics
+            .command(b"a=t,f=24,s=2,v=1,i=7;AAAAAAAA", (0, 0), false);
+        parser
+            .callbacks_mut()
+            .graphics
+            .command(b"a=p,i=7,p=1,U=1,c=2,r=1", (0, 0), false);
+        graphics_text(
+            &mut parser,
+            "ab\x1b[38;2;0;0;7m\u{10eeee}\u{10eeee}".as_bytes(),
+        );
+        let screen = snapshot(&parser);
+        assert_eq!(screen.graphics.len(), 2);
+        assert_eq!((screen.graphics[0].row, screen.graphics[0].col), (1, 0));
+        graphics_text(&mut parser, "\x1b[2;1H\x1b[0m界".as_bytes());
+        assert!(snapshot(&parser).graphics.is_empty());
+    }
+
     use super::*;
 
     #[tokio::test]
@@ -6064,14 +6746,14 @@ mod tests {
     }
     #[test]
     fn vt100_snapshot_retains_terminal_contents() {
-        let mut parser = PtyParser::new_with_callbacks(3, 10, 100, PtyCallbacks::default());
+        let mut parser = pty_parser(3, 10, 100, PtyCallbacks::default());
         parser.process(b"hello\r\nworld");
         assert!(snapshot(&parser).contents.contains("hello"));
     }
     #[test]
     fn read_history_recovers_full_scrollback() {
         // A 24-row screen with plenty of scrollback fed 3000 numbered lines.
-        let mut parser = PtyParser::new_with_callbacks(24, 20, 10_000, PtyCallbacks::default());
+        let mut parser = pty_parser(24, 20, 10_000, PtyCallbacks::default());
         for n in 1..=3000 {
             parser.process(format!("{n}\r\n").as_bytes());
         }
@@ -6091,7 +6773,7 @@ mod tests {
     /// Paint an 80x24-style sample with the escape sequences a colored `ls`,
     /// a prompt, and a 256/RGB-color TUI would emit.
     fn mixed_sample(rows: u16, cols: u16) -> PtyParser {
-        let mut parser = PtyParser::new_with_callbacks(rows, cols, 100, PtyCallbacks::default());
+        let mut parser = pty_parser(rows, cols, 100, PtyCallbacks::default());
         for row in 0..rows {
             let line = match row % 4 {
                 0 => format!("\x1b[0;34mdir-{row:03}\x1b[0m  \x1b[0;32mrun.sh\x1b[0m  plain.txt"),
@@ -6113,7 +6795,7 @@ mod tests {
 
     #[test]
     fn snapshot_coalesces_colors_and_attributes_into_runs() {
-        let mut parser = PtyParser::new_with_callbacks(2, 20, 100, PtyCallbacks::default());
+        let mut parser = pty_parser(2, 20, 100, PtyCallbacks::default());
         parser.process(b"\x1b[31mred\x1b[1mbold\x1b[0mplain");
         let screen = snapshot(&parser);
         let runs = &screen.rows[0];
@@ -6132,7 +6814,7 @@ mod tests {
 
     #[test]
     fn snapshot_keeps_wide_chars_in_two_columns() {
-        let mut parser = PtyParser::new_with_callbacks(1, 10, 100, PtyCallbacks::default());
+        let mut parser = pty_parser(1, 10, 100, PtyCallbacks::default());
         parser.process("宽x".as_bytes());
         let screen = snapshot(&parser);
         let text: String = screen.rows[0].iter().map(|run| run.text.as_str()).collect();
@@ -6143,12 +6825,109 @@ mod tests {
 
     #[test]
     fn snapshot_reports_terminal_modes() {
-        let mut parser = PtyParser::new_with_callbacks(2, 10, 100, PtyCallbacks::default());
+        let mut parser = pty_parser(2, 10, 100, PtyCallbacks::default());
         parser.process(b"\x1b[?2004h\x1b[?1000h\x1b[?25l");
         let screen = snapshot(&parser);
         assert!(screen.bracketed_paste);
         assert!(screen.mouse_reporting);
         assert!(!screen.cursor_visible);
+    }
+
+    #[test]
+    fn snapshot_carries_osc8_labeled_link_cells() {
+        let mut parser = pty_parser(2, 20, 100, PtyCallbacks::default());
+        graphics_text(
+            &mut parser,
+            b"\x1b]8;;https://example.test/docs\x1b\\docs\x1b]8;;\x1b\\",
+        );
+        let screen = snapshot(&parser);
+        assert_eq!(screen.contents.trim(), "docs");
+        assert_eq!(screen.links.len(), 1);
+        assert_eq!(screen.links[0].uri, "https://example.test/docs");
+        assert_eq!((screen.links[0].start_col, screen.links[0].end_col), (0, 4));
+    }
+
+    #[test]
+    fn scrolled_snapshot_carries_retained_osc8_link_cells() {
+        let mut parser = pty_parser(2, 20, 100, PtyCallbacks::default());
+        parser.callbacks_mut().graphics.command(
+            b"a=T,f=24,s=1,v=1,i=9,c=1,r=1;AAAA",
+            (0, 0),
+            false,
+        );
+        graphics_text(
+            &mut parser,
+            b"\x1b]8;;https://example.test/history\x1b\\one\x1b]8;;\x1b\\\r\nplain\r\nlast",
+        );
+        parser.screen_mut().set_scrollback(1);
+        let screen = snapshot(&parser);
+        assert!(screen.links.iter().any(|link| {
+            (link.row, link.start_col, link.end_col, link.uri.as_str())
+                == (0, 0, 3, "https://example.test/history")
+        }));
+        assert_eq!(screen.graphics.len(), 1);
+        assert_eq!((screen.graphics[0].row, screen.graphics[0].col), (0, 0));
+    }
+
+    #[test]
+    fn pane_synchronized_output_control_is_not_replayed_to_the_host() {
+        let mut parser = pty_parser(2, 20, 100, PtyCallbacks::default());
+        // Pane output is parsed into the daemon-owned screen. Even an app that
+        // forgets the DECRST terminator cannot leave the attached host waiting.
+        graphics_text(&mut parser, b"\x1b[?2026hstill-visible");
+        let screen = snapshot(&parser);
+        assert_eq!(screen.contents.trim(), "still-visible");
+        assert!(!screen
+            .rows
+            .iter()
+            .flat_map(|row| row.iter())
+            .any(|run| run.text.contains("2026")));
+    }
+
+    #[test]
+    fn pane_synchronized_output_holds_then_releases_a_frame() {
+        let mut parser = pty_parser(2, 20, 100, PtyCallbacks::default());
+        parser.callbacks_mut().graphics.command(
+            b"a=T,f=24,s=1,v=1,i=10,c=1,r=1;AAAA",
+            (0, 0),
+            false,
+        );
+        graphics_text(
+            &mut parser,
+            b"\x1b]8;;https://example.test/frozen\x1b\\old\x1b]8;;\x1b\\",
+        );
+        let before = snapshot(&parser);
+        assert_eq!(
+            (
+                before.links[0].row,
+                before.links[0].start_col,
+                before.links[0].end_col
+            ),
+            (0, 0, 3)
+        );
+        assert_eq!((before.graphics[0].row, before.graphics[0].col), (0, 0));
+        graphics_text(&mut parser, b"\x1b[?2026hpartial");
+        let frozen = snapshot_for_client(&mut parser);
+        assert_eq!(frozen.contents.trim(), "old");
+        assert_eq!(frozen.links, before.links);
+        assert_eq!(frozen.graphics, before.graphics);
+        graphics_text(&mut parser, b" final\x1b[?2026l");
+        let released = snapshot_for_client(&mut parser);
+        assert_eq!(released.contents.trim(), "oldpartial final");
+        assert_eq!(released.links, before.links);
+        assert_eq!(released.graphics, before.graphics);
+    }
+
+    #[test]
+    fn pane_synchronized_output_timeout_releases_without_more_bytes() {
+        let mut parser = pty_parser(2, 20, 100, PtyCallbacks::default());
+        graphics_text(&mut parser, b"old\x1b[?2026hpartial");
+        let callbacks = parser.callbacks_mut();
+        callbacks.sync_frozen.as_mut().unwrap().0 = Instant::now() - Duration::from_secs(2);
+        assert_eq!(
+            snapshot_for_client(&mut parser).contents.trim(),
+            "oldpartial"
+        );
     }
 
     #[test]
@@ -6181,7 +6960,7 @@ mod tests {
 
     #[test]
     fn osc_window_title_reaches_the_detection_callback() {
-        let mut parser = PtyParser::new_with_callbacks(3, 20, 100, PtyCallbacks::default());
+        let mut parser = pty_parser(3, 20, 100, PtyCallbacks::default());
         parser.process(b"\x1b]2;claude\x07");
         assert_eq!(parser.callbacks().title, "claude");
         parser.process(b"\x1b]0;codex\x07");
@@ -6293,10 +7072,10 @@ mod tests {
 
     #[test]
     fn cold_history_replay_restores_formatted_active_screen() {
-        let mut source = PtyParser::new_with_callbacks(3, 20, 100, PtyCallbacks::default());
+        let mut source = pty_parser(3, 20, 100, PtyCallbacks::default());
         source.process(b"\x1b[31mred ready\x1b[0m");
         let saved = snapshot(&source);
-        let mut restored = PtyParser::new_with_callbacks(3, 20, 100, PtyCallbacks::default());
+        let mut restored = pty_parser(3, 20, 100, PtyCallbacks::default());
         restore_screen(
             &mut restored,
             &saved,
@@ -6328,12 +7107,7 @@ mod tests {
         .expect("test pane");
         // The reader keeps the original parser, so shell profile output cannot
         // race the synthetic parser this regression test controls.
-        pane.parser = Arc::new(Mutex::new(PtyParser::new_with_callbacks(
-            2,
-            20,
-            100,
-            PtyCallbacks::default(),
-        )));
+        pane.parser = Arc::new(Mutex::new(pty_parser(2, 20, 100, PtyCallbacks::default())));
         {
             let mut parser = pane.parser.lock().expect("parser lock");
             parser.process(b"one\r\ntwo\r\nthree\r\nfour\r\n");
@@ -6541,13 +7315,13 @@ mod tests {
 
     #[test]
     fn handoff_restores_both_terminal_buffers_and_saved_cursor() {
-        let mut source = PtyParser::new_with_callbacks(6, 30, 100, PtyCallbacks::default());
+        let mut source = pty_parser(6, 30, 100, PtyCallbacks::default());
         source.process(b"shell line\r\nshell prompt> ");
         let primary = source.screen().contents_formatted();
         source.process(b"\x1b[?1049h\x1b[31meditor contents\x1b[0m\x1b[3;5H\x1b7\x1b[5;9H");
         let alternate = source.screen().contents_formatted();
         let (screen, history) = terminal_handoff(&source).unwrap();
-        let mut target = PtyParser::new_with_callbacks(6, 30, 100, PtyCallbacks::default());
+        let mut target = pty_parser(6, 30, 100, PtyCallbacks::default());
         target.process(history.as_bytes());
         target.process(&screen);
         assert!(target.screen().alternate_screen());
@@ -6561,7 +7335,7 @@ mod tests {
 
     #[test]
     fn alternate_screen_has_no_local_history_and_restores_normal_screen() {
-        let mut parser = PtyParser::new_with_callbacks(2, 20, 100, PtyCallbacks::default());
+        let mut parser = pty_parser(2, 20, 100, PtyCallbacks::default());
         parser.process(b"one\r\ntwo\r\nthree\r\n");
         parser.process(b"\x1b[?1049halt\r\n");
         assert!(parser.screen().alternate_screen());
@@ -6574,7 +7348,7 @@ mod tests {
 
     #[test]
     fn live_detection_screen_ignores_history_viewport() {
-        let mut parser = PtyParser::new_with_callbacks(2, 20, 100, PtyCallbacks::default());
+        let mut parser = pty_parser(2, 20, 100, PtyCallbacks::default());
         parser.process(b"old\r\nolder\r\nlive\r\nnow\r\n");
         parser.screen_mut().set_scrollback(2);
         let offset = parser.screen().scrollback();
@@ -8148,13 +8922,23 @@ mod tests {
                 context: None,
             })
             .expect("spawn restored pane");
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        assert!(restored
-            .panes
-            .lock()
-            .expect("panes")
-            .values()
-            .any(|pane| pane.snapshot().0.contents.contains("per-workspace")));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let ready = restored
+                .panes
+                .lock()
+                .expect("panes")
+                .values()
+                .any(|pane| pane.snapshot().0.contents.contains("per-workspace"));
+            if ready {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "restored workspace environment did not reach its pane"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 
     #[tokio::test]
@@ -8314,5 +9098,36 @@ mod tests {
         accept.abort();
         let _ = fs::remove_file(&socket);
         let _ = fs::remove_dir(&directory);
+    }
+}
+
+#[cfg(test)]
+mod parser_safety_regressions {
+    use super::*;
+
+    #[test]
+    fn one_row_wrapped_output_never_underflows() {
+        let mut parser = PtyParser::new_with_callbacks(
+            NonZeroU16::new(1).unwrap(),
+            NonZeroU16::new(6).unwrap(),
+            64,
+            PtyCallbacks::default(),
+        );
+        parser.process(b"12345678901234567890");
+        assert_eq!(parser.screen().contents().trim(), "90");
+    }
+
+    #[test]
+    fn wide_erase_after_resize_never_panics() {
+        let mut parser = PtyParser::new_with_callbacks(
+            NonZeroU16::new(2).unwrap(),
+            NonZeroU16::new(4).unwrap(),
+            64,
+            PtyCallbacks::default(),
+        );
+        parser.process("宽界".as_bytes());
+        parser.set_size(NonZeroU16::new(1).unwrap(), NonZeroU16::new(2).unwrap());
+        parser.process(b"\x1b[2J\x1b[K");
+        assert!(parser.screen().contents().trim().is_empty());
     }
 }

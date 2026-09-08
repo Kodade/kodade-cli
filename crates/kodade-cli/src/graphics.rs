@@ -219,9 +219,10 @@ impl Renderer {
             }
             for p in &visible {
                 let host = self.assets[&p.key].host;
-                write!(commands, "\x1b[{};{}H\x1b_Ga=p,i={host},p={},q=2,C=1,c={},r={},x={},y={},w={},h={},z={}\x1b\\",
+                write!(commands, "\x1b[{};{}H\x1b_Ga=p,i={host},p={},q=2,C=1,c={},r={},x={},y={},w={},h={},X={},Y={},z={}\x1b\\",
                     p.area.y + 1, p.area.x + 1, p.source.placement, p.area.width, p.area.height,
-                    p.source.source_x, p.source.source_y, p.source.source_width, p.source.source_height, p.source.z)?;
+                    p.source.source_x, p.source.source_y, p.source.source_width, p.source.source_height,
+                    p.source.x_offset, p.source.y_offset, p.source.z)?;
             }
             self.previous = visible;
         }
@@ -347,6 +348,8 @@ mod tests {
             source_y: 0,
             source_width: 80,
             source_height: 80,
+            x_offset: 0,
+            y_offset: 0,
             z: 0,
         };
         let (cropped, rect) = clip(&source, Rect::new(20, 4, 10, 4)).unwrap();

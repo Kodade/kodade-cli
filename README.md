@@ -30,6 +30,10 @@ Current development also includes:
 - Exact native conversation restore and opt-in terminal history after a cold restart.
 - An offline [agent automation guide](docs/AGENT-GUIDE.md), available with `kodade-cli agent guide`.
 - Terminal images, PNG paste, and a focused view for narrow terminals.
+- OSC 8 links open their exact target from live output or local history; terminal
+  frames stay atomic where synchronized output is supported.
+- Local copies use the platform clipboard when available and retain OSC 52 for
+  SSH, remote panes, and terminals without a native clipboard tool.
 - Verified stable/preview updates for standalone installations.
 
 These changes are being validated for the next release. See the
@@ -149,11 +153,12 @@ panel below the workspaces lists agent panes by urgency, and each workspace
 carries a color swatch (right-click → `Color…`, or an auto-hashed fallback). See
 [docs/CONFIG.md](docs/CONFIG.md#settings).
 
-Dragging inside a pane selects text and copies it on release
-(`mouse.copy_on_select`, OSC 52 so it works over SSH); double-click selects a
-word, triple-click a line, and ctrl/cmd-click opens the URL under the pointer
-with `ui.link_command`. Panes running a mouse-aware program (vim, lazygit,
-htop) get the events themselves unless `mouse.passthrough = false`. Hold
+Dragging inside a pane selects text and copies it on release (the local platform
+clipboard when available, otherwise OSC 52 so it works over SSH); double-click
+selects a word, triple-click a line, and ctrl/cmd-click opens the URL under the
+pointer with `ui.link_command`. OSC 8 labels use their exact target, including
+in local history. Panes running a mouse-aware program (vim, lazygit, htop) get
+the events themselves unless `mouse.passthrough = false`. Hold
 `shift` while wheeling to inspect Ködade CLI's local history; once history is
 open, wheel down returns to live output before wheel events return to the
 application. `prefix PageUp` and `prefix PageDown` provide the same local
@@ -181,14 +186,15 @@ pane keeps that pane's normal local-history behavior.
 | `H` `M` `L` | Cursor to viewport top / middle / bottom |
 | `v` / `V` / `ctrl+v` | Char / line / block selection anchor |
 | `/` `?` then `n` `N` | Search forward / back (case-insensitive), step matches |
-| `y` | Copy the selection (or current line) via OSC 52 and the paste buffer |
+| `y` | Copy the selection (or current line) to the local clipboard, with OSC 52 fallback |
 | `e` | Open the buffer in `$EDITOR` (fallback `vi`) in a new split |
 | `esc` | Clear search, then the selection, then exit; `q` exits |
 
-Copying sends the selection through OSC 52, including over SSH; copy payloads
-are limited to 100 KB. The buffer is refetched (throttled) while the pane keeps
-producing output. Copy mode draws plain text — the frozen cell colors of the
-live screen are not reproduced there.
+Copying uses the local platform clipboard when available. It falls back to OSC
+52 for SSH, remote panes, and unavailable clipboard tools; payloads are limited
+to 100 KB. The buffer is refetched (throttled) while the pane keeps producing
+output. Copy mode draws plain text — the frozen cell colors of the live screen
+are not reproduced there.
 
 Paste is bracketed so a program can tell it from typing. Pasted text is
 sanitized by default (`paste.sanitize`): CRLF is normalized, embedded escape

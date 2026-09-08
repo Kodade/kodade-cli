@@ -122,7 +122,15 @@ background color, and attribute bits (bold, italic, underline, dim, inverse);
 colors are `Default`, `Indexed(u8)`, or `Rgb`. Wide characters are emitted once
 and their continuation cell dropped, so a run's display width equals the
 columns it covers. `Screen` also carries the cursor position and visibility and
-the pane's bracketed-paste and mouse-reporting modes.
+the pane's bracketed-paste and mouse-reporting modes. It carries bounded OSC 8
+link ranges for visible cells too. Pane DECSYNC (`CSI ? 2026 h/l`) freezes the
+last complete screen for at most one second, including link and graphics
+metadata, so malformed pane output cannot indefinitely hold an attached client.
+
+The daemon uses the maintained `atuin-vt100` fork under the existing `vt100`
+dependency alias. Keep parser dimensions at the daemon boundary as
+`NonZeroU16`; `terminal_size` is the single conversion point for PTY requests
+and protects the parser from zero-sized resize input.
 
 Socket paths are selected in this order:
 
@@ -266,6 +274,9 @@ Terminal modes are owned by `terminal::TerminalModes`; cleanup runs after detach
 failed setup, UI errors, and before panic reporting. `python3 scripts/tui-smoke-test.py`
 exercises a real controlling PTY, detach, a broken transport, and restoration of
 termios, alternate screen, bracketed paste, and cursor visibility.
+`python3 scripts/terminal-links-tui-smoke.py` exercises labeled OSC 8 links in
+history and live output, link retirement after a same-text overwrite, and a
+child pane's synchronized-output freeze/release path.
 
 
 ## Live daemon handoff

@@ -25,7 +25,7 @@ pub(super) fn terminal_handoff(parser: &PtyParser) -> Result<(Vec<u8>, String)> 
         screen.extend_from_slice(switch);
         // Format grids with absolute addressing before restoring their modes.
         screen.extend_from_slice(b"\x1b[?6l\x1b[r");
-        screen.extend(copy.screen().state_formatted());
+        screen.extend_from_slice(copy.screen().state_formatted().as_bytes());
         let (top, bottom, origin) = grid_modes(copy.screen());
         screen.extend_from_slice(format!("\x1b[{};{}r", top + 1, bottom + 1).as_bytes());
         // DEC save/restore retains each grid's cursor and origin-mode state.
@@ -53,7 +53,7 @@ fn append_cursor(output: &mut Vec<u8>, screen: &vt100::Screen, top: u16, origin:
     output.extend_from_slice(b"\x1b[m");
     let cursor = screen.cursor_state_formatted();
     if origin {
-        let mut remaining = cursor.as_slice();
+        let mut remaining = cursor.as_bytes();
         while let Some(start) = remaining.windows(2).position(|bytes| bytes == b"\x1b[") {
             output.extend_from_slice(&remaining[..start]);
             remaining = &remaining[start + 2..];
@@ -77,9 +77,9 @@ fn append_cursor(output: &mut Vec<u8>, screen: &vt100::Screen, top: u16, origin:
         }
         output.extend_from_slice(remaining);
     } else {
-        output.extend(cursor);
+        output.extend_from_slice(cursor.as_bytes());
     }
-    output.extend(screen.attributes_formatted());
+    output.extend_from_slice(screen.attributes_formatted().as_bytes());
 }
 
 /// vt100 intentionally keeps margins and origin mode private. Probe a clone
@@ -93,11 +93,10 @@ fn grid_modes(screen: &vt100::Screen) -> (u16, u16, bool) {
     probe.process(b"\x1b[999;1H");
     let bottom = probe.screen().cursor_position().0;
 
-    let mut origin_probe = vt100::Parser::new(rows.saturating_add(3), cols, 0);
+    let expanded_rows = std::num::NonZeroU16::new(rows.get().saturating_add(3)).unwrap();
+    let mut origin_probe = vt100::Parser::new(expanded_rows, cols, 0);
     *origin_probe.screen_mut() = screen.clone();
-    origin_probe
-        .screen_mut()
-        .set_size(rows.saturating_add(3), cols);
+    origin_probe.screen_mut().set_size(expanded_rows, cols);
     origin_probe.process(b"\x1b[2;3r\x1b[1;1H");
     let origin = origin_probe.screen().cursor_position().0 == 1;
     (top, bottom, origin)
@@ -105,7 +104,8 @@ fn grid_modes(screen: &vt100::Screen) -> (u16, u16, bool) {
 
 fn history_ansi(parser: &mut PtyParser) -> String {
     let (rows, cols) = parser.screen().size();
-    let rows = rows as usize;
+    let rows = rows.get() as usize;
+    let cols = cols.get();
     parser.screen_mut().set_scrollback(usize::MAX);
     let max = parser.screen().scrollback();
     let budget = HISTORY_LIMIT.saturating_sub(2 * rows + 2);
@@ -122,7 +122,12 @@ fn history_ansi(parser: &mut PtyParser) -> String {
         if index == max - 1 {
             previous_wrapped = wrapped;
         }
-        let mut row = parser.screen().rows_formatted(0, cols).next().unwrap();
+        let mut row = parser
+            .screen()
+            .rows_formatted(0, cols)
+            .next()
+            .unwrap()
+            .into_bytes();
         let continuation = if index > 0 {
             parser.screen_mut().set_scrollback(max - index + 1);
             parser.screen().row_wrapped(0)
@@ -153,7 +158,7 @@ fn history_ansi(parser: &mut PtyParser) -> String {
         }
     }
     kept.reverse();
-    let mut history = kept.concat();
+    let mut history: Vec<u8> = kept.concat();
     if !history.is_empty() {
         // A history row wrapping into the live grid needs a printable byte to
         // commit that wrap. The temporary cell is erased by screen replay.
@@ -174,20 +179,20 @@ mod tests {
     use super::*;
 
     fn parser(rows: u16, cols: u16, bytes: &[u8]) -> PtyParser {
-        let mut parser = PtyParser::new_with_callbacks(rows, cols, 64, PtyCallbacks::default());
+        let mut parser = crate::pty_parser(rows, cols, 64, PtyCallbacks::default());
         parser.process(bytes);
         parser
     }
 
     fn assert_grid_eq(left: &vt100::Screen, right: &vt100::Screen) {
         assert_eq!(left.size(), right.size());
-        for row in 0..left.size().0 {
+        for row in 0..left.size().0.get() {
             assert_eq!(
                 left.row_wrapped(row),
                 right.row_wrapped(row),
                 "wrap row {row}"
             );
-            for col in 0..left.size().1 {
+            for col in 0..left.size().1.get() {
                 assert_eq!(
                     left.cell(row, col),
                     right.cell(row, col),
@@ -207,7 +212,7 @@ mod tests {
         );
         let (screen, history) = terminal_handoff(&source).unwrap();
         assert!(history.contains("\x1b["));
-        let mut replay = PtyParser::new_with_callbacks(3, 6, 64, PtyCallbacks::default());
+        let mut replay = crate::pty_parser(3, 6, 64, PtyCallbacks::default());
         replay.process(history.as_bytes());
         replay.process(&screen);
         assert_grid_eq(source.screen(), replay.screen());
@@ -226,14 +231,14 @@ mod tests {
     #[test]
     fn replay_preserves_history_across_viewports_and_bounds_large_exports() {
         for rows in [2, 5] {
-            let mut source = PtyParser::new_with_callbacks(rows, 6, 64, PtyCallbacks::default());
+            let mut source = crate::pty_parser(rows, 6, 64, PtyCallbacks::default());
             for line in 0..30 {
                 source.process(
                     format!("\x1b[3{}m{:03}abcdefghi\x1b[m\r\n", line % 8, line).as_bytes(),
                 );
             }
             let (screen, history) = terminal_handoff(&source).unwrap();
-            let mut replay = PtyParser::new_with_callbacks(rows, 6, 64, PtyCallbacks::default());
+            let mut replay = crate::pty_parser(rows, 6, 64, PtyCallbacks::default());
             replay.process(history.as_bytes());
             replay.process(&screen);
             source.screen_mut().set_scrollback(usize::MAX);
@@ -246,7 +251,7 @@ mod tests {
                 assert_grid_eq(source.screen(), replay.screen());
             }
         }
-        let mut large = PtyParser::new_with_callbacks(50, 100, 10_000, PtyCallbacks::default());
+        let mut large = crate::pty_parser(50, 100, 10_000, PtyCallbacks::default());
         for _ in 0..10_000 {
             large.process(b"\x1b[31mA\x1b[32mB\x1b[33mC\x1b[34mD\x1b[35mE\x1b[m\r\n");
         }
@@ -263,7 +268,7 @@ mod tests {
             b"primary\x1b7\x1b[2;5r\x1b[?6h\x1b[?47halt\x1b7\x1b[3;4r\x1b[?6h",
         );
         let (screen, history) = terminal_handoff(&source).unwrap();
-        let mut replay = PtyParser::new_with_callbacks(6, 10, 64, PtyCallbacks::default());
+        let mut replay = crate::pty_parser(6, 10, 64, PtyCallbacks::default());
         replay.process(history.as_bytes());
         replay.process(&screen);
         assert!(replay.screen().alternate_screen());

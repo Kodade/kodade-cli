@@ -8,6 +8,7 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  RUST_TEST_THREADS: 4
 
 jobs:
   check:
@@ -37,3 +38,7 @@ jobs:
         run: |
           python3 scripts/smoke-test.py target/debug/kodade-cli
           python3 scripts/plugin-context-tui-smoke.py target/debug/kodade-cli --handoff
+      - name: Exercise graphics media through a real PTY
+        run: python3 scripts/graphics-media-smoke.py target/debug/kodade-cli
+      - name: Exercise terminal links and synchronized pane frames
+        run: python3 scripts/terminal-links-tui-smoke.py target/debug/kodade-cli

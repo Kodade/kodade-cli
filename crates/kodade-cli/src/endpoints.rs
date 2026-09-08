@@ -364,6 +364,7 @@ async fn connect_machine(
                         updates.send(app::Update::EndpointFailed { reason: "daemon upgrading; reconnecting".into() }).await?;
                         return Ok(Some(connected_session));
                     }
+                    Ok(ServerMessage::Clipboard { pane, text }) => Some(app::Update::Clipboard { pane, text }),
                     Ok(ServerMessage::Welcome { session, .. }) => Some(app::Update::Session(session)),
                     Ok(ServerMessage::Notification(notification)) | Ok(ServerMessage::Event(kodade_cli_proto::Event::Notification(notification))) => Some(app::Update::Notification(notification)),
                     Ok(ServerMessage::Event(kodade_cli_proto::Event::SessionRenamed { name, socket })) => {

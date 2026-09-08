@@ -104,6 +104,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "atuin-vt100"
+version = "0.19.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6541b562687e0c6682aa49aec5b7fc21aae2d57e1e228d492dcde84d3925059a"
+dependencies = [
+ "itoa",
+ "unicode-width",
+ "vte",
+]
+
+[[package]]
 name = "autocfg"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -785,8 +796,10 @@ name = "kodade-cli-daemon"
 version = "0.2.1"
 dependencies = [
  "anyhow",
+ "atuin-vt100",
  "base64",
  "dirs",
+ "flate2",
  "kodade-cli-proto",
  "libc",
  "png",
@@ -796,7 +809,6 @@ dependencies = [
  "tokio",
  "toml",
  "unicode-width",
- "vt100",
  "vte",
 ]
 
@@ -1986,17 +1998,6 @@ name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
-
-[[package]]
-name = "vt100"
-version = "0.16.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "054ff75fb8fa83e609e685106df4faeffdf3a735d3c74ebce97ec557d5d36fd9"
-dependencies = [
- "itoa",
- "unicode-width",
- "vte",
-]
 
 [[package]]
 name = "vte"

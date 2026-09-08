@@ -940,7 +940,7 @@ mod tests {
             id: "slow".into(),
             name: "Slow".into(),
             command: format!(
-                "printf '%s' \"$KODADE_PLUGIN_CONTEXT\" > {}; sleep 2",
+                "printf '%s' \"$KODADE_PLUGIN_CONTEXT\" > {}; sleep 30",
                 marker.display()
             ),
             description: String::new(),
@@ -954,7 +954,7 @@ mod tests {
             &InvocationContext::default(),
             "session",
             Path::new("/tmp/socket"),
-            Duration::from_millis(500)
+            Duration::from_secs(2)
         )
         .await
         .is_err());

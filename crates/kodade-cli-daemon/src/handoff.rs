@@ -140,6 +140,16 @@ pub(crate) struct PaneRuntime {
     #[serde(default)]
     pub(crate) graphics: crate::graphics::HandoffState,
     #[serde(default)]
+    pub(crate) hyperlinks: Option<crate::hyperlinks::HandoffState>,
+    #[serde(default)]
+    pub(crate) clipboard: Option<(u64, Vec<u8>, Vec<u8>)>,
+    #[serde(default)]
+    pub(crate) graphics_placeholder: Vec<u8>,
+    #[serde(default)]
+    pub(crate) sync_tail: Vec<u8>,
+    #[serde(default)]
+    pub(crate) sync_frozen: Option<(u64, kodade_cli_proto::Screen)>,
+    #[serde(default)]
     pub(crate) agent_generation: u64,
     #[serde(default)]
     pub(crate) activity_revision: u64,

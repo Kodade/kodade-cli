@@ -3,6 +3,7 @@ mod atomic_file;
 mod attention;
 mod automation;
 mod cli;
+mod clipboard;
 mod commands;
 mod config;
 mod connection;
