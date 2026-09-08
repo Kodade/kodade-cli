@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Keep a real attached client on its own pane through two daemon upgrades."""
 import fcntl
+import errno
 import json
 import os
 from pathlib import Path
@@ -85,7 +86,15 @@ with tempfile.TemporaryDirectory(prefix="kh-", dir="/tmp") as directory:
             if select.select([master], [], [], 0.03)[0]:
                 transcript.extend(os.read(master, 65536))
         assert client.returncode == 0
-        assert termios.tcgetattr(slave) == modes, "TUI did not restore terminal modes"
+        try:
+            restored_modes = termios.tcgetattr(slave)
+        except termios.error as error:
+            # macOS detaches the slave from the ended controlling session.
+            # The master remains the same PTY and still exposes its termios.
+            if error.args[0] != errno.ENOTTY:
+                raise
+            restored_modes = termios.tcgetattr(master)
+        assert restored_modes == modes, "TUI did not restore terminal modes"
         assert not list((root / "run/kodade-cli").glob(".up-*")), "handoff staging leaked"
         print("Live TUI handoff passed: two replacements, independent focus, original shell execution, terminal cleanup")
     finally:
