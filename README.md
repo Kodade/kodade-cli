@@ -20,13 +20,18 @@ After upgrading, start a new session to use the updated daemon. Existing
 sessions keep their running daemon until stopped; save work in those panes
 before stopping them.
 
-| Milestone | Scope | Status |
-|---|---|---|
-| M0 | Cargo workspace, daemon/client handshake, one PTY, rendering, keyboard passthrough | Done |
-| M1 | Splits, tabs, workspaces, resize, mouse focus/resize/select, prefix keys, detach/reattach | Done |
-| M2 | Agent detection, five states, sidebar rollup, agent subcommands, Claude Code hooks | Done |
-| M3 | Themes, config, navigate mode, menus, scrollback/copy mode, OSC 52 | Done |
-| M4 | CI builds, release binaries, install script, documentation | Done |
+Current development also includes:
+
+- Local and saved SSH machines in one workspace, with independent reconnects.
+- A command center (`prefix space`) and attention history (`prefix A`).
+- Guarded agent launch/prompt/wait automation and live integration reloads.
+- Local extensions with command actions, event hooks, and terminal panes.
+- Terminal images, PNG paste, and a focused view for narrow terminals.
+- Verified stable/preview updates for standalone installations.
+
+These changes are being validated for the next release. See the
+[competitive delivery ledger](docs/features/herdr-parity/PLAN.md) for shipped
+work, behavioral evidence, and the remaining gaps.
 
 ## Install
 

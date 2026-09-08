@@ -466,6 +466,30 @@ mod tests {
     }
 
     #[test]
+    fn rejected_update_preserves_executable_and_removes_staging() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("kodade-update-rejected-{nonce}"));
+        fs::create_dir_all(&root).unwrap();
+        let destination = root.join("kodade-cli");
+        fs::write(&destination, b"working executable").unwrap();
+        let archive = fixture_archive(&[("package/kodade-cli", b"replacement", 0o755)]);
+        assert!(install_archive(&archive, &"0".repeat(64), &destination).is_err());
+        let truncated = &archive[..archive.len() / 2];
+        let digest = format!("{:x}", Sha256::digest(truncated));
+        assert!(install_archive(truncated, &digest, &destination).is_err());
+        assert_eq!(fs::read(&destination).unwrap(), b"working executable");
+        assert_eq!(
+            fs::read_dir(&root).unwrap().count(),
+            1,
+            "staging file leaked"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn archive_rejects_links_duplicates_nonexecutables_and_large_binaries() {
         let noexec = fixture_archive(&[("package/kodade-cli", b"not executable", 0o644)]);
         assert!(extract_binary(&noexec).is_err());
