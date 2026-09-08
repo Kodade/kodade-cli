@@ -265,7 +265,7 @@ async fn main() -> Result<()> {
         }
         // `new` is the alias of `workspace new`.
         Some(cli::Command::New { workspace, path }) => {
-            new_workspace(&socket, workspace, path).await
+            new_workspace(&socket, workspace, path, Vec::new()).await
         }
         Some(cli::Command::Run {
             workspace,
@@ -757,7 +757,9 @@ async fn workspace(socket: &Path, command: cli::WorkspaceCommand) -> Result<()> 
             Ok(())
         }
         // Same idempotent create-or-select as the top-level `new` alias.
-        cli::WorkspaceCommand::New { name, path } => new_workspace(socket, name, path).await,
+        cli::WorkspaceCommand::New { name, path, env } => {
+            new_workspace(socket, name, path, env).await
+        }
         cli::WorkspaceCommand::Close { workspace } => {
             let id = resolve_workspace_name(socket, &workspace).await?;
             commands::layout(
@@ -864,14 +866,26 @@ async fn new_workspace(
     socket: &Path,
     name: String,
     path: Option<std::path::PathBuf>,
+    env: Vec<(String, String)>,
 ) -> Result<()> {
     let layout = commands::layout(commands::request(socket, commands::layout_query()).await?)?;
     if let Ok(id) = commands::resolve_workspace(&layout, &name) {
+        if !env.is_empty() {
+            bail!("workspace '{name}' already exists; --env only applies when creating a workspace")
+        }
         commands::request(socket, ClientMessage::SelectWorkspace { id }).await?;
         println!("{}", id.0);
     } else {
         let reply = commands::layout(
-            commands::request(socket, ClientMessage::NewWorkspace { name, root: path }).await?,
+            commands::request(
+                socket,
+                ClientMessage::NewWorkspace {
+                    name,
+                    root: path,
+                    env: env.into_iter().collect(),
+                },
+            )
+            .await?,
         )?;
         println!("{}", reply.active_workspace.0);
     }
@@ -1248,6 +1262,8 @@ async fn worktree(socket: &Path, command: cli::WorktreeCommand) -> Result<()> {
         cli::WorktreeCommand::Add {
             branch,
             from,
+            base,
+            path,
             workspace,
         } => {
             let layout =
@@ -1263,14 +1279,53 @@ async fn worktree(socket: &Path, command: cli::WorktreeCommand) -> Result<()> {
                 .find(|item| item.id == ws)
                 .and_then(|item| item.root.clone())
                 .ok_or_else(|| anyhow!("workspace has no root directory to branch from"))?;
+            let path = path.map(|path| {
+                if path.is_absolute() {
+                    path
+                } else {
+                    repo_root.join(path)
+                }
+            });
             let reply = commands::layout(
                 commands::request(
                     socket,
                     ClientMessage::NewWorktreeWorkspace {
                         repo_root,
                         branch,
-                        from,
+                        from: base.or(from),
+                        path,
                     },
+                )
+                .await?,
+            )?;
+            println!("{}", reply.active_workspace.0);
+            Ok(())
+        }
+        cli::WorktreeCommand::Open { path, workspace } => {
+            let layout =
+                commands::layout(commands::request(socket, commands::layout_query()).await?)?;
+            let ws = workspace
+                .as_deref()
+                .map(|name| commands::resolve_workspace(&layout, name))
+                .transpose()?
+                .unwrap_or(layout.active_workspace);
+            let repo_root = layout
+                .workspaces
+                .iter()
+                .find(|item| item.id == ws)
+                .and_then(|item| item.root.clone())
+                .ok_or_else(|| {
+                    anyhow!("workspace has no root directory to open a worktree from")
+                })?;
+            let path = if path.is_absolute() {
+                path
+            } else {
+                repo_root.join(path)
+            };
+            let reply = commands::layout(
+                commands::request(
+                    socket,
+                    ClientMessage::OpenWorktreeWorkspace { repo_root, path },
                 )
                 .await?,
             )?;

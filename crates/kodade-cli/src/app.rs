@@ -19,6 +19,7 @@ use ratatui::{backend::CrosstermBackend, layout::Rect, style::Color, Frame, Term
 #[cfg(test)]
 use ratatui::{TerminalOptions, Viewport};
 use std::{
+    collections::HashMap,
     collections::{BTreeMap, HashSet},
     io::Write,
     path::{Path, PathBuf},
@@ -1223,7 +1224,15 @@ impl App {
                     focused_cwd.as_deref(),
                     dirs::home_dir().as_deref(),
                 );
-                write(writer, &ClientMessage::NewWorkspace { name, root }).await?;
+                write(
+                    writer,
+                    &ClientMessage::NewWorkspace {
+                        name,
+                        root,
+                        env: HashMap::new(),
+                    },
+                )
+                .await?;
                 self.new_workspace = false;
             }
             KeyCode::Esc => {
@@ -1263,6 +1272,7 @@ impl App {
                                 repo_root,
                                 branch,
                                 from,
+                                path: None,
                             },
                         )
                         .await?;

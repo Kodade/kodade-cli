@@ -144,6 +144,9 @@ struct Workspace {
     root: Option<PathBuf>,
     /// Sidebar swatch color as `#rrggbb`, when the user set one (#19).
     color: Option<String>,
+    /// Explicit environment supplied for this workspace. New panes receive a
+    /// copy at spawn time; changing it never reaches already-running panes.
+    env: HashMap<String, String>,
     /// Git metadata is refreshed together every two seconds, keeping snapshot
     /// rendering free of filesystem reads.
     branch: Option<String>,
@@ -588,6 +591,7 @@ impl Session {
                 tabs: vec![tab],
                 root: None,
                 color: None,
+                env: HashMap::new(),
                 branch: None,
                 main_worktree_root: None,
                 parent: None,
@@ -667,8 +671,13 @@ impl Session {
                         .is_none()
                         .then(|| replay.get(&saved_pane.id).cloned())
                         .flatten();
-                    let new_id =
-                        session.new_pane_with_replay(&saved_pane.title, cwd, command, replay)?;
+                    let new_id = session.new_pane_with_replay(
+                        &saved_pane.title,
+                        cwd,
+                        command,
+                        replay,
+                        saved.env.clone(),
+                    )?;
                     if let Some(native) = resumed_native {
                         session
                             .panes
@@ -713,6 +722,7 @@ impl Session {
                 active_tab,
                 root: saved.root.clone(),
                 color: saved.color.clone(),
+                env: saved.env.clone(),
                 branch: None,
                 main_worktree_root: None,
                 parent: None,
@@ -744,6 +754,7 @@ impl Session {
                 name: workspace.name.clone(),
                 root: workspace.root.clone(),
                 color: workspace.color.clone(),
+                env: workspace.env.clone(),
                 active_tab: workspace.active_tab.0,
                 tabs: workspace
                     .tabs
@@ -913,24 +924,15 @@ impl Session {
         self.new_pane_with_id(self.pane_id(), title, cwd, command, None)
     }
 
-    fn new_pane_with_context(
-        &self,
-        title: &str,
-        cwd: Option<PathBuf>,
-        command: Option<Vec<String>>,
-        context_file: Option<ContextFile>,
-    ) -> Result<PaneId> {
-        self.new_pane_with_id(self.pane_id(), title, cwd, command, context_file)
-    }
-
     fn new_pane_with_replay(
         &self,
         title: &str,
         cwd: Option<PathBuf>,
         command: Option<Vec<String>>,
         replay: Option<history::PaneHistory>,
+        env: HashMap<String, String>,
     ) -> Result<PaneId> {
-        self.new_pane_with_id_replay(self.pane_id(), title, cwd, command, replay, None)
+        self.new_pane_with_id_replay(self.pane_id(), title, cwd, command, replay, None, env)
     }
 
     /// Spawn a pane under a caller-chosen id, used by `layout apply` so a pane
@@ -943,7 +945,7 @@ impl Session {
         command: Option<Vec<String>>,
         context_file: Option<ContextFile>,
     ) -> Result<PaneId> {
-        self.new_pane_with_id_replay(id, title, cwd, command, None, context_file)
+        self.new_pane_with_id_replay(id, title, cwd, command, None, context_file, HashMap::new())
     }
     fn new_pane_with_id_replay(
         &self,
@@ -953,7 +955,9 @@ impl Session {
         command: Option<Vec<String>>,
         replay: Option<history::PaneHistory>,
         context_file: Option<ContextFile>,
+        env: HashMap<String, String>,
     ) -> Result<PaneId> {
+        validate_workspace_env(&env)?;
         let (cols, rows) = replay
             .as_ref()
             .and_then(|entry| history::dimensions(&entry.screen))
@@ -971,6 +975,7 @@ impl Session {
             command,
             context_file,
             replay,
+            env,
         )?);
         self.panes
             .lock()
@@ -978,6 +983,49 @@ impl Session {
             .insert(id, pane);
         self.emit(Event::PaneOpened { pane: id });
         Ok(id)
+    }
+
+    fn workspace_env(&self, workspace: WorkspaceId) -> Result<HashMap<String, String>> {
+        self.state
+            .lock()
+            .map_err(|_| anyhow!("state lock poisoned"))?
+            .workspaces
+            .iter()
+            .find(|item| item.id == workspace)
+            .map(|item| item.env.clone())
+            .ok_or_else(|| anyhow!("workspace {} not found", workspace.0))
+    }
+
+    fn new_workspace_pane(
+        &self,
+        workspace: WorkspaceId,
+        title: &str,
+        cwd: Option<PathBuf>,
+        command: Option<Vec<String>>,
+    ) -> Result<PaneId> {
+        self.new_pane_with_id_replay(
+            self.pane_id(),
+            title,
+            cwd,
+            command,
+            None,
+            None,
+            self.workspace_env(workspace)?,
+        )
+    }
+
+    fn new_workspace_pane_with_context(
+        &self,
+        workspace: WorkspaceId,
+        title: &str,
+        cwd: Option<PathBuf>,
+        command: Option<Vec<String>>,
+        context_file: Option<ContextFile>,
+    ) -> Result<PaneId> {
+        self.new_pane_with_id_replay(
+            self.pane_id(), title, cwd, command, None, context_file,
+            self.workspace_env(workspace)?,
+        )
     }
 
     /// The cwd a new pane should inherit: the focused pane's live cwd, then the
@@ -1043,7 +1091,7 @@ impl Session {
         let context_file = context
             .map(|context| ContextFile::create(&context))
             .transpose()?;
-        let pane = self.new_pane_with_context(&title, cwd, command, context_file)?;
+        let pane = self.new_workspace_pane_with_context(target, &title, cwd, command, context_file)?;
         // Allocate the tab id up front; `tab_id` locks state and must not be
         // called while the guard below is held.
         let new_tab_id = self.tab_id();
@@ -1899,7 +1947,15 @@ impl Session {
                     .map_err(|_| anyhow!("state lock poisoned"))?
                     .active_workspace;
                 let cwd = self.inherit_cwd(active, None, None);
-                let pane = self.new_pane("shell", cwd, None)?;
+                let pane = self.new_pane_with_id_replay(
+                    self.pane_id(),
+                    "shell",
+                    cwd,
+                    None,
+                    None,
+                    None,
+                    self.workspace_env(active)?,
+                )?;
                 let mut state = self
                     .state
                     .lock()
@@ -1918,7 +1974,11 @@ impl Session {
                 repo_root,
                 branch,
                 from,
-            } => self.new_worktree_workspace(repo_root, branch, from)?,
+                path,
+            } => self.new_worktree_workspace(repo_root, branch, from, path)?,
+            ClientMessage::OpenWorktreeWorkspace { repo_root, path } => {
+                self.open_worktree_workspace(repo_root, path)?
+            }
             ClientMessage::RemoveWorktreeWorkspace { id, keep } => {
                 self.remove_worktree_workspace(id, keep)?
             }
@@ -1984,7 +2044,7 @@ impl Session {
                     .map_err(|_| anyhow!("state lock poisoned"))?
                     .active_workspace;
                 let cwd = self.inherit_cwd(active, None, None);
-                let pane = self.new_pane("shell", cwd, None)?;
+                let pane = self.new_workspace_pane(active, "shell", cwd, None)?;
                 let id = self.tab_id();
                 let mut state = self
                     .state
@@ -2215,9 +2275,18 @@ impl Session {
                 drop(state);
                 self.notify();
             }
-            ClientMessage::NewWorkspace { name, root } => {
+            ClientMessage::NewWorkspace { name, root, env } => {
                 // A workspace root seeds its first pane's cwd; later panes inherit.
-                let pane = self.new_pane("shell", root.clone(), None)?;
+                validate_workspace_env(&env)?;
+                let pane = self.new_pane_with_id_replay(
+                    self.pane_id(),
+                    "shell",
+                    root.clone(),
+                    None,
+                    None,
+                    None,
+                    env.clone(),
+                )?;
                 let tab_id = self.tab_id();
                 let id = self.workspace_id();
                 let mut state = self
@@ -2237,6 +2306,7 @@ impl Session {
                     }],
                     root,
                     color: None,
+                    env,
                     branch: None,
                     main_worktree_root: None,
                     parent: None,
@@ -2397,7 +2467,7 @@ impl Session {
     }
 
     fn close_pane(&self) -> Result<()> {
-        let needs_fresh = {
+        let (needs_fresh, active) = {
             let state = self
                 .state
                 .lock()
@@ -2412,11 +2482,14 @@ impl Session {
                 .iter()
                 .find(|tab| tab.id == workspace.active_tab)
                 .expect("active tab exists");
-            workspace.tabs.len() == 1 && matches!(tab.tree, LayoutTree::Leaf { .. })
+            (
+                workspace.tabs.len() == 1 && matches!(tab.tree, LayoutTree::Leaf { .. }),
+                state.active_workspace,
+            )
         };
         // Spawn before taking the state lock: id allocation also reads session state.
         let fresh_pane = needs_fresh
-            .then(|| self.new_pane("shell", None, None))
+            .then(|| self.new_workspace_pane(active, "shell", None, None))
             .transpose()?;
         let removed;
         let mut events = Vec::new();
@@ -2477,7 +2550,7 @@ impl Session {
     }
 
     fn close_tab(&self, id: TabId) -> Result<()> {
-        let needs_fresh = {
+        let replacement_workspace = {
             let state = self
                 .state
                 .lock()
@@ -2485,12 +2558,13 @@ impl Session {
             state
                 .workspaces
                 .iter()
-                .any(|workspace| workspace.tabs.len() == 1 && workspace.tabs[0].id == id)
+                .find(|workspace| workspace.tabs.len() == 1 && workspace.tabs[0].id == id)
+                .map(|workspace| workspace.id)
         };
-        let fresh = needs_fresh
-            .then(|| self.new_pane("shell", None, None))
+        let fresh = replacement_workspace
+            .map(|workspace| self.new_workspace_pane(workspace, "shell", None, None))
             .transpose()?;
-        let fresh_tab = needs_fresh.then(|| self.tab_id());
+        let fresh_tab = replacement_workspace.map(|_| self.tab_id());
         let mut events = Vec::new();
         let pane_ids = {
             let mut state = self
@@ -2551,8 +2625,9 @@ impl Session {
         repo_root: PathBuf,
         branch: String,
         from: Option<String>,
+        path: Option<PathBuf>,
     ) -> Result<()> {
-        let repo = git::repo_root(&repo_root)
+        let repo = git::worktree_owner(&repo_root)
             .ok_or_else(|| anyhow!("{} is not inside a git repository", repo_root.display()))?;
         let basename = repo
             .file_name()
@@ -2560,7 +2635,15 @@ impl Session {
             .ok_or_else(|| anyhow!("repository path has no name"))?
             .to_owned();
         // `<worktrees.directory>/<repo-basename>/<branch>`; a slashed branch nests.
-        let dest = persist::worktrees_directory().join(&basename).join(&branch);
+        let dest = path
+            .map(|path| {
+                if path.is_absolute() {
+                    path
+                } else {
+                    repo.join(path)
+                }
+            })
+            .unwrap_or_else(|| persist::worktrees_directory().join(&basename).join(&branch));
         git::worktree_add(&repo, &branch, from.as_deref(), &dest)?;
 
         let name = format!("{basename}:{branch}");
@@ -2584,6 +2667,70 @@ impl Session {
             }],
             root: Some(dest),
             color: None,
+            env: HashMap::new(),
+            branch: Some(branch),
+            main_worktree_root: None,
+            parent: None,
+            metadata_checked_at: None,
+        });
+        state.active_workspace = id;
+        drop(state);
+        self.resize_current()
+    }
+
+    /// Open an already-registered linked worktree. Its directory is only read;
+    /// cleanup still goes through Git's registered-worktree checks.
+    fn open_worktree_workspace(&self, repo_root: PathBuf, path: PathBuf) -> Result<()> {
+        let repo = git::worktree_owner(&repo_root)
+            .ok_or_else(|| anyhow!("{} is not inside a git repository", repo_root.display()))?;
+        let path = if path.is_absolute() {
+            path
+        } else {
+            repo.join(path)
+        };
+        let dest = path
+            .canonicalize()
+            .with_context(|| format!("open worktree {}", path.display()))?;
+        if git::main_worktree_root(&dest).is_none() || !git::registered_worktree(&repo, &dest) {
+            bail!("{} is not a worktree of {}", dest.display(), repo.display());
+        }
+        let already_open = self
+            .state
+            .lock()
+            .map_err(|_| anyhow!("state lock poisoned"))?
+            .workspaces
+            .iter()
+            .any(|workspace| workspace.root.as_ref() == Some(&dest));
+        if already_open {
+            bail!("worktree {} is already open", dest.display());
+        }
+        let branch =
+            git::current_branch(&dest).ok_or_else(|| anyhow!("worktree has detached HEAD"))?;
+        let basename = repo
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| anyhow!("repository path has no name"))?;
+        let pane = self.new_pane("shell", Some(dest.clone()), None)?;
+        let tab_id = self.tab_id();
+        let id = self.workspace_id();
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow!("state lock poisoned"))?;
+        state.workspaces.push(Workspace {
+            id,
+            name: format!("{basename}:{branch}"),
+            active_tab: tab_id,
+            tabs: vec![Tab {
+                id: tab_id,
+                name: "shell".into(),
+                tree: LayoutTree::Leaf { pane },
+                focused: pane,
+                zoomed: false,
+            }],
+            root: Some(dest),
+            color: None,
+            env: HashMap::new(),
             branch: Some(branch),
             main_worktree_root: None,
             parent: None,
@@ -2618,9 +2765,10 @@ impl Session {
         // available to fix the problem. Git can remove a registered worktree
         // even while a pane has it as its cwd on supported Unix platforms.
         if !keep {
-            if let Some((main, dest)) = removal {
-                git::worktree_remove(&main, &dest, false)?;
-            }
+            let Some((main, dest)) = removal else {
+                bail!("workspace is not a linked git worktree; refusing to remove its directory")
+            };
+            git::worktree_remove(&main, &dest, false)?;
         }
         self.close_workspace(id)?;
         Ok(())
@@ -2636,7 +2784,7 @@ impl Session {
                 && state.workspaces.iter().any(|workspace| workspace.id == id)
         };
         let fresh = needs_fresh
-            .then(|| self.new_pane("shell", None, None))
+            .then(|| self.new_workspace_pane(id, "shell", None, None))
             .transpose()?;
         let fresh_tab = needs_fresh.then(|| self.tab_id());
         let mut events = Vec::new();
@@ -2718,7 +2866,7 @@ impl Session {
     fn move_pane_to_tab(&self, pane: PaneId, tab: TabId) -> Result<()> {
         // Decide up front whether the source workspace would be emptied; the
         // replacement pane has to be spawned before the state lock is taken.
-        let needs_fresh = {
+        let replacement_workspace = {
             let state = self
                 .state
                 .lock()
@@ -2730,15 +2878,16 @@ impl Session {
                     let workspace = &state.workspaces[source_ws];
                     let only_leaf =
                         matches!(workspace.tabs[source_tab].tree, LayoutTree::Leaf { .. });
-                    only_leaf && workspace.tabs.len() == 1 && source_ws != target_ws
+                    (only_leaf && workspace.tabs.len() == 1 && source_ws != target_ws)
+                        .then_some(workspace.id)
                 }
-                _ => false,
+                _ => None,
             }
         };
-        let fresh_pane = needs_fresh
-            .then(|| self.new_pane("shell", None, None))
+        let fresh_pane = replacement_workspace
+            .map(|workspace| self.new_workspace_pane(workspace, "shell", None, None))
             .transpose()?;
-        let fresh_tab = needs_fresh.then(|| self.tab_id());
+        let fresh_tab = replacement_workspace.map(|_| self.tab_id());
         let mut events = Vec::new();
         {
             let mut state = self
@@ -3024,12 +3173,14 @@ impl Session {
                             anyhow!("tab {} has no entry for pane {}", saved_tab.id, id.0)
                         })?;
                     let cwd = restore_cwd(saved_pane.cwd.clone(), saved.root.clone());
-                    self.new_pane_with_id(
+                    self.new_pane_with_id_replay(
                         *id,
                         &saved_pane.title,
                         cwd,
                         saved_pane.command.clone(),
                         None,
+                        None,
+                        saved.env.clone(),
                     )?;
                     spawned.push(*id);
                 }
@@ -3060,6 +3211,7 @@ impl Session {
                 active_tab,
                 root: saved.root.clone(),
                 color: saved.color.clone(),
+                env: saved.env.clone(),
                 branch: None,
                 main_worktree_root: None,
                 parent: None,
@@ -3280,6 +3432,7 @@ impl Pane {
         run: Option<Vec<String>>,
         context_file: Option<ContextFile>,
         replay: Option<history::PaneHistory>,
+        environment: HashMap<String, String>,
     ) -> Result<Self> {
         let pty_system = native_pty_system();
         let pair = pty_system.openpty(PtySize {
@@ -3313,6 +3466,10 @@ impl Pane {
         if let Some(dir) = &cwd {
             command.cwd(dir);
         }
+        for (key, value) in environment {
+            command.env(key, value);
+        }
+        // Ködade's routing identity remains authoritative over workspace env.
         command.env("KODADE_PANE", id.0.to_string());
         command.env("KODADE_SOCKET", hook_socket);
         command.env("KODADE_SESSION", session);
@@ -3639,6 +3796,27 @@ impl Pane {
         }
         process.checked_at = now;
     }
+}
+
+fn validate_workspace_env(env: &HashMap<String, String>) -> Result<()> {
+    for key in env.keys() {
+        let valid = key.bytes().enumerate().all(|(index, byte)| {
+            byte == b'_' || (byte.is_ascii_alphabetic()) || (index > 0 && byte.is_ascii_digit())
+        });
+        if !valid {
+            bail!("workspace environment key must be a shell-style identifier: {key:?}");
+        }
+        if matches!(
+            key.as_str(),
+            "KODADE_PANE" | "KODADE_SOCKET" | "KODADE_SESSION" | "KODADE_BIN"
+        ) {
+            bail!("workspace environment cannot override reserved key {key}");
+        }
+    }
+    if env.values().any(|value| value.contains('\0')) {
+        bail!("workspace environment values cannot contain NUL");
+    }
+    Ok(())
 }
 
 /// Directory a restored pane should start in: its saved cwd if it still exists,
@@ -4924,6 +5102,8 @@ mod tests {
             None,
             Some(vec!["sleep".into(), "60".into()]),
             None,
+            None,
+            HashMap::new(),
         )
         .expect("test pane");
         // The reader keeps the original parser, so shell profile output cannot
@@ -4993,6 +5173,7 @@ mod tests {
                     active_tab: TabId(2),
                     root: None,
                     color: None,
+                    env: HashMap::new(),
                     branch: None,
                     main_worktree_root: None,
                     parent: None,
@@ -5011,6 +5192,7 @@ mod tests {
                     active_tab: TabId(5),
                     root: None,
                     color: None,
+                    env: HashMap::new(),
                     branch: None,
                     main_worktree_root: None,
                     parent: None,
@@ -5042,6 +5224,7 @@ mod tests {
                 active_tab: TabId(2),
                 root: None,
                 color: None,
+                env: HashMap::new(),
                 branch: None,
                 main_worktree_root: None,
                 parent: None,
@@ -5109,6 +5292,7 @@ mod tests {
                     name: "one".into(),
                     root: Some(PathBuf::from("/tmp")),
                     color: Some("#e7a33b".into()),
+                    env: HashMap::new(),
                     active_tab: 20,
                     tabs: vec![
                         persist::TabFile {
@@ -5160,6 +5344,7 @@ mod tests {
                     name: "two".into(),
                     root: None,
                     color: None,
+                    env: HashMap::new(),
                     active_tab: 22,
                     tabs: vec![persist::TabFile {
                         id: 22,
@@ -6275,6 +6460,7 @@ mod tests {
             .handle(ClientMessage::NewWorkspace {
                 name: "two".into(),
                 root: None,
+                env: HashMap::new(),
             })
             .expect("second workspace");
         let (first_workspace, moved_pane, target_tab) = {
@@ -6361,11 +6547,8 @@ mod tests {
 
         let session = Session::spawn(80, 24, "dirty-worktree".into()).expect("spawn session");
         session
-            .handle(ClientMessage::NewWorkspace {
-                name: "feature".into(),
-                root: Some(worktree.clone()),
-            })
-            .expect("open worktree workspace");
+            .open_worktree_workspace(repo.clone(), worktree.clone())
+            .expect("open existing worktree workspace");
         let workspace = session
             .state
             .lock()
@@ -6388,6 +6571,107 @@ mod tests {
 
         git::worktree_remove(&repo, &worktree, true).expect("forced cleanup");
         fs::remove_dir_all(base).ok();
+    }
+
+    #[tokio::test]
+    async fn workspace_environment_reaches_future_pty_panes_and_persists() {
+        let session = Session::spawn(80, 24, "workspace-env".into()).expect("spawn session");
+        let env = HashMap::from([("KODADE_ISSUE52".into(), "per-workspace".into())]);
+        session
+            .handle(ClientMessage::NewWorkspace {
+                name: "environment".into(),
+                root: None,
+                env: env.clone(),
+            })
+            .expect("create workspace");
+        let workspace = session.state.lock().expect("state").active_workspace;
+        for name in ["one", "two"] {
+            session
+                .handle(ClientMessage::NewPane {
+                    workspace: Some(workspace),
+                    tab: None,
+                    split: None,
+                    command: Some(vec![
+                        "sh".into(),
+                        "-c".into(),
+                        "printf %s \"$KODADE_ISSUE52\"; sleep 1".into(),
+                    ]),
+                    name: Some(name.into()),
+                })
+                .expect("spawn pane");
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let contents: Vec<_> = session
+            .panes
+            .lock()
+            .expect("panes")
+            .values()
+            .map(|pane| pane.snapshot().0.contents)
+            .collect();
+        assert_eq!(
+            contents
+                .iter()
+                .filter(|text| text.contains("per-workspace"))
+                .count(),
+            2
+        );
+        assert_eq!(
+            session
+                .build_file()
+                .workspaces
+                .iter()
+                .find(|item| item.id == workspace.0)
+                .unwrap()
+                .env,
+            env
+        );
+        let restored = Session::restore(session.build_file(), false).expect("cold restore");
+        let restored_workspace = restored
+            .state
+            .lock()
+            .expect("state")
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.name == "environment")
+            .expect("restored workspace")
+            .id;
+        restored
+            .handle(ClientMessage::NewPane {
+                workspace: Some(restored_workspace),
+                tab: None,
+                split: None,
+                command: Some(vec![
+                    "sh".into(),
+                    "-c".into(),
+                    "printf %s \"$KODADE_ISSUE52\"; sleep 1".into(),
+                ]),
+                name: Some("restored".into()),
+            })
+            .expect("spawn restored pane");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(restored
+            .panes
+            .lock()
+            .expect("panes")
+            .values()
+            .any(|pane| pane.snapshot().0.contents.contains("per-workspace")));
+    }
+
+    #[tokio::test]
+    async fn daemon_rejects_invalid_and_reserved_workspace_environment() {
+        let session = Session::spawn(80, 24, "workspace-env-invalid".into()).expect("spawn");
+        for env in [
+            HashMap::from([("KODADE_SOCKET".into(), "forged".into())]),
+            HashMap::from([("1INVALID".into(), "value".into())]),
+        ] {
+            assert!(session
+                .handle(ClientMessage::NewWorkspace {
+                    name: "invalid".into(),
+                    root: None,
+                    env,
+                })
+                .is_err());
+        }
     }
 
     #[tokio::test]

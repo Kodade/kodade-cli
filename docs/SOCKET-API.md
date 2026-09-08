@@ -75,14 +75,15 @@ printf '%s\n' '{"Query":"Layout"}' | nc -U /tmp/kodade-cli-$UID/default.sock
 | `MoveTab` | `{"MoveTab":{"delta":1}}` | `Layout` |
 | `MovePaneToTab` | `{"MovePaneToTab":{"pane":3,"tab":2}}` | `Layout` |
 | `SetWorkspaceColor` | `{"SetWorkspaceColor":{"id":1,"color":"#e7a33b"}}` | `Layout` |
-| `NewWorktreeWorkspace` | `{"NewWorktreeWorkspace":{"repo_root":"/src/repo","branch":"feat-a","from":"main"}}` | `Layout` |
+| `NewWorktreeWorkspace` | `{"NewWorktreeWorkspace":{"repo_root":"/src/repo","branch":"feat-a","from":"main","path":null}}` | `Layout` |
+| `OpenWorktreeWorkspace` | `{"OpenWorktreeWorkspace":{"repo_root":"/src/repo","path":"../linked"}}` | `Layout` |
 | `RemoveWorktreeWorkspace` | `{"RemoveWorktreeWorkspace":{"id":9,"keep":false}}` | `Layout` |
 | `SwapPane` | `{"SwapPane":{"direction":"Right"}}` | `Layout` |
 | `BreakPane` | `"BreakPane"` | `Layout` |
 | `EqualizeLayout` | `"EqualizeLayout"` | `Layout` |
 | `SelectWorkspace` | `{"SelectWorkspace":{"id":1}}` | `Layout` |
 | `SelectWorkspaceDelta` | `{"SelectWorkspaceDelta":{"delta":1}}` | `Layout` |
-| `NewWorkspace` | `{"NewWorkspace":{"name":"repo","root":"/src/repo"}}` | `Layout` |
+| `NewWorkspace` | `{"NewWorkspace":{"name":"repo","root":"/src/repo","env":{"EDITOR":"vim"}}}` | `Layout` |
 | `NewPane` | `{"NewPane":{"workspace":null,"tab":null,"split":"Horizontal","command":["codex"],"name":null}}` | `Layout` |
 | `ResizePane` | `{"ResizePane":{"direction":"Right","cells":5}}` | `Layout` |
 | `ScrollPane` | `{"ScrollPane":{"id":3,"delta":10}}` | `Layout` |
@@ -99,8 +100,10 @@ move receives a fresh shell tab, because a workspace always has at least one.
 
 `NewWorktreeWorkspace` runs `git worktree add` for `branch` (created from `from`,
 or checked out when it already exists) under the `[worktrees] directory` config
-(default `~/.kodade/worktrees`), then opens a `repo:branch` workspace rooted in
-the new worktree. `RemoveWorktreeWorkspace` runs a non-forced `git worktree
+(default `~/.kodade/worktrees`) or its explicit `path`, then opens a
+`repo:branch` workspace rooted in the new worktree. `OpenWorktreeWorkspace`
+opens only an already registered linked checkout of `repo_root`; it never
+creates, copies, or removes a directory. `RemoveWorktreeWorkspace` runs a non-forced `git worktree
 remove` before closing the workspace unless `keep` is set. If Git refuses a
 dirty or otherwise unremovable checkout, the daemon replies `Error` and leaves
 the workspace and its panes intact. The directory is only ever removed when Git
@@ -108,6 +111,11 @@ reports it as a registered worktree. Each `WorkspaceInfo` in a `Layout` carries 
 `branch` (the workspace root's current git branch, refreshed on the daemon's 2 s
 tick, `null` outside a repo) and a `parent` (the workspace id whose root is a
 worktree workspace's main repo, when that workspace is open, else `null`).
+
+`NewWorkspace.env` is explicit per-workspace environment metadata. The daemon
+validates shell-style names, rejects Ködade's routing variables, persists it,
+and applies it only to future panes in that workspace; it never changes a shell
+profile or already-running panes.
 
 `ApplyLayout` **executes code**: every pane the file names that is not already
 alive is spawned with the saved `command`, through the login shell, in the saved

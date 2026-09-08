@@ -386,6 +386,7 @@ impl Action {
             Self::NewWorkspace => ClientMessage::NewWorkspace {
                 name: "workspace".into(),
                 root: None,
+                env: HashMap::new(),
             },
             Self::FocusUp => ClientMessage::FocusPane {
                 direction: Direction::Up,

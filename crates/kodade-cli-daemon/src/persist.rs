@@ -295,6 +295,7 @@ mod tests {
                     name: "one".into(),
                     root: Some(PathBuf::from("/tmp")),
                     color: Some("#e7a33b".into()),
+                    env: Default::default(),
                     active_tab: 20,
                     tabs: vec![
                         TabFile {
@@ -346,6 +347,7 @@ mod tests {
                     name: "two".into(),
                     root: None,
                     color: None,
+                    env: Default::default(),
                     active_tab: 22,
                     tabs: vec![TabFile {
                         id: 22,
