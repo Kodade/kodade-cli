@@ -14,7 +14,7 @@ import termios
 import time
 
 binary = Path(sys.argv[1] if len(sys.argv) > 1 else "target/debug/kodade-cli").resolve()
-with tempfile.TemporaryDirectory(prefix="kh-") as directory:
+with tempfile.TemporaryDirectory(prefix="kh-", dir="/tmp") as directory:
     root = Path(directory)
     env = {k: v for k, v in os.environ.items() if not k.startswith("KODADE_")}
     env.update(HOME=directory, XDG_RUNTIME_DIR=str(root / "run"),

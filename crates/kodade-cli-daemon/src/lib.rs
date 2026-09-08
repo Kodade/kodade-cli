@@ -22,7 +22,7 @@ use std::{
     io::{Read, Write},
     os::{
         fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd},
-        unix::fs::FileTypeExt,
+        unix::{ffi::OsStrExt, fs::FileTypeExt},
     },
     path::{Path, PathBuf},
     process::Command,
@@ -136,6 +136,10 @@ impl Drop for HandoffActive<'_> {
 /// Own target cleanup before the capture guard is allowed to resume the source.
 struct Replacement {
     directory: PathBuf,
+    /// A short `/tmp` symlink to `directory` when macOS's sockaddr path limit
+    /// would reject the private staging sockets. The staging files still live
+    /// in `directory`, so their final renames stay on the public socket FS.
+    staging_alias: Option<PathBuf>,
     handoff: PathBuf,
     staged: PathBuf,
     staged_hook: PathBuf,
@@ -156,18 +160,65 @@ fn handoff_nonce() -> Result<String> {
     Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
+// macOS has a 104-byte `sockaddr_un::sun_path`; Linux allows 108. Keep the
+// stricter limit so a session valid on both platforms can be upgraded on both.
+const MAX_UNIX_SOCKET_PATH_BYTES: usize = 103;
+
+fn socket_path_fits(path: &Path) -> bool {
+    path.as_os_str().as_bytes().len() <= MAX_UNIX_SOCKET_PATH_BYTES
+}
+
+/// Point a short, unpredictable name in sticky `/tmp` at the owned staging
+/// directory. Socket creation through this symlink still creates entries in
+/// the runtime directory, preserving same-filesystem atomic renames.
+fn staging_alias(directory: &Path) -> Result<PathBuf> {
+    use std::os::unix::fs::symlink;
+
+    let target = fs::canonicalize(directory).context("resolve handoff staging directory")?;
+    let uid = unsafe { libc::geteuid() };
+    for _ in 0..8 {
+        let alias = PathBuf::from(format!("/tmp/.kodade-up-{uid}-{}", &handoff_nonce()?[..12]));
+        match symlink(&target, &alias) {
+            Ok(()) => return Ok(alias),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error).context("create short handoff staging alias"),
+        }
+    }
+    bail!("could not allocate a short handoff staging alias")
+}
+
 impl Replacement {
     fn new(public: PathBuf, hook: PathBuf) -> Result<Self> {
+        Self::new_in(
+            socket_dir().join(format!(".up-{}", &handoff_nonce()?[..16])),
+            public,
+            hook,
+        )
+    }
+
+    fn new_in(directory: PathBuf, public: PathBuf, hook: PathBuf) -> Result<Self> {
         use std::os::unix::fs::DirBuilderExt;
-        let directory = socket_dir().join(format!(".up-{}", &handoff_nonce()?[..16]));
         fs::DirBuilder::new().mode(0o700).create(&directory)?;
+        let staging_alias = if socket_path_fits(&directory.join("new-hook")) {
+            None
+        } else {
+            match staging_alias(&directory) {
+                Ok(alias) => Some(alias),
+                Err(error) => {
+                    let _ = fs::remove_dir(&directory);
+                    return Err(error);
+                }
+            }
+        };
+        let staging_directory = staging_alias.as_ref().unwrap_or(&directory);
         Ok(Self {
-            handoff: directory.join("handoff"),
-            staged: directory.join("new"),
-            staged_hook: directory.join("new-hook"),
+            handoff: staging_directory.join("handoff"),
+            staged: staging_directory.join("new"),
+            staged_hook: staging_directory.join("new-hook"),
             public_backup: directory.join("old"),
             hook_backup: directory.join("old-hook"),
             directory,
+            staging_alias,
             public,
             hook,
             public_saved: false,
@@ -202,6 +253,9 @@ impl Drop for Replacement {
                     }
                 }
             }
+        }
+        if let Some(alias) = &self.staging_alias {
+            let _ = fs::remove_file(alias);
         }
         if restored {
             let _ = fs::remove_dir_all(&self.directory);
@@ -5956,6 +6010,47 @@ mod tests {
             ),
             PathBuf::from("/tmp/kodade-cli-501/default.sock")
         );
+    }
+    #[test]
+    fn long_handoff_staging_uses_a_short_alias_on_the_same_filesystem() {
+        let base = PathBuf::from("/tmp").join(format!(
+            "kodade-handoff-{}-{}",
+            std::process::id(),
+            "x".repeat(80)
+        ));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir(&base).expect("create long staging parent");
+        let directory = base.join(".up-0123456789abcdef");
+        let replacement = Replacement::new_in(
+            directory.clone(),
+            base.join("session.sock"),
+            base.join("hooks.sock"),
+        )
+        .expect("create replacement with a short staging alias");
+        let alias = replacement
+            .staging_alias
+            .clone()
+            .expect("long staging path uses an alias");
+        assert!(socket_path_fits(&replacement.handoff));
+        assert!(socket_path_fits(&replacement.staged));
+        assert!(socket_path_fits(&replacement.staged_hook));
+        assert_eq!(
+            fs::canonicalize(replacement.staged.parent().expect("staging parent")).unwrap(),
+            fs::canonicalize(&directory).unwrap(),
+            "the short bind path must resolve into the public socket directory"
+        );
+        let listener = handoff::bind_listener(&replacement.staged).expect("bind via staging alias");
+        fs::hard_link(&replacement.staged, &replacement.staged_hook)
+            .expect("link staged hook through alias");
+        fs::rename(&replacement.staged, &replacement.public)
+            .expect("atomically publish socket from the staging directory");
+        drop(listener);
+        drop(replacement);
+        assert!(
+            fs::symlink_metadata(alias).is_err(),
+            "staging alias is removed with the transaction"
+        );
+        fs::remove_dir_all(base).expect("remove long staging parent");
     }
     #[test]
     fn session_names_are_safe_single_path_components() {
