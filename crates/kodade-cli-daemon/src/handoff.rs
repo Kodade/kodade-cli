@@ -146,6 +146,8 @@ pub(crate) struct PaneRuntime {
     #[serde(default)]
     pub(crate) graphics_virtual_style: crate::graphics::VirtualStyleHandoff,
     #[serde(default)]
+    pub(crate) terminal_colors: crate::terminal_colors::Snapshot,
+    #[serde(default)]
     pub(crate) clipboard: Option<(u64, Vec<u8>, Vec<u8>)>,
     #[serde(default)]
     pub(crate) graphics_placeholder: Vec<u8>,

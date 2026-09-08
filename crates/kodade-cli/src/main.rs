@@ -1480,6 +1480,11 @@ async fn tui(
             enabled: state.compact_enabled(cols),
         })?)
         .await?;
+    writer
+        .write_all(&encode(&ClientMessage::SetTerminalColors {
+            colors: state.theme_colors(),
+        })?)
+        .await?;
     // Subscribe so the TUI learns about session-level changes (a rename moves
     // the socket under it). Subscribed connections receive notifications as
     // `Event::Notification` instead of `ServerMessage::Notification`.
@@ -1501,6 +1506,7 @@ async fn tui(
             session.to_string(),
             state.pane_cols(cols),
             rows,
+            state.theme_colors(),
             router.updates(id.clone(), tx.clone()),
             machine_rx,
         );
@@ -1512,6 +1518,7 @@ async fn tui(
             cols: state.pane_cols(cols),
             rows,
             compact: state.compact_enabled(cols),
+            colors: state.theme_colors(),
         },
         router.updates(endpoints::EndpointId::Local, tx.clone()),
         command_rx,

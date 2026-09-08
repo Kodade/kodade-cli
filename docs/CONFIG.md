@@ -522,6 +522,14 @@ the program. Colors 16–255 use the terminal's own 256-color cube and 24-bit
 colors are passed through unchanged. A cell with no color set uses `text` on
 `bg`.
 
+An attached interactive client reports its `text`, `bg`, and 16 ANSI colors to
+the daemon for read-only terminal queries. Pane programs can therefore query
+OSC 10, OSC 11, and known OSC 4 entries without changing the palette. OSC 12
+and palette entries 16–255 remain unanswered because Ködade does not own a
+host cursor color or the host terminal's extended palette. Read-only clients
+do not replace a pane's query colors. A nonempty `NO_COLOR` disables these
+answers because the client is not emitting the reported theme colors.
+
 The complete built-in `kodade-dark` theme:
 
 ```toml
