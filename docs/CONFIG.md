@@ -235,6 +235,7 @@ modifier (`ctrl+…`/`alt+…`) fires globally.
 | `paste_buffer` | `]` |
 | `mouse_toggle` | `m` |
 | `notification_jump` | `N` |
+| `next_machine` | `M` |
 <!-- keys:end -->
 
 `close_tab` asks for confirmation in the status bar when a pane in the tab is

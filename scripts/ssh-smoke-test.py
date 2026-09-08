@@ -9,6 +9,11 @@ only touches those owned paths/processes.
 
 import json
 import os
+import pty
+import fcntl
+import termios
+import threading
+import struct
 from pathlib import Path
 import socket
 import subprocess
@@ -146,7 +151,13 @@ def main() -> None:
                 raise RuntimeError(f"kodade {' '.join(args)} failed\nstdout: {result.stdout}\nstderr: {result.stderr}")
             return result
 
+        def pane_output(*args: str) -> str:
+            """Transient tunnel reconnects are expected while TUI workers attach."""
+            return run(*args, ok=False).stdout
+
         events: list[subprocess.Popen[str]] = []
+        tui: subprocess.Popen[bytes] | None = None
+        tui_drain_stop: threading.Event | None = None
         sshd = subprocess.Popen(
             [str(SSHD), "-D", "-e", "-f", str(sshd_config)],
             env=env,
@@ -157,11 +168,38 @@ def main() -> None:
         try:
             wait_until("rootless sshd", lambda: subprocess.run([str(SSH), "-F", str(ssh_config), "kodade-smoke", "true"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2).returncode == 0)
 
+            # Saved machines are client-local profiles. The normal interactive
+            # attach starts these in independent workers; the catalog itself
+            # must never touch the remote host or the local session socket.
+            machine = run("machine", "add", "kodade-smoke", "--label", "Smoke host", "--remote-session", SESSION).stdout.strip()
+            if not machine.startswith("m-"):
+                raise RuntimeError(f"machine add did not return an id: {machine!r}")
+            catalog = json.loads(run("machine", "list", "--json").stdout)
+            if not any(item["id"] == machine and item["target"] == "kodade-smoke" and item["session"] == SESSION for item in catalog):
+                raise RuntimeError("saved machine catalog did not preserve target/session")
+            # This unreachable profile starts alongside the real one. The
+            # local marker below proves its bounded connection attempts never
+            # freeze normal attach or queue input for later replay.
+            run("machine", "add", "missing-kodade-smoke-host", "--label", "Offline host")
+
+            # A real controlling PTY exercises the ordinary local attach with
+            # the saved profile loaded. Both daemons start pane id 1, so the
+            # marker assertions also prove endpoint identity, not pane id.
+            local_pane = run("-s", SESSION, "run", "--name", "local-probe", "--", "sh", "-c", "exec sleep 30").stdout.strip()
+            if not local_pane.isdigit():
+                raise RuntimeError(f"local run did not return a pane id: {local_pane!r}")
+            local_layout = json.loads(run("-s", SESSION, "ls", "--json").stdout)
+            local_pane = str(next(item["id"] for item in local_layout["panes"] if item["focused"]))
+
             # A remote run starts the remote daemon through SSH, forwards its
             # socket, and returns a pane id. Read its output through a fresh tunnel.
             pane = run("--remote", "kodade-smoke", "-s", SESSION, "run", "--name", "probe", "--", "sh", "-c", "printf SSH_SMOKE_OK; exec sleep 30").stdout.strip()
             if not pane.isdigit():
                 raise RuntimeError(f"remote run did not return a pane id: {pane!r}")
+            remote_layout = json.loads(run("--remote", "kodade-smoke", "-s", SESSION, "ls", "--json").stdout)
+            pane = str(next(item["id"] for item in remote_layout["panes"] if item["focused"]))
+            if pane != local_pane:
+                raise RuntimeError("smoke setup requires colliding local/remote pane ids")
             wait_until(
                 "remote pane output",
                 lambda: "SSH_SMOKE_OK" in run("--remote", "kodade-smoke", "-s", SESSION, "pane", "read", pane).stdout,
@@ -169,6 +207,74 @@ def main() -> None:
             remote_socket = Path(run("--remote", "kodade-smoke", "-s", SESSION, "session", "path").stdout.strip())
             if not remote_socket.exists():
                 raise RuntimeError("remote session path was not a live socket")
+
+            master, slave = pty.openpty()
+            fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 120, 0, 0))
+            def controlling_tty() -> None:
+                os.setsid()
+                fcntl.ioctl(0, termios.TIOCSCTTY, 0)
+            tui = subprocess.Popen(
+                [str(BINARY), "-s", SESSION],
+                env={**env, "TERM": "xterm-256color"},
+                stdin=slave,
+                stdout=slave,
+                stderr=slave,
+                close_fds=True,
+                preexec_fn=controlling_tty,
+            )
+            os.close(slave)
+            tui_drain_stop = threading.Event()
+            def drain_tui() -> None:
+                while not tui_drain_stop.is_set():
+                    try:
+                        if not os.read(master, 65536):
+                            return
+                    except OSError:
+                        return
+            threading.Thread(target=drain_tui, daemon=True).start()
+            time.sleep(1.5)
+            if tui.poll() is not None:
+                raise RuntimeError(f"ordinary TUI attach exited early: {tui.returncode}")
+            # Dismiss first-run onboarding and prove raw PTY input reaches the
+            # local daemon before attempting endpoint selection.
+            os.write(master, b"\x1b")
+            time.sleep(0.2)
+            os.write(master, b"printf LOCAL_BEFORE_SWITCH\r")
+            wait_until(
+                "local TUI marker before switch",
+                lambda: "LOCAL_BEFORE_SWITCH" in pane_output("-s", SESSION, "pane", "read", local_pane),
+            )
+            # prefix M selects the saved endpoint; its input must reach remote
+            # pane 1 only, despite local pane 1 existing too.
+            os.write(master, b"\x02")
+            time.sleep(0.15)
+            os.write(master, b"M")
+            time.sleep(0.15)
+            os.write(master, b"printf REMOTE_TUI_MARKER\r")
+            wait_until(
+                "remote TUI marker",
+                lambda: "REMOTE_TUI_MARKER" in pane_output("--remote", "kodade-smoke", "-s", SESSION, "pane", "read", pane),
+                seconds=20,
+            )
+            if "REMOTE_TUI_MARKER" in pane_output("-s", SESSION, "pane", "read", local_pane):
+                raise RuntimeError("remote-selected TUI input leaked to local pane")
+
+            # Disable is observed by the attached client; it closes the remote
+            # channel and returns selection to local without restarting TUI.
+            run("machine", "disable", machine)
+            time.sleep(1.5)
+            os.write(master, b"printf LOCAL_TUI_MARKER\r")
+            wait_until(
+                "local TUI marker after disable",
+                lambda: "LOCAL_TUI_MARKER" in pane_output("-s", SESSION, "pane", "read", local_pane),
+            )
+            if "LOCAL_TUI_MARKER" in pane_output("--remote", "kodade-smoke", "-s", SESSION, "pane", "read", pane):
+                raise RuntimeError("disabled remote endpoint still received TUI input")
+            os.write(master, b"\x02d")
+            tui.wait(timeout=8)
+            tui_drain_stop.set()
+            os.close(master)
+            tui = None
 
             # Two concurrent event streams each hold a tunnel. Stopping one
             # cannot remove the other's local endpoint or disconnect its stream.
@@ -210,6 +316,14 @@ def main() -> None:
             run("--remote", "kodade-smoke", "-s", RENAMED, "pane", "read", pane)
             print("SSH smoke passed: daemon startup, run/read, independent tunnels, rename, teardown")
         finally:
+            if tui is not None and tui.poll() is None:
+                tui.terminate()
+                try:
+                    tui.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    tui.kill()
+            if tui_drain_stop is not None:
+                tui_drain_stop.set()
             for process in events:
                 if process.poll() is None:
                     process.terminate()

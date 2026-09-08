@@ -171,6 +171,11 @@ pub enum Command {
         #[command(subcommand)]
         command: SessionCommand,
     },
+    /// Manage saved SSH machine profiles stored on this client.
+    Machine {
+        #[command(subcommand)]
+        command: MachineCommand,
+    },
     /// Export or apply a session layout (the persistence JSON).
     Layout {
         #[command(subcommand)]
@@ -376,6 +381,36 @@ pub enum SessionCommand {
     Rename {
         #[arg(value_name = "NAME", value_parser = session_name)]
         name: String,
+    },
+}
+
+#[derive(Debug, Subcommand, PartialEq, Eq)]
+pub enum MachineCommand {
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+    Add {
+        #[arg(value_name = "SSH_TARGET")]
+        target: String,
+        #[arg(long)]
+        label: String,
+        #[arg(long = "remote-session")]
+        session: Option<String>,
+    },
+    Rename {
+        id: String,
+        #[arg(long)]
+        label: String,
+    },
+    Enable {
+        id: String,
+    },
+    Disable {
+        id: String,
+    },
+    Remove {
+        id: String,
     },
 }
 
@@ -1349,6 +1384,36 @@ mod tests {
         );
         assert!(
             Cli::try_parse_from(["kodade-cli", "agent", "wait", "3", "--state", "busy"]).is_err()
+        );
+    }
+
+    #[test]
+    fn parses_machine_catalog_commands() {
+        assert_eq!(
+            parse(&[
+                "kodade-cli",
+                "machine",
+                "add",
+                "buildbox",
+                "--label",
+                "Build",
+                "--remote-session",
+                "agents"
+            ])
+            .command,
+            Some(Command::Machine {
+                command: MachineCommand::Add {
+                    target: "buildbox".into(),
+                    label: "Build".into(),
+                    session: Some("agents".into())
+                }
+            })
+        );
+        assert_eq!(
+            parse(&["kodade-cli", "machine", "disable", "m-1"]).command,
+            Some(Command::Machine {
+                command: MachineCommand::Disable { id: "m-1".into() }
+            })
         );
     }
 }

@@ -59,7 +59,7 @@ pub async fn resolve_socket(cli: &cli::Cli) -> Result<(PathBuf, Option<Tunnel>)>
             None,
         )),
         Some(host) => {
-            let (socket, tunnel) = connect(host, &cli.session).await?;
+            let (socket, tunnel) = connect_endpoint(host, &cli.session).await?;
             Ok((socket, Some(tunnel)))
         }
     }
@@ -158,7 +158,7 @@ fn remote_word(word: &str) -> String {
     }
 }
 
-fn validate_host(host: &str) -> Result<()> {
+pub(crate) fn validate_host(host: &str) -> Result<()> {
     if host.is_empty()
         || host.starts_with('-')
         || host.chars().any(|ch| ch.is_whitespace() || ch.is_control())
@@ -177,6 +177,10 @@ fn control_path() -> PathBuf {
 /// The shared control-master options every `ssh` invocation carries.
 fn control_opts(control_path: &str) -> Vec<String> {
     vec![
+        "-o".into(),
+        "BatchMode=yes".into(),
+        "-o".into(),
+        "ConnectTimeout=10".into(),
         "-o".into(),
         "ControlMaster=auto".into(),
         "-o".into(),
@@ -263,7 +267,7 @@ async fn ssh_output(args: &[String]) -> Result<std::process::Output> {
 
 /// Set up (or reuse) the SSH forward for `host`/`session` and return the local
 /// socket plus the tunnel guard.
-async fn connect(host: &str, session: &str) -> Result<(PathBuf, Tunnel)> {
+pub async fn connect_endpoint(host: &str, session: &str) -> Result<(PathBuf, Tunnel)> {
     validate_host(host)?;
     crate::cli::session_name(session).map_err(anyhow::Error::msg)?;
     ensure_runtime_dir()?;
@@ -426,6 +430,10 @@ mod tests {
         assert_eq!(
             version,
             vec![
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "ConnectTimeout=10",
                 "-o",
                 "ControlMaster=auto",
                 "-o",

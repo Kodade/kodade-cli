@@ -372,3 +372,6 @@ for reference and contributor details. The product direction is in
 ## License
 
 Apache License 2.0 — see [LICENSE](LICENSE) and [NOTICE](NOTICE).
+
+Saved SSH machines appear together in the sidebar, with independent reconnects
+and endpoint-scoped agent alerts. See [Machines](docs/MACHINES.md).

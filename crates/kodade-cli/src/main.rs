@@ -7,10 +7,12 @@ mod commands;
 mod config;
 mod connection;
 mod doctor;
+mod endpoints;
 mod help;
 mod input;
 mod integrations;
 mod keys;
+mod machines;
 mod mode;
 mod notify;
 mod overlay;
@@ -150,6 +152,7 @@ async fn main() -> Result<()> {
         Some(cli::Command::Session { command }) => {
             session_command(remote.as_deref(), &socket, &session, command).await
         }
+        Some(cli::Command::Machine { command }) => machine(command),
         Some(cli::Command::Worktree { command }) => worktree(&socket, command).await,
         Some(cli::Command::Ls { json }) => {
             let layout =
@@ -341,6 +344,57 @@ async fn main() -> Result<()> {
             Ok(())
         }
     }
+}
+
+fn machine(command: cli::MachineCommand) -> Result<()> {
+    let mut catalog = machines::load()?;
+    match command {
+        cli::MachineCommand::List { json } => {
+            if json {
+                println!("{}", serde_json::to_string_pretty(&catalog.machines)?);
+            } else {
+                for machine in &catalog.machines {
+                    println!(
+                        "{}\t{}\t{}\t{}",
+                        machine.id,
+                        if machine.enabled {
+                            "enabled"
+                        } else {
+                            "disabled"
+                        },
+                        machine.label,
+                        machine.target
+                    );
+                }
+            }
+        }
+        cli::MachineCommand::Add {
+            target,
+            label,
+            session,
+        } => {
+            let profile = catalog.add(label, target, session)?;
+            println!("{}", profile.id);
+            machines::save(&catalog)?;
+        }
+        cli::MachineCommand::Rename { id, label } => {
+            catalog.get_mut(&id)?.label = label;
+            machines::save(&catalog)?;
+        }
+        cli::MachineCommand::Enable { id } => {
+            catalog.get_mut(&id)?.enabled = true;
+            machines::save(&catalog)?;
+        }
+        cli::MachineCommand::Disable { id } => {
+            catalog.get_mut(&id)?.enabled = false;
+            machines::save(&catalog)?;
+        }
+        cli::MachineCommand::Remove { id } => {
+            catalog.remove(&id)?;
+            machines::save(&catalog)?;
+        }
+    }
+    Ok(())
 }
 
 /// `pane` subcommands. Pane-targeted actions the daemon only applies to the
@@ -1058,7 +1112,12 @@ async fn attach(socket: &Path, session: &str, config: &config::Config, remote: b
     // differs from the local path and must not trigger a local daemon.
     let can_spawn = socket == kodade_cli_daemon::socket_path(session).as_path();
     let stream = connection::connect(socket, session, can_spawn).await?;
-    tui(stream, config, session, socket, remote).await
+    let profiles = if !remote {
+        machines::load()?.machines
+    } else {
+        Vec::new()
+    };
+    tui(stream, config, session, socket, remote, profiles).await
 }
 
 /// Sets up the terminal, hands the socket to `App`, and always restores it.
@@ -1068,6 +1127,7 @@ async fn tui(
     session: &str,
     socket: &Path,
     remote: bool,
+    profiles: Vec<machines::MachineProfile>,
 ) -> Result<()> {
     let (reader, mut writer) = stream.into_split();
     let mut lines = BufReader::new(reader).lines();
@@ -1095,7 +1155,45 @@ async fn tui(
     writer
         .write_all(&encode(&ClientMessage::Subscribe)?)
         .await?;
-    let (tx, mut rx) = mpsc::channel(16);
+    let (tx, mut rx) = mpsc::channel(64);
+    let (command_tx, mut command_rx) = mpsc::channel(64);
+    let mut router = endpoints::Router::new(endpoints::EndpointId::Local);
+    router.register(endpoints::EndpointId::Local, command_tx);
+    router.mark_online(endpoints::EndpointId::Local);
+    state.configure_machines(&profiles);
+    for profile in profiles.into_iter().filter(|profile| profile.enabled) {
+        let (machine_tx, machine_rx) = mpsc::channel(64);
+        let id = endpoints::EndpointId::Machine(profile.id.clone());
+        router.register(id.clone(), machine_tx);
+        endpoints::spawn_machine(
+            profile,
+            session.to_string(),
+            state.pane_cols(cols),
+            rows,
+            router.updates(id.clone(), tx.clone()),
+            machine_rx,
+        );
+    }
+    let writer_updates = router.updates(endpoints::EndpointId::Local, tx.clone());
+    tokio::spawn(async move {
+        while let Some(message) = command_rx.recv().await {
+            let Ok(encoded) = encode(&message) else {
+                break;
+            };
+            if !matches!(
+                tokio::time::timeout(Duration::from_secs(5), writer.write_all(&encoded)).await,
+                Ok(Ok(()))
+            ) {
+                let _ = writer_updates
+                    .send(app::Update::EndpointFailed {
+                        reason: "local endpoint disconnected".into(),
+                    })
+                    .await;
+                break;
+            }
+        }
+    });
+    let reader_tx = router.updates(endpoints::EndpointId::Local, tx.clone());
     tokio::spawn(async move {
         while let Ok(Some(line)) = lines.next_line().await {
             let update = match decode(line.as_bytes()) {
@@ -1110,16 +1208,25 @@ async fn tui(
                 Ok(ServerMessage::Event(Event::SessionRenamed { name, socket })) => {
                     app::Update::SessionRenamed { name, socket }
                 }
+                Ok(ServerMessage::Error { message }) => app::Update::RequestError(message),
+                Ok(ServerMessage::Shutdown) => app::Update::EndpointFailed {
+                    reason: "local endpoint shut down".into(),
+                },
                 _ => continue,
             };
-            if tx.send(update).await.is_err() {
+            if reader_tx.send(update).await.is_err() {
                 break;
             }
         }
+        let _ = reader_tx
+            .send(app::Update::EndpointFailed {
+                reason: "local endpoint disconnected".into(),
+            })
+            .await;
     });
     let _modes = terminal::TerminalModes::enter(config.mouse)?;
     let mut term = Terminal::new(CrosstermBackend::new(std::io::stdout()))?;
-    state.run(&mut term, &mut writer, &mut rx).await
+    state.run(&mut term, &mut router, &mut rx, &tx).await
 }
 
 /// Read the daemon's opening `Welcome` and verify its protocol version before
