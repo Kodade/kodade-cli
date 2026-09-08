@@ -5,8 +5,133 @@
 
 use std::path::PathBuf;
 
-use anyhow::Result;
+use anyhow::{anyhow, bail, Result};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
+
+/// Versioned, local extension manifest shared by the CLI and detached daemon.
+/// The manifest remains deliberately small: commands run through the user's
+/// shell, while Ködade supplies only session/workspace/pane context.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginManifest {
+    pub manifest_version: u32,
+    pub id: String,
+    pub name: String,
+    pub version: String,
+    #[serde(default)]
+    pub min_kodade_version: Option<String>,
+    /// Optional build command run only for a managed GitHub installation.
+    #[serde(default)]
+    pub build: Option<String>,
+    #[serde(default)]
+    pub actions: Vec<PluginAction>,
+    #[serde(default)]
+    pub startup: Vec<PluginHook>,
+    #[serde(default)]
+    pub events: Vec<PluginEventHook>,
+    #[serde(default)]
+    pub panes: Vec<PluginPane>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginAction {
+    pub id: String,
+    pub name: String,
+    pub command: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub pane: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginHook {
+    pub command: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginEventHook {
+    pub event: String,
+    pub command: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginPane {
+    pub name: String,
+    pub command: String,
+}
+
+/// Validate a manifest before either client or detached daemon executes it.
+/// Keeping this beside the shared schema prevents the two processes from
+/// accepting different extension contracts.
+pub fn validate_plugin_manifest(manifest: &PluginManifest, current_version: &str) -> Result<()> {
+    if manifest.manifest_version != 1 {
+        bail!(
+            "unsupported plugin manifest version {}",
+            manifest.manifest_version
+        );
+    }
+    if !plugin_id(&manifest.id) {
+        bail!("plugin id must use lowercase letters, digits, '-' or '_'");
+    }
+    if manifest.name.trim().is_empty() || manifest.version.trim().is_empty() {
+        bail!("plugin name and version are required");
+    }
+    if let Some(required) = &manifest.min_kodade_version {
+        if plugin_version_gt(required, current_version)? {
+            bail!("plugin requires Ködade CLI {required} or newer");
+        }
+    }
+    let mut action_ids = std::collections::HashSet::new();
+    for action in &manifest.actions {
+        if !plugin_id(&action.id)
+            || action.name.trim().is_empty()
+            || action.command.trim().is_empty()
+            || !action_ids.insert(&action.id)
+        {
+            bail!("plugin actions need unique ids, names, and commands");
+        }
+    }
+    if manifest
+        .panes
+        .iter()
+        .any(|pane| pane.name.trim().is_empty() || pane.command.trim().is_empty())
+    {
+        bail!("plugin panes need names and commands");
+    }
+    if manifest
+        .startup
+        .iter()
+        .any(|hook| hook.command.trim().is_empty())
+    {
+        bail!("plugin hook command cannot be empty");
+    }
+    if manifest
+        .events
+        .iter()
+        .any(|hook| hook.event.trim().is_empty() || hook.command.trim().is_empty())
+    {
+        bail!("plugin event hooks need an event and command");
+    }
+    Ok(())
+}
+fn plugin_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'_')
+        })
+}
+fn plugin_version_gt(required: &str, current: &str) -> Result<bool> {
+    fn parts(value: &str) -> Result<Vec<u64>> {
+        value
+            .split('.')
+            .map(|part| {
+                part.parse()
+                    .map_err(|_| anyhow!("invalid version {value:?}"))
+            })
+            .collect()
+    }
+    Ok(parts(required)? > parts(current)?)
+}
 
 /// Wire protocol version. Bumped whenever a client and daemon can no longer
 /// understand each other. Both ends compare it at attach time (see `Hello` /
@@ -191,6 +316,9 @@ pub enum ClientMessage {
         id: WorkspaceId,
         keep: bool,
     },
+    /// Re-read bundled and user override detection manifests without restarting
+    /// the daemon. The old set remains active when the replacement is invalid.
+    ReloadManifests,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -207,6 +335,20 @@ pub enum QueryKind {
     Session,
     /// The protocol schema: version plus the message names this daemon knows.
     Schema,
+    /// The active manifest set, including whether each entry is bundled or a
+    /// user override. This is intentionally metadata, not screen rules.
+    Manifests,
+}
+
+/// Inspectable metadata for one active agent detection manifest.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManifestInfo {
+    pub name: String,
+    pub display: String,
+    pub process: Vec<String>,
+    pub title: Vec<String>,
+    pub rules: usize,
+    pub source: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -246,6 +388,8 @@ pub enum ServerMessage {
         client_messages: Vec<String>,
         server_messages: Vec<String>,
     },
+    /// Reply to `Query(Manifests)` and `ReloadManifests`.
+    Manifests(Vec<ManifestInfo>),
     Error {
         message: String,
     },
@@ -689,6 +833,7 @@ pub const CLIENT_MESSAGE_NAMES: &[&str] = &[
     "SetWorkspaceColor",
     "NewWorktreeWorkspace",
     "RemoveWorktreeWorkspace",
+    "ReloadManifests",
 ];
 
 /// Every `ServerMessage` variant name (see [`CLIENT_MESSAGE_NAMES`]).
@@ -702,6 +847,7 @@ pub const SERVER_MESSAGE_NAMES: &[&str] = &[
     "Event",
     "Session",
     "Schema",
+    "Manifests",
     "Error",
     "Shutdown",
 ];
@@ -756,6 +902,7 @@ pub fn client_message_name(message: &ClientMessage) -> &'static str {
         ClientMessage::SetWorkspaceColor { .. } => "SetWorkspaceColor",
         ClientMessage::NewWorktreeWorkspace { .. } => "NewWorktreeWorkspace",
         ClientMessage::RemoveWorktreeWorkspace { .. } => "RemoveWorktreeWorkspace",
+        ClientMessage::ReloadManifests => "ReloadManifests",
     }
 }
 
@@ -771,6 +918,7 @@ pub fn server_message_name(message: &ServerMessage) -> &'static str {
         ServerMessage::Event(_) => "Event",
         ServerMessage::Session(_) => "Session",
         ServerMessage::Schema { .. } => "Schema",
+        ServerMessage::Manifests(_) => "Manifests",
         ServerMessage::Error { .. } => "Error",
         ServerMessage::Shutdown => "Shutdown",
     }
@@ -1017,6 +1165,7 @@ mod tests {
                 id: workspace,
                 keep: false,
             },
+            ClientMessage::ReloadManifests,
         ]
     }
 
@@ -1075,6 +1224,14 @@ mod tests {
                 workspaces: Vec::new(),
             }),
             schema_message(),
+            ServerMessage::Manifests(vec![ManifestInfo {
+                name: "codex".into(),
+                display: "Codex".into(),
+                process: vec!["codex".into()],
+                title: vec!["Codex".into()],
+                rules: 2,
+                source: "builtin".into(),
+            }]),
             ServerMessage::Error {
                 message: "boom".into(),
             },

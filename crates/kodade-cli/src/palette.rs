@@ -7,12 +7,24 @@ use crate::{
     overlay::{Overlay, OverlayRow, OverlayTarget},
     picker::fuzzy_score,
 };
+use std::path::PathBuf;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PaletteTarget {
     Action(Action),
-    Agent { name: String, command: Vec<String> },
+    Agent {
+        name: String,
+        command: Vec<String>,
+    },
     Shell,
+    PluginAction {
+        plugin: String,
+        directory: PathBuf,
+        action: String,
+        command: String,
+        pane: bool,
+    },
+    PluginUnavailable(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -60,6 +72,33 @@ impl Palette {
             search: "terminal shell new pane tab".into(),
             target: PaletteTarget::Shell,
         });
+        match crate::plugins::palette_actions() {
+            Ok(actions) => {
+                for item in actions {
+                    all.push(Item {
+                        label: format!("plugin · {} · {}", item.plugin, item.action.name),
+                        hint: if item.action.pane { "open pane" } else { "run" }.into(),
+                        search: format!(
+                            "plugin {} {} {}",
+                            item.plugin, item.action.id, item.action.description
+                        ),
+                        target: PaletteTarget::PluginAction {
+                            plugin: item.plugin,
+                            directory: item.directory,
+                            action: item.action.id,
+                            command: item.action.command,
+                            pane: item.action.pane,
+                        },
+                    });
+                }
+            }
+            Err(error) => all.push(Item {
+                label: "plugin registry unavailable".into(),
+                hint: error.to_string(),
+                search: "plugin registry error".into(),
+                target: PaletteTarget::PluginUnavailable(error.to_string()),
+            }),
+        }
         for (name, action) in Config::actions() {
             let hint = config
                 .chords_for(*action)

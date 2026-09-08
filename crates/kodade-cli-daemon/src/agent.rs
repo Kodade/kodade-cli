@@ -153,6 +153,7 @@ mod tests {
                 state: ManifestState::Blocked,
                 any: vec!["y/n".into()],
             }],
+            source: crate::manifest::ManifestSource::Builtin,
         }
     }
 

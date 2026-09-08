@@ -5,7 +5,11 @@ use kodade_cli_proto::{
     WorkspaceInfo,
 };
 use regex::Regex;
-use std::{fs, path::Path, time::Duration};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    time::Duration,
+};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::UnixStream,
@@ -272,17 +276,8 @@ pub struct SessionEntry {
 /// Enumerate `*.sock` in the runtime directory and probe each one.
 pub async fn session_entries() -> Result<Vec<SessionEntry>> {
     let dir = kodade_cli_daemon::socket_dir();
+    let read = session_socket_paths(&dir)?;
     let mut entries = Vec::new();
-    let mut read = match fs::read_dir(&dir) {
-        Ok(read) => read,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(entries),
-        Err(error) => return Err(error).context("read the Ködade CLI runtime directory"),
-    }
-    .filter_map(Result::ok)
-    .map(|entry| entry.path())
-    .filter(|path| path.extension().is_some_and(|ext| ext == "sock"))
-    .collect::<Vec<_>>();
-    read.sort();
     for path in read {
         let name = path
             .file_stem()
@@ -301,6 +296,21 @@ pub async fn session_entries() -> Result<Vec<SessionEntry>> {
         });
     }
     Ok(entries)
+}
+
+fn session_socket_paths(dir: &Path) -> Result<Vec<PathBuf>> {
+    let entries = Vec::new();
+    let mut read = match fs::read_dir(dir) {
+        Ok(read) => read,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(entries),
+        Err(error) => return Err(error).context("read the Ködade CLI runtime directory"),
+    }
+    .filter_map(Result::ok)
+    .map(|entry| entry.path())
+    .filter(|path| path.extension().is_some_and(|ext| ext == "sock"))
+    .collect::<Vec<_>>();
+    read.sort();
+    Ok(read)
 }
 
 /// Connect to a socket and ask for its layout, giving up after [`PROBE_TIMEOUT`].
@@ -828,6 +838,21 @@ mod tests {
              work  1 workspace(s)  1 tab(s)  1 pane(s) (restored)\n\
              stale  0 workspace(s)  0 tab(s)  0 pane(s) (dead)"
         );
+    }
+
+    #[test]
+    fn session_listing_ignores_private_hook_socket_subdirectory() {
+        let directory =
+            std::env::temp_dir().join(format!("kodade-session-list-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir_all(directory.join("hooks")).unwrap();
+        fs::write(directory.join("work.sock"), []).unwrap();
+        fs::write(directory.join("hooks/123.sock"), []).unwrap();
+        assert_eq!(
+            session_socket_paths(&directory).unwrap(),
+            vec![directory.join("work.sock")]
+        );
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

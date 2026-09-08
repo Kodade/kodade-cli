@@ -45,6 +45,11 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand, PartialEq, Eq)]
 pub enum Command {
+    /// Manage local, versioned command extensions.
+    Plugin {
+        #[command(subcommand)]
+        command: PluginCommand,
+    },
     /// Run the session daemon (started automatically when attaching).
     Daemon {
         /// Session name; defaults to the global --session value.
@@ -502,6 +507,20 @@ pub enum AgentCommand {
     },
     /// Refresh agent-detection manifests from the repo (opt-in network call).
     UpdateManifests,
+    /// Inspect the active manifest cache, or atomically reload local overrides.
+    Manifests {
+        /// Re-read bundled and user override manifests without restarting.
+        #[arg(long)]
+        reload: bool,
+        /// Print JSON instead of an aligned table.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Validate a manifest file against the daemon schema without installing it.
+    ValidateManifest {
+        #[arg(value_name = "PATH")]
+        path: PathBuf,
+    },
     /// Wait until a pane reaches an agent state; exits 2 on timeout.
     Wait {
         #[arg(value_name = "TARGET")]
@@ -578,22 +597,70 @@ pub enum IntegrateCommand {
         /// Merge the hooks into ~/.claude/settings.json instead of printing them.
         #[arg(long)]
         write: bool,
+        /// Remove only Ködade-managed hooks from the settings file.
+        #[arg(long, conflicts_with = "write")]
+        remove: bool,
     },
     /// Gemini CLI hooks (Claude-compatible) that report agent state.
     GeminiCli {
         /// Merge the hooks into ~/.gemini/settings.json instead of printing them.
         #[arg(long)]
         write: bool,
+        /// Remove only Ködade-managed hooks from the settings file.
+        #[arg(long, conflicts_with = "write")]
+        remove: bool,
     },
-    /// Codex `notify` entry that reports agent state.
+    /// Codex lifecycle hooks that report agent state without replacing `notify`.
     Codex {
-        /// Merge the entry into ~/.codex/config.toml instead of printing it.
+        /// Merge the entries into ~/.codex/hooks.json instead of printing them.
         #[arg(long)]
         write: bool,
-        /// Replace an existing `notify` entry instead of refusing.
+        /// Retained for compatibility; Codex hooks never replace `notify`.
         #[arg(long)]
         force: bool,
+        /// Remove only Ködade-managed hooks from ~/.codex/hooks.json.
+        #[arg(long, conflicts_with = "write")]
+        remove: bool,
     },
+    /// OpenCode local plugin (official API documented; fixture-tested here).
+    OpenCode {
+        #[arg(long)]
+        write: bool,
+        #[arg(long, conflicts_with = "write")]
+        remove: bool,
+    },
+    /// Pi global extension (verified against installed Pi 0.85.1 docs).
+    Pi {
+        #[arg(long)]
+        write: bool,
+        #[arg(long, conflicts_with = "write")]
+        remove: bool,
+    },
+}
+
+#[derive(Debug, Subcommand, PartialEq, Eq)]
+pub enum PluginCommand {
+    /// List installed extensions and whether they are enabled.
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Register a local extension directory without copying it.
+    Link { path: PathBuf },
+    /// Clone a GitHub OWNER/REPO[/SUBDIR] extension into Ködade's managed directory.
+    Install { source: String },
+    /// Stop loading an extension while retaining its files and registry entry.
+    Disable { id: String },
+    /// Re-enable a registered extension.
+    Enable { id: String },
+    /// Remove a local link from the registry; its source directory remains untouched.
+    Unlink { id: String },
+    /// Remove a managed extension and its registry entry. Linked directories are protected.
+    Uninstall { id: String },
+    /// Run an extension action in the current workspace/pane context.
+    Run { id: String, action: String },
+    /// Open a named extension pane in a new Ködade tab.
+    Pane { id: String, pane: String },
 }
 
 // Pane ids are plain integers on the wire; keep the error message script-friendly.
@@ -644,6 +711,20 @@ mod tests {
                 "{name:?}"
             );
         }
+    }
+
+    #[test]
+    fn parses_plugin_lifecycle_commands() {
+        assert!(matches!(
+            parse(&["kodade-cli", "plugin", "link", "./demo"]).command,
+            Some(Command::Plugin {
+                command: PluginCommand::Link { .. }
+            })
+        ));
+        assert!(matches!(
+            parse(&["kodade-cli", "plugin", "run", "demo", "hello"]).command,
+            Some(Command::Plugin { command: PluginCommand::Run { id, action } }) if id == "demo" && action == "hello"
+        ));
     }
 
     fn parse(args: &[&str]) -> Cli {
@@ -714,7 +795,10 @@ mod tests {
         assert_eq!(
             parse(&["kodade-cli", "integrate", "claude-code", "--write"]).command,
             Some(Command::Integrate {
-                target: IntegrateCommand::ClaudeCode { write: true }
+                target: IntegrateCommand::ClaudeCode {
+                    write: true,
+                    remove: false
+                }
             })
         );
         assert_eq!(
@@ -889,14 +973,18 @@ mod tests {
             Some(Command::Integrate {
                 target: IntegrateCommand::Codex {
                     write: true,
-                    force: true
+                    force: true,
+                    remove: false,
                 }
             })
         );
         assert_eq!(
             parse(&["kodade-cli", "integrate", "gemini-cli", "--write"]).command,
             Some(Command::Integrate {
-                target: IntegrateCommand::GeminiCli { write: true }
+                target: IntegrateCommand::GeminiCli {
+                    write: true,
+                    remove: false
+                }
             })
         );
         assert_eq!(
