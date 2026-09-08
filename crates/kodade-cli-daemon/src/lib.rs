@@ -4312,18 +4312,6 @@ fn read_pty(
     });
 }
 
-#[cfg(test)]
-mod terminal_query_tests {
-    use super::{PtyCallbacks, PtyParser};
-
-    #[test]
-    fn cursor_queries_reply_at_their_stream_position() {
-        let mut parser = PtyParser::new_with_callbacks(12, 20, 100, PtyCallbacks::default());
-        parser.process(b"\x1b[2;3H\x1b[6n\x1b[9;9H\x1b[?6n");
-        assert_eq!(parser.callbacks().terminal_replies, b"\x1b[2;3R\x1b[?9;9R");
-    }
-}
-
 /// Track the cell movement that also moves graphics; terminal controls remain
 /// interpreted by vt100, and image state follows clear/reset/alternate buffers.
 fn graphics_text(parser: &mut PtyParser, text: &[u8]) {
@@ -4917,6 +4905,13 @@ mod tests {
     }
     use super::*;
     use tokio::net::{UnixListener, UnixStream};
+
+    #[test]
+    fn cursor_queries_reply_at_their_stream_position() {
+        let mut parser = PtyParser::new_with_callbacks(12, 20, 100, PtyCallbacks::default());
+        parser.process(b"\x1b[2;3H\x1b[6n\x1b[9;9H\x1b[?6n");
+        assert_eq!(parser.callbacks().terminal_replies, b"\x1b[2;3R\x1b[?9;9R");
+    }
 
     #[tokio::test]
     async fn pane_context_is_created_after_acceptance_and_removed_with_the_pane() {
