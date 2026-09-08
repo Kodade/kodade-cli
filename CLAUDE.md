@@ -8,7 +8,12 @@ binary that a Ködade user can run over SSH or in any terminal and manage
 several agent panes without the desktop app.
 
 ## Status
-v0.2.1 adds a charcoal dark theme and stable scrollback (#25/#26). Release process: docs/RELEASING.md; Homebrew tap Kodade/homebrew-tap is updated by the release workflow. Next: gather real-session prompt strings for the unverified manifests, README screenshots, live remote test. Last touched 2026-09-07.
+v0.2.1 is the latest published version. The development branch adds reliable
+independent clients, command/attention palettes, guarded agent automation,
+machine workspaces, extensions, live integrations, images, compact views, and
+verified updates. The competitive delivery ledger and remaining acceptance
+gates live in docs/features/herdr-parity/PLAN.md. Release process:
+docs/RELEASING.md. Updated 2026-09-08.
 
 ## Commands
 ```bash

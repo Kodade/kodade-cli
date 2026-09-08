@@ -2,6 +2,9 @@
 
 mod agent;
 mod git;
+mod graphics;
+mod image_paste;
+pub use image_paste::{validate_png, MAX_IMAGE_BYTES};
 mod layout;
 mod manifest;
 mod persist;
@@ -31,12 +34,13 @@ use kodade_cli_proto::{
 };
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::{UnixListener, UnixStream},
     sync::broadcast,
 };
 
 struct Session {
+    images: image_paste::Inbox,
     /// Session name; behind a lock because `session rename` moves it (#16).
     name: Mutex<String>,
     state: Mutex<SessionState>,
@@ -93,6 +97,7 @@ struct ClientView {
     scroll: HashMap<PaneId, usize>,
     cols: u16,
     rows: u16,
+    compact: bool,
 }
 
 impl ClientView {
@@ -116,6 +121,7 @@ impl ClientView {
             scroll: HashMap::new(),
             cols,
             rows,
+            compact: false,
         }
     }
 }
@@ -158,6 +164,8 @@ struct StoredSelection {
 #[derive(Default)]
 struct PtyCallbacks {
     title: String,
+    graphics: graphics::Store,
+    graphics_tracker: graphics::Tracker,
 }
 impl vt100::Callbacks for PtyCallbacks {
     fn set_window_title(&mut self, _: &mut vt100::Screen, title: &[u8]) {
@@ -168,7 +176,7 @@ type PtyParser = vt100::Parser<PtyCallbacks>;
 
 struct Pane {
     title: Mutex<String>,
-    writer: Mutex<Box<dyn Write + Send>>,
+    writer: Arc<Mutex<Box<dyn Write + Send>>>,
     master: Mutex<Box<dyn MasterPty + Send>>,
     parser: Arc<Mutex<PtyParser>>,
     last_output: Arc<Mutex<Instant>>,
@@ -360,6 +368,7 @@ pub async fn run(session_name: String) -> Result<()> {
                 // `kill-session` is deliberate: drop the state file so it does
                 // not resurrect on the next cold start.
                 persist::remove_session_file(&session.session_name());
+                session.images.clear();
                 drop(listener);
                 let _ = fs::remove_file(session.socket_path());
                 let _ = fs::remove_file(session.hook_socket());
@@ -367,6 +376,7 @@ pub async fn run(session_name: String) -> Result<()> {
             }
             _ = sigterm.recv() => {
                 session.save();
+                session.images.clear();
                 drop(listener);
                 let _ = fs::remove_file(session.socket_path());
                 let _ = fs::remove_file(session.hook_socket());
@@ -463,6 +473,7 @@ impl Session {
         let (shutdown, _) = broadcast::channel(16);
         let (events, _) = broadcast::channel(256);
         let session = Self {
+            images: image_paste::Inbox::default(),
             name: Mutex::new(name),
             state: Mutex::new(SessionState {
                 workspaces: Vec::new(),
@@ -521,6 +532,7 @@ impl Session {
         let (shutdown, _) = broadcast::channel(16);
         let (events, _) = broadcast::channel(256);
         let session = Self {
+            images: image_paste::Inbox::default(),
             name: Mutex::new(file.name.clone()),
             state: Mutex::new(SessionState {
                 workspaces: Vec::new(),
@@ -1025,6 +1037,10 @@ impl Session {
     /// mutation implementation without allowing that temporary selection to
     /// escape to a different socket or into persisted state.
     fn handle_view(&self, message: ClientMessage, view: &mut ClientView) -> Result<()> {
+        if let ClientMessage::SetCompactView { enabled } = message {
+            view.compact = enabled;
+            return self.resize_for_view(view);
+        }
         if let ClientMessage::Hello { cols, rows, .. } | ClientMessage::Resize { cols, rows } =
             message
         {
@@ -1051,6 +1067,11 @@ impl Session {
             .view_dispatch
             .lock()
             .map_err(|_| anyhow!("view dispatch lock poisoned"))?;
+        // Set the foreground application's dimensions before delivering input;
+        // it may inspect its PTY immediately when the write wakes it.
+        if matches!(message, ClientMessage::Input { .. }) {
+            self.resize_view_locked(view)?;
+        }
         // A view-changing operation becomes the PTY size arbiter. This is
         // under the same dispatch lock as selection staging, so another client
         // cannot publish its dimensions between the arbitration and dispatch.
@@ -1090,6 +1111,18 @@ impl Session {
             }
         }
         drop(state);
+        if result.is_ok()
+            && !matches!(
+                message,
+                ClientMessage::Query(_)
+                    | ClientMessage::Input { .. }
+                    | ClientMessage::Subscribe
+                    | ClientMessage::ReadPane { .. }
+                    | ClientMessage::KillSession
+            )
+        {
+            self.resize_view_locked(view)?;
+        }
         drop(_dispatch);
         if matches!(message, ClientMessage::RenameSession { .. }) && result.is_ok() {
             self.save();
@@ -1179,17 +1212,10 @@ impl Session {
         Ok(ClientView::from_state(&state, cols, rows))
     }
 
-    /// Project shared panes through either the persisted/script selection or a
-    /// connection's independent view.  Detection remains session-wide; only
-    /// selection and scrollback are viewer state.
-    fn snapshot_for(&self, view: Option<&ClientView>) -> Result<LayoutSnapshot> {
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| anyhow!("state lock poisoned"))?;
-        // Refresh git-derived sidebar metadata at most every 2 s. Snapshot
-        // rendering itself must not canonicalize worktree paths per frame.
-        refresh_workspace_metadata(&mut state, Instant::now());
+    fn view_selection<'a>(
+        state: &'a SessionState,
+        view: Option<&ClientView>,
+    ) -> (&'a Workspace, &'a Tab, PaneId) {
         let workspace_id = view
             .map(|view| view.workspace)
             .filter(|id| state.workspaces.iter().any(|item| item.id == *id))
@@ -1212,13 +1238,37 @@ impl Session {
             .and_then(|view| view.focused.get(&tab.id).copied())
             .filter(|id| layout::contains(&tab.tree, *id))
             .unwrap_or(tab.focused);
-        let tree = if tab.zoomed {
+        (workspace, tab, focused)
+    }
+
+    /// Project shared panes through either the persisted/script selection or a
+    /// connection's independent view.  Detection remains session-wide; only
+    /// selection and scrollback are viewer state.
+    fn snapshot_for(&self, view: Option<&ClientView>) -> Result<LayoutSnapshot> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow!("state lock poisoned"))?;
+        // Refresh git-derived sidebar metadata at most every 2 s. Snapshot
+        // rendering itself must not canonicalize worktree paths per frame.
+        refresh_workspace_metadata(&mut state, Instant::now());
+        let (workspace, tab, focused) = Self::view_selection(&state, view);
+        let tree = if tab.zoomed || view.is_some_and(|view| view.compact) {
             LayoutTree::Leaf { pane: focused }
         } else {
             tab.tree.clone()
         };
         let mut ids = Vec::new();
-        layout::leaves(&tree, &mut ids);
+        // Compact clients still need every pane's identity for the switcher;
+        // the projected tree controls visibility and physical PTY sizing.
+        layout::leaves(
+            if view.is_some_and(|view| view.compact) {
+                &tab.tree
+            } else {
+                &tree
+            },
+            &mut ids,
+        );
         let panes = self
             .panes
             .lock()
@@ -1529,14 +1579,30 @@ impl Session {
             .view_dispatch
             .lock()
             .map_err(|_| anyhow!("view dispatch lock poisoned"))?;
+        self.resize_view_locked(view)
+    }
+
+    fn resize_view_locked(&self, view: &ClientView) -> Result<()> {
         *self
             .size
             .lock()
             .map_err(|_| anyhow!("size lock poisoned"))? = (view.cols, view.rows);
-        let snapshot = self.snapshot_for(Some(view))?;
+        // Resizing needs only the layout tree, not a full screen/agent snapshot.
+        let tree = {
+            let state = self
+                .state
+                .lock()
+                .map_err(|_| anyhow!("state lock poisoned"))?;
+            let (_, tab, focused) = Self::view_selection(&state, Some(view));
+            if tab.zoomed || view.compact {
+                LayoutTree::Leaf { pane: focused }
+            } else {
+                tab.tree.clone()
+            }
+        };
         let mut sizes = Vec::new();
         pane_sizes(
-            &snapshot.tree,
+            &tree,
             view.cols.max(1),
             view.rows.saturating_sub(2).max(1),
             &mut sizes,
@@ -1598,6 +1664,7 @@ impl Session {
                 version: _,
             }
             | ClientMessage::Resize { cols, rows } => self.resize(cols, rows)?,
+            ClientMessage::SetCompactView { .. } => {}
             ClientMessage::Input { bytes } => {
                 let state = self
                     .state
@@ -1688,6 +1755,9 @@ impl Session {
                 pane.reset_scrollback();
                 pane.write(&bytes)?;
                 self.notify();
+            }
+            ClientMessage::PasteImage { pane, data } => {
+                self.paste_image(pane, &data)?;
             }
             ClientMessage::RenamePaneId { id, name } => {
                 let panes = self
@@ -2555,6 +2625,36 @@ impl Session {
         self.socket.lock().expect("socket lock poisoned").clone()
     }
 
+    fn paste_image(&self, id: PaneId, data: &str) -> Result<PathBuf> {
+        let pane = self
+            .panes
+            .lock()
+            .map_err(|_| anyhow!("pane lock poisoned"))?
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| anyhow!("pane {} not found", id.0))?;
+        let path = self.images.save(data)?;
+        let text = format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"));
+        let bracketed = pane
+            .parser
+            .lock()
+            .expect("parser lock")
+            .screen()
+            .bracketed_paste();
+        let bytes = if bracketed {
+            format!("\x1b[200~{text}\x1b[201~").into_bytes()
+        } else {
+            text.into_bytes()
+        };
+        if let Err(error) = pane.write(&bytes) {
+            self.images.discard(&path);
+            return Err(error);
+        }
+        pane.reset_scrollback();
+        self.notify();
+        Ok(path)
+    }
+
     /// Replace the layout with a persisted one (`layout apply`). Panes whose ids
     /// are still alive keep their PTY; every other pane named by a saved tree is
     /// spawned fresh through the same path a cold restore uses — including the
@@ -2985,7 +3085,7 @@ impl Pane {
             .slave
             .spawn_command(command)
             .context("spawn login shell in PTY")?;
-        let writer = pair.master.take_writer()?;
+        let writer = Arc::new(Mutex::new(pair.master.take_writer()?));
         let reader = pair.master.try_clone_reader()?;
         let parser = Arc::new(Mutex::new(PtyParser::new_with_callbacks(
             rows,
@@ -2998,11 +3098,12 @@ impl Pane {
             reader,
             Arc::clone(&parser),
             Arc::clone(&last_output),
+            Arc::clone(&writer),
             updates,
         );
         Ok(Self {
             title: Mutex::new(title.into()),
-            writer: Mutex::new(writer),
+            writer,
             master: Mutex::new(pair.master),
             parser,
             last_output,
@@ -3074,6 +3175,16 @@ impl Pane {
         (history.join("\n"), count)
     }
     fn resize(&self, cols: u16, rows: u16) -> Result<()> {
+        if self
+            .parser
+            .lock()
+            .map_err(|_| anyhow!("PTY parser lock poisoned"))?
+            .screen()
+            .size()
+            == (rows, cols)
+        {
+            return Ok(());
+        }
         self.master
             .lock()
             .map_err(|_| anyhow!("PTY master lock poisoned"))?
@@ -3397,23 +3508,78 @@ fn read_pty(
     mut reader: Box<dyn Read + Send>,
     parser: Arc<Mutex<PtyParser>>,
     last_output: Arc<Mutex<Instant>>,
+    writer: Arc<Mutex<Box<dyn Write + Send>>>,
     updates: broadcast::Sender<()>,
 ) {
     tokio::task::spawn_blocking(move || {
+        let mut decoder = graphics::Decoder::default();
         let mut bytes = [0_u8; 4096];
         while let Ok(count) = reader.read(&mut bytes) {
             if count == 0 {
                 break;
             }
-            parser
-                .lock()
-                .expect("PTY parser lock poisoned")
-                .process(&bytes[..count]);
+            let mut replies = Vec::new();
+            {
+                let mut parser = parser.lock().expect("PTY parser lock poisoned");
+                for token in decoder.feed(&bytes[..count]) {
+                    match token {
+                        graphics::Token::Invalid => {
+                            parser.callbacks_mut().graphics.cancel_transfer()
+                        }
+                        graphics::Token::Text(text) => graphics_text(&mut parser, &text),
+                        graphics::Token::Graphics(frame) => {
+                            let cursor = parser.screen().cursor_position();
+                            let alternate = parser.screen().alternate_screen();
+                            let result = parser
+                                .callbacks_mut()
+                                .graphics
+                                .command(&frame, cursor, alternate);
+                            replies.extend(result.reply);
+                            if let Some((rows, cols)) = result.advance {
+                                let (height, width) = parser.screen().size();
+                                let rows = rows.min(height);
+                                graphics_text(&mut parser, &vec![b'\n'; usize::from(rows)]);
+                                parser.process(
+                                    format!(
+                                        "\x1b[{}G",
+                                        cursor.1.saturating_add(cols).min(width.saturating_sub(1))
+                                            + 1
+                                    )
+                                    .as_bytes(),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            if !replies.is_empty() {
+                if let Ok(mut writer) = writer.lock() {
+                    let _ = writer.write_all(&replies);
+                }
+            }
             *last_output.lock().expect("output lock poisoned") = Instant::now();
             let _ = updates.send(());
         }
     });
 }
+/// Track the cell movement that also moves graphics; terminal controls remain
+/// interpreted by vt100, and image state follows clear/reset/alternate buffers.
+fn graphics_text(parser: &mut PtyParser, text: &[u8]) {
+    let mut tracker = std::mem::take(&mut parser.callbacks_mut().graphics_tracker);
+    let mut store = std::mem::take(&mut parser.callbacks_mut().graphics);
+    for &byte in text {
+        let before_alt = parser.screen().alternate_screen();
+        tracker.feed(byte, parser.screen(), &mut store);
+        parser.process(&[byte]);
+        let alternate = parser.screen().alternate_screen();
+        if alternate && !before_alt {
+            store.clear(true);
+        }
+    }
+    parser.callbacks_mut().graphics_tracker = tracker;
+    parser.callbacks_mut().graphics = store;
+}
+
 /// Collect the pane's full scrollback plus visible screen as plain-text lines,
 /// oldest first. Walks the vt100 scrollback in screen-height windows from the
 /// top down; the caller restores the live scroll offset afterward. Pure over the
@@ -3470,6 +3636,10 @@ fn snapshot(parser: &PtyParser) -> Screen {
         rows: (0..rows).map(|row| screen_row(screen, row, cols)).collect(),
         bracketed_paste: screen.bracketed_paste(),
         mouse_reporting: screen.mouse_protocol_mode() != vt100::MouseProtocolMode::None,
+        graphics: parser
+            .callbacks()
+            .graphics
+            .placements(screen.alternate_screen(), screen.scrollback()),
     }
 }
 
@@ -3580,9 +3750,47 @@ fn pane_sizes(tree: &LayoutTree, width: u16, height: u16, output: &mut Vec<(Pane
     }
 }
 
+/// Maximum newline-delimited client request. This permits the largest encoded
+/// 8 MiB PNG plus protocol envelope without buffering an unbounded peer line.
+const MAX_CLIENT_LINE: usize = 16 * 1024 * 1024;
+
+async fn read_client_line<R: AsyncBufRead + Unpin>(
+    reader: &mut R,
+    line: &mut Vec<u8>,
+) -> Result<Option<Vec<u8>>> {
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            return if line.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(std::mem::take(line)))
+            };
+        }
+        let end = available
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map(|index| index + 1)
+            .unwrap_or(available.len());
+        if line.len().saturating_add(end) > MAX_CLIENT_LINE {
+            bail!("client message exceeds 16 MiB");
+        }
+        line.extend_from_slice(&available[..end]);
+        reader.consume(end);
+        if line.ends_with(b"\n") {
+            line.pop();
+            if line.ends_with(b"\r") {
+                line.pop();
+            }
+            return Ok(Some(std::mem::take(line)));
+        }
+    }
+}
+
 async fn serve_client(stream: UnixStream, session: Arc<Session>) -> Result<()> {
     let (reader, mut writer) = stream.into_split();
-    let mut reader = BufReader::new(reader).lines();
+    let mut reader = BufReader::new(reader);
+    let mut line_buffer = Vec::new();
     let mut updates = session.updates.subscribe();
     let mut events = session.events.subscribe();
     let mut shutdown = session.shutdown.subscribe();
@@ -3599,9 +3807,9 @@ async fn serve_client(stream: UnixStream, session: Arc<Session>) -> Result<()> {
     let mut last_notify_seq = session.notify_high_water();
     loop {
         tokio::select! {
-            line = reader.next_line() => {
+            line = read_client_line(&mut reader, &mut line_buffer) => {
                 let Some(line) = line? else { return Ok(()); };
-                let message = decode::<ClientMessage>(line.as_bytes())?;
+                let message = decode::<ClientMessage>(&line)?;
                 // A client whose protocol version differs cannot be served; tell
                 // it plainly and close so it fails fast instead of misbehaving.
                 if let ClientMessage::Hello { version, .. } = message {
@@ -3642,6 +3850,26 @@ async fn serve_client(stream: UnixStream, session: Arc<Session>) -> Result<()> {
                                 return Ok(());
                             }
                         }
+                        continue;
+                    }
+                    ClientMessage::Query(QueryKind::Image { pane, id, revision }) => {
+                        let image = session.panes.lock().map_err(|_| anyhow!("pane lock poisoned"))?
+                            .get(&pane).cloned().ok_or_else(|| anyhow!("pane not found"))
+                            .and_then(|pane| pane.parser.lock().map_err(|_| anyhow!("parser lock poisoned"))?
+                                .callbacks().graphics.image(id, revision));
+                        let message = match image {
+                            Ok(image) => ServerMessage::Image { pane, image },
+                            Err(error) => ServerMessage::Error { message: error.to_string() },
+                        };
+                        write_server(&mut writer, &message).await?;
+                        continue;
+                    }
+                    ClientMessage::PasteImage { pane, data } => {
+                        let reply = match session.paste_image(pane, &data) {
+                            Ok(path) => ServerMessage::ImagePasted { pane, path },
+                            Err(error) => ServerMessage::Error { message: error.to_string() },
+                        };
+                        write_server(&mut writer, &reply).await?;
                         continue;
                     }
                     ClientMessage::Query(QueryKind::Pane(id)) => {
@@ -3835,7 +4063,68 @@ async fn send_notifications(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn graphics_follow_bottom_row_autowrap_and_scroll_commands() {
+        let mut parser = PtyParser::new_with_callbacks(4, 10, 100, PtyCallbacks::default());
+        parser.callbacks_mut().graphics.command(
+            b"a=T,f=24,s=1,v=1,i=7,c=1,r=1,C=1;AAAA",
+            (2, 0),
+            false,
+        );
+        graphics_text(&mut parser, b"\x1b[4;1H0123456789x");
+        assert_eq!(parser.callbacks().graphics.placements(false, 0)[0].row, 1);
+        graphics_text(&mut parser, b"\x1b[1S");
+        assert_eq!(parser.callbacks().graphics.placements(false, 0)[0].row, 0);
+        graphics_text(&mut parser, b"\x1b[1T");
+        assert_eq!(parser.callbacks().graphics.placements(false, 0)[0].row, 1);
+        graphics_text(&mut parser, b"\x1b[2J");
+        assert!(parser.callbacks().graphics.placements(false, 0).is_empty());
+    }
     use super::*;
+
+    #[tokio::test]
+    async fn client_line_reader_accepts_empty_and_rejects_oversized_requests() {
+        let (mut write, read) = tokio::io::duplex(MAX_CLIENT_LINE + 2);
+        write.write_all(b"\n").await.unwrap();
+        drop(write);
+        assert_eq!(
+            read_client_line(&mut BufReader::new(read), &mut Vec::new())
+                .await
+                .unwrap(),
+            Some(Vec::new())
+        );
+
+        let (mut write, read) = tokio::io::duplex(MAX_CLIENT_LINE + 2);
+        let payload = vec![b'x'; MAX_CLIENT_LINE + 1];
+        tokio::spawn(async move {
+            write.write_all(&payload).await.unwrap();
+        });
+        assert!(read_client_line(&mut BufReader::new(read), &mut Vec::new())
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn client_line_reader_keeps_partial_upload_when_a_snapshot_interrupts() {
+        let (mut writer, reader) = tokio::io::duplex(128);
+        let mut reader = BufReader::new(reader);
+        let mut pending = Vec::new();
+        writer.write_all(b"{\"Input\":").await.unwrap();
+        assert!(tokio::time::timeout(
+            Duration::from_millis(10),
+            read_client_line(&mut reader, &mut pending)
+        )
+        .await
+        .is_err());
+        writer.write_all(b"{\"bytes\":[]}}\n").await.unwrap();
+        assert_eq!(
+            read_client_line(&mut reader, &mut pending)
+                .await
+                .unwrap()
+                .unwrap(),
+            b"{\"Input\":{\"bytes\":[]}}"
+        );
+    }
     #[test]
     fn socket_path_uses_runtime_directory_when_available() {
         assert_eq!(
@@ -4589,6 +4878,70 @@ mod tests {
         })
         .await
         .expect("error reply")
+    }
+
+    #[tokio::test]
+    async fn compact_focus_and_input_restore_the_interacting_clients_pty_size() {
+        let session = Session::spawn(120, 30, "compact-size".into()).unwrap();
+        session.handle(ClientMessage::SplitRight).unwrap();
+        let mut narrow = session.new_client_view().unwrap();
+        narrow.cols = 40;
+        narrow.rows = 20;
+        session
+            .handle_view(ClientMessage::SetCompactView { enabled: true }, &mut narrow)
+            .unwrap();
+        session
+            .handle_view(ClientMessage::FocusPaneCycle { forward: true }, &mut narrow)
+            .unwrap();
+        let focused = narrow.focused[&narrow.tabs[&narrow.workspace]];
+        let pane = session.panes.lock().unwrap()[&focused].clone();
+        assert_eq!(pane.master.lock().unwrap().get_size().unwrap().cols, 38);
+        let mut wide = session.new_client_view().unwrap();
+        wide.cols = 120;
+        session.resize_for_view(&wide).unwrap();
+        session
+            .handle_view(ClientMessage::Input { bytes: Vec::new() }, &mut narrow)
+            .unwrap();
+        assert_eq!(pane.master.lock().unwrap().get_size().unwrap().cols, 38);
+    }
+
+    #[tokio::test]
+    async fn compact_view_projects_focused_pane_without_mutating_tab_layout() {
+        let session = Session::spawn(100, 30, "compact-view".into()).expect("spawn session");
+        session.handle(ClientMessage::SplitRight).expect("split");
+        let full = session.snapshot().expect("full snapshot");
+        assert!(matches!(full.tree, LayoutTree::Split { .. }));
+        let mut view = session.new_client_view().expect("view");
+        session
+            .handle_view(ClientMessage::SetCompactView { enabled: true }, &mut view)
+            .expect("enable compact");
+        let compact = session
+            .snapshot_for_client(&view)
+            .expect("compact snapshot");
+        assert!(matches!(compact.tree, LayoutTree::Leaf { .. }));
+        assert_eq!(
+            compact.panes.len(),
+            2,
+            "switcher retains hidden pane identities"
+        );
+        assert!(!compact.zoomed);
+        let state = session.state.lock().expect("state");
+        assert!(!state.workspaces[0].tabs[0].zoomed);
+        assert!(matches!(
+            state.workspaces[0].tabs[0].tree,
+            LayoutTree::Split { .. }
+        ));
+        drop(state);
+        session
+            .handle_view(ClientMessage::SetCompactView { enabled: false }, &mut view)
+            .expect("disable compact");
+        assert!(matches!(
+            session
+                .snapshot_for_client(&view)
+                .expect("restored snapshot")
+                .tree,
+            LayoutTree::Split { .. }
+        ));
     }
 
     #[tokio::test]

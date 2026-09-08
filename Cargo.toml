@@ -12,6 +12,8 @@ license = "Apache-2.0"
 authors = ["ContractorKeith"]
 
 [workspace.dependencies]
+# Base64 encodes bounded Kitty image transfers without copying raw terminal escape sequences.
+base64 = "0.22"
 # `anyhow` keeps the small binary boundary readable without a custom error hierarchy yet.
 anyhow = "1"
 # clap gives the binary real subcommand help, typed flags, and future completions.
@@ -23,6 +25,7 @@ clap_complete = "4"
 crossterm = "0.29"
 # `dirs` supplies the cross-platform home-directory fallback for socket state.
 dirs = "5"
+flate2 = "1"
 libc = "0.2"
 # Portable-pty hosts the login shell independently from the attaching client.
 portable-pty = "0.9"
@@ -36,6 +39,9 @@ regex = "1"
 # Serde JSON is the documented, script-friendly daemon protocol.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+semver = "1"
+sha2 = "0.10"
+tar = "0.4"
 # TOML plus Serde derives load public agent-detection manifests without a custom parser.
 toml = "0.8"
 # `toml_edit` merges the Codex `notify` entry into config.toml without dropping user comments (#20 reuses it).
@@ -44,3 +50,8 @@ toml_edit = "0.22"
 tokio = { version = "1", features = ["io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 # vt100 makes the daemon the durable owner of screen and scrollback state.
 vt100 = "0.16"
+# Observe the same terminal controls as vt100 to keep image anchors with text.
+vte = "0.15"
+unicode-width = "0.2"
+# Validate PNG uploads with bounded decompression before retaining attachments.
+png = "0.18"

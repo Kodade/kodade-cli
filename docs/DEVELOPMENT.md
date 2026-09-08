@@ -212,8 +212,11 @@ control connection; `ls` prefixes each line with `host:`. The command builders (
 local socket resolver are unit-tested in `remote.rs`; the live tunnel path is
 only exercised against a real host.
 
-Out of scope (phase 2): multiple remotes in one sidebar, and auto-installing
-`kodade-cli` on the remote host.
+Saved remote profiles and independent connection workers are implemented in
+`machines.rs` and `endpoints.rs`; see [MACHINES.md](MACHINES.md). Each worker
+tags updates with its connection generation so a queued message from a removed
+profile cannot update a replacement. The app retains one layout cache per
+endpoint. OpenSSH remains responsible for credentials.
 
 ## Startup and context
 

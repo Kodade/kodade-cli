@@ -20,13 +20,18 @@ After upgrading, start a new session to use the updated daemon. Existing
 sessions keep their running daemon until stopped; save work in those panes
 before stopping them.
 
-| Milestone | Scope | Status |
-|---|---|---|
-| M0 | Cargo workspace, daemon/client handshake, one PTY, rendering, keyboard passthrough | Done |
-| M1 | Splits, tabs, workspaces, resize, mouse focus/resize/select, prefix keys, detach/reattach | Done |
-| M2 | Agent detection, five states, sidebar rollup, agent subcommands, Claude Code hooks | Done |
-| M3 | Themes, config, navigate mode, menus, scrollback/copy mode, OSC 52 | Done |
-| M4 | CI builds, release binaries, install script, documentation | Done |
+Current development also includes:
+
+- Local and saved SSH machines in one workspace, with independent reconnects.
+- A command center (`prefix space`) and attention history (`prefix A`).
+- Guarded agent launch/prompt/wait automation and live integration reloads.
+- Local extensions with command actions, event hooks, and terminal panes.
+- Terminal images, PNG paste, and a focused view for narrow terminals.
+- Verified stable/preview updates for standalone installations.
+
+These changes are being validated for the next release. See the
+[competitive delivery ledger](docs/features/herdr-parity/PLAN.md) for shipped
+work, behavioral evidence, and the remaining gaps.
 
 ## Install
 
@@ -56,6 +61,19 @@ cargo run -p kodade-cli
 ```
 
 The installer supports macOS and Linux on arm64 and x86_64.
+
+## Updates
+
+`kodade-cli update --check` prints the installed and available version from the
+stable channel. Use `kodade-cli update --channel preview --check` to select and
+check preview releases; `kodade-cli update --show-channel` prints the saved
+choice. The selected channel is stored separately from workspace settings.
+
+Recognized Homebrew and system-package paths receive package-manager upgrade
+guidance. Use the package manager for any other managed installation. Standalone
+installations download the published platform archive, verify its
+`SHA256SUMS` entry, and atomically replace the executable. `--install-to PATH`
+is available for an explicit standalone destination.
 
 ## Quick usage
 
@@ -112,9 +130,16 @@ tab, or workspace for its menu; the pane menu can break a pane out to its own
 tab or equalize the layout, and the tab menu can reorder tabs. In navigate mode, `j`/`k` move through the
 sidebar and `enter` selects a row (folding/unfolding a workspace, or activating a tab/pane); `q` or `esc` exits.
 
+Below 70 columns, compact view shows the focused pane at full width while
+keeping every split and process alive. Click `[<]` / `[>]` to cycle panes or
+`[Switch]` to search workspaces, tabs, and panes; keyboard shortcuts keep working.
+Widening restores the split layout. This preference belongs to each attached
+client, so a second wide terminal keeps its own view. Set
+`sidebar.compact_view = "on"` or `"off"` to override automatic switching.
+
 The sidebar has three shapes cycled by `prefix b`: the full list, a compact
 3-column rail of workspace state dots, and a hidden 1-column gutter. It is
-configurable via `[sidebar]` (`width`, `collapsed`, `auto_hide_below`,
+configurable via `[sidebar]` (`width`, `collapsed`, `auto_hide_below`, `compact_view`,
 `agents_panel`) and auto-hides on narrow terminals. Every workspace can be
 folded (`enter` in navigate, `*` expands all; remembered per session), an agents
 panel below the workspaces lists agent panes by urgency, and each workspace
@@ -369,6 +394,17 @@ See [docs/CONFIG.md](docs/CONFIG.md), [docs/AGENT-DETECTION.md](docs/AGENT-DETEC
 for reference and contributor details. The product direction is in
 [docs/PRD.md](docs/PRD.md).
 
+## Terminal images
+
+Kitty and Ghostty can display images emitted by panes. Images stay inside pane
+borders, survive detach, and follow scrolling. Press `prefix I` to paste a
+clipboard PNG, or run `kodade-cli pane paste-image 3 screenshot.png`; remote
+panes receive an uploaded file on their own host. See [graphics support and
+limits](docs/GRAPHICS.md).
+
 ## License
 
 Apache License 2.0 — see [LICENSE](LICENSE) and [NOTICE](NOTICE).
+
+Saved SSH machines appear together in the sidebar, with independent reconnects
+and endpoint-scoped agent alerts. See [Machines](docs/MACHINES.md).
