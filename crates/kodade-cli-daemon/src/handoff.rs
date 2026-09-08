@@ -386,7 +386,7 @@ pub(crate) fn send_fds(stream: &UnixStream, fds: &[RawFd]) -> io::Result<()> {
     message.msg_iov = iov.as_ptr() as *mut _;
     message.msg_iovlen = 1;
     message.msg_control = control.as_mut_ptr() as *mut _;
-    message.msg_controllen = control.len();
+    message.msg_controllen = control.len() as _;
     unsafe {
         let cmsg = libc::CMSG_FIRSTHDR(&message);
         if cmsg.is_null() {
@@ -430,7 +430,7 @@ pub(crate) fn recv_fds(stream: &UnixStream, expected: usize) -> io::Result<Vec<R
     message.msg_iov = iov.as_mut_ptr();
     message.msg_iovlen = 1;
     message.msg_control = control.as_mut_ptr() as *mut _;
-    message.msg_controllen = control.len();
+    message.msg_controllen = control.len() as _;
     #[cfg(target_os = "linux")]
     let flags = libc::MSG_CMSG_CLOEXEC;
     #[cfg(not(target_os = "linux"))]
