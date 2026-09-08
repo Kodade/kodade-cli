@@ -52,9 +52,10 @@ survive concurrent screen updates.
 
 Images can arrive directly, through ordinary files or protocol temporary files,
 or through POSIX shared memory on Unix daemons. File ranges use `O/S`; symlinks
-are followed, special files are rejected, and only named protocol files inside
-temporary directories are deleted. POSIX shared memory is unlinked after
-opening. All sources stay on the pane's daemon machine; remote clients receive
+are followed, special files and media not owned by the daemon user are rejected,
+and only named protocol files inside temporary directories are deleted. POSIX
+shared memory is owner-checked before it is unlinked after opening. All sources
+stay on the pane's daemon machine; remote clients receive
 normalized pixel data. Zlib (`o=z`) compression is bounded before image
 validation. Both compressed and uncompressed data count against the per-image
 limits.
