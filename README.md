@@ -63,7 +63,18 @@ cargo build
 cargo run -p kodade-cli
 ```
 
-The installer supports macOS and Linux on arm64 and x86_64.
+The installer supports macOS and Linux on arm64 and x86_64. On Windows x64,
+run PowerShell 5.1+:
+
+```powershell
+irm https://raw.githubusercontent.com/Kodade/kodade-cli/main/install.ps1 | iex
+```
+
+It installs to `$env:LOCALAPPDATA\kodade-cli\bin` by default. Set
+`KODADE_INSTALL_DIR` or pass `-InstallDir` when saving the script first. The
+installer verifies the published ZIP against its exact `SHA256SUMS` entry,
+does not change system settings or PATH permanently, and supports Windows x64
+only; ARM Windows users need x64 emulation or a future native release.
 
 ## Updates
 

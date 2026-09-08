@@ -180,6 +180,7 @@ async fn run_bounded_for(
     command: &mut tokio::process::Command,
     timeout: Duration,
 ) -> Result<(std::process::ExitStatus, Vec<u8>, Vec<u8>)> {
+    #[cfg(unix)]
     unsafe {
         command.pre_exec(|| {
             if libc::setpgid(0, 0) == -1 {
@@ -189,6 +190,7 @@ async fn run_bounded_for(
         });
     }
     let mut child = command.spawn().context("start plugin hook")?;
+    #[cfg(unix)]
     let pid = child
         .id()
         .ok_or_else(|| anyhow!("plugin hook has no process id"))? as i32;
@@ -199,7 +201,9 @@ async fn run_bounded_for(
     let status = match tokio::time::timeout(timeout, child.wait()).await {
         Ok(status) => status.context("wait for plugin hook")?,
         Err(_) => {
+            #[cfg(unix)]
             terminate_group(pid, libc::SIGTERM);
+            #[cfg(unix)]
             settle_group(pid).await;
             let _ = child.wait().await;
             bail!("hook timed out after {} seconds", timeout.as_secs());
@@ -207,11 +211,14 @@ async fn run_bounded_for(
     };
     // A shell may exit while a background child still owns the output pipe.
     // Hooks are bounded units of work, so no descendant may survive the hook.
+    #[cfg(unix)]
     terminate_group(pid, libc::SIGTERM);
+    #[cfg(unix)]
     settle_group(pid).await;
     let stdout = match tokio::time::timeout(KILL_GRACE, stdout_task).await {
         Ok(result) => result.context("join hook stdout")??,
         Err(_) => {
+            #[cfg(unix)]
             terminate_group(pid, libc::SIGKILL);
             Vec::new()
         }
@@ -219,6 +226,7 @@ async fn run_bounded_for(
     let stderr = match tokio::time::timeout(KILL_GRACE, stderr_task).await {
         Ok(result) => result.context("join hook stderr")??,
         Err(_) => {
+            #[cfg(unix)]
             terminate_group(pid, libc::SIGKILL);
             Vec::new()
         }
@@ -265,11 +273,13 @@ fn log_lock() -> &'static Mutex<()> {
     static VALUE: OnceLock<Mutex<()>> = OnceLock::new();
     VALUE.get_or_init(|| Mutex::new(()))
 }
+#[cfg(unix)]
 fn terminate_group(pid: i32, signal: i32) {
     unsafe {
         libc::kill(-pid, signal);
     }
 }
+#[cfg(unix)]
 async fn settle_group(pid: i32) {
     terminate_group(pid, libc::SIGTERM);
     if group_alive(pid) {
@@ -277,6 +287,7 @@ async fn settle_group(pid: i32) {
         terminate_group(pid, libc::SIGKILL);
     }
 }
+#[cfg(unix)]
 fn group_alive(pid: i32) -> bool {
     unsafe {
         libc::kill(-pid, 0) == 0
