@@ -262,6 +262,8 @@ struct ReportedHook {
     state: AgentStateKind,
     source: String,
     agent: Option<String>,
+    process_pid: Option<i32>,
+    process_name: Option<String>,
     reported_at: Instant,
 }
 
@@ -2443,12 +2445,15 @@ impl Session {
                     .get(&pane)
                     .ok_or_else(|| anyhow!("pane {} not found", pane.0))?;
                 let hook_agent = trusted_hook_agent(&source, native_session.as_ref());
+                let process = pane.process_evidence(Instant::now(), true);
                 let mut hook = pane.hook.lock().expect("hook lock poisoned");
                 let changed = hook.as_ref().is_none_or(|previous| previous.state != state);
                 *hook = Some(ReportedHook {
                     state,
                     source,
                     agent: hook_agent,
+                    process_pid: process.pid,
+                    process_name: process.name,
                     reported_at: Instant::now(),
                 });
                 drop(hook);
@@ -3687,6 +3692,8 @@ impl Pane {
                 state: hook.state,
                 source: hook.source,
                 agent: hook.agent,
+                process_pid: hook.process_pid,
+                process_name: hook.process_name,
                 age: now.saturating_duration_since(hook.reported_at),
                 // A `done` report is released once the pane prints anything new.
                 output_since_report: last_output > hook.reported_at,
@@ -3695,13 +3702,14 @@ impl Pane {
         let mut detection = agent::detect(
             manifests,
             process.name.as_deref().or(Some(&self.spawn_process)),
+            process.pid,
             &title,
             &screen,
             output_age,
             hook,
         );
-        // A hook-backed adapter can run under Node/Python. Once that process
-        // exits to a shell, ignore any stale title and sticky hook state.
+        // A hook-backed adapter can run under Node/Python. Once it exits to a
+        // shell, ignore a stale title as an additional conservative guard.
         if process.name.as_deref().is_some_and(agent::is_shell)
             && self
                 .agent_identity
@@ -6194,6 +6202,8 @@ mod tests {
             state: AgentStateKind::Blocked,
             source: "test".into(),
             agent: None,
+            process_pid: None,
+            process_name: None,
             reported_at: Instant::now(),
         });
         assert!(session
@@ -6207,35 +6217,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recognized_hook_identity_survives_a_node_wrapper_but_not_a_shell() {
+    async fn recognized_hook_identity_retires_after_a_non_shell_replacement() {
         let session = Session::spawn(80, 24, "hook-wrapper-identity".into()).unwrap();
         let pane_id = session.snapshot().unwrap().panes[0].id;
         let pane = Arc::clone(&session.panes.lock().unwrap()[&pane_id]);
         {
             let mut process = pane.process.lock().unwrap();
+            process.pid = Some(100);
             process.name = Some("node".into());
             process.checked_at = Instant::now();
         }
-        session
-            .handle(ClientMessage::AgentState {
-                pane: pane_id,
-                state: AgentStateKind::Working,
-                source: "kodade:pi".into(),
-                native_session: Some(NativeSession {
-                    source: "kodade:pi".into(),
-                    agent: "pi".into(),
-                    id: None,
-                    path: None,
-                }),
-            })
-            .unwrap();
-        assert_eq!(
-            session.pane_snapshot(pane_id).unwrap().agent.as_deref(),
-            Some("Pi")
-        );
+        *pane.hook.lock().unwrap() = Some(ReportedHook {
+            state: AgentStateKind::Working,
+            source: "kodade:pi".into(),
+            agent: Some("Pi".into()),
+            process_pid: Some(100),
+            process_name: Some("node".into()),
+            reported_at: Instant::now(),
+        });
+        let pi = session.pane_snapshot(pane_id).unwrap();
+        assert_eq!(pi.agent.as_deref(), Some("Pi"));
 
-        pane.process.lock().unwrap().name = Some("sh".into());
+        {
+            let mut process = pane.process.lock().unwrap();
+            process.pid = Some(101);
+            process.name = Some("sleep".into());
+        }
         assert_eq!(session.pane_snapshot(pane_id).unwrap().agent, None);
+        assert!(session
+            .prompt_agent(pane_id, "Pi", pi.agent_generation, b"must-not-write")
+            .is_err());
     }
 
     #[tokio::test]

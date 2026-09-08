@@ -27,9 +27,9 @@ Detection uses the highest available authority in this order:
 
 1. **Lifecycle hook.** A hook report wins when it is still current. Recognized
    Ködade adapters also identify their agent when a JavaScript/Python wrapper
-   is the foreground process. That identity is bound to current process
-   evidence and is retired when the pane returns to a shell. Arbitrary hook
-   source text never becomes an identity. For
+   is the foreground process. That identity is bound to the captured wrapper
+   PID and executable name, and is retired when any foreground process
+   replacement occurs. Arbitrary hook source text never becomes an identity. For
    `blocked`, `working`, and `idle` reports that means no more than 30 seconds
    old — the daemon constant is `HOOK_TTL = Duration::from_secs(30)`, and a
    report exactly 30 seconds old is still valid. A `done` report has **no

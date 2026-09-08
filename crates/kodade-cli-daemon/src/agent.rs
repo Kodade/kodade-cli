@@ -16,6 +16,10 @@ pub struct HookState {
     pub source: String,
     /// Display identity from a recognized Ködade lifecycle adapter.
     pub agent: Option<String>,
+    /// Foreground process evidence captured when the hook arrived. Hook
+    /// identity cannot survive a process replacement.
+    pub process_pid: Option<i32>,
+    pub process_name: Option<String>,
     pub age: Duration,
     /// True when the pane emitted PTY output after this hook was reported.
     /// A `done` report sticks until output appears (or the next report), rather
@@ -48,6 +52,7 @@ pub struct Detection {
 pub fn detect(
     manifests: &[Manifest],
     process: Option<&str>,
+    process_pid: Option<i32>,
     title: &str,
     screen: &str,
     output_age: Duration,
@@ -59,8 +64,9 @@ pub fn detect(
     let agent = manifest.map(|manifest| manifest.display.clone());
     if let Some(hook) = hook.filter(hook_is_current) {
         // Adapter callbacks commonly run under Node/Python instead of the
-        // agent executable. A shell is conclusive evidence that it exited.
-        let hook_agent = (!process.is_some_and(is_shell) && agent.is_none())
+        // agent executable. Accept their identity only for the same observed
+        // process, never for a later arbitrary foreground program.
+        let hook_agent = (agent.is_none() && hook_matches_wrapper(process, process_pid, &hook))
             .then(|| hook.agent.clone())
             .flatten();
         let identity_from_hook = hook_agent.is_some();
@@ -135,6 +141,20 @@ pub(crate) fn is_shell(process: &str) -> bool {
     matches!(process, "sh" | "bash" | "zsh" | "fish" | "nu")
 }
 
+fn hook_matches_wrapper(process: Option<&str>, process_pid: Option<i32>, hook: &HookState) -> bool {
+    let Some(process) = process else {
+        return false;
+    };
+    // Missing process evidence must fail closed. In particular, never let the
+    // spawn command stand in for a later foreground process.
+    let (Some(process_pid), Some(hook_pid)) = (process_pid, hook.process_pid) else {
+        return false;
+    };
+    matches!(process, "node" | "nodejs" | "python" | "python3")
+        && hook.process_name.as_deref() == Some(process)
+        && hook_pid == process_pid
+}
+
 pub fn rollup(states: impl IntoIterator<Item = AgentStateKind>) -> AgentStateKind {
     states
         .into_iter()
@@ -177,6 +197,7 @@ mod tests {
         let detected = detect(
             &[manifest()],
             Some("codex"),
+            None,
             "",
             "y/n",
             Duration::from_secs(10),
@@ -184,6 +205,8 @@ mod tests {
                 state: AgentStateKind::Working,
                 source: "claude".into(),
                 agent: None,
+                process_pid: None,
+                process_name: None,
                 age: Duration::from_secs(4),
                 output_since_report: false,
             }),
@@ -193,6 +216,7 @@ mod tests {
         let expired = detect(
             &[manifest()],
             Some("codex"),
+            None,
             "",
             "y/n",
             Duration::from_secs(10),
@@ -200,6 +224,8 @@ mod tests {
                 state: AgentStateKind::Working,
                 source: "claude".into(),
                 agent: None,
+                process_pid: None,
+                process_name: None,
                 age: Duration::from_secs(31),
                 output_since_report: false,
             }),
@@ -213,6 +239,7 @@ mod tests {
         let sticky = detect(
             &[manifest()],
             Some("codex"),
+            None,
             "",
             "y/n",
             Duration::from_secs(10),
@@ -220,6 +247,8 @@ mod tests {
                 state: AgentStateKind::Done,
                 source: "claude".into(),
                 agent: None,
+                process_pid: None,
+                process_name: None,
                 age: Duration::from_secs(600),
                 output_since_report: false,
             }),
@@ -230,6 +259,7 @@ mod tests {
         let released = detect(
             &[manifest()],
             Some("codex"),
+            None,
             "",
             "y/n",
             Duration::from_secs(10),
@@ -237,6 +267,8 @@ mod tests {
                 state: AgentStateKind::Done,
                 source: "claude".into(),
                 agent: None,
+                process_pid: None,
+                process_name: None,
                 age: Duration::from_secs(2),
                 output_since_report: true,
             }),
@@ -250,6 +282,8 @@ mod tests {
             state: AgentStateKind::Working,
             source: "kodade:pi".into(),
             agent: Some("Pi".into()),
+            process_pid: Some(42),
+            process_name: Some("node".into()),
             age: Duration::ZERO,
             output_since_report: false,
         };
@@ -257,6 +291,7 @@ mod tests {
             detect(
                 &[],
                 Some("node"),
+                Some(42),
                 "",
                 "",
                 Duration::ZERO,
@@ -267,9 +302,79 @@ mod tests {
             Some("Pi")
         );
         assert_eq!(
-            detect(&[], Some("sh"), "", "", Duration::ZERO, Some(hook)).agent,
+            detect(
+                &[],
+                Some("sh"),
+                Some(42),
+                "",
+                "",
+                Duration::ZERO,
+                Some(hook)
+            )
+            .agent,
             None
         );
+    }
+
+    #[test]
+    fn hook_identity_rejects_a_different_or_unrecognized_process() {
+        let hook = HookState {
+            state: AgentStateKind::Done,
+            source: "kodade:pi".into(),
+            agent: Some("Pi".into()),
+            process_pid: Some(42),
+            process_name: Some("node".into()),
+            age: Duration::ZERO,
+            output_since_report: false,
+        };
+        assert!(detect(
+            &[],
+            Some("sleep"),
+            Some(99),
+            "",
+            "",
+            Duration::ZERO,
+            Some(hook.clone())
+        )
+        .agent
+        .is_none());
+        assert!(detect(
+            &[],
+            Some("node"),
+            None,
+            "",
+            "",
+            Duration::ZERO,
+            Some(hook.clone())
+        )
+        .agent
+        .is_none());
+        // A replacement Node process is still unrelated: the PID captured by
+        // the adapter callback is part of the hook identity.
+        assert!(detect(
+            &[],
+            Some("node"),
+            Some(43),
+            "",
+            "",
+            Duration::ZERO,
+            Some(hook.clone())
+        )
+        .agent
+        .is_none());
+        let mut replacement = hook;
+        replacement.process_name = Some("nodejs".into());
+        assert!(detect(
+            &[],
+            Some("node"),
+            Some(42),
+            "",
+            "",
+            Duration::ZERO,
+            Some(replacement)
+        )
+        .agent
+        .is_none());
     }
 
     #[test]
@@ -277,7 +382,16 @@ mod tests {
         let mut titled = manifest();
         titled.title = vec!["Codex".into()];
         assert_eq!(
-            detect(&[titled], Some("sh"), "Codex", "", Duration::ZERO, None,).agent,
+            detect(
+                &[titled],
+                Some("sh"),
+                None,
+                "Codex",
+                "",
+                Duration::ZERO,
+                None,
+            )
+            .agent,
             Some("Codex".into())
         );
     }
@@ -342,6 +456,7 @@ mod tests {
             let detected = detect(
                 std::slice::from_ref(&manifest),
                 Some(process),
+                None,
                 title,
                 screen,
                 Duration::ZERO,
@@ -365,6 +480,7 @@ mod tests {
         let rule = detect(
             &[manifest()],
             Some("codex"),
+            None,
             "",
             "continue? y/n",
             Duration::ZERO,
@@ -374,6 +490,7 @@ mod tests {
         let unknown = detect(
             &[manifest()],
             Some("vim"),
+            None,
             "",
             "",
             Duration::from_secs(3),

@@ -248,3 +248,23 @@ fn hook_backed_node_agent_needs_no_osc_title() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+#[test]
+fn hook_identity_does_not_survive_a_node_to_sleep_replacement() {
+    let harness = Harness::new();
+    // Pi's hook is emitted from Node without OSC. The Node process then exits
+    // after handing the PTY to sleep, leaving the sticky hook state behind.
+    // Guarded automation must not paste into that replacement process.
+    harness.start(
+        "hook-pi-replacement",
+        "node -e 'const { spawn, spawnSync } = require(\"child_process\"); const report = state => spawnSync(process.env.KODADE_BIN, [\"-s\", process.env.KODADE_SESSION, \"agent\", \"report\", process.env.KODADE_PANE, state, \"--source\", \"kodade:pi\", \"--native-agent\", \"pi\"]); report(\"working\"); setTimeout(() => { spawn(\"sleep\", [\"10\"], { stdio: \"inherit\" }); process.exit(0); }, 300);'",
+    );
+    harness.wait_for_agent("Pi");
+    thread::sleep(Duration::from_millis(800));
+    let rejected = harness.command(["agent", "prompt", "Pi", "SENTINEL-MUST-NOT-ARRIVE"]);
+    assert!(
+        !rejected.status.success(),
+        "stale hook identity accepted replacement: {}",
+        String::from_utf8_lossy(&rejected.stderr)
+    );
+}
