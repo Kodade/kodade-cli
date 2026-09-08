@@ -95,18 +95,21 @@ pub struct InvocationContext {
 }
 
 impl InvocationContext {
+    pub fn supports_contexts(&self, contexts: &[PluginActionContext]) -> bool {
+        contexts.iter().all(|scope| match scope {
+            PluginActionContext::Global => true,
+            PluginActionContext::Workspace => self.workspace_id.is_some(),
+            PluginActionContext::Tab => self.tab_id.is_some(),
+            PluginActionContext::Pane => self.pane.is_some(),
+            PluginActionContext::Selection => self
+                .selected_text
+                .as_ref()
+                .is_some_and(|text| !text.is_empty()),
+        })
+    }
+
     pub fn supports(&self, action: &PluginAction) -> bool {
-        action.contexts.is_empty()
-            || action.contexts.iter().all(|scope| match scope {
-                PluginActionContext::Global => true,
-                PluginActionContext::Workspace => self.workspace_id.is_some(),
-                PluginActionContext::Tab => self.tab_id.is_some(),
-                PluginActionContext::Pane => self.pane.is_some(),
-                PluginActionContext::Selection => self
-                    .selected_text
-                    .as_ref()
-                    .is_some_and(|text| !text.is_empty()),
-            })
+        action.contexts.is_empty() || self.supports_contexts(&action.contexts)
     }
 }
 

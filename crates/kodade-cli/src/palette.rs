@@ -25,6 +25,7 @@ pub enum PaletteTarget {
         pane: bool,
     },
     PluginUnavailable(String),
+    ConfiguredCommand(usize),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -106,6 +107,19 @@ impl Palette {
                 search: "plugin registry error".into(),
                 target: PaletteTarget::PluginUnavailable(error.to_string()),
             }),
+        }
+        for (index, command) in config
+            .commands
+            .iter()
+            .enumerate()
+            .filter(|(_, command)| context.supports_contexts(&command.contexts))
+        {
+            all.push(Item {
+                label: format!("command · {}", command.label),
+                hint: if command.pane { "open pane" } else { "run" }.into(),
+                search: format!("command {} {}", command.label, command.command),
+                target: PaletteTarget::ConfiguredCommand(index),
+            });
         }
         for (name, action) in Config::actions() {
             let hint = config
