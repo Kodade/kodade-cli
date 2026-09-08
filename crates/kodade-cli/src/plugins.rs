@@ -747,7 +747,10 @@ mod tests {
         let subdir = clone.join("plugin");
         fs::create_dir_all(&subdir).unwrap();
         let managed = fs::canonicalize(&root).unwrap();
-        assert_eq!(managed_install_root_in(&managed, &subdir).unwrap(), clone);
+        assert_eq!(
+            managed_install_root_in(&managed, &subdir).unwrap(),
+            clone.canonicalize().unwrap()
+        );
         assert!(managed_install_root_in(&managed, Path::new("/tmp")).is_err());
         fs::remove_dir_all(root).unwrap();
     }
