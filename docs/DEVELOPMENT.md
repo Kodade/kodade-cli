@@ -219,3 +219,8 @@ and installer details.
 Run `python3 scripts/smoke-test.py` after building to exercise cold startup,
 real PTY output, diagnostics, non-destructive config creation, inherited context,
 rename, and shutdown in an isolated home/runtime.
+
+Terminal modes are owned by `terminal::TerminalModes`; cleanup runs after detach,
+failed setup, UI errors, and before panic reporting. `python3 scripts/tui-smoke-test.py`
+exercises a real controlling PTY, detach, a broken transport, and restoration of
+termios, alternate screen, bracketed paste, and cursor visibility.

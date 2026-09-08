@@ -22,14 +22,10 @@ mod render;
 mod selection;
 mod settings;
 mod state;
+mod terminal;
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{CommandFactory, FromArgMatches};
-use crossterm::{
-    event::{DisableBracketedPaste, EnableBracketedPaste},
-    execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
-};
 use kodade_cli_proto::{
     decode, encode, ClientMessage, Direction, Event, QueryKind, ServerMessage, SplitAxis,
     PROTOCOL_VERSION,
@@ -1023,24 +1019,9 @@ async fn tui(
             }
         }
     });
-    enable_raw_mode()?;
-    let mut stdout = std::io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
-    // Bracketed paste lets the client tell a paste from typing (#21).
-    execute!(stdout, EnableBracketedPaste)?;
-    if config.mouse {
-        execute!(stdout, crossterm::event::EnableMouseCapture)?;
-    }
-    let mut term = Terminal::new(CrosstermBackend::new(stdout))?;
-    let result = state.run(&mut term, &mut writer, &mut rx).await;
-    disable_raw_mode()?;
-    execute!(term.backend_mut(), DisableBracketedPaste)?;
-    execute!(term.backend_mut(), LeaveAlternateScreen)?;
-    if config.mouse {
-        execute!(term.backend_mut(), crossterm::event::DisableMouseCapture)?;
-    }
-    term.show_cursor()?;
-    result
+    let _modes = terminal::TerminalModes::enter(config.mouse)?;
+    let mut term = Terminal::new(CrosstermBackend::new(std::io::stdout()))?;
+    state.run(&mut term, &mut writer, &mut rx).await
 }
 
 /// Read the daemon's opening `Welcome` and verify its protocol version before
@@ -1059,17 +1040,13 @@ async fn handshake(
         match decode::<ServerMessage>(line.as_bytes()) {
             Ok(ServerMessage::Welcome { session, version }) => {
                 if version != PROTOCOL_VERSION {
-                    eprintln!(
-                        "protocol version mismatch: client {PROTOCOL_VERSION}, daemon {version} — upgrade kodade-cli on both ends"
-                    );
-                    std::process::exit(1);
+                    bail!("protocol version mismatch: client {PROTOCOL_VERSION}, daemon {version} — upgrade kodade-cli on both ends");
                 }
                 state.handle_session(session);
                 return Ok(());
             }
             Ok(ServerMessage::Error { message }) => {
-                eprintln!("{message}");
-                std::process::exit(1);
+                bail!("{message}");
             }
             // Ignore anything before the Welcome (there should be nothing).
             _ => continue,
