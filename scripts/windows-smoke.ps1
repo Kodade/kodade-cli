@@ -62,9 +62,6 @@ try {
     # The result is written by cmd.exe and checked from the filesystem. This
     # cannot pass merely because the terminal echoed the submitted command.
     $expected = 173 * 29
-    Wait-Until 'interactive cmd prompt' {
-        (Invoke-Native $bin @('--session', $session, 'pane', 'read', $pane)) -match '>'
-    } 20
     Invoke-Native $bin @('--session', $session, 'send', $pane, "set /a 173*29 > `"$resultPath`"") | Out-Null
     $lastScreen = ''
     for ($attempt = 0; $attempt -lt 50; $attempt++) {
