@@ -2,6 +2,7 @@ $ErrorActionPreference = 'Stop'
 
 function Join-NativeArguments([string[]]$Arguments) {
     (($Arguments | ForEach-Object {
+        if ($_ -eq '') { return '""' }
         if ($_ -notmatch '[\s"]') { return $_ }
         '"' + (($_ -replace '(\\*)"', '$1$1\"') -replace '(\\*)$', '$1$1') + '"'
     }) -join ' ')
