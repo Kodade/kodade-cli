@@ -26,12 +26,17 @@ mod paste;
 mod picker;
 mod plugins;
 mod reconnect_view;
+#[cfg(unix)]
+mod remote;
+#[cfg(windows)]
+#[path = "remote_windows.rs"]
 mod remote;
 mod render;
 mod selection;
 mod settings;
 mod state;
 mod terminal;
+mod transport;
 mod update;
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -43,7 +48,6 @@ use ratatui::{backend::CrosstermBackend, Terminal};
 use std::{path::Path, time::Duration};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
-    net::UnixStream,
     sync::mpsc,
 };
 
@@ -75,6 +79,9 @@ async fn main() -> Result<()> {
 
     // Commands that never open a session socket run locally; `session` verbs
     // pass through to the host when `--remote` is set.
+    if matches!(args.command, Some(cli::Command::Bridge)) {
+        return bridge_session(&args.session).await;
+    }
     let needs_socket = matches!(
         args.command,
         None | Some(
@@ -151,6 +158,7 @@ async fn main() -> Result<()> {
     // The config is only loaded where it is used, so `config validate` does not
     // print its warnings twice.
     match command {
+        Some(cli::Command::Bridge) => unreachable!("bridge returns before socket dispatch"),
         Some(cli::Command::Update {
             check,
             channel,
@@ -235,9 +243,14 @@ async fn main() -> Result<()> {
                 staged_hook,
                 hook_socket,
             ) {
+                #[cfg(unix)]
                 (Some(import), Some(token), Some(socket), Some(hook), Some(final_hook)) => {
                     kodade_cli_daemon::run_import(name, import, token, socket, hook, final_hook)
                         .await
+                }
+                #[cfg(not(unix))]
+                (Some(_), Some(_), Some(_), Some(_), Some(_)) => {
+                    bail!("live daemon upgrade is supported on Unix only")
                 }
                 (None, None, None, None, None) => kodade_cli_daemon::run(name).await,
                 _ => bail!("incomplete daemon handoff arguments"),
@@ -525,6 +538,21 @@ async fn main() -> Result<()> {
             Ok(())
         }
     }
+}
+
+/// Remote SSH invokes this hidden command. It owns no protocol framing: the
+/// peer receives exactly the daemon byte stream over the SSH stdio channel.
+async fn bridge_session(session: &str) -> Result<()> {
+    let socket = kodade_cli_daemon::socket_path(session);
+    let daemon = connection::connect(&socket, session, true).await?;
+    let (mut read, mut write) = daemon.into_split();
+    let mut stdin = tokio::io::stdin();
+    let mut stdout = tokio::io::stdout();
+    tokio::select! {
+        result = tokio::io::copy(&mut stdin, &mut write) => { result?; }
+        result = tokio::io::copy(&mut read, &mut stdout) => { result?; }
+    }
+    Ok(())
 }
 
 async fn machine(command: cli::MachineCommand) -> Result<()> {
@@ -1448,7 +1476,7 @@ async fn attach(socket: &Path, session: &str, config: &config::Config, remote: b
 
 /// Sets up the terminal, hands the socket to `App`, and always restores it.
 async fn tui(
-    stream: UnixStream,
+    stream: transport::Stream,
     config: &config::Config,
     session: &str,
     socket: &Path,
@@ -1526,7 +1554,7 @@ async fn tui(
 /// the daemon sends when it rejects our `Hello`) prints a message and exits 1
 /// so the user never sees a half-drawn screen (#23).
 async fn handshake(
-    lines: &mut tokio::io::Lines<BufReader<tokio::net::unix::OwnedReadHalf>>,
+    lines: &mut tokio::io::Lines<BufReader<transport::OwnedReadHalf>>,
     state: &mut app::App,
 ) -> Result<()> {
     loop {

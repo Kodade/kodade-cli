@@ -82,6 +82,7 @@ impl UnicodeTracker {
         }
         std::mem::take(&mut self.chars.0)
     }
+    #[cfg(any(unix, test))]
     pub fn capture_handoff(&self) -> Result<UnicodeHandoff> {
         if self.overflow {
             bail!("unfinished unicode sequence exceeds handoff limit");
@@ -90,6 +91,7 @@ impl UnicodeTracker {
             pending: self.pending.clone(),
         })
     }
+    #[cfg(any(unix, test))]
     pub fn restore_handoff(state: UnicodeHandoff) -> Self {
         let mut result = Self {
             pending: state.pending,
@@ -104,6 +106,7 @@ impl UnicodeTracker {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg(any(unix, test))]
 pub struct UnicodeHandoff {
     pending: Vec<u8>,
 }
@@ -201,6 +204,7 @@ impl VirtualStyle {
         self.foreground
             .map(|image| (image, self.underline.unwrap_or(0)))
     }
+    #[cfg(any(unix, test))]
     pub fn capture_handoff(&self) -> Result<VirtualStyleHandoff> {
         if self.overflow {
             bail!("unfinished SGR sequence exceeds handoff limit");
@@ -211,6 +215,7 @@ impl VirtualStyle {
             pending: self.pending.clone(),
         })
     }
+    #[cfg(any(unix, test))]
     pub fn restore_handoff(state: VirtualStyleHandoff) -> Self {
         let mut result = Self {
             foreground: state.foreground,
@@ -228,6 +233,7 @@ impl VirtualStyle {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg(any(unix, test))]
 pub struct VirtualStyleHandoff {
     foreground: Option<u32>,
     underline: Option<u32>,
@@ -662,6 +668,7 @@ impl Tracker {
 
 /// Bounded graphics and unfinished escape input carried across a live handoff.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg(any(unix, test))]
 pub(crate) struct HandoffState {
     store: HandoffStore,
     decoder: Decoder,
@@ -672,6 +679,7 @@ pub(crate) struct HandoffState {
 /// The JSON handoff format cannot encode tuple map keys. Keep Store optimized
 /// for terminal updates and serialize its sparse virtual grid as explicit rows.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg(any(unix, test))]
 struct HandoffStore {
     images: BTreeMap<u32, ImageData>,
     image_numbers: BTreeMap<u32, u32>,
@@ -684,6 +692,7 @@ struct HandoffStore {
     last_virtual_cell: Option<(bool, i32, u16)>,
 }
 
+#[cfg(any(unix, test))]
 impl From<&Store> for HandoffStore {
     fn from(store: &Store) -> Self {
         Self {
@@ -704,6 +713,7 @@ impl From<&Store> for HandoffStore {
     }
 }
 
+#[cfg(any(unix, test))]
 impl From<HandoffStore> for Store {
     fn from(store: HandoffStore) -> Self {
         Self {
@@ -724,6 +734,7 @@ impl From<HandoffStore> for Store {
     }
 }
 
+#[cfg(any(unix, test))]
 impl HandoffState {
     pub(crate) fn capture(store: &Store, decoder: &Decoder, tracker: &Tracker) -> Result<Self> {
         if tracker.overflow {

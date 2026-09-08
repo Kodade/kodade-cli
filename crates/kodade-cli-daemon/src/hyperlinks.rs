@@ -36,6 +36,7 @@ struct Grid {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg(any(unix, test))]
 pub(crate) struct HandoffState {
     active: Option<u16>,
     uris: Vec<String>,
@@ -489,6 +490,7 @@ impl Tracker {
             self.history.pop_front();
         }
     }
+    #[cfg(any(unix, test))]
     pub(crate) fn capture_handoff(&self) -> anyhow::Result<HandoffState> {
         if self.overflow {
             anyhow::bail!("unfinished hyperlink sequence exceeds handoff limit");
@@ -504,6 +506,7 @@ impl Tracker {
             pending: self.pending.clone(),
         })
     }
+    #[cfg(any(unix, test))]
     pub(crate) fn restore_handoff(state: HandoffState) -> Self {
         let mut result = Self {
             active: state.active,

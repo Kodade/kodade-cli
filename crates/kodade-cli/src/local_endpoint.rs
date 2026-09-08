@@ -5,13 +5,10 @@ use kodade_cli_proto::{decode, encode, ClientMessage, Event, ServerMessage, PROT
 use std::{path::PathBuf, time::Duration};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines},
-    net::{
-        unix::{OwnedReadHalf, OwnedWriteHalf},
-        UnixStream,
-    },
     sync::mpsc,
 };
 
+use crate::transport::{OwnedReadHalf, OwnedWriteHalf};
 use crate::{app::Update, endpoints::Updates};
 
 pub struct Connection {
@@ -118,7 +115,7 @@ async fn reconnect(
 ) -> Result<(Connection, String)> {
     tokio::time::timeout(Duration::from_secs(10), async {
         let stream = loop {
-            match UnixStream::connect(socket).await {
+            match crate::transport::connect(socket).await {
                 Ok(stream) => break stream,
                 Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
             }

@@ -195,6 +195,32 @@ impl Drop for BackendGroup {
 mod tests {
     use super::*;
 
+    #[cfg(windows)]
+    #[tokio::test]
+    #[ignore = "uses the Windows system clipboard; CI runs this explicitly"]
+    async fn windows_native_clipboard_roundtrips_unicode() {
+        async fn read_text() -> Result<String> {
+            let output = tokio::time::timeout(Duration::from_secs(10),
+                tokio::process::Command::new("powershell.exe")
+                    .args(["-NoProfile", "-NonInteractive", "-Command",
+                        "[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding; [Console]::Write((Get-Clipboard -Raw))"])
+                    .kill_on_drop(true).output()).await??;
+            anyhow::ensure!(output.status.success(), "read Windows clipboard");
+            Ok(String::from_utf8(output.stdout)?)
+        }
+        let previous = read_text().await.expect("save clipboard text");
+        let expected = "Ködade 日本語 🚀";
+        let result = async {
+            native_copy(expected).await?;
+            read_text().await
+        }
+        .await;
+        native_copy(&previous)
+            .await
+            .expect("restore clipboard text");
+        assert_eq!(result.expect("native clipboard text"), expected);
+    }
+
     #[test]
     fn limits_at_a_character_boundary() {
         let text = format!("{}é", "x".repeat(OSC52_LIMIT));

@@ -2,19 +2,22 @@
 //! basename, and live working directory. Platform lookups are isolated behind
 //! pure parsers so the wire formats can be unit-tested without a live process.
 
+#[cfg(not(windows))]
 use std::path::PathBuf;
+#[cfg(not(windows))]
 use std::process::Command;
 
 /// Live working directory of `pid`, or `None` when it can't be read.
 ///
 /// Linux reads `/proc/<pid>/cwd`; macOS shells out to `lsof` since there is no
 /// procfs. Callers cache the result (see `Pane`), so one lookup per tick is fine.
+#[cfg(not(windows))]
 pub fn cwd_of(pid: i32) -> Option<PathBuf> {
     #[cfg(target_os = "linux")]
     {
         std::fs::read_link(format!("/proc/{pid}/cwd")).ok()
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
     {
         let output = Command::new("lsof")
             .args(["-a", "-p", &pid.to_string(), "-d", "cwd", "-Fn"])
@@ -25,6 +28,7 @@ pub fn cwd_of(pid: i32) -> Option<PathBuf> {
 }
 
 /// Full command line of `pid` via `ps -p PID -o args=`, or `None` if empty.
+#[cfg(not(windows))]
 pub fn command_of(pid: i32) -> Option<String> {
     let output = Command::new("ps")
         .args(["-p", &pid.to_string(), "-o", "args="])
@@ -36,6 +40,7 @@ pub fn command_of(pid: i32) -> Option<String> {
 /// Kernel start-time identity for a PID. A daemon that adopts a PTY cannot
 /// `waitpid` its original child, so later cleanup compares this value before
 /// signalling a potentially reused PID.
+#[cfg(unix)]
 pub fn start_identity(pid: i32) -> Option<String> {
     #[cfg(target_os = "linux")]
     {
@@ -44,7 +49,29 @@ pub fn start_identity(pid: i32) -> Option<String> {
         let ticks = stat[end + 2..].split_whitespace().nth(19)?;
         Some(ticks.to_owned())
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    {
+        let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::uninit();
+        let size = std::mem::size_of::<libc::proc_bsdinfo>() as i32;
+        let read = unsafe {
+            libc::proc_pidinfo(
+                pid,
+                libc::PROC_PIDTBSDINFO,
+                0,
+                info.as_mut_ptr().cast(),
+                size,
+            )
+        };
+        if read != size {
+            return None;
+        }
+        let info = unsafe { info.assume_init() };
+        Some(format!(
+            "{}:{}",
+            info.pbi_start_tvsec, info.pbi_start_tvusec
+        ))
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         let _ = pid;
         None
@@ -59,8 +86,107 @@ pub fn process_basename(command: &str) -> Option<String> {
     Some(name.trim_start_matches('-').to_owned())
 }
 
+/// Return the live program under a ConPTY's initial shell. Windows has no
+/// process-group leader API, so inspect the bounded Toolhelp snapshot. A pane
+/// spawned directly as an agent (such as `node.exe`) is its own foreground
+/// program; only a shell root needs its descendants inspected.
+#[cfg(windows)]
+#[derive(Clone)]
+struct WindowsProcessEntry {
+    pid: u32,
+    parent: u32,
+    name: String,
+}
+
+#[cfg(windows)]
+fn is_windows_shell(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "cmd.exe" | "conhost.exe"
+    )
+}
+
+#[cfg(windows)]
+fn descendant_from_entries(
+    root: u32,
+    entries: &[WindowsProcessEntry],
+) -> Option<(i32, Option<String>)> {
+    let root_entry = entries.iter().find(|entry| entry.pid == root)?;
+    if !is_windows_shell(&root_entry.name) {
+        return Some((root as i32, Some(windows_process_name(&root_entry.name))));
+    }
+    let mut queue = vec![root];
+    let mut visited = std::collections::HashSet::new();
+    while let Some(parent) = queue.pop() {
+        if !visited.insert(parent) {
+            continue;
+        }
+        for child in entries.iter().filter(|entry| entry.parent == parent) {
+            if !is_windows_shell(&child.name) {
+                return Some((child.pid as i32, Some(windows_process_name(&child.name))));
+            }
+            queue.push(child.pid);
+        }
+    }
+    Some((root as i32, None))
+}
+
+#[cfg(windows)]
+pub fn descendant_process(root: u32) -> Option<(i32, Option<String>)> {
+    use windows_sys::Win32::{
+        Foundation::{CloseHandle, INVALID_HANDLE_VALUE},
+        System::Diagnostics::ToolHelp::{
+            CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+            TH32CS_SNAPPROCESS,
+        },
+    };
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    if snapshot == INVALID_HANDLE_VALUE {
+        return None;
+    }
+    let mut entry = PROCESSENTRY32W {
+        dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+        ..unsafe { std::mem::zeroed() }
+    };
+    let mut entries = Vec::new();
+    unsafe {
+        if Process32FirstW(snapshot, &mut entry) != 0 {
+            loop {
+                let end = entry
+                    .szExeFile
+                    .iter()
+                    .position(|c| *c == 0)
+                    .unwrap_or(entry.szExeFile.len());
+                entries.push(WindowsProcessEntry {
+                    pid: entry.th32ProcessID,
+                    parent: entry.th32ParentProcessID,
+                    name: String::from_utf16_lossy(&entry.szExeFile[..end]),
+                });
+                entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+                if Process32NextW(snapshot, &mut entry) == 0 {
+                    break;
+                }
+            }
+        }
+        CloseHandle(snapshot);
+    }
+    descendant_from_entries(root, &entries)
+}
+
+/// Toolhelp exposes executable filenames (`node.exe`), while manifests and
+/// hook adapters name the foreground program (`node`). Keep the identity in
+/// that shared form before comparing a hook to the live pane process.
+#[cfg(windows)]
+fn windows_process_name(name: &str) -> String {
+    name.strip_suffix(".exe")
+        .or_else(|| name.strip_suffix(".EXE"))
+        .unwrap_or(name)
+        .to_owned()
+}
+
 /// Wrap the pieces of a command so the login shell runs them verbatim. Each
 /// argument is single-quoted (no external `shell-escape` dependency).
+#[cfg(unix)]
 pub fn shell_command(args: &[String]) -> String {
     args.iter()
         .map(|arg| shell_quote(arg))
@@ -69,12 +195,13 @@ pub fn shell_command(args: &[String]) -> String {
 }
 
 /// Single-quote one argument for POSIX shells, escaping embedded quotes.
+#[cfg(unix)]
 fn shell_quote(arg: &str) -> String {
     format!("'{}'", arg.replace('\'', "'\\''"))
 }
 
 /// Parse the `n` field of `lsof -Fn` output into a path.
-#[cfg(any(not(target_os = "linux"), test))]
+#[cfg(any(target_os = "macos", all(test, unix)))]
 fn parse_lsof_cwd(output: &str) -> Option<PathBuf> {
     output
         .lines()
@@ -84,14 +211,24 @@ fn parse_lsof_cwd(output: &str) -> Option<PathBuf> {
 }
 
 /// Parse `ps -o args=` output: the single trimmed line, or `None` if blank.
+#[cfg(not(windows))]
 fn parse_ps_args(output: &str) -> Option<String> {
     let trimmed = output.trim();
     (!trimmed.is_empty()).then(|| trimmed.to_owned())
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn current_process_has_a_stable_kernel_start_identity() {
+        let pid = std::process::id() as i32;
+        let first = start_identity(pid).expect("kernel process identity");
+        assert!(!first.is_empty());
+        assert_eq!(start_identity(pid).as_deref(), Some(first.as_str()));
+        assert!(start_identity(-1).is_none());
+    }
 
     #[test]
     fn parses_lsof_cwd_field() {
@@ -134,5 +271,62 @@ mod tests {
         );
         // An embedded single quote closes, escapes, and reopens the quoting.
         assert_eq!(shell_command(&["it's".into()]), "'it'\\''s'");
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_direct_agent_root_is_not_replaced_by_a_reporter_child() {
+        let entries = vec![
+            WindowsProcessEntry {
+                pid: 10,
+                parent: 1,
+                name: "node.exe".into(),
+            },
+            WindowsProcessEntry {
+                pid: 11,
+                parent: 10,
+                name: "kodade-cli.exe".into(),
+            },
+        ];
+        assert_eq!(
+            descendant_from_entries(10, &entries),
+            Some((10, Some("node".into())))
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_shell_root_returns_its_agent_descendant() {
+        let entries = vec![
+            WindowsProcessEntry {
+                pid: 10,
+                parent: 1,
+                name: "cmd.exe".into(),
+            },
+            WindowsProcessEntry {
+                pid: 11,
+                parent: 10,
+                name: "conhost.exe".into(),
+            },
+            WindowsProcessEntry {
+                pid: 12,
+                parent: 11,
+                name: "node.exe".into(),
+            },
+            WindowsProcessEntry {
+                pid: 13,
+                parent: 12,
+                name: "kodade-cli.exe".into(),
+            },
+        ];
+        assert_eq!(
+            descendant_from_entries(10, &entries),
+            Some((12, Some("node".into())))
+        );
     }
 }

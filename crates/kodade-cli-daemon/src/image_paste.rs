@@ -5,7 +5,6 @@ use serde::{Deserialize, Serialize};
 use std::{
     fs,
     io::{Cursor, Write},
-    os::unix::fs::{DirBuilderExt, OpenOptionsExt},
     path::PathBuf,
     sync::Mutex,
 };
@@ -63,13 +62,22 @@ impl Inbox {
         validate_png(&bytes)?;
         let mut state = self.0.lock().expect("image inbox lock");
         if state.is_none() {
-            let nonce = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)?
-                .as_nanos();
+            let mut random = [0_u8; 16];
+            getrandom::getrandom(&mut random)
+                .map_err(|error| anyhow::anyhow!("image directory nonce: {error}"))?;
+            let nonce: String = random.iter().map(|byte| format!("{byte:02x}")).collect();
             let path =
                 std::env::temp_dir().join(format!("kodade-images-{}-{nonce}", std::process::id()));
-            fs::DirBuilder::new()
-                .mode(0o700)
+            #[cfg(unix)]
+            let mut builder = fs::DirBuilder::new();
+            #[cfg(windows)]
+            let builder = fs::DirBuilder::new();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt;
+                builder.mode(0o700);
+            }
+            builder
                 .create(&path)
                 .context("create private image directory")?;
             *state = Some(Directory {
@@ -86,12 +94,14 @@ impl Inbox {
         }
         directory.next += 1;
         let path = directory.path.join(format!("image-{}.png", directory.next));
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&path)
-            .context("save PNG")?;
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&path).context("save PNG")?;
         if let Err(error) = file.write_all(&bytes).and_then(|_| file.sync_all()) {
             let _ = fs::remove_file(&path);
             return Err(error.into());
@@ -129,11 +139,13 @@ impl Inbox {
         }
     }
 
+    #[cfg(unix)]
     pub(crate) fn snapshot(&self) -> Option<Directory> {
         self.0.lock().expect("image inbox lock").clone()
     }
 
     /// Stage access to the source's attachments without taking deletion rights.
+    #[cfg(unix)]
     pub(crate) fn import(directory: Option<Directory>) -> Result<Self> {
         let Some(mut directory) = directory else {
             return Ok(Self::default());
@@ -157,6 +169,7 @@ impl Inbox {
         Ok(Self(Mutex::new(Some(directory))))
     }
 
+    #[cfg(unix)]
     pub(crate) fn take_ownership(&self) {
         if let Some(directory) = self.0.lock().expect("image inbox lock").as_mut() {
             directory.owned = true;
@@ -174,6 +187,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg(unix)]
     fn staged_handoff_cannot_delete_source_attachments_but_committed_owner_can() {
         let mut bytes = Vec::new();
         {
@@ -223,7 +237,9 @@ mod tests {
         let inbox = Inbox::default();
         let path = inbox.save(&STANDARD.encode(&bytes)).unwrap();
         assert_eq!(fs::read(&path).unwrap(), bytes);
+        #[cfg(unix)]
         use std::os::unix::fs::PermissionsExt;
+        #[cfg(unix)]
         assert_eq!(
             fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o600

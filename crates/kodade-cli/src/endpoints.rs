@@ -12,7 +12,6 @@ use std::{
 use crate::{app, machines::MachineProfile, remote};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
-    net::UnixStream,
     sync::mpsc,
 };
 
@@ -262,7 +261,7 @@ async fn connect_machine(
             Some(_) => return Err(anyhow!("endpoint input discarded during setup")),
         },
     };
-    let stream = tokio::time::timeout(Duration::from_secs(5), UnixStream::connect(&socket))
+    let stream = tokio::time::timeout(Duration::from_secs(5), crate::transport::connect(&socket))
         .await
         .context("connect forwarded endpoint socket timed out")?
         .context("connect forwarded endpoint socket")?;
@@ -382,7 +381,7 @@ async fn connect_machine(
 }
 
 async fn write_endpoint(
-    writer: &mut tokio::net::unix::OwnedWriteHalf,
+    writer: &mut crate::transport::OwnedWriteHalf,
     message: &ClientMessage,
 ) -> Result<()> {
     tokio::time::timeout(Duration::from_secs(5), writer.write_all(&encode(message)?))

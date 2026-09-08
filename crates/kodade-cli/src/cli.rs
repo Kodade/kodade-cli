@@ -93,6 +93,9 @@ pub enum Command {
         #[arg(long, hide = true)]
         hook_socket: Option<PathBuf>,
     },
+    /// Proxy a local daemon connection over stdin/stdout for an SSH client.
+    #[command(hide = true)]
+    Bridge,
     /// Diagnose configuration, tools, and daemon health without starting a session.
     #[command(visible_alias = "status")]
     Doctor {
