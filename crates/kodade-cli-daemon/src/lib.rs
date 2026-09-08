@@ -4991,6 +4991,21 @@ mod tests {
     }
 
     #[test]
+    fn pane_synchronized_output_control_is_not_replayed_to_the_host() {
+        let mut parser = pty_parser(2, 20, 100, PtyCallbacks::default());
+        // Pane output is parsed into the daemon-owned screen. Even an app that
+        // forgets the DECRST terminator cannot leave the attached host waiting.
+        graphics_text(&mut parser, b"\x1b[?2026hstill-visible");
+        let screen = snapshot(&parser);
+        assert_eq!(screen.contents.trim(), "still-visible");
+        assert!(!screen
+            .rows
+            .iter()
+            .flat_map(|row| row.iter())
+            .any(|run| run.text.contains("2026")));
+    }
+
+    #[test]
     fn styled_snapshots_stay_within_size_budgets() {
         // proto::encode is the same serde_json path the socket uses.
         let small = encode(&snapshot(&mixed_sample(24, 80)))
