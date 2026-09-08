@@ -2620,7 +2620,8 @@ impl App {
                 .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER)
             {
                 self.clear_selection();
-                self.open_link(id, row as usize, col as usize);
+                self.open_link(id, row as usize, col as usize, writer)
+                    .await?;
                 return Ok(());
             }
             let mode = match self.click_count(mouse.column, mouse.row) {
@@ -2758,13 +2759,19 @@ impl App {
     }
 
     // Ctrl/cmd-click: open the URL under the pointer with `ui.link_command`.
-    fn open_link(&mut self, pane: PaneId, row: usize, col: usize) {
+    async fn open_link(
+        &mut self,
+        pane: PaneId,
+        row: usize,
+        col: usize,
+        writer: &mut Router,
+    ) -> Result<()> {
         let url = self
             .pane_screen(pane)
             .and_then(|screen| selection::link_at(screen, row, col));
         let Some(url) = url else {
             self.set_note(" no link here");
-            return;
+            return Ok(());
         };
         // Plugin executables are local. A URL from a remote endpoint must not
         // accidentally carry that endpoint's filesystem context into a local
@@ -2774,6 +2781,35 @@ impl App {
                 Ok(Some((plugin, handler, action))) => {
                     let context = self.plugin_context(Some(url.clone()));
                     if context.supports(&action) {
+                        if action.pane {
+                            let workspace = context.workspace.clone().unwrap_or_default();
+                            let focused = context.pane.clone().unwrap_or_default();
+                            let command = crate::plugins::pane_command_with_context(
+                                &plugin.manifest.id,
+                                &plugin.installed.path,
+                                &action.command,
+                                Some(&action.id),
+                                &workspace,
+                                &focused,
+                                &context,
+                            )?;
+                            write(
+                                writer,
+                                &ClientMessage::NewPane {
+                                    workspace: None,
+                                    tab: None,
+                                    split: None,
+                                    command: Some(command),
+                                    name: Some(format!(
+                                        "plugin · {} · {}",
+                                        plugin.manifest.id, action.name
+                                    )),
+                                },
+                            )
+                            .await?;
+                            self.set_note(format!(" plugin {} handling {}", handler.title, url));
+                            return Ok(());
+                        }
                         let session = self.session_name.clone();
                         let socket = self.socket.clone();
                         let results = self.plugin_result_tx.clone();
@@ -2803,7 +2839,7 @@ impl App {
                             let _ = results.send(message);
                         });
                         self.set_note(format!(" plugin {} handling {}", handler.title, url));
-                        return;
+                        return Ok(());
                     }
                 }
                 Err(error) => self.set_note(format!(" plugin URL handler unavailable: {error}")),
@@ -2824,6 +2860,7 @@ impl App {
             }
             Err(error) => self.set_note(format!(" open failed: {error}")),
         }
+        Ok(())
     }
 
     // The newest screen for a pane, if it is still in the layout.
@@ -3343,7 +3380,8 @@ mod tests {
 
     #[test]
     fn auto_hide_collapses_at_80_columns_and_restores_when_widened() {
-        let config = config::Config::default();
+        let mut config = config::Config::default();
+        config.copy_on_select = false;
         let mut app = App::new(&config, "work", PathBuf::from("/tmp/kodade-test.sock"));
         // Default auto_hide_below is 100 columns; 80 is under it.
         app.apply_auto_hide(80);
@@ -3739,6 +3777,62 @@ mod tests {
             zoomed: false,
             restored: false,
         }
+    }
+
+    #[test]
+    fn mouse_selection_reaches_command_context_only_for_its_endpoint_and_pane() {
+        use ratatui::{backend::CrosstermBackend, Terminal};
+        let mut config = config::Config::default();
+        config.copy_on_select = false;
+        let mut app = App::new(
+            &config,
+            "selection-test",
+            PathBuf::from("/tmp/kodade-test.sock"),
+        );
+        let screen = Screen {
+            contents: "selected".into(),
+            rows: vec![vec![kodade_cli_proto::Run {
+                text: "selected".into(),
+                fg: kodade_cli_proto::CellColor::Default,
+                bg: kodade_cli_proto::CellColor::Default,
+                attrs: 0,
+            }]],
+            ..Default::default()
+        };
+        let mut layout = layout_named(&["work"]);
+        layout.tabs = vec![kodade_cli_proto::TabInfo {
+            id: kodade_cli_proto::TabId(1),
+            name: "tab".into(),
+            active: true,
+            state: AgentStateKind::Idle,
+        }];
+        layout.panes = vec![kodade_cli_proto::PaneSnapshot {
+            id: PaneId(1),
+            title: "shell".into(),
+            focused: true,
+            scroll_offset: 0,
+            screen: screen.clone(),
+            agent: None,
+            agent_generation: 0,
+            activity_revision: 0,
+            state: AgentStateKind::Idle,
+            state_reason: String::new(),
+            state_age_secs: 0,
+            cwd: Some(PathBuf::from("/tmp/work")),
+        }];
+        app.layout = Some(layout);
+        let mut selection = Selection::new(PaneId(1), (0, 0), SelectionMode::Char, &screen);
+        selection.set_head((0, 7), &screen);
+        app.selection = Some(selection);
+        app.selecting = true;
+        let mut terminal = Terminal::new(CrosstermBackend::new(std::io::stdout())).unwrap();
+        app.finish_selection(&mut terminal).unwrap();
+        assert_eq!(
+            app.plugin_context(None).selected_text.as_deref(),
+            Some("selected")
+        );
+        app.selected_endpoint = EndpointId::Machine("other".into());
+        assert_eq!(app.plugin_context(None).selected_text, None);
     }
 
     #[test]
