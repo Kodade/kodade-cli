@@ -15,6 +15,7 @@ use std::{
 };
 
 use anyhow::{bail, Context, Result};
+use sha2::Digest;
 use tokio::{net::UnixStream, process::Command};
 
 use crate::cli;
@@ -27,7 +28,7 @@ const INSTALL_HINT: &str =
 
 /// How long to wait for the forwarded local socket to accept a connection.
 const TUNNEL_TIMEOUT: Duration = Duration::from_secs(10);
-const REMOTE_INSTALL: &str = "$HOME/.local/bin/kodade-cli";
+const REMOTE_INSTALL: &str = "\"$HOME/.local/bin/kodade-cli\"";
 
 /// A live SSH forward. Dropping it stops forwarding and removes the local
 /// socket file; the control master lingers (`ControlPersist`) so a reconnect is
@@ -257,14 +258,24 @@ pub fn run_args(control_path: &str, host: &str, remote_args: &[&str]) -> Vec<Str
 fn probe_args(control_path: &str, host: &str) -> Vec<String> {
     let mut args = control_opts(control_path);
     args.push(host.into());
-    args.push("uname -s; uname -m; if [ -x $HOME/.local/bin/kodade-cli ]; then printf '%s\\n' $HOME/.local/bin/kodade-cli; else command -v kodade-cli || true; fi".into());
+    args.push("uname -s; uname -m; if [ -x \"$HOME/.local/bin/kodade-cli\" ]; then printf '%s\\n' \"$HOME/.local/bin/kodade-cli\"; else command -v kodade-cli || true; fi".into());
     args
 }
 
-fn upload_args(control_path: &str, host: &str) -> Vec<String> {
+fn upload_args(
+    control_path: &str,
+    host: &str,
+    expected_bytes: usize,
+    expected_sha256: &str,
+    expected_version: &str,
+) -> Vec<String> {
     let mut args = control_opts(control_path);
     args.push(host.into());
-    args.push("set -eu; dest=$HOME/.local/bin/kodade-cli; mkdir -p \"${dest%/*}\"; tmp=\"$dest.tmp.$$\"; trap 'rm -f \"$tmp\"' EXIT HUP INT TERM; cat >\"$tmp\"; chmod 755 \"$tmp\"; mv -f \"$tmp\" \"$dest\"; trap - EXIT".into());
+    // Values originate from a verified local artifact / package metadata, and
+    // are constrained to digits or a semantic version before interpolation.
+    args.push(format!(
+        "set -eu; umask 077; dest=\"$HOME/.local/bin/kodade-cli\"; dir=\"${{dest%/*}}\"; mkdir -p \"$dir\"; tmp=$(mktemp \"$dir/.kodade-cli.XXXXXX\"); trap 'rm -f \"$tmp\"' EXIT HUP INT TERM; cat >\"$tmp\"; bytes=$(wc -c <\"$tmp\" | tr -d '[:space:]'); [ \"$bytes\" = \"{expected_bytes}\" ]; if command -v sha256sum >/dev/null 2>&1; then actual=$(sha256sum \"$tmp\" | awk '{{print $1}}'); else actual=$(shasum -a 256 \"$tmp\" | awk '{{print $1}}'); fi; [ \"$actual\" = \"{expected_sha256}\" ]; chmod 755 \"$tmp\"; LC_ALL=C \"$tmp\" --version | grep -Fx \"kodade-cli {expected_version}\" >/dev/null; mv -f \"$tmp\" \"$dest\"; trap - EXIT"
+    ));
     args
 }
 
@@ -309,11 +320,45 @@ pub async fn prepare_machine(host: &str, install: bool) -> Result<()> {
     )?)?)?;
     let archive = update::fetch(update::release_asset_url(&release, &asset)?)?;
     let binary = update::verified_binary(&archive, &update::checksum(&sums, &asset)?)?;
+    let expected_sha256 = format!("{:x}", sha2::Sha256::digest(&binary));
+    tokio::time::timeout(
+        Duration::from_secs(45),
+        upload_binary(
+            &control,
+            host,
+            &binary,
+            &expected_sha256,
+            release.tag_name.trim_start_matches('v'),
+        ),
+    )
+    .await
+    .context("remote install timed out")??;
+    let installed = ssh_output(&version_args(&control, host)).await?;
+    if !installed.status.success() || !remote_version_is_compatible(&installed.stdout) {
+        bail!("remote install on {host} did not produce a compatible kodade-cli");
+    }
+    Ok(())
+}
+
+async fn upload_binary(
+    control: &str,
+    host: &str,
+    binary: &[u8],
+    expected_sha256: &str,
+    expected_version: &str,
+) -> Result<()> {
     let mut child = Command::new("ssh")
-        .args(upload_args(&control, host))
+        .args(upload_args(
+            control,
+            host,
+            binary.len(),
+            expected_sha256,
+            expected_version,
+        ))
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
+        .kill_on_drop(true)
         .spawn()
         .context("start remote install")?;
     use tokio::io::AsyncWriteExt;
@@ -326,9 +371,9 @@ pub async fn prepare_machine(host: &str, install: bool) -> Result<()> {
         .await
         .context("upload verified remote binary")?;
     drop(stdin);
-    let output = tokio::time::timeout(Duration::from_secs(45), child.wait_with_output())
+    let output = child
+        .wait_with_output()
         .await
-        .context("remote install timed out")?
         .context("wait for remote install")?;
     if !output.status.success() {
         bail!(
@@ -351,7 +396,7 @@ fn remote_version_is_compatible(stdout: &[u8]) -> bool {
     };
     let local =
         semver::Version::parse(env!("CARGO_PKG_VERSION")).expect("package version is semver");
-    remote.major == local.major
+    remote == local
 }
 
 fn os_to_target(value: &str) -> Result<&'static str> {
@@ -560,7 +605,7 @@ mod tests {
                 "-o",
                 "ControlPersist=60",
                 "user@host",
-                "if [ -x $HOME/.local/bin/kodade-cli ]; then exec $HOME/.local/bin/kodade-cli --version; else exec kodade-cli --version; fi",
+                "if [ -x \"$HOME/.local/bin/kodade-cli\" ]; then exec \"$HOME/.local/bin/kodade-cli\" --version; else exec kodade-cli --version; fi",
             ]
         );
 
@@ -568,7 +613,7 @@ mod tests {
             socket_path_args(cp, host, "work")
                 .last()
                 .map(String::as_str),
-            Some("if [ -x $HOME/.local/bin/kodade-cli ]; then exec $HOME/.local/bin/kodade-cli session path -s work; else exec kodade-cli session path -s work; fi")
+            Some("if [ -x \"$HOME/.local/bin/kodade-cli\" ]; then exec \"$HOME/.local/bin/kodade-cli\" session path -s work; else exec kodade-cli session path -s work; fi")
         );
         assert!(socket_path_args(cp, host, "work")
             .last()
@@ -593,13 +638,17 @@ mod tests {
 
     #[test]
     fn remote_install_upload_is_staged_and_never_touches_system_paths() {
-        let command = upload_args("/tmp/cm-%C", "buildbox")
+        let command = upload_args("/tmp/cm-%C", "buildbox", 42, &"a".repeat(64), "0.2.1")
             .last()
             .unwrap()
             .clone();
-        assert!(command.contains("dest=$HOME/.local/bin/kodade-cli"));
+        assert!(command.contains("dest=\"$HOME/.local/bin/kodade-cli\""));
+        assert!(command.contains("mktemp \"$dir/.kodade-cli.XXXXXX\""));
+        assert!(command.contains("[ \"$bytes\" = \"42\" ]"));
+        assert!(command.contains("[ \"$actual\" = \""));
         assert!(command.contains("chmod 755 \"$tmp\""));
         assert!(command.contains("mv -f \"$tmp\" \"$dest\""));
+        assert!(command.contains("--version | grep -Fx \"kodade-cli 0.2.1\""));
         assert!(!command.contains("/usr/bin"));
     }
 
@@ -613,7 +662,8 @@ mod tests {
 
     #[test]
     fn remote_version_requires_the_current_major_protocol_generation() {
-        assert!(remote_version_is_compatible(b"kodade-cli 0.2.9\n"));
+        assert!(remote_version_is_compatible(b"kodade-cli 0.2.1\n"));
+        assert!(!remote_version_is_compatible(b"kodade-cli 0.2.9\n"));
         assert!(!remote_version_is_compatible(b"kodade-cli 1.0.0\n"));
         assert!(!remote_version_is_compatible(b"unparseable\n"));
     }
