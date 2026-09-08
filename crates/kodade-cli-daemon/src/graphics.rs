@@ -30,6 +30,7 @@ pub struct UnicodeTracker {
     parser: vte::Parser,
     chars: UnicodeChars,
     pending: Vec<u8>,
+    overflow: bool,
 }
 
 #[derive(Default)]
@@ -40,8 +41,8 @@ impl vte::Perform for UnicodeChars {
         self.0.push(c);
         self.1 = true;
     }
-    fn execute(&mut self, _: u8) {
-        self.1 = true;
+    fn execute(&mut self, byte: u8) {
+        self.1 = matches!(byte, 0x18 | 0x1a);
     }
     fn esc_dispatch(&mut self, _: &[u8], _: bool, _: u8) {
         self.1 = true;
@@ -52,23 +53,37 @@ impl vte::Perform for UnicodeChars {
     fn osc_dispatch(&mut self, _: &[&[u8]], _: bool) {
         self.1 = true;
     }
+    fn unhook(&mut self) {
+        self.1 = true;
+    }
 }
 
 impl UnicodeTracker {
     pub fn feed(&mut self, byte: u8) -> Vec<char> {
         self.chars.0.clear();
         self.chars.1 = false;
-        self.pending.push(byte);
+        let standalone = self.pending.is_empty() && byte < 32 && byte != 27;
+        if self.pending.len() < MAX_FRAME {
+            self.pending.push(byte);
+        } else {
+            self.overflow = true;
+        }
         let mut parser = std::mem::take(&mut self.parser);
         parser.advance(&mut self.chars, &[byte]);
         self.parser = parser;
-        if self.chars.1 {
+        if self.chars.1 || standalone {
             self.pending.clear();
+            self.overflow = false;
+            // OSC/DCS dispatch at ESC finishes the string, leaving the parser
+            // inside the new escape sequence until the next byte arrives.
+            if byte == 27 {
+                self.pending.push(byte);
+            }
         }
         std::mem::take(&mut self.chars.0)
     }
     pub fn capture_handoff(&self) -> Result<UnicodeHandoff> {
-        if self.pending.len() > MAX_FRAME {
+        if self.overflow {
             bail!("unfinished unicode sequence exceeds handoff limit");
         }
         Ok(UnicodeHandoff {
@@ -159,17 +174,27 @@ pub struct VirtualStyle {
     underline: Option<u32>,
     pending: Vec<u8>,
     complete: bool,
+    overflow: bool,
 }
 
 impl VirtualStyle {
     pub fn feed(&mut self, byte: u8) {
         self.complete = false;
-        self.pending.push(byte);
+        let standalone = self.pending.is_empty() && byte < 32 && byte != 27;
+        if self.pending.len() < MAX_FRAME {
+            self.pending.push(byte);
+        } else {
+            self.overflow = true;
+        }
         let mut parser = std::mem::take(&mut self.parser);
         parser.advance(self, &[byte]);
         self.parser = parser;
-        if self.complete {
+        if self.complete || standalone {
             self.pending.clear();
+            self.overflow = false;
+            if byte == 27 {
+                self.pending.push(byte);
+            }
         }
     }
     pub fn ids(&self) -> Option<(u32, u32)> {
@@ -177,7 +202,7 @@ impl VirtualStyle {
             .map(|image| (image, self.underline.unwrap_or(0)))
     }
     pub fn capture_handoff(&self) -> Result<VirtualStyleHandoff> {
-        if self.pending.len() > MAX_FRAME {
+        if self.overflow {
             bail!("unfinished SGR sequence exceeds handoff limit");
         }
         Ok(VirtualStyleHandoff {
@@ -213,10 +238,20 @@ impl vte::Perform for VirtualStyle {
     fn print(&mut self, _: char) {
         self.complete = true;
     }
-    fn execute(&mut self, _: u8) {
+    fn execute(&mut self, byte: u8) {
+        self.complete = matches!(byte, 0x18 | 0x1a);
+    }
+    fn esc_dispatch(&mut self, intermediate: &[u8], ignore: bool, byte: u8) {
+        self.complete = true;
+        if !ignore && intermediate.is_empty() && byte == b'c' {
+            self.foreground = None;
+            self.underline = None;
+        }
+    }
+    fn osc_dispatch(&mut self, _: &[&[u8]], _: bool) {
         self.complete = true;
     }
-    fn esc_dispatch(&mut self, _: &[u8], _: bool, _: u8) {
+    fn unhook(&mut self) {
         self.complete = true;
     }
     fn csi_dispatch(&mut self, params: &vte::Params, _: &[u8], ignore: bool, command: char) {
@@ -430,6 +465,7 @@ impl vte::Perform for Controls {
         self.0 = Some(Control::Print(c));
     }
     fn execute(&mut self, byte: u8) {
+        self.1 = matches!(byte, 0x18 | 0x1a);
         if matches!(byte, 10..=12) {
             self.0 = Some(Control::Index);
         }
@@ -504,6 +540,9 @@ impl Tracker {
         if self.events.1 || standalone_control {
             self.pending.clear();
             self.overflow = false;
+            if byte == 27 {
+                self.pending.push(byte);
+            }
         }
         let Some(event) = self.events.0.take() else {
             return 0;
@@ -1871,7 +1910,7 @@ mod tests {
 
     #[test]
     fn handoff_rebuilds_unicode_and_sgr_parsers_at_every_byte() {
-        let unicode = "\u{10eeee}\u{0305}".as_bytes();
+        let unicode = "\x1b]0;title\x1b\\\x1bP+qquery\x1b\\\x1b[3\n1m\u{10eeee}\u{0305}".as_bytes();
         for split in 0..unicode.len() {
             let mut source = UnicodeTracker::default();
             for &byte in &unicode[..split] {
@@ -1892,7 +1931,7 @@ mod tests {
             }
             assert_eq!(expected, actual, "unicode split {split}");
         }
-        let sgr = b"\x1b[38;5;42;58;5;9m";
+        let sgr = b"\x1b]0;title\x1b\\\x1bP+qquery\x1b\\\x1b[38;\n5;42;58;5;9m";
         for split in 0..sgr.len() {
             let mut source = VirtualStyle::default();
             for &byte in &sgr[..split] {
@@ -1910,6 +1949,24 @@ mod tests {
             assert_eq!(source.ids(), restored.ids(), "SGR split {split}");
             assert_eq!(source.ids(), Some((42, 9)));
         }
+    }
+
+    #[test]
+    fn unrelated_complete_controls_do_not_accumulate_handoff_state() {
+        let mut unicode = UnicodeTracker::default();
+        let mut style = VirtualStyle::default();
+        for _ in 0..1024 {
+            for &byte in b"\x1b]0;window title\x1b\\\x1bP+qquery\x1b\\" {
+                unicode.feed(byte);
+                style.feed(byte);
+            }
+        }
+        assert!(unicode.capture_handoff().unwrap().pending.is_empty());
+        assert!(style.capture_handoff().unwrap().pending.is_empty());
+        for &byte in b"\x1b[38;5;42m\x1bc" {
+            style.feed(byte);
+        }
+        assert_eq!(style.ids(), None);
     }
 
     #[test]

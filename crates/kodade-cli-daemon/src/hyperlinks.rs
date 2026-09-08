@@ -25,6 +25,7 @@ pub struct Tracker {
     history_capacity: usize,
     margins: [Option<(u16, u16)>; 2],
     pending: Vec<u8>,
+    overflow: bool,
 }
 
 #[derive(Default, Debug, Clone, Serialize, Deserialize)]
@@ -47,7 +48,7 @@ pub(crate) struct HandoffState {
 }
 
 #[derive(Default)]
-struct Events(Option<Event>);
+struct Events(Option<Event>, bool);
 enum Event {
     Print(char),
     Execute(u8),
@@ -58,23 +59,28 @@ enum Event {
 
 impl vte::Perform for Events {
     fn print(&mut self, c: char) {
+        self.1 = true;
         self.0 = Some(Event::Print(c));
     }
     fn execute(&mut self, b: u8) {
+        self.1 = matches!(b, 0x18 | 0x1a);
         self.0 = Some(Event::Execute(b));
     }
     fn esc_dispatch(&mut self, i: &[u8], ignore: bool, b: u8) {
+        self.1 = true;
         if !ignore && i.is_empty() {
             self.0 = Some(Event::Esc(b));
         }
     }
     fn osc_dispatch(&mut self, p: &[&[u8]], _: bool) {
+        self.1 = true;
         if p.first() == Some(&b"8".as_slice()) && p.len() >= 3 {
             let uri = String::from_utf8_lossy(p[2]).into_owned();
             self.0 = Some(Event::Osc(valid_uri(&uri).then_some(uri)));
         }
     }
     fn csi_dispatch(&mut self, p: &vte::Params, i: &[u8], ignore: bool, c: char) {
+        self.1 = true;
         if ignore || !i.is_empty() {
             return;
         }
@@ -82,6 +88,9 @@ impl vte::Perform for Events {
             c,
             p.iter().map(|x| x.first().copied().unwrap_or(0)).collect(),
         ));
+    }
+    fn unhook(&mut self) {
+        self.1 = true;
     }
 }
 
@@ -224,12 +233,24 @@ impl Tracker {
         let top = margin.0.min(rows - 1);
         let bottom = margin.1.min(rows - 1).max(top);
         self.events.0 = None;
-        self.pending.push(byte);
+        self.events.1 = false;
+        let standalone = self.pending.is_empty() && byte < 32 && byte != 27;
+        if self.pending.len() < MAX_PENDING_BYTES {
+            self.pending.push(byte);
+        } else {
+            self.overflow = true;
+        }
         self.parser.advance(&mut self.events, &[byte]);
+        if self.events.1 || standalone {
+            self.pending.clear();
+            self.overflow = false;
+            if byte == 27 {
+                self.pending.push(byte);
+            }
+        }
         let Some(event) = self.events.0.take() else {
             return;
         };
-        self.pending.clear();
         match event {
             Event::Osc(uri) => {
                 self.active = uri.and_then(|uri| {
@@ -469,7 +490,7 @@ impl Tracker {
         }
     }
     pub(crate) fn capture_handoff(&self) -> anyhow::Result<HandoffState> {
-        if self.pending.len() > MAX_PENDING_BYTES {
+        if self.overflow {
             anyhow::bail!("unfinished hyperlink sequence exceeds handoff limit");
         }
         Ok(HandoffState {
@@ -608,8 +629,23 @@ mod tests {
     }
 
     #[test]
+    fn oversized_partial_osc_refuses_handoff_then_recovers_at_termination() {
+        let (mut tracker, mut screen) = (Tracker::default(), parser());
+        feed(&mut tracker, &mut screen, b"\x1b]0;");
+        feed(
+            &mut tracker,
+            &mut screen,
+            &vec![b'x'; MAX_PENDING_BYTES + 100],
+        );
+        assert_eq!(tracker.pending.len(), MAX_PENDING_BYTES);
+        assert!(tracker.capture_handoff().is_err());
+        feed(&mut tracker, &mut screen, b"\x07");
+        assert!(tracker.capture_handoff().unwrap().pending.is_empty());
+    }
+
+    #[test]
     fn handoff_rebuilds_every_partial_osc8_byte() {
-        let input = b"\x1b]8;;https://example.test/path\x1b\\label\x1b]8;;\x1b\\";
+        let input = b"\x1b]0;title\x1b\\\x1bP+qquery\x1b\\\x1b]8;;https://example.test/path\x1b\\la\x1b[1\tCbel\x1b]8;;\x1b\\";
         for split in 0..input.len() {
             let (mut source, mut source_screen) = (Tracker::default(), parser());
             feed(&mut source, &mut source_screen, &input[..split]);
