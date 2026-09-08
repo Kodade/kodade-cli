@@ -20,8 +20,9 @@ Ködade CLI also works independently of the
 
 ## Status
 
-v0.3.0 supports macOS and Linux on arm64 and x86_64. Standalone binaries and
-checksums are available from [GitHub Releases](https://github.com/Kodade/kodade-cli/releases).
+v0.3.0 supports macOS and Linux on arm64 and x86_64. Distribution uses Homebrew
+and [standalone GitHub releases](https://github.com/Kodade/kodade-cli/releases)
+with checksums.
 Native Windows binaries and Windows installation support remain deferred.
 
 ### What’s in v0.3.0
