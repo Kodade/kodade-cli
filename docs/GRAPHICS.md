@@ -31,7 +31,7 @@ A forced process kill can leave them for the OS's temporary-file cleanup.
 
 ## Protocol support and limits
 
-Supported Kitty actions are direct, uncompressed RGB (`f=24`), RGBA (`f=32`),
+Supported Kitty actions include RGB (`f=24`), RGBA (`f=32`),
 and PNG (`f=100`) transmission (`a=t`), transmit and place (`a=T`), place
 (`a=p`), query (`a=q`), and all/image deletion (`a=d,d=a/A/i/I`). Image IDs,
 revisions, chunking, quiet responses, cell-sized placements, source cropping,
@@ -47,15 +47,24 @@ image and byte limits too. Layouts carry placement metadata; pixel data travels
 through `Query(Image)`. Daemon JSON requests are capped at 16 MiB before
 deserialization, while partial uploads survive concurrent screen updates.
 
-File/shared-memory transfers, compression, animation, virtual Unicode and
-relative placements, pixel placement offsets, and the remaining delete selectors are not implemented.
-Unsupported transmission modes return an error. Ködade never reads a path
-supplied by a graphics escape sequence. This is bounded Kitty support, not
-the full protocol.
+Images can arrive directly, through ordinary files or protocol temporary
+files, or through POSIX shared memory on Unix daemons. File ranges use `O/S`;
+symlinks are followed, special files are rejected, and only named protocol
+files inside temporary directories are deleted. POSIX shared memory is
+unlinked after opening. All of these sources stay on the pane's daemon machine;
+remote clients receive normalized pixel data. Zlib (`o=z`) compression uses the
+existing workspace's flate2 dependency and is bounded before image validation.
+Both compressed and uncompressed data count against the per-image limits.
+
+Animation, virtual Unicode and relative placements, pixel placement offsets,
+and the remaining delete selectors are not implemented on this branch yet.
+Unsupported modes return an error.
 
 ## Verification
 
 Kitty 0.48.2 on Linux arm64 was exercised in a real graphical terminal window.
+`scripts/graphics-media-smoke.py` verifies exact pixels and ownership cleanup
+for direct, zlib, file/range, temporary-file, and POSIX shared-memory transfers.
 `scripts/graphics-smoke-test.py` also uses a real daemon and controlling PTY to
 check image emission/fetch, modal hide/restore, resize, detach cleanup, PNG
 paste, and session attachment cleanup. The isolated localhost OpenSSH smoke also verifies PNG upload, image metadata,

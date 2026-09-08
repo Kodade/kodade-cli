@@ -1,5 +1,7 @@
 //! A bounded Kitty graphics store. Escape commands never reach the host terminal.
 
+mod media;
+
 use std::collections::BTreeMap;
 
 use anyhow::{bail, Context, Result};
@@ -384,13 +386,7 @@ impl Store {
             bail!("unsupported graphics action");
         }
         if action != "p" {
-            if params.get("t").is_some_and(|v| v != "d") || params.contains_key("o") {
-                bail!("use uncompressed direct transfer");
-            }
-            let bytes = STANDARD.decode(&encoded).context("invalid image base64")?;
-            if bytes.len() > MAX_IMAGE {
-                bail!("image exceeds 8 MiB");
-            }
+            let bytes = media::load(&params, &encoded)?;
             let format = number(&params, "f", 32)?;
             let (width, height) = dimensions(format, &params, &bytes)?;
             if action == "q" {
@@ -422,6 +418,7 @@ impl Store {
                 }
                 id = self.next_image;
             }
+            let encoded = STANDARD.encode(bytes);
             let stored = self
                 .images
                 .iter()
@@ -442,7 +439,7 @@ impl Store {
                     format,
                     width,
                     height,
-                    data: STANDARD.encode(bytes),
+                    data: encoded,
                 },
             );
             self.placements.retain(|(_, p)| p.image != id);
@@ -610,6 +607,181 @@ mod tests {
             assert_eq!(text, b"beforeafter");
             assert_eq!(frames, vec![b"a=T,f=24,s=1,v=1,i=7;AAAA".to_vec()]);
         }
+    }
+
+    #[test]
+    fn zlib_pixels_are_decoded_before_storage_and_bad_streams_preserve_the_image() {
+        let mut store = Store::default();
+        // RFC 1950 stream for the RGB pixel [255, 0, 128].
+        let compressed = b"eJz7z9AAAAOAAYA=".to_vec();
+        let mut frame = b"a=T,f=24,s=1,v=1,i=7,o=z;".to_vec();
+        frame.extend(&compressed);
+        let outcome = store.command(&frame, (0, 0), false);
+        assert_eq!(outcome.reply, b"\x1b_Gi=7;OK\x1b\\");
+        let placement = &store.placements(false, 0)[0];
+        assert_eq!(store.image(7, placement.revision).unwrap().data, "/wCA");
+        let revision = placement.revision;
+        let outcome = store.command(b"a=T,f=24,s=1,v=1,i=7,o=z;AAAA", (0, 0), false);
+        assert!(String::from_utf8_lossy(&outcome.reply).contains("EINVAL"));
+        assert_eq!(store.image(7, revision).unwrap().data, "/wCA");
+    }
+
+    #[test]
+    fn file_images_read_only_the_requested_range_and_temporary_images_are_removed() {
+        let path = std::env::temp_dir().join(format!(
+            "tty-graphics-protocol-kodade-{}-file",
+            std::process::id()
+        ));
+        std::fs::write(&path, [99, 255, 0, 128, 77]).unwrap();
+        let encoded = STANDARD.encode(path.to_str().unwrap());
+        let mut store = Store::default();
+        let frame = format!("a=T,t=f,f=24,s=1,v=1,i=9,O=1,S=3;{encoded}");
+        assert_eq!(
+            store.command(frame.as_bytes(), (0, 0), false).reply,
+            b"\x1b_Gi=9;OK\x1b\\"
+        );
+        let placement = &store.placements(false, 0)[0];
+        assert_eq!(store.image(9, placement.revision).unwrap().data, "/wCA");
+        assert!(path.exists(), "regular file belongs to the sender");
+        let frame = frame.replace("t=f", "t=t");
+        assert_eq!(
+            store.command(frame.as_bytes(), (0, 0), false).reply,
+            b"\x1b_Gi=9;OK\x1b\\"
+        );
+        assert!(!path.exists(), "protocol temporary file was consumed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shared_memory_pixels_are_loaded_and_the_object_is_unlinked() {
+        use std::os::fd::FromRawFd;
+        let name = std::ffi::CString::new(format!("/kc-graphics-{}", std::process::id())).unwrap();
+        let fd = unsafe {
+            libc::shm_open(
+                name.as_ptr(),
+                libc::O_RDWR | libc::O_CREAT | libc::O_EXCL,
+                0o600,
+            )
+        };
+        assert!(fd >= 0, "{}", std::io::Error::last_os_error());
+        let _file = unsafe { std::fs::File::from_raw_fd(fd) };
+        assert_eq!(unsafe { libc::ftruncate(fd, 5) }, 0);
+        let mapping = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                5,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                fd,
+                0,
+            )
+        };
+        assert_ne!(mapping, libc::MAP_FAILED);
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                [99u8, 255, 0, 128, 77].as_ptr(),
+                mapping.cast::<u8>(),
+                5,
+            );
+            libc::munmap(mapping, 5);
+        }
+        let frame = format!(
+            "a=T,t=s,f=24,s=1,v=1,i=19,O=1,S=3;{}",
+            STANDARD.encode(name.as_bytes())
+        );
+        let mut store = Store::default();
+        let outcome = store.command(frame.as_bytes(), (0, 0), false);
+        // Always clean the fixture even on the red run.
+        let reopened = unsafe { libc::shm_open(name.as_ptr(), libc::O_RDONLY, 0) };
+        if reopened >= 0 {
+            unsafe {
+                libc::close(reopened);
+                libc::shm_unlink(name.as_ptr());
+            }
+        }
+        assert_eq!(outcome.reply, b"\x1b_Gi=19;OK\x1b\\");
+        let placement = &store.placements(false, 0)[0];
+        assert_eq!(store.image(19, placement.revision).unwrap().data, "/wCA");
+        assert_eq!(reopened, -1, "shared memory was consumed");
+    }
+
+    #[test]
+    fn malformed_and_oversized_compression_cannot_replace_valid_pixels() {
+        use std::io::Write;
+        let mut store = Store::default();
+        store.command(b"a=T,f=24,s=1,v=1,i=7;/wCA", (0, 0), false);
+        let revision = store.placements(false, 0)[0].revision;
+        let compressed = STANDARD.decode("eJz7z9AAAAOAAYA=").unwrap();
+        let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
+        encoder.write_all(&vec![0; MAX_IMAGE + 1]).unwrap();
+        let bomb = encoder.finish().unwrap();
+        for bytes in [compressed[..compressed.len() - 1].to_vec(), bomb] {
+            let frame = format!("a=T,f=24,s=1,v=1,i=7,o=z;{}", STANDARD.encode(bytes));
+            assert!(
+                String::from_utf8_lossy(&store.command(frame.as_bytes(), (0, 0), false).reply)
+                    .contains("EINVAL")
+            );
+            assert_eq!(store.image(7, revision).unwrap().data, "/wCA");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_media_follows_symlinks_but_refuses_special_files_and_unsafe_cleanup() {
+        use std::os::unix::fs::symlink;
+        let root = std::env::temp_dir().join(format!("kc-graphics-files-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let source = root.join("pixels");
+        let link = root.join("linked-pixels");
+        let fifo = root.join("pipe");
+        std::fs::write(&source, [255, 0, 128]).unwrap();
+        symlink(&source, &link).unwrap();
+        let mut store = Store::default();
+        let request = |mode: &str, path: &std::path::Path| {
+            format!(
+                "a=q,t={mode},f=24,s=1,v=1,i=7;{}",
+                STANDARD.encode(path.to_str().unwrap())
+            )
+        };
+        assert_eq!(
+            store
+                .command(request("f", &link).as_bytes(), (0, 0), false)
+                .reply,
+            b"\x1b_Gi=7;OK\x1b\\"
+        );
+        assert!(String::from_utf8_lossy(
+            &store
+                .command(request("t", &source).as_bytes(), (0, 0), false)
+                .reply
+        )
+        .contains("EINVAL"));
+        assert!(
+            source.exists(),
+            "a file without the protocol marker is never deleted"
+        );
+        let name = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        assert!(String::from_utf8_lossy(
+            &store
+                .command(request("f", &fifo).as_bytes(), (0, 0), false)
+                .reply
+        )
+        .contains("EINVAL"));
+        assert!(String::from_utf8_lossy(
+            &store
+                .command(
+                    request("f", std::path::Path::new("/dev/zero")).as_bytes(),
+                    (0, 0),
+                    false
+                )
+                .reply
+        )
+        .contains("EINVAL"));
+        assert!(
+            store.placements(false, 0).is_empty(),
+            "query leaves no placement"
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

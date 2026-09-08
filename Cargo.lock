@@ -799,6 +799,7 @@ dependencies = [
  "atuin-vt100",
  "base64",
  "dirs",
+ "flate2",
  "kodade-cli-proto",
  "libc",
  "png",

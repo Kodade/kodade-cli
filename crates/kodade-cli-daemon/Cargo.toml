@@ -8,6 +8,7 @@ license.workspace = true
 base64.workspace = true
 anyhow.workspace = true
 dirs.workspace = true
+flate2.workspace = true
 libc.workspace = true
 kodade-cli-proto = { path = "../kodade-cli-proto" }
 portable-pty.workspace = true
