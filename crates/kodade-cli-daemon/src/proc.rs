@@ -2,19 +2,22 @@
 //! basename, and live working directory. Platform lookups are isolated behind
 //! pure parsers so the wire formats can be unit-tested without a live process.
 
+#[cfg(not(windows))]
 use std::path::PathBuf;
+#[cfg(not(windows))]
 use std::process::Command;
 
 /// Live working directory of `pid`, or `None` when it can't be read.
 ///
 /// Linux reads `/proc/<pid>/cwd`; macOS shells out to `lsof` since there is no
 /// procfs. Callers cache the result (see `Pane`), so one lookup per tick is fine.
+#[cfg(not(windows))]
 pub fn cwd_of(pid: i32) -> Option<PathBuf> {
     #[cfg(target_os = "linux")]
     {
         std::fs::read_link(format!("/proc/{pid}/cwd")).ok()
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
     {
         let output = Command::new("lsof")
             .args(["-a", "-p", &pid.to_string(), "-d", "cwd", "-Fn"])
@@ -25,6 +28,7 @@ pub fn cwd_of(pid: i32) -> Option<PathBuf> {
 }
 
 /// Full command line of `pid` via `ps -p PID -o args=`, or `None` if empty.
+#[cfg(not(windows))]
 pub fn command_of(pid: i32) -> Option<String> {
     let output = Command::new("ps")
         .args(["-p", &pid.to_string(), "-o", "args="])
@@ -41,22 +45,101 @@ pub fn process_basename(command: &str) -> Option<String> {
     Some(name.trim_start_matches('-').to_owned())
 }
 
+/// Return the live program under a ConPTY's initial shell. Windows has no
+/// process-group leader API, so inspect the bounded Toolhelp snapshot and walk
+/// descendants until a non-shell child (the actual agent) appears.
+#[cfg(windows)]
+pub fn descendant_process(root: u32) -> Option<(i32, Option<String>)> {
+    use windows_sys::Win32::{
+        Foundation::{CloseHandle, INVALID_HANDLE_VALUE},
+        System::Diagnostics::ToolHelp::{
+            CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+            TH32CS_SNAPPROCESS,
+        },
+    };
+    #[derive(Clone)]
+    struct Entry {
+        pid: u32,
+        parent: u32,
+        name: String,
+    }
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    if snapshot == INVALID_HANDLE_VALUE {
+        return None;
+    }
+    let mut entry = PROCESSENTRY32W {
+        dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+        ..unsafe { std::mem::zeroed() }
+    };
+    let mut entries = Vec::new();
+    unsafe {
+        if Process32FirstW(snapshot, &mut entry) != 0 {
+            loop {
+                let end = entry
+                    .szExeFile
+                    .iter()
+                    .position(|c| *c == 0)
+                    .unwrap_or(entry.szExeFile.len());
+                entries.push(Entry {
+                    pid: entry.th32ProcessID,
+                    parent: entry.th32ParentProcessID,
+                    name: String::from_utf16_lossy(&entry.szExeFile[..end]),
+                });
+                entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+                if Process32NextW(snapshot, &mut entry) == 0 {
+                    break;
+                }
+            }
+        }
+        CloseHandle(snapshot);
+    }
+    let shell = |name: &str| {
+        matches!(
+            name.to_ascii_lowercase().as_str(),
+            "cmd.exe" | "conhost.exe"
+        )
+    };
+    let mut queue = vec![root];
+    while let Some(parent) = queue.pop() {
+        for child in entries.iter().filter(|entry| entry.parent == parent) {
+            if !shell(&child.name) {
+                return Some((child.pid as i32, Some(child.name.clone())));
+            }
+            queue.push(child.pid);
+        }
+    }
+    entries.iter().find(|entry| entry.pid == root).map(|entry| {
+        (
+            root as i32,
+            (!shell(&entry.name)).then(|| entry.name.clone()),
+        )
+    })
+}
+
 /// Wrap the pieces of a command so the login shell runs them verbatim. Each
 /// argument is single-quoted (no external `shell-escape` dependency).
 pub fn shell_command(args: &[String]) -> String {
-    args.iter()
-        .map(|arg| shell_quote(arg))
-        .collect::<Vec<_>>()
-        .join(" ")
+    #[cfg(unix)]
+    {
+        args.iter()
+            .map(|arg| shell_quote(arg))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+    #[cfg(windows)]
+    {
+        args.join(" ")
+    }
 }
 
 /// Single-quote one argument for POSIX shells, escaping embedded quotes.
+#[cfg(unix)]
 fn shell_quote(arg: &str) -> String {
     format!("'{}'", arg.replace('\'', "'\\''"))
 }
 
 /// Parse the `n` field of `lsof -Fn` output into a path.
-#[cfg(any(not(target_os = "linux"), test))]
+#[cfg(any(target_os = "macos", all(test, unix)))]
 fn parse_lsof_cwd(output: &str) -> Option<PathBuf> {
     output
         .lines()
@@ -66,12 +149,13 @@ fn parse_lsof_cwd(output: &str) -> Option<PathBuf> {
 }
 
 /// Parse `ps -o args=` output: the single trimmed line, or `None` if blank.
+#[cfg(not(windows))]
 fn parse_ps_args(output: &str) -> Option<String> {
     let trimmed = output.trim();
     (!trimmed.is_empty()).then(|| trimmed.to_owned())
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
