@@ -25,7 +25,7 @@ The largest gaps were outside basic splitting and navigation. Ködade already ha
 | Windows | Unix-only transport | Deferred from v0.3.0. This release supports only Linux and macOS; Windows work is not release evidence. |
 | Live upgrades | Restarting the daemon restarted its panes | Transactional Unix PTY transfer, rollback, client reconnect and preserved live context (#42). A v0.2.1 daemon predates this contract and needs a separate-session migration. |
 | Extended graphics | File, temporary-file, shared-memory, compressed media and virtual/relative placement gaps | Bounded media decoding and ownership, Unicode placeholders and relative geometry; real PTY and host rendering proof (#61) |
-| Keyboard negotiation | Enhanced input and terminal capability queries missing | Per-pane keyboard negotiation and supported capability replies (#64); final Unix release evidence remains pending. |
+| Keyboard negotiation | Enhanced input and terminal capability queries missing | Per-pane keyboard negotiation, handoff-preserved parser state, accurate capability replies and theme-aware OSC 10/11/12/4 color queries (#64). |
 | Windows remote bootstrap | Windows client could not prepare Unix hosts | Deferred with native Windows support; it is outside the v0.3.0 release scope. |
 | Terminal polish | Labeled OSC 8 links, synchronized output and native copy were absent | Implemented in #58 with parser regressions addressed in #59; final Unix release evidence remains pending. |
 
@@ -60,3 +60,14 @@ Defaults should make the first session useful. Advanced commands, hooks and mach
 The strongest reasons to choose Ködade are the combined workflows: open local and SSH projects together; send a guarded prompt to the intended agent; run an extension with the exact selected text and pane context; resume the correct conversation; and, for a v0.3.0 Unix daemon, update the workspace without losing running shells. These claims have prior focused real-process tests in addition to Rust unit tests; final integrated release evidence remains pending.
 
 The documented limits remain part of the product contract. [Graphics](../../GRAPHICS.md) describes the supported Kitty subset. [Agent detection](../../AGENT-DETECTION.md) lists each lifecycle and exact-native-resume contract, and separates verified contracts from identification-only rules. Native live PTY handoff is a Unix capability. The ledger must remain explicit about actual operating-system runner results and release artifacts; a compiling platform branch or a printed fixture label is insufficient evidence.
+
+## Remaining terminal fidelity limits
+
+This release does not claim universal terminal-protocol equivalence. Ködade
+preserves basic underlines, but does not retain double, curly, dotted, or dashed
+underlines. The pinned HerdR does retain these styles through its host/remote
+path (`src/pane/terminal.rs`, `src/protocol/wire.rs`, and
+`src/protocol/render_ansi.rs`). Neither compared host/remote path preserves
+independent underline colors. Ködade answers unsupported `Su`, `Smulx`, and
+`Setulc` capability queries negatively instead of promising unavailable
+rendering. Graphics animation remains outside the documented Kitty subset.

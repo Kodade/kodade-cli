@@ -527,7 +527,13 @@ colors to the daemon for read-only terminal queries. Pane programs can query
 OSC 10, OSC 11, OSC 12, and every OSC 4 entry: slots 0–15 use the attached
 theme and slots 16–255 use the fixed standard xterm palette. Read-only clients
 do not replace a pane's query colors. A nonempty `NO_COLOR` disables these
-answers because the client is not emitting the reported theme colors.
+answers because the client is not emitting the reported theme colors. Theme
+changes and reconnects update each endpoint. Programs cannot mutate the
+client theme through OSC color setters.
+
+Pane rendering supports basic underlines. Styled underlines (double, curly,
+dotted, and dashed) and independent underline colors are not preserved.
+Capability queries therefore do not advertise `Su`, `Smulx`, or `Setulc`.
 
 The complete built-in `kodade-dark` theme:
 

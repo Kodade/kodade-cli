@@ -25,6 +25,8 @@ created.
 - Preserve negotiated keyboard modes, modified shortcuts, and key event types
   while retaining legacy input for applications that do not request them.
 
+- Answer terminal color queries from the actual client theme, including cursor
+  and all 256 palette entries; preserve theme ownership through reconnects.
 - Add bounded Kitty graphics, PNG paste, OSC 8 links, synchronized terminal
   frames, and native local clipboard support with OSC 52 fallback.
 - Add Unix live daemon handoff for sessions already running v0.3.0. A failed

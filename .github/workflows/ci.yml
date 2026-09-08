@@ -46,3 +46,5 @@ jobs:
       - name: Exercise terminal keyboard input through a real TUI
         if: runner.os != 'Windows'
         run: python3 scripts/terminal-keyboard-tui-smoke.py target/debug/kodade-cli
+      - name: Exercise live terminal colors and handoff reconnect
+        run: python3 scripts/terminal-colors-tui-smoke.py target/debug/kodade-cli
