@@ -76,7 +76,7 @@ impl Palette {
             });
         }
         all.push(Item {
-            label: "agent · shell".into(),
+            label: "shell · new tab".into(),
             hint: "new tab".into(),
             search: "terminal shell new pane tab".into(),
             target: PaletteTarget::Shell,

@@ -157,6 +157,11 @@ pub fn overlay_key(overlay: &mut Overlay, key: KeyEvent) -> OverlayEvent {
 /// The centered box the overlay occupies inside `area`.
 pub fn overlay_rect(area: Rect, overlay: &Overlay) -> Rect {
     let rows = overlay.rows.len() as u16;
+    let rows = if overlay.title.starts_with("command center") {
+        rows.min(16)
+    } else {
+        rows
+    };
     let chrome = if overlay.filter.is_some() { 4 } else { 3 };
     let width = area.width.saturating_sub(4).clamp(8, 72);
     let height = area

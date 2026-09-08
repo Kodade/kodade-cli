@@ -1164,6 +1164,7 @@ mod tests {
                         name: "zsh".into(),
                         state: AgentStateKind::Idle,
                         state_age_secs: 12,
+                        detected: true,
                     }],
                 }],
             }],
