@@ -64,7 +64,7 @@ name = "example-agent"
 # Human-readable label shown for a detected agent.
 display = "Example Agent"
 
-# Optional: command that resumes the agent's last session (metadata only).
+# Optional metadata command that opens the agent's resume surface.
 resume = "example-agent --continue"
 
 # Exact foreground process basenames that identify the agent.
@@ -108,7 +108,7 @@ only — no screen rules — until a real session confirms their prompt strings.
 Verified:
 
 - Claude Code (`claude-code.toml`) — blocked/working rules, `resume = "claude --continue"`
-- Codex (`codex.toml`) — blocked/working rules, `resume = "codex resume --last"`
+- Codex (`codex.toml`) — blocked/working rules, `resume = "codex resume"`
 - Grok Build (`grok.toml`) — blocked rule, `resume = "grok --continue"`
 - OpenCode (`opencode.toml`) — blocked/working rules
 - Gemini CLI (`gemini-cli.toml`) — blocked rule, `resume = "gemini --resume latest"`
@@ -134,10 +134,11 @@ Ködade hosts).
 
 ### `resume`
 
-A manifest may set an optional `resume` string — the command that resumes the
-agent's most recent session (for example `codex resume --last`). Session
-restore uses it to relaunch an agent where it left off. It is metadata only and
-does not affect state detection.
+A manifest may set an optional `resume` string — a metadata command that opens
+the agent's resume surface (for example `codex resume`). It does not select a
+session and does not participate in restoration or state detection. Restoring
+a saved pane requires an integration-reported native ID and that agent's exact
+ID-based command.
 
 ### The `y/n` caveat
 
@@ -241,7 +242,7 @@ state, so detection does not depend on screen strings alone.
   `qwen --resume ID` in its [hooks](https://github.com/QwenLM/qwen-code/blob/main/docs/users/features/hooks.md) and [headless reference](https://github.com/QwenLM/qwen-code/blob/main/docs/users/features/headless.md).
 - `integrate omp [--write]` — writes a Pi-compatible extension below OMP's
   configured agent directory (normally `~/.omp/agent/extensions`). It reports
-  `session_start` → done and `agent_start`/`agent_settled` → working/done with
+  `session_start` → idle and `agent_start`/`agent_settled` → working/done with
   the session ID or session file. OMP's local CLI help documents
   `--resume=<id-or-path>`; the installed extension is fixture-tested here.
 - `integrate kilo [--write]` — writes an auto-loaded global plugin at
@@ -269,13 +270,13 @@ state, so detection does not depend on screen strings alone.
 - `integrate mastra [--write]` — merges Mastra Code's flat command entries
   into `~/.mastracode/hooks.json`: session start → idle, prompt/agent/tool
   events → working, permission requests → blocked, and agent end/stop → done.
-  Its documented `session_id` is retained for exact restoration with
-  `mastracode --thread ID`.
+  The vendor documents a `session_id` hook field, but no CLI thread-resume
+  argument; Ködade therefore keeps it out of native restore metadata.
 - `integrate grok [--write]` — writes Ködade's self-contained `SessionStart`
   configuration to `~/.grok/hooks/kodade-cli.json` (or
   `$GROK_HOME/hooks/kodade-cli.json`). Grok merges hook files in that
   directory, so it does not modify any user hook file. The documented
-  `session_id` restores exactly with `grok --resume ID`.
+  `sessionId` restores exactly with `grok --resume ID`.
 
 Merges are idempotent and never remove unrelated keys or hooks. A previously
 installed Ködade report hook for the same event is upgraded in place (matched

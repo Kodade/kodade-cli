@@ -1151,6 +1151,12 @@ fn remove_hooks_value(settings: &mut Value) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use std::{
+        io::Write,
+        process::{Command, Stdio},
+        time::{SystemTime, UNIX_EPOCH},
+    };
 
     #[test]
     fn downloaded_manifest_must_match_the_daemon_schema() {
@@ -1374,6 +1380,65 @@ mod tests {
         remove_root_hook_settings(&mastra).unwrap();
         let retained: Value = serde_json::from_slice(&fs::read(&mastra).unwrap()).unwrap();
         assert_eq!(retained["Stop"][0]["command"], "echo keep");
+        fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn generated_remaining_hook_commands_receive_the_complete_vendor_payload() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let temp = std::env::temp_dir().join(format!("kodade-hook-exec-{unique}"));
+        fs::create_dir_all(&temp).unwrap();
+        let args = temp.join("args");
+        let payload_file = temp.join("payload");
+        let recorder = temp.join("record-kodade-call");
+        fs::write(
+            &recorder,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > {}\ncat > {}\n",
+                args.display(),
+                payload_file.display()
+            ),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&recorder, fs::Permissions::from_mode(0o755)).unwrap();
+        let payload =
+            r#"{"sessionId":"root-id","session_id":"root-snake","nested":{"sessionId":"decoy"}}"#;
+
+        for command in [
+            devin_hooks()["Stop"][0]["hooks"][0]["command"]
+                .as_str()
+                .unwrap(),
+            mastra_hooks()["Stop"][0]["command"].as_str().unwrap(),
+            grok_hooks()["hooks"]["SessionStart"][0]["hooks"][0]["command"]
+                .as_str()
+                .unwrap(),
+        ] {
+            let mut child = Command::new("sh")
+                .arg("-c")
+                .arg(command)
+                .env("KODADE_PANE", "19")
+                .env("KODADE_SOCKET", "/tmp/kodade.sock")
+                .env("KODADE_BIN", &recorder)
+                .stdin(Stdio::piped())
+                .spawn()
+                .unwrap();
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(payload.as_bytes())
+                .unwrap();
+            assert!(child.wait().unwrap().success());
+            assert_eq!(fs::read_to_string(&payload_file).unwrap(), payload);
+            let argv = fs::read_to_string(&args).unwrap();
+            assert!(argv.contains("agent\nreport\n19"));
+            assert!(argv.contains("--hook-json"));
+        }
         fs::remove_dir_all(temp).unwrap();
     }
 

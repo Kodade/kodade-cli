@@ -1188,6 +1188,14 @@ fn hook_session_id(source: &str, agent: Option<&str>) -> Result<Option<String>> 
     }
     let value: serde_json::Value =
         serde_json::from_slice(&payload).context("parse hook payload")?;
+    Ok(hook_session_id_from_value(&value, source, agent))
+}
+
+fn hook_session_id_from_value(
+    value: &serde_json::Value,
+    source: &str,
+    agent: Option<&str>,
+) -> Option<String> {
     let key = match (source, agent) {
         ("kodade:codex", Some("codex")) => "session_id",
         ("kodade:claude-code", Some("claude")) | ("kodade:gemini-cli", Some("gemini")) => {
@@ -1198,13 +1206,13 @@ fn hook_session_id(source: &str, agent: Option<&str>) -> Result<Option<String>> 
         | ("kodade:droid", Some("droid"))
         | ("kodade:kimi", Some("kimi"))
         | ("kodade:qwen", Some("qwen")) => "session_id",
-        ("kodade:grok", Some("grok")) | ("kodade:mastra", Some("mastra")) => "session_id",
-        _ => return Ok(None),
+        ("kodade:grok", Some("grok")) => "sessionId",
+        _ => return None,
     };
-    Ok(value
+    value
         .get(key)
         .and_then(serde_json::Value::as_str)
-        .map(str::to_owned))
+        .map(str::to_owned)
 }
 
 fn print_manifests(message: ServerMessage, json: bool) -> Result<()> {
@@ -1497,4 +1505,22 @@ fn init_config() -> Result<()> {
     file.write_all(b"# K\xc3\xb6dade CLI configuration. Unspecified settings keep their defaults.\n# Run kodade-cli keys to inspect live bindings; prefix space opens the command center.\ntheme = \"auto\"\n\n# Off by default: retain a bounded private screen replay after a cold restart.\n[session]\npane_history = false\n\n[sidebar]\nwidth = 24\n\n[notify]\nonly_when_unfocused = true\n")?;
     println!("created {}", path.display());
     Ok(())
+}
+
+#[cfg(test)]
+mod hook_payload_tests {
+    use super::*;
+
+    #[test]
+    fn grok_uses_the_documented_top_level_camel_case_session_id() {
+        let payload = serde_json::json!({
+            "sessionId": "grok-root",
+            "toolInput": { "sessionId": "nested-decoy" },
+            "session_id": "snake-decoy",
+        });
+        assert_eq!(
+            hook_session_id_from_value(&payload, "kodade:grok", Some("grok")),
+            Some("grok-root".into())
+        );
+    }
 }
