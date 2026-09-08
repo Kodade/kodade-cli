@@ -24,6 +24,7 @@ mod selection;
 mod settings;
 mod state;
 mod terminal;
+mod update;
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{CommandFactory, FromArgMatches};
@@ -53,6 +54,9 @@ async fn main() -> Result<()> {
     )?;
     let session = args.session.clone();
     let remote = args.remote.clone();
+    if remote.is_some() && matches!(args.command, Some(cli::Command::Update { .. })) {
+        bail!("update is local-only; run kodade-cli update on the remote host directly");
+    }
 
     // Commands that never open a session socket run locally; `session` verbs
     // pass through to the host when `--remote` is set.
@@ -132,6 +136,60 @@ async fn main() -> Result<()> {
     // The config is only loaded where it is used, so `config validate` does not
     // print its warnings twice.
     match command {
+        Some(cli::Command::Update {
+            check,
+            channel,
+            show_channel,
+            install_to,
+        }) => {
+            if let Some(channel) = channel.as_deref() {
+                update::save_channel(channel)?;
+            }
+            let channel = channel.unwrap_or(update::saved_channel()?);
+            if show_channel {
+                println!("{channel}");
+                return Ok(());
+            }
+            let metadata = String::from_utf8(update::fetch(update::metadata_url(&channel))?)?;
+            let release = update::select_release(&channel, &metadata)?;
+            if check && install_to.is_none() {
+                println!(
+                    "channel: {channel}\ninstalled: {}\navailable: {}",
+                    env!("CARGO_PKG_VERSION"),
+                    release.tag_name
+                );
+                Ok(())
+            } else if install_to.is_none()
+                && !update::release_is_newer(&release.tag_name, env!("CARGO_PKG_VERSION"))
+            {
+                println!(
+                    "Ködade CLI {} is already current on the {channel} channel.",
+                    env!("CARGO_PKG_VERSION")
+                );
+                Ok(())
+            } else {
+                let explicit_destination = install_to.is_some();
+                let destination = install_to.unwrap_or(
+                    std::env::current_exe().context("find installed kodade-cli executable")?,
+                );
+                if !explicit_destination {
+                    if let Some(command) = update::package_upgrade_command(&destination) {
+                        println!("This Ködade installation is package-managed. Upgrade it with:\n  {command}");
+                        return Ok(());
+                    }
+                }
+                let version = release.tag_name.trim_start_matches('v');
+                let asset = update::platform_asset(version)?;
+                let sums = String::from_utf8(update::fetch(update::release_asset_url(
+                    &release,
+                    "SHA256SUMS",
+                )?)?)?;
+                let archive = update::fetch(update::release_asset_url(&release, &asset)?)?;
+                update::install_archive(&archive, &update::checksum(&sums, &asset)?, &destination)?;
+                println!("installed verified {version} to {}", destination.display());
+                Ok(())
+            }
+        }
         // No subcommand attaches the TUI to the session.
         None => attach(&socket, &session, &config::Config::load(), remote.is_some()).await,
         Some(cli::Command::Doctor { json }) => {

@@ -23,6 +23,7 @@ clap_complete = "4"
 crossterm = "0.29"
 # `dirs` supplies the cross-platform home-directory fallback for socket state.
 dirs = "5"
+flate2 = "1"
 libc = "0.2"
 # Portable-pty hosts the login shell independently from the attaching client.
 portable-pty = "0.9"
@@ -36,6 +37,9 @@ regex = "1"
 # Serde JSON is the documented, script-friendly daemon protocol.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+semver = "1"
+sha2 = "0.10"
+tar = "0.4"
 # TOML plus Serde derives load public agent-detection manifests without a custom parser.
 toml = "0.8"
 # `toml_edit` merges the Codex `notify` entry into config.toml without dropping user comments (#20 reuses it).
