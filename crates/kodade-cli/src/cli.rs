@@ -479,6 +479,8 @@ impl From<DirectionArg> for Direction {
 
 #[derive(Debug, Subcommand, PartialEq, Eq)]
 pub enum AgentCommand {
+    /// Print the versioned local automation guide without connecting to a session.
+    Guide,
     /// List recognized agents and their states.
     Ls {
         /// Print the matching pane snapshots as JSON.

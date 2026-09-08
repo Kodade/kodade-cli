@@ -225,7 +225,9 @@ background; `tokyo-night` and custom themes are also available. See the
 [Themes](docs/CONFIG.md#themes) section for the schema.
 
 Run `kodade-cli --help` for the full command list and `kodade-cli --version`
-for the installed version. The scripting commands are:
+for the installed version. `kodade-cli agent guide` prints the bundled
+[automation guide](docs/AGENT-GUIDE.md), including targeting, guarded prompts,
+waits, remote endpoints, and exit codes. The scripting commands are:
 
 - `kodade-cli ls` — list sessions, workspaces, tabs, panes, and states.
 - `kodade-cli new -w NAME [PATH]` — create a workspace with an optional root
