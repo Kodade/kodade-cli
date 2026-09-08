@@ -4,6 +4,7 @@ use kodade_cli_proto::{
     PaneId, PaneSnapshot, QueryKind, ServerMessage, SessionFile, TabId, TabInfo, WorkspaceId,
     WorkspaceInfo,
 };
+use regex::Regex;
 use std::{fs, path::Path, time::Duration};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
@@ -164,6 +165,93 @@ pub async fn poll_pane(
             return Ok(false);
         }
         tokio::time::sleep(POLL).await;
+    }
+}
+
+/// Fetch the pane text exactly as `pane read` does, including scrollback when
+/// requested. Keeping this at the socket seam makes waits work for background
+/// tabs and workspaces too.
+pub async fn read_pane(
+    socket: &Path,
+    pane: PaneId,
+    scrollback: bool,
+    lines: Option<usize>,
+) -> Result<String> {
+    match request(
+        socket,
+        ClientMessage::ReadPane {
+            id: pane,
+            scrollback,
+            lines,
+        },
+    )
+    .await?
+    {
+        ServerMessage::PaneText { text, .. } => Ok(text),
+        other => bail!("daemon sent an unexpected {}", server_message_name(&other)),
+    }
+}
+
+/// Compile the caller's requested output matcher once before polling.
+pub fn output_matcher(text: &str, regex: bool) -> Result<OutputMatcher> {
+    if regex {
+        Ok(OutputMatcher::Regex(
+            Regex::new(text).context("invalid --regex pattern")?,
+        ))
+    } else {
+        Ok(OutputMatcher::Literal(text.to_owned()))
+    }
+}
+
+pub enum OutputMatcher {
+    Literal(String),
+    Regex(Regex),
+}
+
+impl OutputMatcher {
+    pub fn matches(&self, text: &str) -> bool {
+        match self {
+            Self::Literal(needle) => text.contains(needle),
+            Self::Regex(pattern) => pattern.is_match(text),
+        }
+    }
+}
+
+/// Resolve a script target that names a numeric pane id or a unique
+/// recognized-agent label / pane title. The caller validates whether
+/// the resulting pane is an agent before it sends input.
+pub async fn resolve_agent_target(socket: &Path, target: &str) -> Result<PaneSnapshot> {
+    let layout = layout(request(socket, layout_query()).await?)?;
+    if let Ok(id) = target.parse::<u64>() {
+        return pane_snapshot(
+            request(socket, ClientMessage::Query(QueryKind::Pane(PaneId(id)))).await?,
+        );
+    }
+
+    // Layout snapshots carry all recognized agents in sidebar metadata, while
+    // full pane titles travel on individual Pane queries. Querying this small
+    // candidate set keeps title resolution global without broadening the wire
+    // protocol or relying on the focused tab.
+    let candidate_ids = layout
+        .workspaces
+        .iter()
+        .flat_map(|workspace| workspace.tabs.iter())
+        .flat_map(|tab| tab.agents.iter())
+        .map(|agent| agent.pane)
+        .chain(layout.panes.iter().map(|pane| pane.id))
+        .collect::<std::collections::HashSet<_>>();
+    let mut matches = Vec::new();
+    for id in candidate_ids {
+        let pane =
+            pane_snapshot(request(socket, ClientMessage::Query(QueryKind::Pane(id))).await?)?;
+        if pane.agent.as_deref() == Some(target) || pane.title == target {
+            matches.push(pane);
+        }
+    }
+    match matches.len() {
+        0 => bail!("agent target '{target}' not found; use a pane id, agent name, or pane title"),
+        1 => Ok(matches.remove(0)),
+        _ => bail!("agent target '{target}' is ambiguous; use a pane id"),
     }
 }
 
@@ -535,14 +623,6 @@ pub fn focused_pane(layout: &LayoutSnapshot) -> Result<PaneId> {
         .ok_or_else(|| anyhow!("no focused pane in reply"))
 }
 
-pub fn find_pane(layout: &LayoutSnapshot, id: PaneId) -> Result<&kodade_cli_proto::PaneSnapshot> {
-    layout
-        .panes
-        .iter()
-        .find(|pane| pane.id == id)
-        .ok_or_else(|| anyhow!("pane {} not found", id.0))
-}
-
 pub fn state_name(state: AgentStateKind) -> &'static str {
     match state {
         AgentStateKind::Blocked => "blocked",
@@ -598,6 +678,8 @@ mod tests {
                 scroll_offset: 0,
                 screen: Screen::default(),
                 agent: Some("Codex".into()),
+                agent_generation: 1,
+                activity_revision: 0,
                 state: AgentStateKind::Blocked,
                 state_reason: "manifest rule 'Allow?' matched".into(),
                 state_age_secs: 0,
@@ -666,6 +748,17 @@ mod tests {
     fn parses_reported_agent_states() {
         assert_eq!(parse_state("done").unwrap(), AgentStateKind::Done);
         assert!(parse_state("busy").is_err());
+    }
+
+    #[test]
+    fn output_matchers_keep_literal_default_and_validate_regexes() {
+        assert!(output_matcher("build [42]", false)
+            .unwrap()
+            .matches("build [42] complete"));
+        assert!(output_matcher(r"build \d+", true)
+            .unwrap()
+            .matches("build 42 complete"));
+        assert!(output_matcher("[", true).is_err());
     }
 
     #[test]

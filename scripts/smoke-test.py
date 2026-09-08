@@ -52,6 +52,16 @@ with tempfile.TemporaryDirectory(prefix="kodade-smoke-") as directory:
         assert next(check for check in report["checks"] if check["name"] == "daemon")["status"] == "ok"
         assert run("-s", "../outside", "session", "path", success=False).returncode != 0
 
+        # Agent start also creates a missing session, and `current` cannot cross sockets.
+        cold = run("-s", "cold-agent", "agent", "start", "--name", "cold", "--",
+                   "sh", "-c", "sleep 30").stdout.strip()
+        assert cold.isdigit()
+        cold_socket = run("-s", "cold-agent", "session", "path").stdout.strip()
+        foreign = run("--socket", cold_socket, "agent", "read", "current",
+                      extra={"KODADE_SESSION": "default", "KODADE_SOCKET": str(socket),
+                             "KODADE_PANE": pane}, success=False)
+        assert foreign.returncode != 0 and "different socket" in foreign.stderr
+
         # Inherited sockets remain authoritative after a live session rename.
         run("session", "rename", "renamed")
         renamed_socket = run("-s", "renamed", "session", "path").stdout.strip()
@@ -68,7 +78,7 @@ with tempfile.TemporaryDirectory(prefix="kodade-smoke-") as directory:
             time.sleep(0.05)
     finally:
         # Cleanup is scoped to sessions created by this test, even after assertions fail.
-        for session in ("default", "renamed"):
+        for session in ("default", "renamed", "cold-agent"):
             run("-s", session, "kill-session", success=False)
 
 print("CLI smoke passed: cold start, real PTY output, diagnostics, config preservation, session context, rename, shutdown")

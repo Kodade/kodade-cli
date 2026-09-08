@@ -126,6 +126,11 @@ struct Pane {
     // Tracks the current detected state and its start as one atomic transition,
     // so concurrent snapshots cannot publish the same change twice.
     state: Mutex<PaneState>,
+    /// Generation of the recognized foreground agent. This changes if the
+    /// process/title evidence identifies a different agent (including none).
+    agent_generation: AtomicU64,
+    agent_identity: Mutex<Option<String>>,
+    activity_revision: AtomicU64,
 }
 
 /// Closing a pane terminates its process so the PTY reader thread exits.
@@ -145,7 +150,9 @@ struct ReportedHook {
     reported_at: Instant,
 }
 
+#[derive(Clone)]
 struct ProcessEvidence {
+    pid: Option<i32>,
     name: Option<String>,
     cwd: Option<PathBuf>,
     checked_at: Instant,
@@ -186,6 +193,8 @@ pub fn validate_agent_manifest(source: &str) -> Result<String> {
     }
     Ok(manifest.name)
 }
+/// Kept in step with the CLI: a prompt is one atomic PTY writer submission.
+const MAX_PROMPT_BYTES: usize = 64 * 1024;
 
 pub fn socket_path(session: &str) -> PathBuf {
     socket_dir().join(format!("{session}.sock"))
@@ -837,6 +846,11 @@ impl Session {
                         scroll_offset,
                         screen,
                         agent: detections[&id].agent.clone(),
+                        agent_generation: pane.track_agent_identity(
+                            &detections[&id].agent,
+                            &pane.process_evidence(now, false),
+                        ),
+                        activity_revision: pane.activity_revision.load(Ordering::Relaxed),
                         state: detections[&id].state,
                         state_reason: detections[&id].reason.clone(),
                         state_age_secs: ages[&id],
@@ -933,11 +947,47 @@ impl Session {
             scroll_offset,
             screen,
             agent: detection.agent.clone(),
+            agent_generation: pane
+                .track_agent_identity(&detection.agent, &pane.process_evidence(now, false)),
+            activity_revision: pane.activity_revision.load(Ordering::Relaxed),
             state: detection.state,
             state_reason: detection.reason.clone(),
             state_age_secs: age,
             cwd: pane.cwd(now),
         })
+    }
+
+    /// Validate the expected agent identity and generation immediately before
+    /// writing. This closes the client-side query/write race for automation.
+    fn prompt_agent(
+        &self,
+        id: PaneId,
+        expected_agent: &str,
+        expected_generation: u64,
+        bytes: &[u8],
+    ) -> Result<PaneSnapshot> {
+        if bytes.len() > MAX_PROMPT_BYTES {
+            bail!("prompt exceeds the {MAX_PROMPT_BYTES}-byte automation limit");
+        }
+        let pane = self
+            .panes
+            .lock()
+            .map_err(|_| anyhow!("pane lock poisoned"))?
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| anyhow!("pane {} not found", id.0))?;
+        let now = Instant::now();
+        let (detection, process) = pane.detect_fresh(&self.manifests, now);
+        let generation = pane.track_agent_identity(&detection.agent, &process);
+        if detection.agent.as_deref() != Some(expected_agent) || generation != expected_generation {
+            bail!("agent pane {} was replaced; resolve the target again", id.0);
+        }
+        if detection.state == AgentStateKind::Blocked {
+            bail!("agent pane {} is blocked", id.0);
+        }
+        pane.write(bytes)?;
+        self.notify();
+        self.pane_snapshot(id)
     }
 
     /// Queues a notification with the next sequence number, capping the ring at
@@ -1042,8 +1092,10 @@ impl Session {
         match message {
             // `Version` / `Session` / `Schema` queries, `Subscribe`, and
             // `ReadPane` are answered by `serve_client`; no state changes here.
-            ClientMessage::Query(_) | ClientMessage::Subscribe | ClientMessage::ReadPane { .. } => {
-            }
+            ClientMessage::Query(_)
+            | ClientMessage::Subscribe
+            | ClientMessage::ReadPane { .. }
+            | ClientMessage::PromptAgent { .. } => {}
             ClientMessage::ApplyLayout(file) => self.apply_layout(file)?,
             ClientMessage::MovePaneToTab { pane, tab } => self.move_pane_to_tab(pane, tab)?,
             ClientMessage::RenameSession { name } => self.rename_session(&name)?,
@@ -1536,11 +1588,18 @@ impl Session {
                 let pane = panes
                     .get(&pane)
                     .ok_or_else(|| anyhow!("pane {} not found", pane.0))?;
-                *pane.hook.lock().expect("hook lock poisoned") = Some(ReportedHook {
+                let mut hook = pane.hook.lock().expect("hook lock poisoned");
+                let changed = hook.as_ref().is_none_or(|previous| previous.state != state);
+                *hook = Some(ReportedHook {
                     state,
                     source,
                     reported_at: Instant::now(),
                 });
+                if changed && matches!(state, AgentStateKind::Working | AgentStateKind::Blocked) {
+                    // Hook reports are authoritative lifecycle transitions even
+                    // before the next snapshot updates sidebar state.
+                    pane.activity_revision.fetch_add(1, Ordering::Relaxed);
+                }
                 self.notify();
             }
         }
@@ -2460,6 +2519,7 @@ impl Pane {
             spawn_cwd: cwd,
             child: Mutex::new(child),
             process: Mutex::new(ProcessEvidence {
+                pid: None,
                 name: None,
                 cwd: None,
                 checked_at: Instant::now() - Duration::from_secs(2),
@@ -2468,6 +2528,9 @@ impl Pane {
                 last: None,
                 since: Instant::now(),
             }),
+            agent_generation: AtomicU64::new(0),
+            agent_identity: Mutex::new(None),
+            activity_revision: AtomicU64::new(0),
         })
     }
     fn snapshot(&self) -> (Screen, usize) {
@@ -2546,6 +2609,25 @@ impl Pane {
             .set_scrollback(0);
     }
     fn detect(&self, manifests: &[manifest::Manifest], now: Instant) -> agent::Detection {
+        self.detect_with_evidence(manifests, now, false).0
+    }
+
+    /// Probe the PTY process group immediately. Guarded automation calls this
+    /// path so its identity check is not protected by the ordinary 2 s cache.
+    fn detect_fresh(
+        &self,
+        manifests: &[manifest::Manifest],
+        now: Instant,
+    ) -> (agent::Detection, ProcessEvidence) {
+        self.detect_with_evidence(manifests, now, true)
+    }
+
+    fn detect_with_evidence(
+        &self,
+        manifests: &[manifest::Manifest],
+        now: Instant,
+        fresh_process: bool,
+    ) -> (agent::Detection, ProcessEvidence) {
         let (screen, title) = {
             let mut parser = self.parser.lock().expect("PTY parser lock poisoned");
             let screen = live_screen_contents(&mut parser);
@@ -2554,7 +2636,7 @@ impl Pane {
         // portable-pty obtains the foreground process-group leader from the PTY itself.
         // `ps` turns that portable pid into a basename without sysctl; unavailable leaders fall
         // back to the login-shell process captured at spawn, with OSC terminal title as evidence.
-        let process = self.process_name(now);
+        let process = self.process_evidence(now, fresh_process);
         let last_output = *self.last_output.lock().expect("output lock poisoned");
         let hook = self
             .hook
@@ -2569,14 +2651,42 @@ impl Pane {
                 output_since_report: last_output > hook.reported_at,
             });
         let output_age = now.saturating_duration_since(last_output);
-        agent::detect(
+        let detection = agent::detect(
             manifests,
-            process.as_deref().or(Some(&self.spawn_process)),
+            process.name.as_deref().or(Some(&self.spawn_process)),
             &title,
             &screen,
             output_age,
             hook,
-        )
+        );
+        (detection, process)
+    }
+
+    /// Return the generation associated with this detection. The first known
+    /// agent receives generation 1; a shell/replacement then a new agent always
+    /// receives a later value, which makes stale prompt guards fail closed.
+    fn track_agent_identity(&self, agent: &Option<String>, process: &ProcessEvidence) -> u64 {
+        let mut identity = self
+            .agent_identity
+            .lock()
+            .expect("agent identity lock poisoned");
+        // A display label alone cannot distinguish two consecutive Codex
+        // processes, or a shell retaining an old OSC title. Include the live
+        // foreground PID/process when the platform can expose it.
+        let next = agent.as_ref().map(|agent| {
+            format!(
+                "{agent}|pid={}|process={}",
+                process
+                    .pid
+                    .map_or_else(|| "unknown".into(), |pid| pid.to_string()),
+                process.name.as_deref().unwrap_or("unknown")
+            )
+        });
+        if *identity != next {
+            *identity = next;
+            self.agent_generation.fetch_add(1, Ordering::Relaxed);
+        }
+        self.agent_generation.load(Ordering::Relaxed)
     }
 
     /// Record one detection atomically and return the preceding state plus age.
@@ -2591,17 +2701,13 @@ impl Pane {
             .transition(state, now)
     }
 
-    fn process_name(&self, now: Instant) -> Option<String> {
-        self.refresh_process(now);
-        self.process
-            .lock()
-            .expect("process lock poisoned")
-            .name
-            .clone()
+    fn process_evidence(&self, now: Instant, force: bool) -> ProcessEvidence {
+        self.refresh_process(now, force);
+        self.process.lock().expect("process lock poisoned").clone()
     }
 
     fn cwd(&self, now: Instant) -> Option<PathBuf> {
-        self.refresh_process(now);
+        self.refresh_process(now, false);
         self.process
             .lock()
             .expect("process lock poisoned")
@@ -2623,9 +2729,9 @@ impl Pane {
     /// Refresh the cached foreground-process name and cwd at most once per 2 s.
     /// The pid comes from the PTY's process-group leader; one `ps` and one
     /// `lsof` (or one procfs read) per pane per tick.
-    fn refresh_process(&self, now: Instant) {
+    fn refresh_process(&self, now: Instant, force: bool) {
         let mut process = self.process.lock().expect("process lock poisoned");
-        if now.saturating_duration_since(process.checked_at) < Duration::from_secs(2) {
+        if !force && now.saturating_duration_since(process.checked_at) < Duration::from_secs(2) {
             return;
         }
         let pid = self
@@ -2634,11 +2740,13 @@ impl Pane {
             .expect("PTY master lock poisoned")
             .process_group_leader();
         if let Some(pid) = pid {
+            process.pid = Some(pid);
             process.name = proc::command_of(pid)
                 .as_deref()
                 .and_then(proc::process_basename);
             process.cwd = proc::cwd_of(pid);
         } else {
+            process.pid = None;
             process.name = None;
             process.cwd = None;
         }
@@ -3006,6 +3114,16 @@ async fn serve_client(stream: UnixStream, session: Arc<Session>) -> Result<()> {
                             Ok((text, scrollback_lines)) => {
                                 write_server(&mut writer, &ServerMessage::PaneText { id, text, scrollback_lines }).await?;
                             }
+                            Err(error) => {
+                                write_server(&mut writer, &ServerMessage::Error { message: error.to_string() }).await?;
+                                return Ok(());
+                            }
+                        }
+                        continue;
+                    }
+                    ClientMessage::PromptAgent { pane, expected_agent, expected_generation, bytes } => {
+                        match session.prompt_agent(pane, &expected_agent, expected_generation, &bytes) {
+                            Ok(snapshot) => write_server(&mut writer, &ServerMessage::Pane(snapshot)).await?,
                             Err(error) => {
                                 write_server(&mut writer, &ServerMessage::Error { message: error.to_string() }).await?;
                                 return Ok(());
@@ -3875,6 +3993,55 @@ mod tests {
             .handle(ClientMessage::SetWorkspaceColor { id, color: None })
             .expect("clear accepted");
         assert_eq!(session.snapshot().unwrap().workspaces[0].color, None);
+    }
+
+    #[tokio::test]
+    async fn guarded_prompt_rejects_replacement_and_blocked_agent_before_write() {
+        let mut session = Session::spawn(80, 24, "guarded-prompt".into()).expect("spawn");
+        session.manifests = vec![manifest::Manifest {
+            name: "fake".into(),
+            display: "Fake Agent".into(),
+            process: vec!["fake-agent".into()],
+            title: vec![],
+            resume: None,
+            rules: vec![],
+        }];
+        let pane_id = session.snapshot().expect("snapshot").panes[0].id;
+        let pane = session.panes.lock().unwrap().get(&pane_id).unwrap().clone();
+        {
+            let mut process = pane.process.lock().unwrap();
+            process.name = Some("fake-agent".into());
+            process.checked_at = Instant::now();
+        }
+        let first = session.pane_snapshot(pane_id).expect("recognized pane");
+        assert_eq!(first.agent.as_deref(), Some("Fake Agent"));
+
+        // Same pane id but a new foreground shell invalidates the old guard.
+        pane.process.lock().unwrap().name = Some("sh".into());
+        assert!(session
+            .prompt_agent(
+                pane_id,
+                "Fake Agent",
+                first.agent_generation,
+                b"must-not-write",
+            )
+            .is_err());
+
+        pane.process.lock().unwrap().name = Some("fake-agent".into());
+        let current = session.pane_snapshot(pane_id).expect("agent restored");
+        *pane.hook.lock().unwrap() = Some(ReportedHook {
+            state: AgentStateKind::Blocked,
+            source: "test".into(),
+            reported_at: Instant::now(),
+        });
+        assert!(session
+            .prompt_agent(
+                pane_id,
+                "Fake Agent",
+                current.agent_generation,
+                b"must-not-write",
+            )
+            .is_err());
     }
 
     #[tokio::test]
