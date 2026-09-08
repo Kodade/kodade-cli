@@ -358,6 +358,12 @@ pub async fn run_session(host: &str, session: &str, command: &cli::SessionComman
         cli::SessionCommand::Rename { name } => {
             (vec!["session", "rename", name, "-s", session], false)
         }
+        cli::SessionCommand::Upgrade { binary } => {
+            if binary.is_some() {
+                bail!("--binary is only supported for a local daemon upgrade");
+            }
+            (vec!["session", "upgrade", "-s", session], false)
+        }
     };
     let output = ssh_output(&run_args(&control, host, &remote_args)).await?;
     if !output.status.success() {

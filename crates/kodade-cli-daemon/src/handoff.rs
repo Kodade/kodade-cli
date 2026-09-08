@@ -222,6 +222,35 @@ pub(crate) fn receive(path: &Path, token: &str) -> io::Result<ReceivedHandoff> {
     receive_with_timeout(path, token, DEFAULT_TIMEOUT)
 }
 
+/// The importer has built its paused runtime and bound its private listener.
+pub(crate) fn ready(stream: &mut UnixStream) -> io::Result<()> {
+    stream.write_all(b"ready\n")?;
+    stream.flush()
+}
+
+/// The source only switches public aliases after this acknowledgement.
+pub(crate) fn wait_ready(stream: &mut UnixStream) -> io::Result<()> {
+    if line(stream, 32)? == "ready" {
+        Ok(())
+    } else {
+        Err(data("handoff importer was not ready"))
+    }
+}
+
+/// Tell the target that the public aliases now address its staged listener.
+pub(crate) fn commit(stream: &mut UnixStream) -> io::Result<()> {
+    stream.write_all(b"commit\n")?;
+    stream.flush()
+}
+
+pub(crate) fn wait_commit(stream: &mut UnixStream) -> io::Result<()> {
+    if line(stream, 32)? == "commit" {
+        Ok(())
+    } else {
+        Err(data("handoff source did not commit"))
+    }
+}
+
 fn receive_with_timeout(
     path: &Path,
     token: &str,

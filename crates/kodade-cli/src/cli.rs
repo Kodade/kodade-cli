@@ -55,6 +55,16 @@ pub enum Command {
         /// Session name; defaults to the global --session value.
         #[arg(value_parser = session_name)]
         session: Option<String>,
+        #[arg(long, hide = true)]
+        import: Option<PathBuf>,
+        #[arg(long, hide = true)]
+        handoff_token: Option<String>,
+        #[arg(long, hide = true)]
+        staged_socket: Option<PathBuf>,
+        #[arg(long, hide = true)]
+        staged_hook: Option<PathBuf>,
+        #[arg(long, hide = true)]
+        hook_socket: Option<PathBuf>,
     },
     /// Diagnose configuration, tools, and daemon health without starting a session.
     #[command(visible_alias = "status")]
@@ -376,6 +386,12 @@ pub enum SessionCommand {
     Rename {
         #[arg(value_name = "NAME", value_parser = session_name)]
         name: String,
+    },
+    /// Replace the running daemon without interrupting pane processes.
+    Upgrade {
+        /// Replacement executable (defaults to the running binary).
+        #[arg(long)]
+        binary: Option<PathBuf>,
     },
 }
 
@@ -804,7 +820,12 @@ mod tests {
         assert_eq!(
             parse(&["kodade-cli", "daemon", "work"]).command,
             Some(Command::Daemon {
-                session: Some("work".into())
+                session: Some("work".into()),
+                import: None,
+                handoff_token: None,
+                staged_socket: None,
+                staged_hook: None,
+                hook_socket: None,
             })
         );
     }

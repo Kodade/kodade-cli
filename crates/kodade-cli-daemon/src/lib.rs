@@ -20,6 +20,7 @@ use std::{
         unix::fs::FileTypeExt,
     },
     path::{Path, PathBuf},
+    process::Command,
     sync::{
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         Arc, Condvar, Mutex,
@@ -80,12 +81,14 @@ struct Session {
     /// Per-daemon socket link injected into every pane. Unlike the public
     /// session socket it survives a session rename, so already-running agent
     /// hooks keep reaching this daemon.
-    hook_socket: PathBuf,
+    hook_socket: Mutex<PathBuf>,
     /// Serializes the short compatibility staging used by [`ClientView`].  The
     /// stored session selection remains the scripting/persistence default; an
     /// attached client temporarily installs only its own selection while one
     /// legacy mutation is dispatched.
     view_dispatch: Mutex<()>,
+    upgraded: AtomicBool,
+    upgrading: broadcast::Sender<()>,
 }
 
 /// Source-side staging guard. Dropping it on any validation, transfer, or
@@ -487,6 +490,11 @@ pub async fn run(session_name: String) -> Result<()> {
     loop {
         tokio::select! {
             _ = shutdown.recv() => {
+                if session.upgraded.load(Ordering::Acquire) {
+                    // The target owns duplicated PTYs. Exit without Rust drops:
+                    // portable-pty closes a master by writing EOT on Drop.
+                    std::process::exit(0);
+                }
                 // `kill-session` is deliberate: drop the state file so it does
                 // not resurrect on the next cold start.
                 persist::remove_session_file(&session.session_name());
@@ -510,6 +518,70 @@ pub async fn run(session_name: String) -> Result<()> {
                         eprintln!("Ködade CLI client disconnected: {error:#}");
                     }
                 });
+            }
+        }
+    }
+}
+
+/// Hidden daemon mode used by a source daemon during a live upgrade.
+pub async fn run_import(
+    session_name: String,
+    handoff_path: PathBuf,
+    token: String,
+    staged_socket: PathBuf,
+    staged_hook: PathBuf,
+    final_hook: PathBuf,
+) -> Result<()> {
+    validate_session_name(&session_name)?;
+    let received = tokio::task::spawn_blocking(move || handoff::receive(&handoff_path, &token))
+        .await
+        .context("join handoff receiver")?
+        .context("receive live handoff")?;
+    let session = unsafe { Session::import_handoff(received.manifest, received.fds) }?;
+    let session = Arc::new(session);
+    let listener = handoff::bind_listener(&staged_socket).context("bind staged daemon socket")?;
+    if staged_hook.exists() {
+        fs::remove_file(&staged_hook).context("remove stale staged hook")?;
+    }
+    fs::hard_link(&staged_socket, &staged_hook).context("link staged hook socket")?;
+    let mut control = received.stream;
+    tokio::task::spawn_blocking(move || {
+        handoff::ready(&mut control)?;
+        handoff::wait_commit(&mut control)
+    })
+    .await
+    .context("join handoff commit")??;
+    for pane in session.panes.lock().expect("pane lock poisoned").values() {
+        pane.reader.resume();
+    }
+    *session.name.lock().expect("name lock poisoned") = session_name;
+    *session.socket.lock().expect("socket lock poisoned") = socket_path(&session.session_name());
+    *session
+        .hook_socket
+        .lock()
+        .expect("hook socket lock poisoned") = final_hook;
+    // The staged names have been atomically published by the source. The
+    // listener remains valid across rename, so serve it directly.
+    serve_imported_listener(tokio::net::UnixListener::from_std(listener)?, session).await
+}
+
+async fn serve_imported_listener(listener: UnixListener, session: Arc<Session>) -> Result<()> {
+    let mut shutdown = session.shutdown.subscribe();
+    tokio::spawn(persist_loop(Arc::clone(&session)));
+    tokio::spawn(subscriber_tick(Arc::clone(&session)));
+    loop {
+        tokio::select! {
+            _ = shutdown.recv() => {
+                persist::remove_session_file(&session.session_name());
+                drop(listener);
+                let _ = fs::remove_file(session.socket_path());
+                let _ = fs::remove_file(session.hook_socket());
+                return Ok(());
+            }
+            accepted = listener.accept() => {
+                let (stream, _) = accepted?;
+                let session = Arc::clone(&session);
+                tokio::spawn(async move { let _ = serve_client(stream, session).await; });
             }
         }
     }
@@ -611,8 +683,10 @@ impl Session {
             events,
             subscribers: AtomicUsize::new(0),
             socket: Mutex::new(socket_path(&name_for_socket)),
-            hook_socket: hook_socket_path(),
+            hook_socket: Mutex::new(hook_socket_path()),
             view_dispatch: Mutex::new(()),
+            upgraded: AtomicBool::new(false),
+            upgrading: broadcast::channel(16).0,
         };
         let pane = session.new_pane("shell", None, None)?;
         let tab = Tab {
@@ -669,8 +743,10 @@ impl Session {
             events,
             subscribers: AtomicUsize::new(0),
             socket: Mutex::new(socket_path(&file.name)),
-            hook_socket: hook_socket_path(),
+            hook_socket: Mutex::new(hook_socket_path()),
             view_dispatch: Mutex::new(()),
+            upgraded: AtomicBool::new(false),
+            upgrading: broadcast::channel(16).0,
         };
         let manifests = session
             .manifests
@@ -840,6 +916,77 @@ impl Session {
         })
     }
 
+    /// Perform the source half of an all-or-nothing daemon replacement.
+    fn upgrade(&self, binary: Option<PathBuf>) -> Result<()> {
+        let binary =
+            binary.unwrap_or(std::env::current_exe().context("find current kodade-cli binary")?);
+        let public = self.socket_path();
+        let hook = self.hook_socket();
+        let nonce = format!(
+            "{}-{}",
+            std::process::id(),
+            Instant::now().elapsed().as_nanos()
+        );
+        let handoff_path = socket_dir().join(format!(".handoff-{nonce}.sock"));
+        let staged_socket = socket_dir().join(format!(".upgrade-{nonce}.sock"));
+        let staged_hook = socket_dir()
+            .join("hooks")
+            .join(format!(".upgrade-{nonce}.sock"));
+        let public_backup = socket_dir().join(format!(".upgrade-old-{nonce}.sock"));
+        let hook_backup = socket_dir()
+            .join("hooks")
+            .join(format!(".upgrade-old-{nonce}.sock"));
+        fs::create_dir_all(hook.parent().expect("hook parent"))?;
+        let listener =
+            handoff::bind_listener(&handoff_path).context("bind private handoff socket")?;
+        let token = format!("{nonce}-{}", std::process::id());
+        let mut child = Command::new(&binary)
+            .arg("daemon")
+            .arg(self.session_name())
+            .arg("--import")
+            .arg(&handoff_path)
+            .arg("--handoff-token")
+            .arg(&token)
+            .arg("--staged-socket")
+            .arg(&staged_socket)
+            .arg("--staged-hook")
+            .arg(&staged_hook)
+            .arg("--hook-socket")
+            .arg(&hook)
+            .spawn()
+            .with_context(|| format!("start replacement daemon {}", binary.display()))?;
+        let captured = self.capture_handoff()?;
+        let result = (|| -> Result<()> {
+            let mut control = handoff::accept_and_validate(&listener, &token, &captured.manifest)
+                .context("validate replacement daemon")?;
+            handoff::send_fds(&control, &captured.fds).context("transfer PTY masters")?;
+            handoff::wait_ready(&mut control).context("wait for replacement daemon")?;
+            // Retain links to both old aliases until the two renames complete,
+            // allowing a filesystem failure to restore the source atomically.
+            fs::hard_link(&public, &public_backup).context("backup public socket")?;
+            fs::hard_link(&hook, &hook_backup).context("backup hook socket")?;
+            if let Err(error) =
+                fs::rename(&staged_socket, &public).and_then(|_| fs::rename(&staged_hook, &hook))
+            {
+                let _ = fs::rename(&public_backup, &public);
+                let _ = fs::rename(&hook_backup, &hook);
+                return Err(error).context("publish replacement socket aliases");
+            }
+            handoff::commit(&mut control).context("commit replacement daemon")?;
+            let _ = fs::remove_file(&public_backup);
+            let _ = fs::remove_file(&hook_backup);
+            Ok(())
+        })();
+        let _ = fs::remove_file(&handoff_path);
+        if result.is_err() {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = fs::remove_file(&staged_socket);
+            let _ = fs::remove_file(&staged_hook);
+        }
+        result
+    }
+
     /// Rebuild session layout with its original ids around imported PTY masters.
     /// Readers remain paused until the transport ownership stage completes.
     #[allow(dead_code)] // Called by the hidden handoff-import daemon mode.
@@ -870,8 +1017,10 @@ impl Session {
             events,
             subscribers: AtomicUsize::new(0),
             socket: Mutex::new(socket_path(&manifest.session.name)),
-            hook_socket: hook_socket_path(),
+            hook_socket: Mutex::new(hook_socket_path()),
             view_dispatch: Mutex::new(()),
+            upgraded: AtomicBool::new(false),
+            upgrading: broadcast::channel(16).0,
         };
         let mut runtimes: HashMap<u64, (handoff::PaneRuntime, RawFd)> = manifest
             .panes
@@ -979,7 +1128,10 @@ impl Session {
     }
 
     fn hook_socket(&self) -> PathBuf {
-        self.hook_socket.clone()
+        self.hook_socket
+            .lock()
+            .expect("hook socket lock poisoned")
+            .clone()
     }
 
     /// Publish a session event to subscribed connections. Never fails: with no
@@ -1969,6 +2121,7 @@ impl Session {
             ClientMessage::KillSession => {
                 let _ = self.shutdown.send(());
             }
+            ClientMessage::Upgrade { .. } => bail!("live upgrade is handled by the socket server"),
             ClientMessage::NewTab => {
                 let active = self
                     .state
@@ -4044,6 +4197,7 @@ async fn serve_client(stream: UnixStream, session: Arc<Session>) -> Result<()> {
     let mut updates = session.updates.subscribe();
     let mut events = session.events.subscribe();
     let mut shutdown = session.shutdown.subscribe();
+    let mut upgrading = session.upgrading.subscribe();
     // Set by `Subscribe`: this connection then receives every session event.
     let mut subscribed = false;
     let mut subscription: Option<SubscriberGuard> = None;
@@ -4144,6 +4298,28 @@ async fn serve_client(stream: UnixStream, session: Arc<Session>) -> Result<()> {
                         }
                         continue;
                     }
+                    ClientMessage::Upgrade { binary } => {
+                        let session_for_upgrade = Arc::clone(&session);
+                        let result = tokio::task::spawn_blocking(move || session_for_upgrade.upgrade(binary))
+                            .await
+                            .context("join live upgrade")?;
+                        match result {
+                            Ok(()) => {
+                                write_server(&mut writer, &ServerMessage::Upgrading).await?;
+                                session.upgraded.store(true, Ordering::Release);
+                                let _ = session.upgrading.send(());
+                                // Give every attached client a scheduling turn to receive its
+                                // explicit reconnect marker before the old process exits.
+                                tokio::time::sleep(Duration::from_millis(50)).await;
+                                let _ = session.shutdown.send(());
+                                return Ok(());
+                            }
+                            Err(error) => {
+                                write_server(&mut writer, &ServerMessage::Error { message: error.to_string() }).await?;
+                                continue;
+                            }
+                        }
+                    }
                     ClientMessage::Subscribe => {
                         // Counted once per connection; the guard decrements it
                         // however this loop exits.
@@ -4227,6 +4403,10 @@ async fn serve_client(stream: UnixStream, session: Arc<Session>) -> Result<()> {
             },
             _ = shutdown.recv() => {
                 write_server(&mut writer, &ServerMessage::Shutdown).await?;
+                return Ok(());
+            },
+            _ = upgrading.recv() => {
+                write_server(&mut writer, &ServerMessage::Upgrading).await?;
                 return Ok(());
             },
         }

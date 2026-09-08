@@ -144,8 +144,29 @@ async fn main() -> Result<()> {
         Some(cli::Command::Plugin { command }) => {
             plugins::command(&socket, &session, remote.is_some(), command).await
         }
-        Some(cli::Command::Daemon { session: name }) => {
-            kodade_cli_daemon::run(name.unwrap_or(session)).await
+        Some(cli::Command::Daemon {
+            session: name,
+            import,
+            handoff_token,
+            staged_socket,
+            staged_hook,
+            hook_socket,
+        }) => {
+            let name = name.unwrap_or(session);
+            match (
+                import,
+                handoff_token,
+                staged_socket,
+                staged_hook,
+                hook_socket,
+            ) {
+                (Some(import), Some(token), Some(socket), Some(hook), Some(final_hook)) => {
+                    kodade_cli_daemon::run_import(name, import, token, socket, hook, final_hook)
+                        .await
+                }
+                (None, None, None, None, None) => kodade_cli_daemon::run(name).await,
+                _ => bail!("incomplete daemon handoff arguments"),
+            }
         }
         Some(cli::Command::Session { command }) => {
             session_command(remote.as_deref(), &socket, &session, command).await
@@ -627,6 +648,16 @@ async fn session_command(
                 commands::request(socket, ClientMessage::RenameSession { name }).await?,
             )?;
             Ok(())
+        }
+        cli::SessionCommand::Upgrade { binary } => {
+            match commands::request(socket, ClientMessage::Upgrade { binary }).await? {
+                ServerMessage::Upgrading => Ok(()),
+                ServerMessage::Error { message } => bail!(message),
+                other => bail!(
+                    "unexpected upgrade reply: {}",
+                    kodade_cli_proto::server_message_name(&other)
+                ),
+            }
         }
     }
 }

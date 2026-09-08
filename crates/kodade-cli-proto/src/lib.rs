@@ -197,6 +197,10 @@ pub enum ClientMessage {
         name: String,
     },
     KillSession,
+    /// Replace this daemon with a freshly started binary while keeping its PTYs.
+    Upgrade {
+        binary: Option<PathBuf>,
+    },
     NewTab,
     NextTab,
     PrevTab,
@@ -393,6 +397,8 @@ pub enum ServerMessage {
     Error {
         message: String,
     },
+    /// The daemon has committed a live handoff. Attached clients reconnect.
+    Upgrading,
     Shutdown,
 }
 
@@ -804,6 +810,7 @@ pub const CLIENT_MESSAGE_NAMES: &[&str] = &[
     "PromptAgent",
     "RenamePaneId",
     "KillSession",
+    "Upgrade",
     "RenameSession",
     "NewTab",
     "NextTab",
@@ -849,6 +856,7 @@ pub const SERVER_MESSAGE_NAMES: &[&str] = &[
     "Schema",
     "Manifests",
     "Error",
+    "Upgrading",
     "Shutdown",
 ];
 
@@ -873,6 +881,7 @@ pub fn client_message_name(message: &ClientMessage) -> &'static str {
         ClientMessage::PromptAgent { .. } => "PromptAgent",
         ClientMessage::RenamePaneId { .. } => "RenamePaneId",
         ClientMessage::KillSession => "KillSession",
+        ClientMessage::Upgrade { .. } => "Upgrade",
         ClientMessage::RenameSession { .. } => "RenameSession",
         ClientMessage::NewTab => "NewTab",
         ClientMessage::NextTab => "NextTab",
@@ -920,6 +929,7 @@ pub fn server_message_name(message: &ServerMessage) -> &'static str {
         ServerMessage::Schema { .. } => "Schema",
         ServerMessage::Manifests(_) => "Manifests",
         ServerMessage::Error { .. } => "Error",
+        ServerMessage::Upgrading => "Upgrading",
         ServerMessage::Shutdown => "Shutdown",
     }
 }
@@ -1098,6 +1108,7 @@ mod tests {
                 name: "a".into(),
             },
             ClientMessage::KillSession,
+            ClientMessage::Upgrade { binary: None },
             ClientMessage::RenameSession { name: "a".into() },
             ClientMessage::NewTab,
             ClientMessage::NextTab,
@@ -1235,6 +1246,7 @@ mod tests {
             ServerMessage::Error {
                 message: "boom".into(),
             },
+            ServerMessage::Upgrading,
             ServerMessage::Shutdown,
         ]
     }
