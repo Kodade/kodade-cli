@@ -1,5 +1,6 @@
 //! Authenticated loopback plus SSH stdio connects Windows clients to Unix daemons.
 use crate::cli;
+use crate::remote_prepare;
 use anyhow::{bail, Context, Result};
 use std::{
     path::PathBuf,
@@ -67,9 +68,25 @@ async fn ssh_output(host: &str, command: &str) -> Result<std::process::Output> {
     .context("SSH command timed out")?
     .context("run ssh")
 }
-pub async fn prepare_machine(host: &str, _install: bool) -> Result<()> {
+fn probe(host: &str) -> Vec<String> {
+    ssh_args(host, "uname -s; uname -m")
+}
+fn upload(host: &str, bytes: usize, checksum: &str, version: &str) -> Vec<String> {
+    ssh_args(host, &format!(
+        "set -eu; umask 077; dest=\"$HOME/.local/bin/kodade-cli\"; dir=\"${{dest%/*}}\"; mkdir -p \"$dir\"; tmp=$(mktemp \"$dir/.kodade-cli.XXXXXX\"); trap 'rm -f \"$tmp\"' EXIT HUP INT TERM; cat >\"$tmp\"; [ \"$(wc -c <\"$tmp\" | tr -d '[:space:]')\" = \"{bytes}\" ]; if command -v sha256sum >/dev/null 2>&1; then actual=$(sha256sum \"$tmp\" | awk '{{print $1}}'); else actual=$(shasum -a 256 \"$tmp\" | awk '{{print $1}}'); fi; [ \"$actual\" = \"{checksum}\" ]; chmod 755 \"$tmp\"; LC_ALL=C \"$tmp\" --version | grep -Fx \"kodade-cli {version}\" >/dev/null; mv -f \"$tmp\" \"$dest\"; trap - EXIT"
+    ))
+}
+pub async fn prepare_machine(host: &str, install: bool) -> Result<()> {
     validate_host(host)?;
-    bail!("remote preparation from Windows is unavailable; install a matching kodade-cli on {host}")
+    remote_prepare::prepare_machine(
+        host,
+        install,
+        probe(host),
+        ssh_args(host, &remote(&["--version"])),
+        |bytes, checksum, version| upload(host, bytes, checksum, version),
+        crate::update::fetch,
+    )
+    .await
 }
 pub async fn connect_endpoint(host: &str, session: &str) -> Result<(PathBuf, Tunnel)> {
     validate_host(host)?;
@@ -80,6 +97,9 @@ pub async fn connect_endpoint(host: &str, session: &str) -> Result<(PathBuf, Tun
             "could not run kodade-cli on {host}: {}",
             String::from_utf8_lossy(&probe.stderr).trim()
         );
+    }
+    if !remote_prepare::version_is_compatible(&probe.stdout) {
+        bail!("{host} has an incompatible kodade-cli; run `kodade-cli machine prepare {host} --install`");
     }
     let record = kodade_cli_daemon::socket_dir().join(format!(
         "bridge-{}-{}.sock",

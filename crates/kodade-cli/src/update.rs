@@ -176,9 +176,9 @@ pub fn verify(bytes: &[u8], expected: &str) -> Result<()> {
 /// Verify a published archive before extracting the executable for a remote
 /// install. The caller owns transport and atomic replacement on that host.
 #[cfg_attr(windows, allow(dead_code))]
-pub fn verified_binary(archive: &[u8], expected: &str) -> Result<Vec<u8>> {
+pub fn verified_remote_binary(archive: &[u8], expected: &str) -> Result<Vec<u8>> {
     verify(archive, expected)?;
-    Ok(extract_binary(archive)?.0)
+    Ok(extract_tar_binary(archive)?.0)
 }
 
 /// Extract the one executable from a verified archive and atomically replace
@@ -294,7 +294,6 @@ fn extract_binary(archive: &[u8]) -> Result<(Vec<u8>, u32)> {
     extract_tar_binary(archive)
 }
 
-#[cfg(not(windows))]
 fn extract_tar_binary(archive: &[u8]) -> Result<(Vec<u8>, u32)> {
     let decoder = flate2::read::GzDecoder::new(Cursor::new(archive));
     let mut archive = tar::Archive::new(LimitedReader::new(decoder, MAX_EXTRACTED_ARCHIVE));

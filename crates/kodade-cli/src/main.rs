@@ -28,6 +28,7 @@ mod remote;
 #[cfg(windows)]
 #[path = "remote_windows.rs"]
 mod remote;
+mod remote_prepare;
 mod render;
 mod selection;
 mod settings;
