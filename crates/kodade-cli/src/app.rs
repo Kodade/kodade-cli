@@ -132,6 +132,7 @@ pub struct App {
     endpoint_labels: BTreeMap<EndpointId, String>,
     endpoints: Manager,
     selected_endpoint: EndpointId,
+    view_needs_resize: bool,
     endpoint_contexts: BTreeMap<EndpointId, (String, PathBuf)>,
     machine_profiles: Vec<crate::machines::MachineProfile>,
     local_session: String,
@@ -290,6 +291,7 @@ impl App {
             machine_profiles: Vec::new(),
             local_session: session.to_string(),
             catalog_checked: Instant::now(),
+            view_needs_resize: false,
             graphics: crate::graphics::Renderer::default(),
             image_clipboard: crate::image_paste::Clipboard::default(),
             prefix: false,
@@ -449,6 +451,7 @@ impl App {
         );
         router.select(next.clone());
         self.selected_endpoint = next.clone();
+        self.view_needs_resize = true;
         self.remote_endpoint = self.primary_remote || next != EndpointId::Local;
         self.notifier = self
             .endpoint_notifiers
@@ -601,6 +604,12 @@ impl App {
     /// Collapse a full sidebar under the auto-hide column threshold, and restore
     /// it once the terminal is wide enough again (#19).
     pub fn apply_auto_hide(&mut self, cols: u16) {
+        if self.compact_enabled(cols) {
+            self.sidebar_mode = SidebarMode::Hidden;
+            self.auto_hidden = true;
+            self.sidebar_hidden_at = Some(Instant::now());
+            return;
+        }
         let below = cols < self.config.sidebar_auto_hide_below;
         if below && self.sidebar_mode == SidebarMode::Full {
             self.sidebar_mode = config_collapsed_mode(&self.config);
@@ -617,6 +626,16 @@ impl App {
     /// Pane width for the current sidebar state, used by `Hello` and `Resize`.
     pub fn pane_cols(&self, cols: u16) -> u16 {
         pane_cols(cols, self.sidebar_width())
+    }
+
+    /// A compact view is a daemon-side per-client projection, never a shared
+    /// zoom mutation. The threshold leaves enough room for a usable shell.
+    pub fn compact_enabled(&self, cols: u16) -> bool {
+        match self.config.compact_view {
+            config::CompactViewMode::Auto => cols < config::COMPACT_VIEW_AUTO_BELOW,
+            config::CompactViewMode::On => true,
+            config::CompactViewMode::Off => false,
+        }
     }
 
     /// Stores a new snapshot. Copy mode refreshes its full-history buffer
@@ -813,6 +832,7 @@ impl App {
             frame,
             layout,
             &render::Ui {
+                compact: self.compact_enabled(frame.area().width),
                 sidebar_mode: self.sidebar_mode,
                 sidebar_width: self.sidebar_width(),
                 collapsed: &self.collapsed,
@@ -971,6 +991,12 @@ impl App {
                     let size = term.size()?;
                     writer.send_to(
                         &endpoint,
+                        ClientMessage::SetCompactView {
+                            enabled: self.compact_enabled(size.width),
+                        },
+                    )?;
+                    writer.send_to(
+                        &endpoint,
                         ClientMessage::Resize {
                             cols: self.pane_cols(size.width),
                             rows: size.height,
@@ -1036,6 +1062,10 @@ impl App {
             if layout_changed {
                 self.refresh_copy().await;
             }
+            if self.view_needs_resize {
+                self.send_resize(writer, term).await?;
+                self.view_needs_resize = false;
+            }
             self.sync_title(term)?;
             term.draw(|frame| self.draw(frame))?;
             let area = self.content_area(term)?;
@@ -1058,8 +1088,17 @@ impl App {
             match event::read()? {
                 Event::Resize(cols, rows) => {
                     self.apply_auto_hide(cols);
-                    let cols = self.pane_cols(cols);
-                    write(writer, &ClientMessage::Resize { cols, rows }).await?
+                    let compact = self.compact_enabled(cols);
+                    let pane_cols = self.pane_cols(cols);
+                    write(
+                        writer,
+                        &ClientMessage::Resize {
+                            cols: pane_cols,
+                            rows,
+                        },
+                    )
+                    .await?;
+                    write(writer, &ClientMessage::SetCompactView { enabled: compact }).await?
                 }
                 Event::Key(key) => {
                     if self.handle_key(key, writer, term).await? == Flow::Detach {
@@ -2229,6 +2268,8 @@ impl App {
                     None => " config reloaded".into(),
                 };
                 self.config = config;
+                self.apply_auto_hide(term.size()?.width);
+                self.view_needs_resize = true;
                 self.set_note(note);
             }
             Err(error) => self.set_note(format!(" config error: {error} · previous config kept")),
@@ -2252,6 +2293,13 @@ impl App {
             &ClientMessage::Resize {
                 cols: self.pane_cols(size.width),
                 rows: size.height,
+            },
+        )
+        .await?;
+        write(
+            writer,
+            &ClientMessage::SetCompactView {
+                enabled: self.compact_enabled(size.width),
             },
         )
         .await
@@ -2342,6 +2390,25 @@ impl App {
                 }
             }
             return Ok(Flow::Continue);
+        }
+        let size = term.size()?;
+        if self.compact_enabled(size.width)
+            && self.menu.is_none()
+            && self.confirm.is_none()
+            && self.copy.is_none()
+            && !self.rename
+            && !self.new_workspace
+            && !self.worktree_new
+            && mouse.kind == MouseEventKind::Down(MouseButton::Left)
+        {
+            let area = self.content_area(term)?;
+            if let Some((_, _, action)) =
+                render::compact_controls(area, self.machine_rows().len() > 1)
+                    .into_iter()
+                    .find(|(rect, _, _)| rect.contains((mouse.column, mouse.row).into()))
+            {
+                return self.run_action(action, writer, term).await;
+            }
         }
         // Context menus own the wheel while open; do not scroll a pane behind
         // an actionable menu.
@@ -2529,7 +2596,7 @@ impl App {
                     mouse.row
                 },
             });
-        } else if mouse.row == 0 {
+        } else if mouse.row == 0 && !self.compact_enabled(size.width) {
             if let Some(id) =
                 input::tab_at(&render::tab_spans_for(current, content_area), mouse.column)
             {
@@ -3205,6 +3272,32 @@ mod tests {
         app.apply_auto_hide(120);
         assert_eq!(app.sidebar_mode, SidebarMode::Full);
         assert!(!app.auto_hidden);
+    }
+
+    #[test]
+    fn compact_view_auto_projects_only_narrow_terminals() {
+        let mut config = config::Config::default();
+        let app = App::new(
+            &config,
+            "compact-test",
+            PathBuf::from("/tmp/kodade-test.sock"),
+        );
+        assert!(app.compact_enabled(config::COMPACT_VIEW_AUTO_BELOW - 1));
+        assert!(!app.compact_enabled(config::COMPACT_VIEW_AUTO_BELOW));
+        config.compact_view = config::CompactViewMode::On;
+        let app = App::new(
+            &config,
+            "compact-test",
+            PathBuf::from("/tmp/kodade-test.sock"),
+        );
+        assert!(app.compact_enabled(200));
+        config.compact_view = config::CompactViewMode::Off;
+        let app = App::new(
+            &config,
+            "compact-test",
+            PathBuf::from("/tmp/kodade-test.sock"),
+        );
+        assert!(!app.compact_enabled(1));
     }
 
     #[test]

@@ -112,9 +112,16 @@ tab, or workspace for its menu; the pane menu can break a pane out to its own
 tab or equalize the layout, and the tab menu can reorder tabs. In navigate mode, `j`/`k` move through the
 sidebar and `enter` selects a row (folding/unfolding a workspace, or activating a tab/pane); `q` or `esc` exits.
 
+Below 70 columns, compact view shows the focused pane at full width while
+keeping every split and process alive. Click `[<]` / `[>]` to cycle panes or
+`[Switch]` to search workspaces, tabs, and panes; keyboard shortcuts keep working.
+Widening restores the split layout. This preference belongs to each attached
+client, so a second wide terminal keeps its own view. Set
+`sidebar.compact_view = "on"` or `"off"` to override automatic switching.
+
 The sidebar has three shapes cycled by `prefix b`: the full list, a compact
 3-column rail of workspace state dots, and a hidden 1-column gutter. It is
-configurable via `[sidebar]` (`width`, `collapsed`, `auto_hide_below`,
+configurable via `[sidebar]` (`width`, `collapsed`, `auto_hide_below`, `compact_view`,
 `agents_panel`) and auto-hides on narrow terminals. Every workspace can be
 folded (`enter` in navigate, `*` expands all; remembered per session), an agents
 panel below the workspaces lists agent panes by urgency, and each workspace

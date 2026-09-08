@@ -1156,6 +1156,11 @@ async fn tui(
     tokio::time::timeout(Duration::from_secs(10), handshake(&mut lines, &mut state))
         .await
         .context("daemon handshake timed out after 10s")??;
+    writer
+        .write_all(&encode(&ClientMessage::SetCompactView {
+            enabled: state.compact_enabled(cols),
+        })?)
+        .await?;
     // Subscribe so the TUI learns about session-level changes (a rename moves
     // the socket under it). Subscribed connections receive notifications as
     // `Event::Notification` instead of `ServerMessage::Notification`.

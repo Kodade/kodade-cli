@@ -111,6 +111,7 @@ impl SidebarModel {
 
 /// Per-frame UI state that is not part of the daemon layout snapshot.
 pub struct Ui<'a> {
+    pub compact: bool,
     pub sidebar_mode: SidebarMode,
     /// Effective sidebar width for the current mode + config.
     pub sidebar_width: u16,
@@ -165,6 +166,7 @@ pub struct Ui<'a> {
 
 pub fn render(frame: &mut Frame, layout: &LayoutSnapshot, ui: &Ui, theme: &Theme) {
     let Ui {
+        compact,
         sidebar_mode,
         sidebar_width,
         collapsed,
@@ -232,7 +234,27 @@ pub fn render(frame: &mut Frame, layout: &LayoutSnapshot, ui: &Ui, theme: &Theme
         .find(|item| item.active)
         .map(|item| item.name.as_str())
         .unwrap_or("workspace");
-    render_tab_bar(frame, workspace, &layout.tabs, areas[0], theme);
+    if compact {
+        let controls = compact_controls(areas[0], machines.len() > 1);
+        for (area, label, _) in &controls {
+            frame.render_widget(
+                Paragraph::new(*label).style(Style::default().fg(theme.accent).bg(theme.bg)),
+                *area,
+            );
+        }
+        let start = controls
+            .last()
+            .map(|(area, _, _)| area.right() + 1)
+            .unwrap_or(areas[0].x);
+        if start < areas[0].right() {
+            frame.render_widget(
+                Paragraph::new(workspace).style(Style::default().fg(theme.dim)),
+                Rect::new(start, areas[0].y, areas[0].right() - start, 1),
+            );
+        }
+    } else {
+        render_tab_bar(frame, workspace, &layout.tabs, areas[0], theme);
+    }
 
     let mut rects = HashMap::new();
     rects_for(&layout.tree, areas[1], &mut rects);
@@ -748,8 +770,34 @@ pub fn tab_label(name: &str, active: bool, state: AgentStateKind) -> String {
     }
 }
 
-/// Draw the tab bar: a fixed wordmark + workspace name on the left, then the
-/// tabs in a scrolling sub-area so the active tab stays visible on overflow.
+/// One hit map for the compact header and its mouse controls.
+pub fn compact_controls(
+    area: Rect,
+    machines: bool,
+) -> Vec<(Rect, &'static str, crate::config::Action)> {
+    use crate::config::Action;
+    let mut x = area.x;
+    [
+        ("[<]", Action::PrevPane),
+        ("[Switch]", Action::Goto),
+        ("[>]", Action::NextPane),
+        ("[Hosts]", Action::NextMachine),
+    ]
+    .into_iter()
+    .filter(|(_, action)| machines || *action != Action::NextMachine)
+    .filter_map(|(label, action)| {
+        let width = label.len() as u16;
+        if x.saturating_add(width) > area.right() {
+            return None;
+        }
+        let rect = Rect::new(x, area.y, width, 1);
+        x += width + 1;
+        Some((rect, label, action))
+    })
+    .collect()
+}
+
+/// Draw the fixed workspace label and a scrolling strip of tabs.
 fn render_tab_bar(frame: &mut Frame, workspace: &str, tabs: &[TabInfo], area: Rect, theme: &Theme) {
     let base = Style::default().bg(theme.tabbar_bg);
     // Fixed prefix fills the whole row (background) and draws the wordmark.
@@ -2091,6 +2139,7 @@ mod tests {
         }];
         let collapsed = no_collapse();
         let ui = Ui {
+            compact: false,
             sidebar_mode: SidebarMode::Hidden,
             sidebar_width: 1,
             collapsed: &collapsed,
@@ -2239,6 +2288,7 @@ mod tests {
         let width = sidebar_width(SidebarMode::Full, &config);
         let collapsed = no_collapse();
         let ui = Ui {
+            compact: false,
             sidebar_mode: SidebarMode::Full,
             sidebar_width: width,
             collapsed: &collapsed,

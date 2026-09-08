@@ -91,6 +91,31 @@ pub fn goto_items(layout: &LayoutSnapshot) -> Vec<PickerItem> {
             }
         }
     }
+    let workspace = layout
+        .workspaces
+        .iter()
+        .find(|w| w.id == layout.active_workspace)
+        .map(|w| w.name.as_str())
+        .unwrap_or("workspace");
+    let tab = layout
+        .tabs
+        .iter()
+        .find(|t| t.id == layout.active_tab)
+        .map(|t| t.name.as_str())
+        .unwrap_or("tab");
+    for pane in &layout.panes {
+        if !items
+            .iter()
+            .any(|item| item.target == PickTarget::Pane(pane.id))
+        {
+            items.push(PickerItem {
+                label: format!("{workspace} › {tab} › {} #{}", pane.title, pane.id.0),
+                detail: "pane".into(),
+                state: pane.state,
+                target: PickTarget::Pane(pane.id),
+            });
+        }
+    }
     items
 }
 

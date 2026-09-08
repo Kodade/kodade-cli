@@ -20,6 +20,7 @@ TOML, or omitted setting uses the defaults below.
 | `sidebar.width` | `24` | Sidebar width in columns, clamped to 16–40. |
 | `sidebar.collapsed` | `"compact"` | What `prefix b` and auto-hide collapse to: `"compact"` (a 3-column rail of workspace dots) or `"hidden"` (a 1-column gutter). |
 | `sidebar.auto_hide_below` | `100` | Collapse the sidebar when the terminal is narrower than this many columns; restore it when widened. |
+| `sidebar.compact_view` | `"auto"` | Project the focused pane full-width below 70 columns (`"on"` and `"off"` override auto detection). |
 | `sidebar.agents_panel` | `true` | Show the agents panel below the workspaces list. |
 | `notify` | `true` | Agent-state notifications. Accepts a boolean or a `[notify]` table. |
 | `notify.enabled` | `true` | Master switch for notifications (table form of `notify`). |
@@ -113,8 +114,16 @@ show = true
 width = 24              # columns, clamped 16–40
 collapsed = "compact"   # "compact" rail or "hidden" gutter
 auto_hide_below = 100   # collapse under this terminal width
+compact_view = "auto"   # focused-pane projection: auto, on, or off
 agents_panel = true
 ```
+
+Below 70 columns, compact view shows the focused pane at full width while
+keeping every split and process alive. Click `[<]` / `[>]` to cycle panes or
+`[Switch]` to search workspaces, tabs, and panes; keyboard shortcuts keep working.
+Widening restores the split layout. This preference belongs to each attached
+client, so a second wide terminal keeps its own view. Set
+`sidebar.compact_view = "on"` or `"off"` to override automatic switching.
 
 `prefix b` cycles the sidebar full → compact → hidden → full. Compact is a
 3-column rail of one state dot per workspace; clicking a dot selects it. In the

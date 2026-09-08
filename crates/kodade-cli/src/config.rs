@@ -22,6 +22,9 @@ pub struct Config {
     pub sidebar_auto_hide_below: u16,
     /// `[sidebar] agents_panel`: show the agents panel below the workspaces (#19).
     pub sidebar_agents_panel: bool,
+    /// `[sidebar] compact_view`: force narrow focus projection on/off, or use
+    /// the terminal width automatically.
+    pub compact_view: CompactViewMode,
     /// `mouse.copy_on_select` — copy as soon as a mouse drag ends (#12).
     pub copy_on_select: bool,
     /// `mouse.scroll_lines` — rows per wheel notch (#12).
@@ -151,6 +154,27 @@ pub enum CollapsedMode {
     /// A 1-column gutter, as in v0.1.
     Hidden,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompactViewMode {
+    Auto,
+    On,
+    Off,
+}
+
+impl CompactViewMode {
+    fn parse(name: &str) -> Option<Self> {
+        match name {
+            "auto" => Some(Self::Auto),
+            "on" => Some(Self::On),
+            "off" => Some(Self::Off),
+            _ => None,
+        }
+    }
+}
+
+/// Auto compact projection begins below this terminal width.
+pub const COMPACT_VIEW_AUTO_BELOW: u16 = 70;
 
 impl CollapsedMode {
     fn parse(name: &str) -> Option<Self> {
@@ -504,6 +528,7 @@ struct SidebarTable {
     collapsed: Option<String>,
     auto_hide_below: Option<u16>,
     agents_panel: Option<bool>,
+    compact_view: Option<String>,
     #[serde(flatten)]
     extra: HashMap<String, toml::Value>,
 }
@@ -619,6 +644,7 @@ impl Default for Config {
             sidebar_collapsed: CollapsedMode::Compact,
             sidebar_auto_hide_below: 100,
             sidebar_agents_panel: true,
+            compact_view: CompactViewMode::Auto,
             copy_on_select: true,
             scroll_lines: 3,
             passthrough: true,
@@ -764,6 +790,14 @@ impl Config {
                 }
                 config.sidebar_agents_panel =
                     table.agents_panel.unwrap_or(config.sidebar_agents_panel);
+                if let Some(mode) = &table.compact_view {
+                    match CompactViewMode::parse(mode) {
+                        Some(mode) => config.compact_view = mode,
+                        None => config
+                            .warnings
+                            .push(format!("unknown sidebar.compact_view {mode}")),
+                    }
+                }
                 config.warn_unknown("sidebar.", &table.extra);
             }
             None => {}
@@ -934,6 +968,12 @@ impl Config {
         let _ = writeln!(out, "collapsed = {}", toml_string(collapsed));
         let _ = writeln!(out, "auto_hide_below = {}", self.sidebar_auto_hide_below);
         let _ = writeln!(out, "agents_panel = {}", self.sidebar_agents_panel);
+        let compact_view = match self.compact_view {
+            CompactViewMode::Auto => "auto",
+            CompactViewMode::On => "on",
+            CompactViewMode::Off => "off",
+        };
+        let _ = writeln!(out, "compact_view = {compact_view:?}");
         let _ = writeln!(out, "\n[mouse]");
         let _ = writeln!(out, "enabled = {}", self.mouse);
         let _ = writeln!(out, "copy_on_select = {}", self.copy_on_select);

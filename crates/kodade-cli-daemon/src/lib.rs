@@ -97,6 +97,7 @@ struct ClientView {
     scroll: HashMap<PaneId, usize>,
     cols: u16,
     rows: u16,
+    compact: bool,
 }
 
 impl ClientView {
@@ -120,6 +121,7 @@ impl ClientView {
             scroll: HashMap::new(),
             cols,
             rows,
+            compact: false,
         }
     }
 }
@@ -1035,6 +1037,10 @@ impl Session {
     /// mutation implementation without allowing that temporary selection to
     /// escape to a different socket or into persisted state.
     fn handle_view(&self, message: ClientMessage, view: &mut ClientView) -> Result<()> {
+        if let ClientMessage::SetCompactView { enabled } = message {
+            view.compact = enabled;
+            return self.resize_for_view(view);
+        }
         if let ClientMessage::Hello { cols, rows, .. } | ClientMessage::Resize { cols, rows } =
             message
         {
@@ -1061,6 +1067,11 @@ impl Session {
             .view_dispatch
             .lock()
             .map_err(|_| anyhow!("view dispatch lock poisoned"))?;
+        // Set the foreground application's dimensions before delivering input;
+        // it may inspect its PTY immediately when the write wakes it.
+        if matches!(message, ClientMessage::Input { .. }) {
+            self.resize_view_locked(view)?;
+        }
         // A view-changing operation becomes the PTY size arbiter. This is
         // under the same dispatch lock as selection staging, so another client
         // cannot publish its dimensions between the arbitration and dispatch.
@@ -1100,6 +1111,18 @@ impl Session {
             }
         }
         drop(state);
+        if result.is_ok()
+            && !matches!(
+                message,
+                ClientMessage::Query(_)
+                    | ClientMessage::Input { .. }
+                    | ClientMessage::Subscribe
+                    | ClientMessage::ReadPane { .. }
+                    | ClientMessage::KillSession
+            )
+        {
+            self.resize_view_locked(view)?;
+        }
         drop(_dispatch);
         if matches!(message, ClientMessage::RenameSession { .. }) && result.is_ok() {
             self.save();
@@ -1189,17 +1212,10 @@ impl Session {
         Ok(ClientView::from_state(&state, cols, rows))
     }
 
-    /// Project shared panes through either the persisted/script selection or a
-    /// connection's independent view.  Detection remains session-wide; only
-    /// selection and scrollback are viewer state.
-    fn snapshot_for(&self, view: Option<&ClientView>) -> Result<LayoutSnapshot> {
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| anyhow!("state lock poisoned"))?;
-        // Refresh git-derived sidebar metadata at most every 2 s. Snapshot
-        // rendering itself must not canonicalize worktree paths per frame.
-        refresh_workspace_metadata(&mut state, Instant::now());
+    fn view_selection<'a>(
+        state: &'a SessionState,
+        view: Option<&ClientView>,
+    ) -> (&'a Workspace, &'a Tab, PaneId) {
         let workspace_id = view
             .map(|view| view.workspace)
             .filter(|id| state.workspaces.iter().any(|item| item.id == *id))
@@ -1222,13 +1238,37 @@ impl Session {
             .and_then(|view| view.focused.get(&tab.id).copied())
             .filter(|id| layout::contains(&tab.tree, *id))
             .unwrap_or(tab.focused);
-        let tree = if tab.zoomed {
+        (workspace, tab, focused)
+    }
+
+    /// Project shared panes through either the persisted/script selection or a
+    /// connection's independent view.  Detection remains session-wide; only
+    /// selection and scrollback are viewer state.
+    fn snapshot_for(&self, view: Option<&ClientView>) -> Result<LayoutSnapshot> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow!("state lock poisoned"))?;
+        // Refresh git-derived sidebar metadata at most every 2 s. Snapshot
+        // rendering itself must not canonicalize worktree paths per frame.
+        refresh_workspace_metadata(&mut state, Instant::now());
+        let (workspace, tab, focused) = Self::view_selection(&state, view);
+        let tree = if tab.zoomed || view.is_some_and(|view| view.compact) {
             LayoutTree::Leaf { pane: focused }
         } else {
             tab.tree.clone()
         };
         let mut ids = Vec::new();
-        layout::leaves(&tree, &mut ids);
+        // Compact clients still need every pane's identity for the switcher;
+        // the projected tree controls visibility and physical PTY sizing.
+        layout::leaves(
+            if view.is_some_and(|view| view.compact) {
+                &tab.tree
+            } else {
+                &tree
+            },
+            &mut ids,
+        );
         let panes = self
             .panes
             .lock()
@@ -1539,14 +1579,30 @@ impl Session {
             .view_dispatch
             .lock()
             .map_err(|_| anyhow!("view dispatch lock poisoned"))?;
+        self.resize_view_locked(view)
+    }
+
+    fn resize_view_locked(&self, view: &ClientView) -> Result<()> {
         *self
             .size
             .lock()
             .map_err(|_| anyhow!("size lock poisoned"))? = (view.cols, view.rows);
-        let snapshot = self.snapshot_for(Some(view))?;
+        // Resizing needs only the layout tree, not a full screen/agent snapshot.
+        let tree = {
+            let state = self
+                .state
+                .lock()
+                .map_err(|_| anyhow!("state lock poisoned"))?;
+            let (_, tab, focused) = Self::view_selection(&state, Some(view));
+            if tab.zoomed || view.compact {
+                LayoutTree::Leaf { pane: focused }
+            } else {
+                tab.tree.clone()
+            }
+        };
         let mut sizes = Vec::new();
         pane_sizes(
-            &snapshot.tree,
+            &tree,
             view.cols.max(1),
             view.rows.saturating_sub(2).max(1),
             &mut sizes,
@@ -1608,6 +1664,7 @@ impl Session {
                 version: _,
             }
             | ClientMessage::Resize { cols, rows } => self.resize(cols, rows)?,
+            ClientMessage::SetCompactView { .. } => {}
             ClientMessage::Input { bytes } => {
                 let state = self
                     .state
@@ -3118,6 +3175,16 @@ impl Pane {
         (history.join("\n"), count)
     }
     fn resize(&self, cols: u16, rows: u16) -> Result<()> {
+        if self
+            .parser
+            .lock()
+            .map_err(|_| anyhow!("PTY parser lock poisoned"))?
+            .screen()
+            .size()
+            == (rows, cols)
+        {
+            return Ok(());
+        }
         self.master
             .lock()
             .map_err(|_| anyhow!("PTY master lock poisoned"))?
@@ -4811,6 +4878,70 @@ mod tests {
         })
         .await
         .expect("error reply")
+    }
+
+    #[tokio::test]
+    async fn compact_focus_and_input_restore_the_interacting_clients_pty_size() {
+        let session = Session::spawn(120, 30, "compact-size".into()).unwrap();
+        session.handle(ClientMessage::SplitRight).unwrap();
+        let mut narrow = session.new_client_view().unwrap();
+        narrow.cols = 40;
+        narrow.rows = 20;
+        session
+            .handle_view(ClientMessage::SetCompactView { enabled: true }, &mut narrow)
+            .unwrap();
+        session
+            .handle_view(ClientMessage::FocusPaneCycle { forward: true }, &mut narrow)
+            .unwrap();
+        let focused = narrow.focused[&narrow.tabs[&narrow.workspace]];
+        let pane = session.panes.lock().unwrap()[&focused].clone();
+        assert_eq!(pane.master.lock().unwrap().get_size().unwrap().cols, 38);
+        let mut wide = session.new_client_view().unwrap();
+        wide.cols = 120;
+        session.resize_for_view(&wide).unwrap();
+        session
+            .handle_view(ClientMessage::Input { bytes: Vec::new() }, &mut narrow)
+            .unwrap();
+        assert_eq!(pane.master.lock().unwrap().get_size().unwrap().cols, 38);
+    }
+
+    #[tokio::test]
+    async fn compact_view_projects_focused_pane_without_mutating_tab_layout() {
+        let session = Session::spawn(100, 30, "compact-view".into()).expect("spawn session");
+        session.handle(ClientMessage::SplitRight).expect("split");
+        let full = session.snapshot().expect("full snapshot");
+        assert!(matches!(full.tree, LayoutTree::Split { .. }));
+        let mut view = session.new_client_view().expect("view");
+        session
+            .handle_view(ClientMessage::SetCompactView { enabled: true }, &mut view)
+            .expect("enable compact");
+        let compact = session
+            .snapshot_for_client(&view)
+            .expect("compact snapshot");
+        assert!(matches!(compact.tree, LayoutTree::Leaf { .. }));
+        assert_eq!(
+            compact.panes.len(),
+            2,
+            "switcher retains hidden pane identities"
+        );
+        assert!(!compact.zoomed);
+        let state = session.state.lock().expect("state");
+        assert!(!state.workspaces[0].tabs[0].zoomed);
+        assert!(matches!(
+            state.workspaces[0].tabs[0].tree,
+            LayoutTree::Split { .. }
+        ));
+        drop(state);
+        session
+            .handle_view(ClientMessage::SetCompactView { enabled: false }, &mut view)
+            .expect("disable compact");
+        assert!(matches!(
+            session
+                .snapshot_for_client(&view)
+                .expect("restored snapshot")
+                .tree,
+            LayoutTree::Split { .. }
+        ));
     }
 
     #[tokio::test]

@@ -314,3 +314,13 @@ source pixel crop, and z order. `Query(Image)` fetches one exact revision as
 Image bytes use base64, bounded to 8 MiB decoded. `PasteImage` validates a PNG,
 saves it privately on the daemon host, and pastes its quoted path without
 submitting input. See [GRAPHICS.md](GRAPHICS.md) for modes, limits, and cleanup.
+
+## Compact client views
+
+`SetCompactView { enabled }` applies after `Hello` to that connection alone.
+The layout tree projects the focused pane while `panes` retains active-tab
+identities for switching. Other processes and the persisted split tree stay
+alive; disabling restores the split projection. Focus and input reapply the
+interacting client's PTY dimensions. Ködade's auto mode enables this below
+70 columns; compact headers provide previous/next pane, Switch, and Hosts
+controls, with the usual keyboard bindings available.
