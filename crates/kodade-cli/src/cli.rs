@@ -803,6 +803,34 @@ pub enum IntegrateCommand {
         #[arg(long, conflicts_with = "write")]
         remove: bool,
     },
+    /// Antigravity CLI lifecycle hooks.
+    Antigravity {
+        #[arg(long)]
+        write: bool,
+        #[arg(long, conflicts_with = "write")]
+        remove: bool,
+    },
+    /// Devin CLI lifecycle hooks.
+    Devin {
+        #[arg(long)]
+        write: bool,
+        #[arg(long, conflicts_with = "write")]
+        remove: bool,
+    },
+    /// Mastra Code lifecycle hooks.
+    Mastra {
+        #[arg(long)]
+        write: bool,
+        #[arg(long, conflicts_with = "write")]
+        remove: bool,
+    },
+    /// Grok CLI session hook.
+    Grok {
+        #[arg(long)]
+        write: bool,
+        #[arg(long, conflicts_with = "write")]
+        remove: bool,
+    },
 }
 
 #[derive(Debug, Subcommand, PartialEq, Eq)]
@@ -1217,6 +1245,24 @@ mod tests {
                     write: true,
                     remove: false
                 }
+            })
+        );
+        assert_eq!(
+            parse(&["kodade-cli", "integrate", "devin", "--write"]).command,
+            Some(Command::Integrate {
+                target: IntegrateCommand::Devin {
+                    write: true,
+                    remove: false,
+                },
+            })
+        );
+        assert_eq!(
+            parse(&["kodade-cli", "integrate", "mastra", "--remove"]).command,
+            Some(Command::Integrate {
+                target: IntegrateCommand::Mastra {
+                    write: false,
+                    remove: true,
+                },
             })
         );
         assert_eq!(

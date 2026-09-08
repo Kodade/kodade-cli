@@ -3904,6 +3904,8 @@ fn valid_native_session(native: &NativeSession) -> bool {
             | ("kodade:pi", "pi", true, false)
             | ("kodade:pi", "pi", false, true)
             | ("kodade:hermes", "hermes", true, false)
+            | ("kodade:devin", "devin", true, false)
+            | ("kodade:grok", "grok", true, false)
     )
 }
 
@@ -3954,6 +3956,12 @@ fn native_resume_argv(native: &NativeSession) -> Option<Vec<String>> {
         }
         ("kodade:hermes", "hermes", Some(id), None) => {
             Some(vec!["hermes".into(), "--resume".into(), id.clone()])
+        }
+        ("kodade:devin", "devin", Some(id), None) => {
+            Some(vec!["devin".into(), "--resume".into(), id.clone()])
+        }
+        ("kodade:grok", "grok", Some(id), None) => {
+            Some(vec!["grok".into(), "--resume".into(), id.clone()])
         }
         ("kodade:pi", "pi", None, Some(path)) => Some(vec![
             "pi".into(),
@@ -5461,6 +5469,41 @@ mod tests {
             }),
         };
         assert_eq!(resume_command(&invalid, true, &mut resumed), None);
+    }
+
+    #[test]
+    fn verified_native_resume_contracts_use_reported_ids() {
+        let devin = NativeSession {
+            source: "kodade:devin".into(),
+            agent: "devin".into(),
+            id: Some("devin-session".into()),
+            path: None,
+        };
+        assert!(valid_native_session(&devin));
+        assert_eq!(
+            native_resume_argv(&devin),
+            Some(vec![
+                "devin".into(),
+                "--resume".into(),
+                "devin-session".into()
+            ])
+        );
+
+        let grok = NativeSession {
+            source: "kodade:grok".into(),
+            agent: "grok".into(),
+            id: Some("grok-session".into()),
+            path: None,
+        };
+        assert!(valid_native_session(&grok));
+        assert_eq!(
+            native_resume_argv(&grok),
+            Some(vec![
+                "grok".into(),
+                "--resume".into(),
+                "grok-session".into()
+            ])
+        );
     }
 
     #[tokio::test]

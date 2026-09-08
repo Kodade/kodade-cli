@@ -17,6 +17,10 @@ pub const INTEGRATIONS: &[&str] = &[
     "omp",
     "kilo",
     "hermes",
+    "antigravity",
+    "devin",
+    "mastra",
+    "grok",
     "opencode",
     "pi",
 ];
@@ -59,6 +63,10 @@ pub fn integrate_list() -> Result<()> {
                 ".hermes/plugins/kodade_cli_agent_state/__init__.py",
                 "plugin",
             ),
+            "antigravity" => (".gemini/config/hooks.json", "hooks"),
+            "devin" => (".config/devin/config.json", "hooks"),
+            "mastra" => (".mastracode/hooks.json", "hooks"),
+            "grok" => (".grok/hooks/kodade-cli.json", "hooks"),
             "opencode" => (
                 ".config/opencode/plugins/kodade-cli-agent-state.js",
                 "plugin (official docs; fixture-tested)",
@@ -69,7 +77,24 @@ pub fn integrate_list() -> Result<()> {
             ),
             _ => continue,
         };
-        let path = home.as_ref().map(|home| home.join(target));
+        let path = match *agent {
+            "copilot" => Some(
+                copilot_dir(home.as_deref(), std::env::var_os("COPILOT_HOME"))?
+                    .join("hooks/kodade-cli.json"),
+            ),
+            "antigravity" => home
+                .as_deref()
+                .map(|home| antigravity_config_dir(home).join("hooks.json")),
+            "devin" => home
+                .as_deref()
+                .map(devin_config_dir)
+                .map(|dir| dir.join("config.json")),
+            "grok" => home
+                .as_deref()
+                .map(grok_config_dir)
+                .map(|dir| dir.join("hooks/kodade-cli.json")),
+            _ => home.as_ref().map(|home| home.join(target)),
+        };
         let available = match &path {
             // "available" = the agent's config directory exists on this machine.
             Some(path) => path.parent().map(|parent| parent.exists()).unwrap_or(false),
@@ -82,6 +107,183 @@ pub fn integrate_list() -> Result<()> {
         println!("{agent:<12} {status:<10} {shown} ({mechanism})");
     }
     Ok(())
+}
+
+/// Devin's documented hook configuration is Claude-compatible. Every payload
+/// includes a stable root `session_id`, which `report_command` records from
+/// stdin through `--hook-json`.
+fn devin_hooks() -> Value {
+    json!({
+        "SessionStart": [{ "hooks": [{ "type": "command", "command": report_command("idle", "kodade:devin", "devin") }] }],
+        "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": report_command("working", "kodade:devin", "devin") }] }],
+        "PreToolUse": [{ "hooks": [{ "type": "command", "command": report_command("working", "kodade:devin", "devin") }] }],
+        "PostToolUse": [{ "hooks": [{ "type": "command", "command": report_command("working", "kodade:devin", "devin") }] }],
+        "PermissionRequest": [{ "hooks": [{ "type": "command", "command": report_command("blocked", "kodade:devin", "devin") }] }],
+        "Stop": [{ "hooks": [{ "type": "command", "command": report_command("done", "kodade:devin", "devin") }] }],
+        "SessionEnd": [{ "hooks": [{ "type": "command", "command": report_command("done", "kodade:devin", "devin") }] }]
+    })
+}
+
+fn devin_config_dir(home: &Path) -> std::path::PathBuf {
+    std::env::var_os("XDG_CONFIG_HOME")
+        .filter(|path| !path.is_empty())
+        .map(Into::into)
+        .unwrap_or_else(|| home.join(".config"))
+        .join("devin")
+}
+
+pub fn integrate_devin(write: bool) -> Result<()> {
+    let home = dirs::home_dir().ok_or_else(|| anyhow!("home directory unavailable"))?;
+    let path = devin_config_dir(&home).join("config.json");
+    if !write {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({ "hooks": devin_hooks() }))?
+        );
+        return Ok(());
+    }
+    if !path.parent().is_some_and(Path::exists) {
+        bail!(
+            "Devin config directory {} does not exist",
+            path.parent().unwrap().display()
+        );
+    }
+    merge_hook_settings(&path, &devin_hooks())?;
+    println!("installed Devin hooks in {}", path.display());
+    Ok(())
+}
+
+pub fn unintegrate_devin() -> Result<()> {
+    let home = dirs::home_dir().ok_or_else(|| anyhow!("home directory unavailable"))?;
+    remove_hook_settings(&devin_config_dir(&home).join("config.json"))
+}
+
+/// Mastra Code stores flat command entries in its global hooks document.
+fn mastra_hooks() -> Value {
+    let hook = |state| json!({ "type": "command", "command": report_command(state, "kodade:mastra", "mastra"), "timeout": 10_000 });
+    json!({
+        "SessionStart": [hook("idle")], "UserPromptSubmit": [hook("working")],
+        "AgentStart": [hook("working")], "PreToolUse": [hook("working")],
+        "PermissionRequest": [hook("blocked")], "PermissionResult": [hook("working")],
+        "SubagentStart": [hook("working")], "SubagentEnd": [hook("working")],
+        "Interrupt": [hook("idle")], "AgentEnd": [hook("done")], "Stop": [hook("done")]
+    })
+}
+
+pub fn integrate_mastra(write: bool) -> Result<()> {
+    let home = dirs::home_dir().ok_or_else(|| anyhow!("home directory unavailable"))?;
+    let path = home.join(".mastracode/hooks.json");
+    if !write {
+        println!("{}", serde_json::to_string_pretty(&mastra_hooks())?);
+        return Ok(());
+    }
+    merge_root_hook_settings(&path, &mastra_hooks())?;
+    println!("installed Mastra Code hooks in {}", path.display());
+    Ok(())
+}
+
+pub fn unintegrate_mastra() -> Result<()> {
+    let home = dirs::home_dir().ok_or_else(|| anyhow!("home directory unavailable"))?;
+    remove_root_hook_settings(&home.join(".mastracode/hooks.json"))
+}
+
+/// Grok merges each JSON file in its hooks directory. Keep Ködade's entry in
+/// a dedicated file so installation never rewrites a user's hook document.
+fn grok_hooks() -> Value {
+    json!({ "hooks": { "SessionStart": [{ "hooks": [{ "type": "command", "command": report_command("working", "kodade:grok", "grok"), "timeout": 10 }] }] } })
+}
+
+fn grok_config_dir(home: &Path) -> std::path::PathBuf {
+    std::env::var_os("GROK_HOME")
+        .filter(|path| !path.is_empty())
+        .map(Into::into)
+        .unwrap_or_else(|| home.join(".grok"))
+}
+
+pub fn integrate_grok(write: bool) -> Result<()> {
+    let home = dirs::home_dir().ok_or_else(|| anyhow!("home directory unavailable"))?;
+    let path = grok_config_dir(&home).join("hooks/kodade-cli.json");
+    if !write {
+        println!("{}", serde_json::to_string_pretty(&grok_hooks())?);
+        return Ok(());
+    }
+    if !path
+        .parent()
+        .and_then(Path::parent)
+        .is_some_and(Path::exists)
+    {
+        bail!(
+            "Grok config directory {} does not exist",
+            path.parent().unwrap().parent().unwrap().display()
+        );
+    }
+    write_owned_file(
+        &path,
+        &format!("{}\n", serde_json::to_string_pretty(&grok_hooks())?),
+    )?;
+    println!("installed Grok hooks in {}", path.display());
+    Ok(())
+}
+
+pub fn unintegrate_grok() -> Result<()> {
+    let home = dirs::home_dir().ok_or_else(|| anyhow!("home directory unavailable"))?;
+    remove_owned_file(&grok_config_dir(&home).join("hooks/kodade-cli.json"))
+}
+
+/// Antigravity command hooks consume JSON on stdin and expect a JSON object on
+/// stdout. Its documented lifecycle does not expose a resume command, so this
+/// reports state only and deliberately does not persist `conversationId`.
+fn antigravity_report_command(state: &str) -> String {
+    format!(
+        "{REPORT_PREFIX} if [ -n \"${{KODADE_PANE:-}}\" ] && [ -n \"${{KODADE_SOCKET:-}}\" ]; then \"${{KODADE_BIN:-kodade-cli}}\" agent report \"$KODADE_PANE\" {state} --source kodade:antigravity >/dev/null 2>&1 || true; fi; printf '{{}}\\n'"
+    )
+}
+
+/// Antigravity discovers named hook blocks from `~/.gemini/config/hooks.json`.
+/// Ködade owns only its block, so sibling hook definitions remain intact.
+fn antigravity_hooks() -> Value {
+    json!({
+        "PreInvocation": [{
+            "type": "command",
+            "command": antigravity_report_command("working"),
+            "timeout": 5,
+        }],
+        "Stop": [{
+            "type": "command",
+            "command": antigravity_report_command("done"),
+            "timeout": 5,
+        }],
+    })
+}
+
+fn antigravity_config_dir(home: &Path) -> std::path::PathBuf {
+    std::env::var_os("ANTIGRAVITY_CLI_CONFIG_DIR")
+        .filter(|path| !path.is_empty())
+        .map(Into::into)
+        .unwrap_or_else(|| home.join(".gemini/config"))
+}
+
+pub fn integrate_antigravity(write: bool) -> Result<()> {
+    let home = dirs::home_dir().ok_or_else(|| anyhow!("home directory unavailable"))?;
+    let path = antigravity_config_dir(&home).join("hooks.json");
+    if !write {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({ "kodade-cli": antigravity_hooks() }))?
+        );
+        return Ok(());
+    }
+    merge_named_hook_block(&path, "kodade-cli", antigravity_hooks())?;
+    println!("installed Antigravity hooks in {}", path.display());
+    Ok(())
+}
+
+pub fn unintegrate_antigravity() -> Result<()> {
+    let home = dirs::home_dir().ok_or_else(|| anyhow!("home directory unavailable"))?;
+    remove_named_hook_block(
+        &antigravity_config_dir(&home).join("hooks.json"),
+        "kodade-cli",
+    )
 }
 
 /// Copilot CLI uses independently-loaded, versioned hook documents.
@@ -98,6 +300,7 @@ fn copilot_hooks() -> Value {
         "hooks": {
             "userPromptSubmitted": [command("working")],
             "agentStop": [command("done")],
+            "permissionRequest": [command("blocked")],
             "errorOccurred": [command("blocked")]
         }
     })
@@ -105,7 +308,8 @@ fn copilot_hooks() -> Value {
 
 pub fn integrate_copilot(write: bool) -> Result<()> {
     let home = dirs::home_dir().ok_or_else(|| anyhow!("home directory unavailable"))?;
-    let path = home.join(".copilot/hooks/kodade-cli.json");
+    let path =
+        copilot_dir(Some(&home), std::env::var_os("COPILOT_HOME"))?.join("hooks/kodade-cli.json");
     if !write {
         println!("{}", serde_json::to_string_pretty(&copilot_hooks())?);
         return Ok(());
@@ -120,7 +324,23 @@ pub fn integrate_copilot(write: bool) -> Result<()> {
 
 pub fn unintegrate_copilot() -> Result<()> {
     let home = dirs::home_dir().ok_or_else(|| anyhow!("home directory unavailable"))?;
-    remove_owned_file(&home.join(".copilot/hooks/kodade-cli.json"))
+    remove_owned_file(
+        &copilot_dir(Some(&home), std::env::var_os("COPILOT_HOME"))?.join("hooks/kodade-cli.json"),
+    )
+}
+
+/// Copilot CLI replaces its complete user configuration root when
+/// `COPILOT_HOME` is set, including the user hook directory.
+fn copilot_dir(
+    home: Option<&Path>,
+    configured: Option<std::ffi::OsString>,
+) -> Result<std::path::PathBuf> {
+    if let Some(dir) = configured.filter(|dir| !dir.is_empty()) {
+        return Ok(dir.into());
+    }
+    Ok(home
+        .ok_or_else(|| anyhow!("home directory unavailable"))?
+        .join(".copilot"))
 }
 
 fn cursor_hooks() -> Value {
@@ -813,6 +1033,36 @@ fn merge_root_hook_settings(path: &Path, new_hooks: &Value) -> Result<()> {
     )
 }
 
+fn merge_named_hook_block(path: &Path, name: &str, block: Value) -> Result<()> {
+    let mut hooks: serde_json::Map<String, Value> = match fs::read_to_string(path) {
+        Ok(source) => serde_json::from_str(&source).context("parse hooks.json")?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Default::default(),
+        Err(error) => return Err(error.into()),
+    };
+    hooks.insert(name.to_owned(), block);
+    write_owned_file(
+        path,
+        &format!("{}\n", serde_json::to_string_pretty(&hooks)?),
+    )
+}
+
+fn remove_named_hook_block(path: &Path, name: &str) -> Result<()> {
+    let source = match fs::read_to_string(path) {
+        Ok(source) => source,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    let mut hooks: serde_json::Map<String, Value> =
+        serde_json::from_str(&source).context("parse hooks.json")?;
+    if hooks.remove(name).is_some() {
+        crate::atomic_file::write(
+            path,
+            format!("{}\n", serde_json::to_string_pretty(&hooks)?).as_bytes(),
+        )?;
+    }
+    Ok(())
+}
+
 fn merge_hooks_value(settings: &mut Value, new_hooks: &Value) -> Result<()> {
     let hooks = settings
         .as_object_mut()
@@ -901,6 +1151,12 @@ fn remove_hooks_value(settings: &mut Value) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use std::{
+        io::Write,
+        process::{Command, Stdio},
+        time::{SystemTime, UNIX_EPOCH},
+    };
 
     #[test]
     fn downloaded_manifest_must_match_the_daemon_schema() {
@@ -992,9 +1248,16 @@ mod tests {
     fn verified_external_hook_shapes_preserve_lifecycle_and_session_keys() {
         let copilot = copilot_hooks();
         assert_eq!(copilot["version"], 1);
-        assert!(copilot["hooks"]["userPromptSubmitted"][0]["command"]
-            .as_str()
-            .is_some_and(|command| command.contains("--hook-json")));
+        for event in [
+            "userPromptSubmitted",
+            "agentStop",
+            "permissionRequest",
+            "errorOccurred",
+        ] {
+            assert!(copilot["hooks"][event][0]["command"]
+                .as_str()
+                .is_some_and(|command| command.contains("--hook-json")));
+        }
         assert!(cursor_hooks()["sessionStart"][0]["command"]
             .as_str()
             .is_some_and(|command| command.contains("kodade:cursor")));
@@ -1006,6 +1269,177 @@ mod tests {
                 .as_str()
                 .is_some_and(|command| command.contains(" done ")));
         }
+    }
+
+    #[test]
+    fn copilot_home_replaces_the_default_config_root() {
+        let home = Path::new("/tmp/kodade-home");
+        assert_eq!(
+            copilot_dir(Some(home), Some("/tmp/kodade-copilot-home".into())).unwrap(),
+            Path::new("/tmp/kodade-copilot-home")
+        );
+        assert_eq!(
+            copilot_dir(Some(home), None).unwrap(),
+            home.join(".copilot")
+        );
+    }
+
+    #[test]
+    fn antigravity_uses_flat_lifecycle_handlers_and_preserves_sibling_blocks() {
+        let hooks = antigravity_hooks();
+        for event in ["PreInvocation", "Stop"] {
+            assert_eq!(hooks[event][0]["type"], "command");
+            assert!(hooks[event][0]["command"]
+                .as_str()
+                .is_some_and(|command| command.contains("--source kodade:antigravity")));
+        }
+        let path = std::env::temp_dir().join(format!("kodade-antigravity-{}", std::process::id()));
+        fs::write(&path, r#"{"user":{"Stop":[{"command":"echo keep"}]}}"#).unwrap();
+        merge_named_hook_block(&path, "kodade-cli", hooks).unwrap();
+        remove_named_hook_block(&path, "kodade-cli").unwrap();
+        let retained: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(retained["user"]["Stop"][0]["command"], "echo keep");
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn antigravity_config_dir_uses_its_default_root() {
+        assert_eq!(
+            antigravity_config_dir(Path::new("/tmp/kodade-home")),
+            Path::new("/tmp/kodade-home/.gemini/config")
+        );
+    }
+
+    #[test]
+    fn devin_mastra_and_grok_generated_fixtures_match_their_hook_contracts() {
+        let devin = devin_hooks();
+        for event in [
+            "SessionStart",
+            "UserPromptSubmit",
+            "PreToolUse",
+            "PostToolUse",
+            "PermissionRequest",
+            "Stop",
+            "SessionEnd",
+        ] {
+            let command = devin[event][0]["hooks"][0]["command"].as_str().unwrap();
+            assert!(command.contains("kodade:devin"));
+            assert!(command.contains("--hook-json"));
+        }
+        assert!(devin["PermissionRequest"][0]["hooks"][0]["command"]
+            .as_str()
+            .is_some_and(|command| command.contains(" blocked ")));
+
+        let mastra = mastra_hooks();
+        for event in ["SessionStart", "AgentStart", "PermissionRequest", "Stop"] {
+            let entry = &mastra[event][0];
+            assert_eq!(entry["type"], "command");
+            assert_eq!(entry["timeout"], 10_000);
+            assert!(entry["command"]
+                .as_str()
+                .is_some_and(|command| command.contains("kodade:mastra")));
+        }
+
+        let grok = grok_hooks();
+        let command = grok["hooks"]["SessionStart"][0]["hooks"][0]["command"]
+            .as_str()
+            .unwrap();
+        assert!(command.contains("kodade:grok"));
+        assert!(command.contains("--hook-json"));
+    }
+
+    #[test]
+    fn remaining_adapter_removal_preserves_user_hooks() {
+        let temp =
+            std::env::temp_dir().join(format!("kodade-remaining-hooks-{}", std::process::id()));
+        fs::create_dir_all(&temp).unwrap();
+
+        let devin = temp.join("devin.json");
+        fs::write(
+            &devin,
+            r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"echo keep"}]}]}}"#,
+        )
+        .unwrap();
+        merge_hook_settings(&devin, &devin_hooks()).unwrap();
+        merge_hook_settings(&devin, &devin_hooks()).unwrap();
+        remove_hook_settings(&devin).unwrap();
+        let retained: Value = serde_json::from_slice(&fs::read(&devin).unwrap()).unwrap();
+        assert_eq!(
+            retained["hooks"]["Stop"][0]["hooks"][0]["command"],
+            "echo keep"
+        );
+
+        let mastra = temp.join("mastra.json");
+        fs::write(
+            &mastra,
+            r#"{"Stop":[{"type":"command","command":"echo keep"}]}"#,
+        )
+        .unwrap();
+        merge_root_hook_settings(&mastra, &mastra_hooks()).unwrap();
+        merge_root_hook_settings(&mastra, &mastra_hooks()).unwrap();
+        remove_root_hook_settings(&mastra).unwrap();
+        let retained: Value = serde_json::from_slice(&fs::read(&mastra).unwrap()).unwrap();
+        assert_eq!(retained["Stop"][0]["command"], "echo keep");
+        fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn generated_remaining_hook_commands_receive_the_complete_vendor_payload() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let temp = std::env::temp_dir().join(format!("kodade-hook-exec-{unique}"));
+        fs::create_dir_all(&temp).unwrap();
+        let args = temp.join("args");
+        let payload_file = temp.join("payload");
+        let recorder = temp.join("record-kodade-call");
+        fs::write(
+            &recorder,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > {}\ncat > {}\n",
+                args.display(),
+                payload_file.display()
+            ),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&recorder, fs::Permissions::from_mode(0o755)).unwrap();
+        let payload =
+            r#"{"sessionId":"root-id","session_id":"root-snake","nested":{"sessionId":"decoy"}}"#;
+
+        for command in [
+            devin_hooks()["Stop"][0]["hooks"][0]["command"]
+                .as_str()
+                .unwrap(),
+            mastra_hooks()["Stop"][0]["command"].as_str().unwrap(),
+            grok_hooks()["hooks"]["SessionStart"][0]["hooks"][0]["command"]
+                .as_str()
+                .unwrap(),
+        ] {
+            let mut child = Command::new("sh")
+                .arg("-c")
+                .arg(command)
+                .env("KODADE_PANE", "19")
+                .env("KODADE_SOCKET", "/tmp/kodade.sock")
+                .env("KODADE_BIN", &recorder)
+                .stdin(Stdio::piped())
+                .spawn()
+                .unwrap();
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(payload.as_bytes())
+                .unwrap();
+            assert!(child.wait().unwrap().success());
+            assert_eq!(fs::read_to_string(&payload_file).unwrap(), payload);
+            let argv = fs::read_to_string(&args).unwrap();
+            assert!(argv.contains("agent\nreport\n19"));
+            assert!(argv.contains("--hook-json"));
+        }
+        fs::remove_dir_all(temp).unwrap();
     }
 
     #[test]
