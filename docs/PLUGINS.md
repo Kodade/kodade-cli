@@ -49,6 +49,24 @@ command = "printf 'pane %s opened\\n' \"$KODADE_PANE\""
 ```
 
 Action ids and plugin ids use lowercase letters, digits, `-`, and `_`.
+
+Actions may declare `contexts = ["workspace", "tab", "pane", "selection"]`.
+An action with no contexts remains globally available for compatibility. The
+command center only shows an action when every declared context is available;
+after selecting text, selection actions appear there too. A `global` context is
+always available.
+
+URL handlers claim ctrl-clicked links before the normal opener. The first
+enabled manifest handler whose regular-expression `pattern` matches runs its
+action; unmatched links keep the configured `ui.link_command` behavior.
+
+```toml
+[[link_handlers]]
+id = "github-issue"
+title = "Open issue helper"
+pattern = "^https://github\\.com/.+/issues/[0-9]+$"
+action = "inspect"
+```
 Ködade rejects unsupported manifest versions, malformed commands, duplicate
 action ids, and registry/manifest mismatches before a command runs. Enabled
 startup and event hooks are loaded by the daemon, so they continue while the
@@ -60,8 +78,13 @@ Actions appear in the command center (`prefix space`). A pane action opens a
 new terminal pane; other actions run locally for at most 30 seconds. Commands
 receive `KODADE_PLUGIN`, `KODADE_ACTION` (actions), `KODADE_EVENT` (hooks),
 `KODADE_SESSION`, `KODADE_SOCKET`, `KODADE_WORKSPACE`, and `KODADE_PANE` when
-that context exists. Pane actions also receive `KODADE_TARGET_PANE`, the pane
-that was focused before the new pane opened.
+that context exists. Context-aware actions receive a private JSON path in
+`KODADE_PLUGIN_CONTEXT` (`KODADE_PLUGIN_CONTEXT_FORMAT=json`) for the background
+job or pane lifetime.
+It contains endpoint, workspace/tab/pane ids, cwd, selected text, and clicked
+URL as data; read the file rather than interpolating values into shell source.
+Pane actions also receive `KODADE_TARGET_PANE`, the pane that was focused
+before the new pane opened.
 
 Run the fixture without network access after building:
 

@@ -28,10 +28,10 @@ use std::{
 use anyhow::{anyhow, bail, Context, Result};
 use kodade_cli_proto::{
     decode, encode, schema_message, AgentInfo, AgentStateKind, CellColor, ClientMessage, Direction,
-    Event, LayoutSnapshot, LayoutTree, ManifestInfo, NativeSession, Notification, PaneId,
-    PaneSnapshot, QueryKind, Run, Screen, ServerMessage, SidebarTabInfo, SplitAxis, TabId, TabInfo,
-    WorkspaceId, WorkspaceInfo, ATTR_BOLD, ATTR_DIM, ATTR_INVERSE, ATTR_ITALIC, ATTR_UNDERLINE,
-    PROTOCOL_VERSION,
+    Event, InvocationContext, LayoutSnapshot, LayoutTree, ManifestInfo, NativeSession,
+    Notification, PaneId, PaneSnapshot, QueryKind, Run, Screen, ServerMessage, SidebarTabInfo,
+    SplitAxis, TabId, TabInfo, WorkspaceId, WorkspaceInfo, ATTR_BOLD, ATTR_DIM, ATTR_INVERSE,
+    ATTR_ITALIC, ATTR_UNDERLINE, PROTOCOL_VERSION,
 };
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use tokio::{
@@ -143,6 +143,9 @@ struct Workspace {
     root: Option<PathBuf>,
     /// Sidebar swatch color as `#rrggbb`, when the user set one (#19).
     color: Option<String>,
+    /// Explicit environment supplied for this workspace. New panes receive a
+    /// copy at spawn time; changing it never reaches already-running panes.
+    env: HashMap<String, String>,
     /// Git metadata is refreshed together every two seconds, keeping snapshot
     /// rendering free of filesystem reads.
     branch: Option<String>,
@@ -203,6 +206,45 @@ struct Pane {
     agent_generation: AtomicU64,
     agent_identity: Mutex<Option<String>>,
     activity_revision: AtomicU64,
+    /// The daemon owns this file until the pane and its PTY child are gone.
+    _context_file: Option<ContextFile>,
+}
+
+const MAX_CONTEXT_BYTES: usize = 64 * 1024;
+
+struct ContextFile(PathBuf);
+
+impl ContextFile {
+    fn create(context: &InvocationContext) -> Result<Self> {
+        let json = serde_json::to_vec(context)?;
+        if json.len() > MAX_CONTEXT_BYTES {
+            bail!("plugin context exceeds {} KiB", MAX_CONTEXT_BYTES / 1024);
+        }
+        let path = std::env::temp_dir().join(format!(
+            "kodade-plugin-context-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_nanos()
+        ));
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&path)?;
+        let context_file = Self(path);
+        file.write_all(&json)?;
+        Ok(context_file)
+    }
+}
+
+impl Drop for ContextFile {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
 }
 
 /// Closing a pane terminates its process so the PTY reader thread exits.
@@ -219,6 +261,9 @@ impl Drop for Pane {
 struct ReportedHook {
     state: AgentStateKind,
     source: String,
+    agent: Option<String>,
+    process_pid: Option<i32>,
+    process_name: Option<String>,
     reported_at: Instant,
 }
 
@@ -548,6 +593,7 @@ impl Session {
                 tabs: vec![tab],
                 root: None,
                 color: None,
+                env: HashMap::new(),
                 branch: None,
                 main_worktree_root: None,
                 parent: None,
@@ -627,8 +673,13 @@ impl Session {
                         .is_none()
                         .then(|| replay.get(&saved_pane.id).cloned())
                         .flatten();
-                    let new_id =
-                        session.new_pane_with_replay(&saved_pane.title, cwd, command, replay)?;
+                    let new_id = session.new_pane_with_replay(
+                        &saved_pane.title,
+                        cwd,
+                        command,
+                        replay,
+                        saved.env.clone(),
+                    )?;
                     if let Some(native) = resumed_native {
                         session
                             .panes
@@ -673,6 +724,7 @@ impl Session {
                 active_tab,
                 root: saved.root.clone(),
                 color: saved.color.clone(),
+                env: saved.env.clone(),
                 branch: None,
                 main_worktree_root: None,
                 parent: None,
@@ -704,6 +756,7 @@ impl Session {
                 name: workspace.name.clone(),
                 root: workspace.root.clone(),
                 color: workspace.color.clone(),
+                env: workspace.env.clone(),
                 active_tab: workspace.active_tab.0,
                 tabs: workspace
                     .tabs
@@ -870,7 +923,7 @@ impl Session {
         cwd: Option<PathBuf>,
         command: Option<Vec<String>>,
     ) -> Result<PaneId> {
-        self.new_pane_with_id(self.pane_id(), title, cwd, command)
+        self.new_pane_with_id(self.pane_id(), title, cwd, command, None)
     }
 
     fn new_pane_with_replay(
@@ -879,8 +932,9 @@ impl Session {
         cwd: Option<PathBuf>,
         command: Option<Vec<String>>,
         replay: Option<history::PaneHistory>,
+        env: HashMap<String, String>,
     ) -> Result<PaneId> {
-        self.new_pane_with_id_replay(self.pane_id(), title, cwd, command, replay)
+        self.new_pane_with_id_replay(self.pane_id(), title, cwd, command, replay, None, env)
     }
 
     /// Spawn a pane under a caller-chosen id, used by `layout apply` so a pane
@@ -891,9 +945,11 @@ impl Session {
         title: &str,
         cwd: Option<PathBuf>,
         command: Option<Vec<String>>,
+        context_file: Option<ContextFile>,
     ) -> Result<PaneId> {
-        self.new_pane_with_id_replay(id, title, cwd, command, None)
+        self.new_pane_with_id_replay(id, title, cwd, command, None, context_file, HashMap::new())
     }
+    #[allow(clippy::too_many_arguments)]
     fn new_pane_with_id_replay(
         &self,
         id: PaneId,
@@ -901,7 +957,10 @@ impl Session {
         cwd: Option<PathBuf>,
         command: Option<Vec<String>>,
         replay: Option<history::PaneHistory>,
+        context_file: Option<ContextFile>,
+        env: HashMap<String, String>,
     ) -> Result<PaneId> {
+        validate_workspace_env(&env)?;
         let (cols, rows) = replay
             .as_ref()
             .and_then(|entry| history::dimensions(&entry.screen))
@@ -917,7 +976,9 @@ impl Session {
             Arc::clone(&self.output_generation),
             cwd,
             command,
+            context_file,
             replay,
+            env,
         )?);
         self.panes
             .lock()
@@ -925,6 +986,54 @@ impl Session {
             .insert(id, pane);
         self.emit(Event::PaneOpened { pane: id });
         Ok(id)
+    }
+
+    fn workspace_env(&self, workspace: WorkspaceId) -> Result<HashMap<String, String>> {
+        self.state
+            .lock()
+            .map_err(|_| anyhow!("state lock poisoned"))?
+            .workspaces
+            .iter()
+            .find(|item| item.id == workspace)
+            .map(|item| item.env.clone())
+            .ok_or_else(|| anyhow!("workspace {} not found", workspace.0))
+    }
+
+    fn new_workspace_pane(
+        &self,
+        workspace: WorkspaceId,
+        title: &str,
+        cwd: Option<PathBuf>,
+        command: Option<Vec<String>>,
+    ) -> Result<PaneId> {
+        self.new_pane_with_id_replay(
+            self.pane_id(),
+            title,
+            cwd,
+            command,
+            None,
+            None,
+            self.workspace_env(workspace)?,
+        )
+    }
+
+    fn new_workspace_pane_with_context(
+        &self,
+        workspace: WorkspaceId,
+        title: &str,
+        cwd: Option<PathBuf>,
+        command: Option<Vec<String>>,
+        context_file: Option<ContextFile>,
+    ) -> Result<PaneId> {
+        self.new_pane_with_id_replay(
+            self.pane_id(),
+            title,
+            cwd,
+            command,
+            None,
+            context_file,
+            self.workspace_env(workspace)?,
+        )
     }
 
     /// The cwd a new pane should inherit: the focused pane's live cwd, then the
@@ -972,6 +1081,7 @@ impl Session {
         split: Option<SplitAxis>,
         command: Option<Vec<String>>,
         name: Option<String>,
+        context: Option<InvocationContext>,
     ) -> Result<()> {
         let target = {
             let state = self
@@ -986,7 +1096,11 @@ impl Session {
         };
         let cwd = self.inherit_cwd(target, tab, None);
         let title = pane_title(name.as_deref(), command.as_deref());
-        let pane = self.new_pane(&title, cwd, command)?;
+        let context_file = context
+            .map(|context| ContextFile::create(&context))
+            .transpose()?;
+        let pane =
+            self.new_workspace_pane_with_context(target, &title, cwd, command, context_file)?;
         // Allocate the tab id up front; `tab_id` locks state and must not be
         // called while the guard below is held.
         let new_tab_id = self.tab_id();
@@ -1271,10 +1385,11 @@ impl Session {
     fn track_pane_agent(
         &self,
         pane: &Pane,
-        agent: &Option<String>,
+        detection: &agent::Detection,
         process: &ProcessEvidence,
     ) -> u64 {
-        let (generation, cleared_native) = pane.track_agent_identity(agent, process);
+        let (generation, cleared_native) =
+            pane.track_agent_identity(&detection.agent, process, detection.identity_from_hook);
         if cleared_native {
             // Retiring a conversation is a persistence mutation even when its
             // pane is hidden and terminal-output persistence is disabled.
@@ -1435,7 +1550,7 @@ impl Session {
         let mut ages = HashMap::new();
         for (id, pane) in panes.iter() {
             let detection = &detections[id];
-            self.track_pane_agent(pane, &detection.agent, &pane.process_evidence(now, false));
+            self.track_pane_agent(pane, detection, &pane.process_evidence(now, false));
             let (previous, age) = pane.transition_state(detection.state, now);
             ages.insert(*id, age);
             // The `track_state` write above makes this fire once per real
@@ -1582,7 +1697,7 @@ impl Session {
             agent: detection.agent.clone(),
             agent_generation: self.track_pane_agent(
                 &pane,
-                &detection.agent,
+                &detection,
                 &pane.process_evidence(now, false),
             ),
             activity_revision: pane.activity_revision.load(Ordering::Relaxed),
@@ -1622,7 +1737,7 @@ impl Session {
             .lock()
             .map_err(|_| anyhow!("manifest lock poisoned"))?;
         let (detection, process) = pane.detect_fresh(&manifests, now);
-        let generation = self.track_pane_agent(&pane, &detection.agent, &process);
+        let generation = self.track_pane_agent(&pane, &detection, &process);
         if detection.agent.as_deref() != Some(expected_agent) || generation != expected_generation {
             bail!("agent pane {} was replaced; resolve the target again", id.0);
         }
@@ -1842,7 +1957,15 @@ impl Session {
                     .map_err(|_| anyhow!("state lock poisoned"))?
                     .active_workspace;
                 let cwd = self.inherit_cwd(active, None, None);
-                let pane = self.new_pane("shell", cwd, None)?;
+                let pane = self.new_pane_with_id_replay(
+                    self.pane_id(),
+                    "shell",
+                    cwd,
+                    None,
+                    None,
+                    None,
+                    self.workspace_env(active)?,
+                )?;
                 let mut state = self
                     .state
                     .lock()
@@ -1861,7 +1984,11 @@ impl Session {
                 repo_root,
                 branch,
                 from,
-            } => self.new_worktree_workspace(repo_root, branch, from)?,
+                path,
+            } => self.new_worktree_workspace(repo_root, branch, from, path)?,
+            ClientMessage::OpenWorktreeWorkspace { repo_root, path } => {
+                self.open_worktree_workspace(repo_root, path)?
+            }
             ClientMessage::RemoveWorktreeWorkspace { id, keep } => {
                 self.remove_worktree_workspace(id, keep)?
             }
@@ -1927,7 +2054,7 @@ impl Session {
                     .map_err(|_| anyhow!("state lock poisoned"))?
                     .active_workspace;
                 let cwd = self.inherit_cwd(active, None, None);
-                let pane = self.new_pane("shell", cwd, None)?;
+                let pane = self.new_workspace_pane(active, "shell", cwd, None)?;
                 let id = self.tab_id();
                 let mut state = self
                     .state
@@ -1956,7 +2083,15 @@ impl Session {
                 split,
                 command,
                 name,
-            } => self.new_pane_message(workspace, tab, split, command, name)?,
+                context,
+            } => self.new_pane_message(
+                workspace,
+                tab,
+                split,
+                command,
+                name,
+                context.map(|context| *context),
+            )?,
             ClientMessage::NextTab | ClientMessage::PrevTab => {
                 let next = matches!(message, ClientMessage::NextTab);
                 let mut state = self
@@ -2150,9 +2285,18 @@ impl Session {
                 drop(state);
                 self.notify();
             }
-            ClientMessage::NewWorkspace { name, root } => {
+            ClientMessage::NewWorkspace { name, root, env } => {
                 // A workspace root seeds its first pane's cwd; later panes inherit.
-                let pane = self.new_pane("shell", root.clone(), None)?;
+                validate_workspace_env(&env)?;
+                let pane = self.new_pane_with_id_replay(
+                    self.pane_id(),
+                    "shell",
+                    root.clone(),
+                    None,
+                    None,
+                    None,
+                    env.clone(),
+                )?;
                 let tab_id = self.tab_id();
                 let id = self.workspace_id();
                 let mut state = self
@@ -2172,6 +2316,7 @@ impl Session {
                     }],
                     root,
                     color: None,
+                    env,
                     branch: None,
                     main_worktree_root: None,
                     parent: None,
@@ -2299,11 +2444,16 @@ impl Session {
                 let pane = panes
                     .get(&pane)
                     .ok_or_else(|| anyhow!("pane {} not found", pane.0))?;
+                let hook_agent = trusted_hook_agent(&source, native_session.as_ref());
+                let process = pane.process_evidence(Instant::now(), true);
                 let mut hook = pane.hook.lock().expect("hook lock poisoned");
                 let changed = hook.as_ref().is_none_or(|previous| previous.state != state);
                 *hook = Some(ReportedHook {
                     state,
                     source,
+                    agent: hook_agent,
+                    process_pid: process.pid,
+                    process_name: process.name,
                     reported_at: Instant::now(),
                 });
                 drop(hook);
@@ -2314,7 +2464,11 @@ impl Session {
                     // this report, so its next detection cannot erase a new ID.
                     let manifests = self.manifests.lock().expect("manifest lock poisoned");
                     let (detection, process) = pane.detect_fresh(&manifests, Instant::now());
-                    pane.track_agent_identity(&detection.agent, &process);
+                    pane.track_agent_identity(
+                        &detection.agent,
+                        &process,
+                        detection.identity_from_hook,
+                    );
                     *pane
                         .native_session
                         .lock()
@@ -2332,7 +2486,7 @@ impl Session {
     }
 
     fn close_pane(&self) -> Result<()> {
-        let needs_fresh = {
+        let (needs_fresh, active) = {
             let state = self
                 .state
                 .lock()
@@ -2347,11 +2501,14 @@ impl Session {
                 .iter()
                 .find(|tab| tab.id == workspace.active_tab)
                 .expect("active tab exists");
-            workspace.tabs.len() == 1 && matches!(tab.tree, LayoutTree::Leaf { .. })
+            (
+                workspace.tabs.len() == 1 && matches!(tab.tree, LayoutTree::Leaf { .. }),
+                state.active_workspace,
+            )
         };
         // Spawn before taking the state lock: id allocation also reads session state.
         let fresh_pane = needs_fresh
-            .then(|| self.new_pane("shell", None, None))
+            .then(|| self.new_workspace_pane(active, "shell", None, None))
             .transpose()?;
         let removed;
         let mut events = Vec::new();
@@ -2412,7 +2569,7 @@ impl Session {
     }
 
     fn close_tab(&self, id: TabId) -> Result<()> {
-        let needs_fresh = {
+        let replacement_workspace = {
             let state = self
                 .state
                 .lock()
@@ -2420,12 +2577,13 @@ impl Session {
             state
                 .workspaces
                 .iter()
-                .any(|workspace| workspace.tabs.len() == 1 && workspace.tabs[0].id == id)
+                .find(|workspace| workspace.tabs.len() == 1 && workspace.tabs[0].id == id)
+                .map(|workspace| workspace.id)
         };
-        let fresh = needs_fresh
-            .then(|| self.new_pane("shell", None, None))
+        let fresh = replacement_workspace
+            .map(|workspace| self.new_workspace_pane(workspace, "shell", None, None))
             .transpose()?;
-        let fresh_tab = needs_fresh.then(|| self.tab_id());
+        let fresh_tab = replacement_workspace.map(|_| self.tab_id());
         let mut events = Vec::new();
         let pane_ids = {
             let mut state = self
@@ -2486,8 +2644,9 @@ impl Session {
         repo_root: PathBuf,
         branch: String,
         from: Option<String>,
+        path: Option<PathBuf>,
     ) -> Result<()> {
-        let repo = git::repo_root(&repo_root)
+        let repo = git::worktree_owner(&repo_root)
             .ok_or_else(|| anyhow!("{} is not inside a git repository", repo_root.display()))?;
         let basename = repo
             .file_name()
@@ -2495,7 +2654,15 @@ impl Session {
             .ok_or_else(|| anyhow!("repository path has no name"))?
             .to_owned();
         // `<worktrees.directory>/<repo-basename>/<branch>`; a slashed branch nests.
-        let dest = persist::worktrees_directory().join(&basename).join(&branch);
+        let dest = path
+            .map(|path| {
+                if path.is_absolute() {
+                    path
+                } else {
+                    repo.join(path)
+                }
+            })
+            .unwrap_or_else(|| persist::worktrees_directory().join(&basename).join(&branch));
         git::worktree_add(&repo, &branch, from.as_deref(), &dest)?;
 
         let name = format!("{basename}:{branch}");
@@ -2519,6 +2686,70 @@ impl Session {
             }],
             root: Some(dest),
             color: None,
+            env: HashMap::new(),
+            branch: Some(branch),
+            main_worktree_root: None,
+            parent: None,
+            metadata_checked_at: None,
+        });
+        state.active_workspace = id;
+        drop(state);
+        self.resize_current()
+    }
+
+    /// Open an already-registered linked worktree. Its directory is only read;
+    /// cleanup still goes through Git's registered-worktree checks.
+    fn open_worktree_workspace(&self, repo_root: PathBuf, path: PathBuf) -> Result<()> {
+        let repo = git::worktree_owner(&repo_root)
+            .ok_or_else(|| anyhow!("{} is not inside a git repository", repo_root.display()))?;
+        let path = if path.is_absolute() {
+            path
+        } else {
+            repo.join(path)
+        };
+        let dest = path
+            .canonicalize()
+            .with_context(|| format!("open worktree {}", path.display()))?;
+        if git::main_worktree_root(&dest).is_none() || !git::registered_worktree(&repo, &dest) {
+            bail!("{} is not a worktree of {}", dest.display(), repo.display());
+        }
+        let already_open = self
+            .state
+            .lock()
+            .map_err(|_| anyhow!("state lock poisoned"))?
+            .workspaces
+            .iter()
+            .any(|workspace| workspace.root.as_ref() == Some(&dest));
+        if already_open {
+            bail!("worktree {} is already open", dest.display());
+        }
+        let branch =
+            git::current_branch(&dest).ok_or_else(|| anyhow!("worktree has detached HEAD"))?;
+        let basename = repo
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| anyhow!("repository path has no name"))?;
+        let pane = self.new_pane("shell", Some(dest.clone()), None)?;
+        let tab_id = self.tab_id();
+        let id = self.workspace_id();
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow!("state lock poisoned"))?;
+        state.workspaces.push(Workspace {
+            id,
+            name: format!("{basename}:{branch}"),
+            active_tab: tab_id,
+            tabs: vec![Tab {
+                id: tab_id,
+                name: "shell".into(),
+                tree: LayoutTree::Leaf { pane },
+                focused: pane,
+                zoomed: false,
+            }],
+            root: Some(dest),
+            color: None,
+            env: HashMap::new(),
             branch: Some(branch),
             main_worktree_root: None,
             parent: None,
@@ -2553,9 +2784,10 @@ impl Session {
         // available to fix the problem. Git can remove a registered worktree
         // even while a pane has it as its cwd on supported Unix platforms.
         if !keep {
-            if let Some((main, dest)) = removal {
-                git::worktree_remove(&main, &dest, false)?;
-            }
+            let Some((main, dest)) = removal else {
+                bail!("workspace is not a linked git worktree; refusing to remove its directory")
+            };
+            git::worktree_remove(&main, &dest, false)?;
         }
         self.close_workspace(id)?;
         Ok(())
@@ -2571,7 +2803,7 @@ impl Session {
                 && state.workspaces.iter().any(|workspace| workspace.id == id)
         };
         let fresh = needs_fresh
-            .then(|| self.new_pane("shell", None, None))
+            .then(|| self.new_workspace_pane(id, "shell", None, None))
             .transpose()?;
         let fresh_tab = needs_fresh.then(|| self.tab_id());
         let mut events = Vec::new();
@@ -2653,7 +2885,7 @@ impl Session {
     fn move_pane_to_tab(&self, pane: PaneId, tab: TabId) -> Result<()> {
         // Decide up front whether the source workspace would be emptied; the
         // replacement pane has to be spawned before the state lock is taken.
-        let needs_fresh = {
+        let replacement_workspace = {
             let state = self
                 .state
                 .lock()
@@ -2665,15 +2897,16 @@ impl Session {
                     let workspace = &state.workspaces[source_ws];
                     let only_leaf =
                         matches!(workspace.tabs[source_tab].tree, LayoutTree::Leaf { .. });
-                    only_leaf && workspace.tabs.len() == 1 && source_ws != target_ws
+                    (only_leaf && workspace.tabs.len() == 1 && source_ws != target_ws)
+                        .then_some(workspace.id)
                 }
-                _ => false,
+                _ => None,
             }
         };
-        let fresh_pane = needs_fresh
-            .then(|| self.new_pane("shell", None, None))
+        let fresh_pane = replacement_workspace
+            .map(|workspace| self.new_workspace_pane(workspace, "shell", None, None))
             .transpose()?;
-        let fresh_tab = needs_fresh.then(|| self.tab_id());
+        let fresh_tab = replacement_workspace.map(|_| self.tab_id());
         let mut events = Vec::new();
         {
             let mut state = self
@@ -2959,7 +3192,15 @@ impl Session {
                             anyhow!("tab {} has no entry for pane {}", saved_tab.id, id.0)
                         })?;
                     let cwd = restore_cwd(saved_pane.cwd.clone(), saved.root.clone());
-                    self.new_pane_with_id(*id, &saved_pane.title, cwd, saved_pane.command.clone())?;
+                    self.new_pane_with_id_replay(
+                        *id,
+                        &saved_pane.title,
+                        cwd,
+                        saved_pane.command.clone(),
+                        None,
+                        None,
+                        saved.env.clone(),
+                    )?;
                     spawned.push(*id);
                 }
                 let focused = if leaves.contains(&PaneId(saved_tab.focused)) {
@@ -2989,6 +3230,7 @@ impl Session {
                 active_tab,
                 root: saved.root.clone(),
                 color: saved.color.clone(),
+                env: saved.env.clone(),
                 branch: None,
                 main_worktree_root: None,
                 parent: None,
@@ -3207,7 +3449,9 @@ impl Pane {
         output_generation: Arc<AtomicU64>,
         cwd: Option<PathBuf>,
         run: Option<Vec<String>>,
+        context_file: Option<ContextFile>,
         replay: Option<history::PaneHistory>,
+        environment: HashMap<String, String>,
     ) -> Result<Self> {
         let pty_system = native_pty_system();
         let pair = pty_system.openpty(PtySize {
@@ -3241,9 +3485,17 @@ impl Pane {
         if let Some(dir) = &cwd {
             command.cwd(dir);
         }
+        for (key, value) in environment {
+            command.env(key, value);
+        }
+        // Ködade's routing identity remains authoritative over workspace env.
         command.env("KODADE_PANE", id.0.to_string());
         command.env("KODADE_SOCKET", hook_socket);
         command.env("KODADE_SESSION", session);
+        if let Some(context_file) = &context_file {
+            command.env("KODADE_PLUGIN_CONTEXT", &context_file.0);
+            command.env("KODADE_PLUGIN_CONTEXT_FORMAT", "json");
+        }
         // Scripts inside a pane call the same binary that hosts them.
         if let Ok(exe) = env::current_exe() {
             command.env("KODADE_BIN", exe);
@@ -3294,6 +3546,7 @@ impl Pane {
             agent_generation: AtomicU64::new(0),
             agent_identity: Mutex::new(None),
             activity_revision: AtomicU64::new(0),
+            _context_file: context_file,
         })
     }
     fn snapshot(&self) -> (Screen, usize) {
@@ -3438,19 +3691,39 @@ impl Pane {
             .map(|hook| agent::HookState {
                 state: hook.state,
                 source: hook.source,
+                agent: hook.agent,
+                process_pid: hook.process_pid,
+                process_name: hook.process_name,
                 age: now.saturating_duration_since(hook.reported_at),
                 // A `done` report is released once the pane prints anything new.
                 output_since_report: last_output > hook.reported_at,
             });
         let output_age = now.saturating_duration_since(last_output);
-        let detection = agent::detect(
+        let mut detection = agent::detect(
             manifests,
             process.name.as_deref().or(Some(&self.spawn_process)),
+            process.pid,
             &title,
             &screen,
             output_age,
             hook,
         );
+        // A hook-backed adapter can run under Node/Python. Once it exits to a
+        // shell, ignore a stale title as an additional conservative guard.
+        if process.name.as_deref().is_some_and(agent::is_shell)
+            && self
+                .agent_identity
+                .lock()
+                .expect("agent identity lock poisoned")
+                .as_deref()
+                .is_some_and(|identity| identity.ends_with("|hook=true"))
+        {
+            detection.agent = None;
+            detection.state = AgentStateKind::Idle;
+            detection.reason = "foreground shell after agent exit".into();
+            detection.from_hook = false;
+            detection.identity_from_hook = false;
+        }
         (detection, process)
     }
 
@@ -3461,6 +3734,7 @@ impl Pane {
         &self,
         agent: &Option<String>,
         process: &ProcessEvidence,
+        from_hook: bool,
     ) -> (u64, bool) {
         let mut identity = self
             .agent_identity
@@ -3471,7 +3745,7 @@ impl Pane {
         // foreground PID/process when the platform can expose it.
         let next = agent.as_ref().map(|agent| {
             format!(
-                "{agent}|pid={}|process={}",
+                "{agent}|pid={}|process={}|hook={from_hook}",
                 process
                     .pid
                     .map_or_else(|| "unknown".into(), |pid| pid.to_string()),
@@ -3564,6 +3838,27 @@ impl Pane {
     }
 }
 
+fn validate_workspace_env(env: &HashMap<String, String>) -> Result<()> {
+    for key in env.keys() {
+        let valid = key.bytes().enumerate().all(|(index, byte)| {
+            byte == b'_' || (byte.is_ascii_alphabetic()) || (index > 0 && byte.is_ascii_digit())
+        });
+        if !valid {
+            bail!("workspace environment key must be a shell-style identifier: {key:?}");
+        }
+        if matches!(
+            key.as_str(),
+            "KODADE_PANE" | "KODADE_SOCKET" | "KODADE_SESSION" | "KODADE_BIN"
+        ) {
+            bail!("workspace environment cannot override reserved key {key}");
+        }
+    }
+    if env.values().any(|value| value.contains('\0')) {
+        bail!("workspace environment values cannot contain NUL");
+    }
+    Ok(())
+}
+
 /// Directory a restored pane should start in: its saved cwd if it still exists,
 /// else the workspace root, else the pane spawn's own default (home / `$SHELL`).
 fn restore_cwd(saved: Option<PathBuf>, root: Option<PathBuf>) -> Option<PathBuf> {
@@ -3633,9 +3928,50 @@ fn valid_native_session(native: &NativeSession) -> bool {
             | ("kodade:codex", "codex", true, false)
             | ("kodade:gemini-cli", "gemini", true, false)
             | ("kodade:opencode", "opencode", true, false)
+            | ("kodade:omp", "omp", true, false)
+            | ("kodade:omp", "omp", false, true)
+            | ("kodade:copilot", "copilot", true, false)
+            | ("kodade:cursor", "cursor", true, false)
+            | ("kodade:droid", "droid", true, false)
+            | ("kodade:kimi", "kimi", true, false)
+            | ("kodade:qwen", "qwen", true, false)
             | ("kodade:pi", "pi", true, false)
             | ("kodade:pi", "pi", false, true)
+            | ("kodade:hermes", "hermes", true, false)
+            | ("kodade:devin", "devin", true, false)
+            | ("kodade:grok", "grok", true, false)
     )
+}
+
+/// Accept identity only from one of our fixed adapter/source pairs. Hook
+/// `source` is user-supplied protocol text, so it must never become a pane
+/// identity by itself.
+fn trusted_hook_agent(source: &str, native: Option<&NativeSession>) -> Option<String> {
+    let native = native?;
+    let (agent, display) = match (source, native.source.as_str(), native.agent.as_str()) {
+        ("kodade:claude-code", "kodade:claude-code", "claude") => ("claude", "Claude Code"),
+        ("kodade:codex", "kodade:codex", "codex") => ("codex", "Codex"),
+        ("kodade:gemini-cli", "kodade:gemini-cli", "gemini") => ("gemini", "Gemini CLI"),
+        ("kodade:copilot", "kodade:copilot", "copilot") => ("copilot", "GitHub Copilot CLI"),
+        ("kodade:cursor", "kodade:cursor", "cursor") => ("cursor", "Cursor CLI"),
+        ("kodade:droid", "kodade:droid", "droid") => ("droid", "Droid"),
+        ("kodade:kimi", "kodade:kimi", "kimi") => ("kimi", "Kimi CLI"),
+        ("kodade:qwen", "kodade:qwen", "qwen") => ("qwen", "Qwen Code"),
+        ("kodade:omp", "kodade:omp", "omp") => ("omp", "OMP"),
+        ("kodade:kilo", "kodade:kilo", "kilo") => ("kilo", "Kilo Code"),
+        ("kodade:hermes", "kodade:hermes", "hermes") => ("hermes", "Hermes"),
+        ("kodade:antigravity", "kodade:antigravity", "antigravity") => {
+            ("antigravity", "Antigravity")
+        }
+        ("kodade:devin", "kodade:devin", "devin") => ("devin", "Devin"),
+        ("kodade:mastra", "kodade:mastra", "mastra") => ("mastra", "Mastra Code"),
+        ("kodade:grok", "kodade:grok", "grok") => ("grok", "Grok Build"),
+        ("kodade:opencode", "kodade:opencode", "opencode") => ("opencode", "OpenCode"),
+        ("kodade:pi", "kodade:pi", "pi") => ("pi", "Pi"),
+        _ => return None,
+    };
+    debug_assert!(!agent.is_empty());
+    Some(display.into())
 }
 
 fn native_resume_argv(native: &NativeSession) -> Option<Vec<String>> {
@@ -3660,8 +3996,37 @@ fn native_resume_argv(native: &NativeSession) -> Option<Vec<String>> {
         ("kodade:opencode", "opencode", Some(id), None) => {
             Some(vec!["opencode".into(), "--session".into(), id.clone()])
         }
+        ("kodade:omp", "omp", Some(id), None) => Some(vec!["omp".into(), format!("--resume={id}")]),
+        ("kodade:omp", "omp", None, Some(path)) => Some(vec![
+            "omp".into(),
+            format!("--resume={}", path.to_string_lossy()),
+        ]),
+        ("kodade:copilot", "copilot", Some(id), None) => {
+            Some(vec!["copilot".into(), format!("--resume={id}")])
+        }
+        ("kodade:cursor", "cursor", Some(id), None) => {
+            Some(vec!["cursor-agent".into(), "--resume".into(), id.clone()])
+        }
+        ("kodade:droid", "droid", Some(id), None) => {
+            Some(vec!["droid".into(), "--resume".into(), id.clone()])
+        }
+        ("kodade:kimi", "kimi", Some(id), None) => {
+            Some(vec!["kimi".into(), "--session".into(), id.clone()])
+        }
+        ("kodade:qwen", "qwen", Some(id), None) => {
+            Some(vec!["qwen".into(), "--resume".into(), id.clone()])
+        }
         ("kodade:pi", "pi", Some(id), None) => {
             Some(vec!["pi".into(), "--session".into(), id.clone()])
+        }
+        ("kodade:hermes", "hermes", Some(id), None) => {
+            Some(vec!["hermes".into(), "--resume".into(), id.clone()])
+        }
+        ("kodade:devin", "devin", Some(id), None) => {
+            Some(vec!["devin".into(), "--resume".into(), id.clone()])
+        }
+        ("kodade:grok", "grok", Some(id), None) => {
+            Some(vec!["grok".into(), "--resume".into(), id.clone()])
         }
         ("kodade:pi", "pi", None, Some(path)) => Some(vec![
             "pi".into(),
@@ -4426,6 +4791,64 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn pane_context_is_created_after_acceptance_and_removed_with_the_pane() {
+        let session = Session::spawn(80, 24, "pane-context-lifetime".into()).expect("session");
+        session
+            .handle(ClientMessage::NewPane {
+                workspace: None,
+                tab: None,
+                split: None,
+                command: Some(vec!["sleep".into(), "60".into()]),
+                name: Some("context".into()),
+                context: Some(Box::new(InvocationContext {
+                    selected_text: Some("selection is data".into()),
+                    ..Default::default()
+                })),
+            })
+            .expect("accept context pane");
+        let pane = session
+            .snapshot()
+            .expect("snapshot")
+            .panes
+            .into_iter()
+            .find(|pane| pane.focused)
+            .expect("focused pane")
+            .id;
+        let path = session
+            .panes
+            .lock()
+            .expect("panes")
+            .get(&pane)
+            .and_then(|pane| pane._context_file.as_ref())
+            .map(|file| file.0.clone())
+            .expect("daemon context file");
+        assert!(path.exists());
+        session
+            .handle(ClientMessage::ClosePane)
+            .expect("close pane");
+        assert!(!path.exists(), "closing a pane releases its context file");
+    }
+
+    #[tokio::test]
+    async fn rejected_pane_context_never_spawns_or_persists_a_file() {
+        let session = Session::spawn(80, 24, "reject-pane-context".into()).expect("session");
+        let before = session.panes.lock().expect("panes").len();
+        let result = session.handle(ClientMessage::NewPane {
+            workspace: None,
+            tab: None,
+            split: None,
+            command: Some(vec!["sleep".into(), "60".into()]),
+            name: Some("too-large".into()),
+            context: Some(Box::new(InvocationContext {
+                selected_text: Some("x".repeat(MAX_CONTEXT_BYTES)),
+                ..Default::default()
+            })),
+        });
+        assert!(result.is_err());
+        assert_eq!(session.panes.lock().expect("panes").len(), before);
+    }
+
+    #[tokio::test]
     async fn client_line_reader_accepts_empty_and_rejects_oversized_requests() {
         let (mut write, read) = tokio::io::duplex(MAX_CLIENT_LINE + 2);
         write.write_all(b"\n").await.unwrap();
@@ -4758,6 +5181,8 @@ mod tests {
             None,
             Some(vec!["sleep".into(), "60".into()]),
             None,
+            None,
+            HashMap::new(),
         )
         .expect("test pane");
         // The reader keeps the original parser, so shell profile output cannot
@@ -4827,6 +5252,7 @@ mod tests {
                     active_tab: TabId(2),
                     root: None,
                     color: None,
+                    env: HashMap::new(),
                     branch: None,
                     main_worktree_root: None,
                     parent: None,
@@ -4845,6 +5271,7 @@ mod tests {
                     active_tab: TabId(5),
                     root: None,
                     color: None,
+                    env: HashMap::new(),
                     branch: None,
                     main_worktree_root: None,
                     parent: None,
@@ -4876,6 +5303,7 @@ mod tests {
                 active_tab: TabId(2),
                 root: None,
                 color: None,
+                env: HashMap::new(),
                 branch: None,
                 main_worktree_root: None,
                 parent: None,
@@ -4943,6 +5371,7 @@ mod tests {
                     name: "one".into(),
                     root: Some(PathBuf::from("/tmp")),
                     color: Some("#e7a33b".into()),
+                    env: HashMap::new(),
                     active_tab: 20,
                     tabs: vec![
                         persist::TabFile {
@@ -4994,6 +5423,7 @@ mod tests {
                     name: "two".into(),
                     root: None,
                     color: None,
+                    env: HashMap::new(),
                     active_tab: 22,
                     tabs: vec![persist::TabFile {
                         id: 22,
@@ -5104,6 +5534,41 @@ mod tests {
             }),
         };
         assert_eq!(resume_command(&invalid, true, &mut resumed), None);
+    }
+
+    #[test]
+    fn verified_native_resume_contracts_use_reported_ids() {
+        let devin = NativeSession {
+            source: "kodade:devin".into(),
+            agent: "devin".into(),
+            id: Some("devin-session".into()),
+            path: None,
+        };
+        assert!(valid_native_session(&devin));
+        assert_eq!(
+            native_resume_argv(&devin),
+            Some(vec![
+                "devin".into(),
+                "--resume".into(),
+                "devin-session".into()
+            ])
+        );
+
+        let grok = NativeSession {
+            source: "kodade:grok".into(),
+            agent: "grok".into(),
+            id: Some("grok-session".into()),
+            path: None,
+        };
+        assert!(valid_native_session(&grok));
+        assert_eq!(
+            native_resume_argv(&grok),
+            Some(vec![
+                "grok".into(),
+                "--resume".into(),
+                "grok-session".into()
+            ])
+        );
     }
 
     #[tokio::test]
@@ -5736,6 +6201,9 @@ mod tests {
         *pane.hook.lock().unwrap() = Some(ReportedHook {
             state: AgentStateKind::Blocked,
             source: "test".into(),
+            agent: None,
+            process_pid: None,
+            process_name: None,
             reported_at: Instant::now(),
         });
         assert!(session
@@ -5745,6 +6213,39 @@ mod tests {
                 current.agent_generation,
                 b"must-not-write",
             )
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn recognized_hook_identity_retires_after_a_non_shell_replacement() {
+        let session = Session::spawn(80, 24, "hook-wrapper-identity".into()).unwrap();
+        let pane_id = session.snapshot().unwrap().panes[0].id;
+        let pane = Arc::clone(&session.panes.lock().unwrap()[&pane_id]);
+        {
+            let mut process = pane.process.lock().unwrap();
+            process.pid = Some(100);
+            process.name = Some("node".into());
+            process.checked_at = Instant::now();
+        }
+        *pane.hook.lock().unwrap() = Some(ReportedHook {
+            state: AgentStateKind::Working,
+            source: "kodade:pi".into(),
+            agent: Some("Pi".into()),
+            process_pid: Some(100),
+            process_name: Some("node".into()),
+            reported_at: Instant::now(),
+        });
+        let pi = session.pane_snapshot(pane_id).unwrap();
+        assert_eq!(pi.agent.as_deref(), Some("Pi"));
+
+        {
+            let mut process = pane.process.lock().unwrap();
+            process.pid = Some(101);
+            process.name = Some("sleep".into());
+        }
+        assert_eq!(session.pane_snapshot(pane_id).unwrap().agent, None);
+        assert!(session
+            .prompt_agent(pane_id, "Pi", pi.agent_generation, b"must-not-write")
             .is_err());
     }
 
@@ -6109,6 +6610,7 @@ mod tests {
             .handle(ClientMessage::NewWorkspace {
                 name: "two".into(),
                 root: None,
+                env: HashMap::new(),
             })
             .expect("second workspace");
         let (first_workspace, moved_pane, target_tab) = {
@@ -6195,11 +6697,9 @@ mod tests {
 
         let session = Session::spawn(80, 24, "dirty-worktree".into()).expect("spawn session");
         session
-            .handle(ClientMessage::NewWorkspace {
-                name: "feature".into(),
-                root: Some(worktree.clone()),
-            })
-            .expect("open worktree workspace");
+            .open_worktree_workspace(repo.clone(), worktree.clone())
+            .expect("open existing worktree workspace");
+        let worktree = worktree.canonicalize().expect("canonical worktree");
         let workspace = session
             .state
             .lock()
@@ -6222,6 +6722,109 @@ mod tests {
 
         git::worktree_remove(&repo, &worktree, true).expect("forced cleanup");
         fs::remove_dir_all(base).ok();
+    }
+
+    #[tokio::test]
+    async fn workspace_environment_reaches_future_pty_panes_and_persists() {
+        let session = Session::spawn(80, 24, "workspace-env".into()).expect("spawn session");
+        let env = HashMap::from([("KODADE_ISSUE52".into(), "per-workspace".into())]);
+        session
+            .handle(ClientMessage::NewWorkspace {
+                name: "environment".into(),
+                root: None,
+                env: env.clone(),
+            })
+            .expect("create workspace");
+        let workspace = session.state.lock().expect("state").active_workspace;
+        for name in ["one", "two"] {
+            session
+                .handle(ClientMessage::NewPane {
+                    workspace: Some(workspace),
+                    tab: None,
+                    split: None,
+                    command: Some(vec![
+                        "sh".into(),
+                        "-c".into(),
+                        "printf %s \"$KODADE_ISSUE52\"; sleep 1".into(),
+                    ]),
+                    name: Some(name.into()),
+                    context: None,
+                })
+                .expect("spawn pane");
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let contents: Vec<_> = session
+            .panes
+            .lock()
+            .expect("panes")
+            .values()
+            .map(|pane| pane.snapshot().0.contents)
+            .collect();
+        assert_eq!(
+            contents
+                .iter()
+                .filter(|text| text.contains("per-workspace"))
+                .count(),
+            2
+        );
+        assert_eq!(
+            session
+                .build_file()
+                .workspaces
+                .iter()
+                .find(|item| item.id == workspace.0)
+                .unwrap()
+                .env,
+            env
+        );
+        let restored = Session::restore(session.build_file(), false).expect("cold restore");
+        let restored_workspace = restored
+            .state
+            .lock()
+            .expect("state")
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.name == "environment")
+            .expect("restored workspace")
+            .id;
+        restored
+            .handle(ClientMessage::NewPane {
+                workspace: Some(restored_workspace),
+                tab: None,
+                split: None,
+                command: Some(vec![
+                    "sh".into(),
+                    "-c".into(),
+                    "printf %s \"$KODADE_ISSUE52\"; sleep 1".into(),
+                ]),
+                name: Some("restored".into()),
+                context: None,
+            })
+            .expect("spawn restored pane");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(restored
+            .panes
+            .lock()
+            .expect("panes")
+            .values()
+            .any(|pane| pane.snapshot().0.contents.contains("per-workspace")));
+    }
+
+    #[tokio::test]
+    async fn daemon_rejects_invalid_and_reserved_workspace_environment() {
+        let session = Session::spawn(80, 24, "workspace-env-invalid".into()).expect("spawn");
+        for env in [
+            HashMap::from([("KODADE_SOCKET".into(), "forged".into())]),
+            HashMap::from([("1INVALID".into(), "value".into())]),
+        ] {
+            assert!(session
+                .handle(ClientMessage::NewWorkspace {
+                    name: "invalid".into(),
+                    root: None,
+                    env,
+                })
+                .is_err());
+        }
     }
 
     #[tokio::test]

@@ -1,0 +1,4 @@
+# Identification uses the documented Muse Code CLI entrypoint only.
+name = "muse"
+display = "Muse Code"
+process = ["muse"]

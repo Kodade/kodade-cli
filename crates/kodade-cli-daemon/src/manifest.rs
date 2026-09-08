@@ -36,7 +36,7 @@ pub struct Manifest {
     pub process: Vec<String>,
     #[serde(default)]
     pub title: Vec<String>,
-    /// Command that resumes the agent's last session, e.g. `codex resume --last`.
+    /// Metadata command that opens an agent's resume surface, e.g. `codex resume`.
     #[serde(default)]
     pub resume: Option<String>,
     #[serde(default, rename = "rule")]
@@ -152,9 +152,18 @@ fn builtin() -> Result<HashMap<String, Manifest>> {
         include_str!("../manifests/copilot.toml"),
         include_str!("../manifests/cline.toml"),
         include_str!("../manifests/amp.toml"),
+        include_str!("../manifests/antigravity.toml"),
         include_str!("../manifests/droid.toml"),
+        include_str!("../manifests/devin.toml"),
         include_str!("../manifests/kimi.toml"),
+        include_str!("../manifests/kilo.toml"),
+        include_str!("../manifests/kiro.toml"),
+        include_str!("../manifests/maki.toml"),
+        include_str!("../manifests/mastra.toml"),
+        include_str!("../manifests/muse.toml"),
+        include_str!("../manifests/omp.toml"),
         include_str!("../manifests/qwen-code.toml"),
+        include_str!("../manifests/qodercli.toml"),
         include_str!("../manifests/pi.toml"),
         include_str!("../manifests/hermes.toml"),
     ]
