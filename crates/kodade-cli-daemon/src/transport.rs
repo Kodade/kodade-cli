@@ -1,5 +1,7 @@
 //! Local daemon transport: Unix sockets on Unix, authenticated loopback on Windows.
 use anyhow::{Context, Result};
+#[cfg(windows)]
+use std::io::Read;
 use std::path::Path;
 #[cfg(unix)]
 pub use tokio::net::{UnixListener as Listener, UnixStream as Stream};
@@ -31,7 +33,7 @@ pub struct Listener {
 #[cfg(windows)]
 #[allow(dead_code)] // The CLI crate connects in production; daemon tests use this seam.
 pub async fn connect(path: &Path) -> Result<Stream> {
-    let record = std::fs::read_to_string(path).context("read private daemon discovery record")?;
+    let record = read_record(path)?;
     let (endpoint, secret) = parse_record(&record)?;
     let mut stream = Stream::connect(endpoint)
         .await
@@ -64,23 +66,25 @@ pub async fn bind(path: &Path) -> Result<Listener> {
 impl Listener {
     /// Reject unauthenticated peers before handing a byte of JSON to the daemon.
     pub async fn accept(&self) -> Result<(Stream, std::net::SocketAddr)> {
-        let (mut stream, address) = self
-            .listener
-            .accept()
+        loop {
+            let (mut stream, address) = self
+                .listener
+                .accept()
+                .await
+                .context("accept loopback connection")?;
+            let mut presented = [0; 32];
+            let authenticated = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                stream.read_exact(&mut presented),
+            )
             .await
-            .context("accept loopback connection")?;
-        let mut presented = [0; 32];
-        tokio::time::timeout(
-            std::time::Duration::from_secs(1),
-            stream.read_exact(&mut presented),
-        )
-        .await
-        .context("loopback authentication timed out")?
-        .context("read loopback authentication")?;
-        if !constant_time_eq(&presented, &self.secret) {
-            anyhow::bail!("unauthenticated loopback connection");
+            .ok()
+            .and_then(Result::ok)
+            .is_some_and(|_| constant_time_eq(&presented, &self.secret));
+            if authenticated {
+                return Ok((stream, address));
+            }
         }
-        Ok((stream, address))
     }
 }
 
@@ -93,18 +97,39 @@ fn constant_time_eq(left: &[u8; 32], right: &[u8; 32]) -> bool {
 }
 
 #[cfg(windows)]
+fn read_record(path: &Path) -> Result<String> {
+    let mut record = String::new();
+    std::fs::File::open(path)
+        .context("open private daemon discovery record")?
+        .take(512)
+        .read_to_string(&mut record)
+        .context("read private daemon discovery record")?;
+    Ok(record)
+}
+
+#[cfg(windows)]
 #[allow(dead_code)] // Used by the test-only daemon transport client above.
 fn parse_record(record: &str) -> Result<(&str, [u8; 32])> {
+    let record = record
+        .strip_suffix('\n')
+        .context("invalid daemon discovery record")?;
     let (endpoint, encoded) = record
-        .trim_end()
         .split_once('\n')
         .context("invalid daemon discovery record")?;
-    if endpoint.parse::<std::net::SocketAddr>().is_err() || encoded.len() != 64 {
+    let address = endpoint
+        .parse::<std::net::SocketAddr>()
+        .context("invalid daemon discovery record")?;
+    if !address.ip().is_loopback()
+        || encoded.len() != 64
+        || !encoded.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
         anyhow::bail!("invalid daemon discovery record");
     }
     let mut secret = [0; 32];
-    for (index, byte) in secret.iter_mut().enumerate() {
-        *byte = u8::from_str_radix(&encoded[index * 2..index * 2 + 2], 16)
+    let (pairs, remainder) = encoded.as_bytes().as_chunks::<2>();
+    debug_assert!(remainder.is_empty());
+    for (byte, hex) in secret.iter_mut().zip(pairs) {
+        *byte = u8::from_str_radix(std::str::from_utf8(hex).expect("ASCII hex"), 16)
             .context("invalid daemon discovery record")?;
     }
     Ok((endpoint, secret))
@@ -112,8 +137,40 @@ fn parse_record(record: &str) -> Result<(&str, [u8; 32])> {
 
 #[cfg(windows)]
 fn write_record(path: &Path, endpoint: &str, secret: &[u8; 32]) -> Result<()> {
+    use std::os::windows::{ffi::OsStrExt, io::FromRawHandle};
+    use windows_sys::Win32::{
+        Foundation::{LocalFree, INVALID_HANDLE_VALUE},
+        Security::SECURITY_ATTRIBUTES,
+        Storage::FileSystem::{CreateFileW, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, FILE_GENERIC_WRITE},
+    };
     let parent = path.parent().context("discovery record needs parent")?;
     std::fs::create_dir_all(parent).context("create discovery directory")?;
+    let descriptor = owner_security_descriptor()?;
+    let path_wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    let attributes = SECURITY_ATTRIBUTES {
+        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: descriptor.cast(),
+        bInheritHandle: 0,
+    };
+    let handle = unsafe {
+        CreateFileW(
+            path_wide.as_ptr(),
+            FILE_GENERIC_WRITE,
+            0,
+            &attributes,
+            CREATE_NEW,
+            FILE_ATTRIBUTE_NORMAL,
+            std::ptr::null_mut(),
+        )
+    };
+    unsafe { LocalFree(descriptor.cast()) };
+    if handle == INVALID_HANDLE_VALUE {
+        anyhow::bail!(
+            "create private daemon discovery record: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+    let mut file = unsafe { std::fs::File::from_raw_handle(handle as _) };
     let text = format!(
         "{endpoint}\n{}\n",
         secret
@@ -121,28 +178,22 @@ fn write_record(path: &Path, endpoint: &str, secret: &[u8; 32]) -> Result<()> {
             .map(|byte| format!("{byte:02x}"))
             .collect::<String>()
     );
-    std::fs::write(path, text).context("write daemon discovery record")?;
-    restrict_to_owner(path)?;
+    use std::io::Write;
+    file.write_all(text.as_bytes())
+        .context("write daemon discovery record")?;
+    file.sync_all().context("sync daemon discovery record")?;
     Ok(())
 }
 
-/// The secret is useful only if another local account cannot read it. `OW` is
-/// the SID of the file owner; the protected DACL prevents inherited broad ACLs.
+/// The record is created with this descriptor, so no reader can retain a broad
+/// inherited handle before its secret is published.
 #[cfg(windows)]
-fn restrict_to_owner(path: &Path) -> Result<()> {
-    use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::{
-        Foundation::LocalFree,
-        Security::{
-            Authorization::{
-                ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
-            },
-            SetFileSecurityW, DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
-            PSECURITY_DESCRIPTOR,
-        },
+fn owner_security_descriptor() -> Result<windows_sys::Win32::Security::PSECURITY_DESCRIPTOR> {
+    use windows_sys::Win32::Security::{
+        Authorization::{ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1},
+        PSECURITY_DESCRIPTOR,
     };
     let sddl: Vec<u16> = "D:P(A;;FA;;;OW)\0".encode_utf16().collect();
-    let path: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
     let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
     unsafe {
         if ConvertStringSecurityDescriptorToSecurityDescriptorW(
@@ -157,18 +208,6 @@ fn restrict_to_owner(path: &Path) -> Result<()> {
                 std::io::Error::last_os_error()
             );
         }
-        let result = SetFileSecurityW(
-            path.as_ptr(),
-            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
-            descriptor,
-        );
-        LocalFree(descriptor.cast());
-        if result == 0 {
-            anyhow::bail!(
-                "restrict daemon discovery record: {}",
-                std::io::Error::last_os_error()
-            );
-        }
     }
-    Ok(())
+    Ok(descriptor)
 }

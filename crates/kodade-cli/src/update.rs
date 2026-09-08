@@ -237,7 +237,7 @@ pub fn install_archive(archive: &[u8], expected: &str, destination: &Path) -> Re
     }
     #[cfg(windows)]
     {
-        schedule_windows_replacement(&staged, &destination)?;
+        let _helper = schedule_windows_replacement(&staged, &destination)?;
         // The detached helper owns the staged file after this point. It first
         // moves the old executable aside, then restores it if the replacement
         // move fails, so a failed update keeps a runnable binary.
@@ -247,7 +247,7 @@ pub fn install_archive(archive: &[u8], expected: &str, destination: &Path) -> Re
 }
 
 #[cfg(windows)]
-fn schedule_windows_replacement(staged: &Path, destination: &Path) -> Result<()> {
+fn schedule_windows_replacement(staged: &Path, destination: &Path) -> Result<std::process::Child> {
     let old = destination.with_extension(format!("old-{}.exe", std::process::id()));
     let quote = |path: &Path| -> Result<String> {
         let text = path.to_str().context("update path is not valid Unicode")?;
@@ -262,7 +262,7 @@ fn schedule_windows_replacement(staged: &Path, destination: &Path) -> Result<()>
     // The child must outlive this executable. PowerShell's delayed loop waits
     // until the image handle is released, then performs a recoverable swap.
     let script = format!(
-        "$ErrorActionPreference='Stop'; for($i=0;$i -lt 100;$i++){{try{{Move-Item -LiteralPath {destination} -Destination {old}; break}}catch{{Start-Sleep -Milliseconds 100}}}}; if(-not(Test-Path -LiteralPath {old})){{exit 1}}; try{{Move-Item -LiteralPath {staged} -Destination {destination}}}catch{{if(-not(Test-Path -LiteralPath {destination})){{Move-Item -LiteralPath {old} -Destination {destination}}}; exit 1}}; Remove-Item -LiteralPath {old} -Force -ErrorAction SilentlyContinue; exit 0"
+        "$ErrorActionPreference='Stop'; if(Test-Path -LiteralPath {destination}){{for($i=0;$i -lt 100;$i++){{try{{Move-Item -LiteralPath {destination} -Destination {old}; break}}catch{{Start-Sleep -Milliseconds 100}}}}; if(-not(Test-Path -LiteralPath {old})){{Remove-Item -LiteralPath {staged} -Force -ErrorAction SilentlyContinue; exit 1}}; try{{Move-Item -LiteralPath {staged} -Destination {destination}}}catch{{if(-not(Test-Path -LiteralPath {destination})){{Move-Item -LiteralPath {old} -Destination {destination}}}; Remove-Item -LiteralPath {staged} -Force -ErrorAction SilentlyContinue; exit 1}}; Remove-Item -LiteralPath {old} -Force -ErrorAction SilentlyContinue}}else{{try{{Move-Item -LiteralPath {staged} -Destination {destination}}}catch{{Remove-Item -LiteralPath {staged} -Force -ErrorAction SilentlyContinue; exit 1}}}}; exit 0"
     );
     Command::new("powershell.exe")
         .args([
@@ -274,8 +274,7 @@ fn schedule_windows_replacement(staged: &Path, destination: &Path) -> Result<()>
             &script,
         ])
         .spawn()
-        .context("start deferred Windows executable replacement")?;
-    Ok(())
+        .context("start deferred Windows executable replacement")
 }
 
 struct TempFileCleanup(Option<PathBuf>);
@@ -651,8 +650,6 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn windows_failed_replacement_restores_the_old_executable() {
-        use std::time::Duration;
-
         let root =
             std::env::temp_dir().join(format!("kodade-update-restore-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
@@ -660,8 +657,9 @@ mod tests {
         let destination = root.join("kodade-cli.exe");
         fs::write(&destination, b"working executable").unwrap();
 
-        schedule_windows_replacement(&root.join("missing-update"), &destination).unwrap();
-        std::thread::sleep(Duration::from_millis(500));
+        let mut helper =
+            schedule_windows_replacement(&root.join("missing-update"), &destination).unwrap();
+        assert!(!helper.wait().unwrap().success());
         assert_eq!(fs::read(&destination).unwrap(), b"working executable");
         assert!(!destination
             .with_extension(format!("old-{}.exe", std::process::id()))

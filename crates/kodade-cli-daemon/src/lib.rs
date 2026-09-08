@@ -6875,21 +6875,23 @@ mod tests {
                 })
                 .expect("spawn pane");
         }
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        let contents: Vec<_> = session
-            .panes
-            .lock()
-            .expect("panes")
-            .values()
-            .map(|pane| pane.snapshot().0.contents)
-            .collect();
-        assert_eq!(
-            contents
-                .iter()
-                .filter(|text| text.contains("per-workspace"))
-                .count(),
-            2
-        );
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let count = session
+                    .panes
+                    .lock()
+                    .expect("panes")
+                    .values()
+                    .filter(|pane| pane.snapshot().0.contents.contains("per-workspace"))
+                    .count();
+                if count == 2 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("both actual PTYs receive workspace variables");
         assert_eq!(
             session
                 .build_file()
@@ -6924,13 +6926,22 @@ mod tests {
                 context: None,
             })
             .expect("spawn restored pane");
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        assert!(restored
-            .panes
-            .lock()
-            .expect("panes")
-            .values()
-            .any(|pane| pane.snapshot().0.contents.contains("per-workspace")));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let ready = restored
+                    .panes
+                    .lock()
+                    .expect("panes")
+                    .values()
+                    .any(|pane| pane.snapshot().0.contents.contains("per-workspace"));
+                if ready {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("restored PTY receives workspace variables");
     }
 
     #[tokio::test]

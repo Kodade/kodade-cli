@@ -1,5 +1,3 @@
-$ErrorActionPreference = 'Stop'
-
 param(
     [Parameter(Mandatory = $true)]
     [string]$WindowsBinary,
@@ -7,8 +5,11 @@ param(
     [string]$LinuxBinary
 )
 
+$ErrorActionPreference = 'Stop'
+
 function Join-NativeArguments([string[]]$Arguments) {
     (($Arguments | ForEach-Object {
+        if ($_ -eq '') { return '""' }
         if ($_ -notmatch '[\s"]') { return $_ }
         '"' + (($_ -replace '(\\*)"', '$1$1\"') -replace '(\\*)$', '$1$1') + '"'
     }) -join ' ')
@@ -70,10 +71,15 @@ try {
 
     Write-Host 'installing Unix OpenSSH server'
     Invoke-Wsl @('sh', '-lc', 'apk add --no-cache openssh')
-    $remoteBinary = Join-Path $distroRoot 'root/.local/bin/kodade-cli'
-    New-Item -ItemType Directory -Force -Path (Split-Path $remoteBinary) | Out-Null
-    Copy-Item -LiteralPath $LinuxBinary -Destination $remoteBinary
-    Invoke-Wsl @('sh', '-lc', 'chmod 700 /root/.local/bin/kodade-cli && mkdir -p /root/.ssh && chmod 700 /root/.ssh')
+    # A freshly imported Alpine rootfs has no host keys. Generate them before
+    # the foreground sshd starts so it can bind rather than exiting silently.
+    Invoke-Wsl @('ssh-keygen', '-A')
+    # WSL imports keep their filesystem opaque to Windows. Copy through the
+    # distro's mounted Windows path so the running Unix instance sees the binary.
+    if ($LinuxBinary -notmatch '^([A-Za-z]):\\(.*)$') { throw "cannot map Windows fixture path into WSL: $LinuxBinary" }
+    $linuxSource = "/mnt/$($matches[1].ToLowerInvariant())/$($matches[2].Replace('\', '/'))"
+    $quotedSource = $linuxSource.Replace("'", "'\''")
+    Invoke-Wsl @('sh', '-lc', "mkdir -p /root/.local/bin /root/.ssh && cp '$quotedSource' /root/.local/bin/kodade-cli && chmod 700 /root/.local/bin/kodade-cli /root/.ssh")
 
     $sshDirectory = Join-Path $clientHome '.ssh'
     New-Item -ItemType Directory -Force -Path $sshDirectory | Out-Null
@@ -110,7 +116,9 @@ Host kodade-unix-fixture
     if (-not $ready) { throw 'Unix SSH fixture did not listen on localhost:2222' }
 
     $previousHome = $env:USERPROFILE
+    $previousUnixHome = $env:HOME
     $env:USERPROFILE = $clientHome
+    $env:HOME = $clientHome
     try {
         Write-Host 'checking Windows remote preparation accepts the installed Unix artifact'
         # This exercises the Windows client's compatibility preflight against
@@ -134,6 +142,14 @@ Host kodade-unix-fixture
             Start-Sleep -Milliseconds 100
         }
         if (-not $seen) { throw 'Unix PTY output did not return through the Windows SSH bridge' }
+
+        # `agent wait` polls the pane until its hook changes it back to idle.
+        # One Windows Tunnel therefore has to accept several sequential daemon
+        # connections, rather than only the initial command connection.
+        $waitPane = (Invoke-Native $WindowsBinary @('--remote', 'kodade-unix-fixture', '--session', $session, 'run', '--', 'sh', '-c', 'sleep 1; "$KODADE_BIN" agent report "$KODADE_PANE" working --source windows-ssh-fixture; sleep 1; "$KODADE_BIN" agent report "$KODADE_PANE" idle --source windows-ssh-fixture') 45).Trim()
+        if ($waitPane -notmatch '^\d+$') { throw "remote wait fixture did not return a pane id: $waitPane" }
+        Start-Sleep -Milliseconds 1300
+        Invoke-Native $WindowsBinary @('--remote', 'kodade-unix-fixture', '--session', $session, 'agent', 'wait', $waitPane, '--state', 'idle', '--timeout', '10') 45 | Out-Null
         Invoke-Native $WindowsBinary @('--remote', 'kodade-unix-fixture', '--session', $session, 'kill-session') 45 | Out-Null
 
         # A remote executable that identifies as another version must be
@@ -149,6 +165,7 @@ Host kodade-unix-fixture
         }
     } finally {
         $env:USERPROFILE = $previousHome
+        $env:HOME = $previousUnixHome
     }
 } finally {
     if ($null -ne $sshProcess -and -not $sshProcess.HasExited) {
