@@ -28,6 +28,7 @@ use std::{
 };
 
 use anyhow::{anyhow, bail, Context, Result};
+use base64::{engine::general_purpose::STANDARD, Engine};
 use kodade_cli_proto::{
     decode, encode, schema_message, AgentInfo, AgentStateKind, CellColor, ClientMessage, Direction,
     Event, InvocationContext, LayoutSnapshot, LayoutTree, ManifestInfo, NativeSession,
@@ -173,16 +174,34 @@ struct StoredSelection {
 #[derive(Default)]
 struct PtyCallbacks {
     title: String,
+    clipboard: Option<(u64, Vec<u8>, Vec<u8>)>,
     graphics: graphics::Store,
     graphics_tracker: graphics::Tracker,
     graphics_placeholder: Vec<u8>,
     graphics_unicode: graphics::UnicodeTracker,
     graphics_virtual_style: graphics::VirtualStyle,
     hyperlinks: hyperlinks::Tracker,
+    sync_tail: Vec<u8>,
+    sync_frozen: Option<(Instant, Screen)>,
 }
 impl vt100::Callbacks for PtyCallbacks {
     fn set_window_title(&mut self, _: &mut vt100::Screen, title: &[u8]) {
         self.title = String::from_utf8_lossy(title).into_owned();
+    }
+    fn copy_to_clipboard(&mut self, _: &mut vt100::Screen, ty: &[u8], data: &[u8]) {
+        self.record_clipboard(ty, data);
+    }
+}
+impl PtyCallbacks {
+    fn record_clipboard(&mut self, ty: &[u8], data: &[u8]) {
+        if data.len() <= 140_000 {
+            static NEXT: AtomicU64 = AtomicU64::new(1);
+            self.clipboard = Some((
+                NEXT.fetch_add(1, Ordering::Relaxed),
+                ty.to_vec(),
+                data.to_vec(),
+            ));
+        }
     }
 }
 type PtyParser = vt100::Parser<PtyCallbacks>;
@@ -194,8 +213,9 @@ fn terminal_size(rows: u16, cols: u16) -> (NonZeroU16, NonZeroU16) {
     )
 }
 
-fn pty_parser(rows: u16, cols: u16, scrollback: usize, callbacks: PtyCallbacks) -> PtyParser {
+fn pty_parser(rows: u16, cols: u16, scrollback: usize, mut callbacks: PtyCallbacks) -> PtyParser {
     let (rows, cols) = terminal_size(rows, cols);
+    callbacks.hyperlinks.set_history_capacity(scrollback);
     PtyParser::new_with_callbacks(rows, cols, scrollback, callbacks)
 }
 
@@ -279,6 +299,9 @@ impl Drop for Pane {
 struct ReportedHook {
     state: AgentStateKind,
     source: String,
+    agent: Option<String>,
+    process_pid: Option<i32>,
+    process_name: Option<String>,
     reported_at: Instant,
 }
 
@@ -1400,10 +1423,11 @@ impl Session {
     fn track_pane_agent(
         &self,
         pane: &Pane,
-        agent: &Option<String>,
+        detection: &agent::Detection,
         process: &ProcessEvidence,
     ) -> u64 {
-        let (generation, cleared_native) = pane.track_agent_identity(agent, process);
+        let (generation, cleared_native) =
+            pane.track_agent_identity(&detection.agent, process, detection.identity_from_hook);
         if cleared_native {
             // Retiring a conversation is a persistence mutation even when its
             // pane is hidden and terminal-output persistence is disabled.
@@ -1564,7 +1588,7 @@ impl Session {
         let mut ages = HashMap::new();
         for (id, pane) in panes.iter() {
             let detection = &detections[id];
-            self.track_pane_agent(pane, &detection.agent, &pane.process_evidence(now, false));
+            self.track_pane_agent(pane, detection, &pane.process_evidence(now, false));
             let (previous, age) = pane.transition_state(detection.state, now);
             ages.insert(*id, age);
             // The `track_state` write above makes this fire once per real
@@ -1711,7 +1735,7 @@ impl Session {
             agent: detection.agent.clone(),
             agent_generation: self.track_pane_agent(
                 &pane,
-                &detection.agent,
+                &detection,
                 &pane.process_evidence(now, false),
             ),
             activity_revision: pane.activity_revision.load(Ordering::Relaxed),
@@ -1751,7 +1775,7 @@ impl Session {
             .lock()
             .map_err(|_| anyhow!("manifest lock poisoned"))?;
         let (detection, process) = pane.detect_fresh(&manifests, now);
-        let generation = self.track_pane_agent(&pane, &detection.agent, &process);
+        let generation = self.track_pane_agent(&pane, &detection, &process);
         if detection.agent.as_deref() != Some(expected_agent) || generation != expected_generation {
             bail!("agent pane {} was replaced; resolve the target again", id.0);
         }
@@ -1770,6 +1794,68 @@ impl Session {
             .lock()
             .map_err(|_| anyhow!("view dispatch lock poisoned"))?;
         self.pane_snapshot(id)
+    }
+
+    /// Consume one OSC 52 write only for this attached connection's focused
+    /// pane. Clipboard data is neither replayed nor exposed through queries.
+    fn view_clipboard(
+        &self,
+        view: &ClientView,
+        seen: &mut HashMap<PaneId, u64>,
+    ) -> Option<ServerMessage> {
+        let focused = {
+            let state = self.state.lock().ok()?;
+            Self::view_selection(&state, Some(view)).2
+        };
+        let panes = self.panes.lock().ok()?;
+        // Advance this connection's cursor for every pane now. A hidden-pane
+        // request is intentionally dropped, never delivered after a later focus.
+        seen.retain(|id, _| panes.contains_key(id));
+        let mut current = None;
+        for (id, pane) in panes.iter() {
+            let parser = pane.parser.lock().ok()?;
+            let Some((seq, selection, encoded)) = &parser.callbacks().clipboard else {
+                continue;
+            };
+            if *seq <= seen.get(id).copied().unwrap_or(0) {
+                continue;
+            }
+            seen.insert(*id, *seq);
+            if *id == focused {
+                current = Some((selection.clone(), encoded.clone()));
+            }
+        }
+        let (selection, encoded) = current?;
+        if selection.as_slice() != b"c" {
+            return None;
+        }
+        let bytes = STANDARD.decode(encoded).ok()?;
+        if bytes.len() > 100_000 {
+            return None;
+        }
+        let text = String::from_utf8(bytes).ok()?;
+        Some(ServerMessage::Clipboard {
+            pane: focused,
+            text,
+        })
+    }
+
+    fn clipboard_cursor(&self) -> HashMap<PaneId, u64> {
+        let Ok(panes) = self.panes.lock() else {
+            return HashMap::new();
+        };
+        panes
+            .iter()
+            .filter_map(|(id, pane)| {
+                pane.parser
+                    .lock()
+                    .ok()?
+                    .callbacks()
+                    .clipboard
+                    .as_ref()
+                    .map(|(seq, _, _)| (*id, *seq))
+            })
+            .collect()
     }
 
     /// Queues a notification with the next sequence number, capping the ring at
@@ -2458,11 +2544,16 @@ impl Session {
                 let pane = panes
                     .get(&pane)
                     .ok_or_else(|| anyhow!("pane {} not found", pane.0))?;
+                let hook_agent = trusted_hook_agent(&source, native_session.as_ref());
+                let process = pane.process_evidence(Instant::now(), true);
                 let mut hook = pane.hook.lock().expect("hook lock poisoned");
                 let changed = hook.as_ref().is_none_or(|previous| previous.state != state);
                 *hook = Some(ReportedHook {
                     state,
                     source,
+                    agent: hook_agent,
+                    process_pid: process.pid,
+                    process_name: process.name,
                     reported_at: Instant::now(),
                 });
                 drop(hook);
@@ -2473,7 +2564,11 @@ impl Session {
                     // this report, so its next detection cannot erase a new ID.
                     let manifests = self.manifests.lock().expect("manifest lock poisoned");
                     let (detection, process) = pane.detect_fresh(&manifests, Instant::now());
-                    pane.track_agent_identity(&detection.agent, &process);
+                    pane.track_agent_identity(
+                        &detection.agent,
+                        &process,
+                        detection.identity_from_hook,
+                    );
                     *pane
                         .native_session
                         .lock()
@@ -3554,8 +3649,11 @@ impl Pane {
         })
     }
     fn snapshot(&self) -> (Screen, usize) {
-        let parser = self.parser.lock().expect("PTY parser lock poisoned");
-        (snapshot(&parser), parser.screen().scrollback())
+        let mut parser = self.parser.lock().expect("PTY parser lock poisoned");
+        (
+            snapshot_for_client(&mut parser),
+            parser.screen().scrollback(),
+        )
     }
     /// Render a requested historical offset without leaving the shared parser
     /// scrolled for another client. `set_scrollback` clamps to available history.
@@ -3563,7 +3661,7 @@ impl Pane {
         let mut parser = self.parser.lock().expect("PTY parser lock poisoned");
         parser.screen_mut().set_scrollback(offset);
         let actual = parser.screen().scrollback();
-        let screen = snapshot(&parser);
+        let screen = snapshot_for_client(&mut parser);
         parser.screen_mut().set_scrollback(0);
         (screen, actual)
     }
@@ -3695,19 +3793,39 @@ impl Pane {
             .map(|hook| agent::HookState {
                 state: hook.state,
                 source: hook.source,
+                agent: hook.agent,
+                process_pid: hook.process_pid,
+                process_name: hook.process_name,
                 age: now.saturating_duration_since(hook.reported_at),
                 // A `done` report is released once the pane prints anything new.
                 output_since_report: last_output > hook.reported_at,
             });
         let output_age = now.saturating_duration_since(last_output);
-        let detection = agent::detect(
+        let mut detection = agent::detect(
             manifests,
             process.name.as_deref().or(Some(&self.spawn_process)),
+            process.pid,
             &title,
             &screen,
             output_age,
             hook,
         );
+        // A hook-backed adapter can run under Node/Python. Once it exits to a
+        // shell, ignore a stale title as an additional conservative guard.
+        if process.name.as_deref().is_some_and(agent::is_shell)
+            && self
+                .agent_identity
+                .lock()
+                .expect("agent identity lock poisoned")
+                .as_deref()
+                .is_some_and(|identity| identity.ends_with("|hook=true"))
+        {
+            detection.agent = None;
+            detection.state = AgentStateKind::Idle;
+            detection.reason = "foreground shell after agent exit".into();
+            detection.from_hook = false;
+            detection.identity_from_hook = false;
+        }
         (detection, process)
     }
 
@@ -3718,6 +3836,7 @@ impl Pane {
         &self,
         agent: &Option<String>,
         process: &ProcessEvidence,
+        from_hook: bool,
     ) -> (u64, bool) {
         let mut identity = self
             .agent_identity
@@ -3728,7 +3847,7 @@ impl Pane {
         // foreground PID/process when the platform can expose it.
         let next = agent.as_ref().map(|agent| {
             format!(
-                "{agent}|pid={}|process={}",
+                "{agent}|pid={}|process={}|hook={from_hook}",
                 process
                     .pid
                     .map_or_else(|| "unknown".into(), |pid| pid.to_string()),
@@ -3924,6 +4043,37 @@ fn valid_native_session(native: &NativeSession) -> bool {
             | ("kodade:devin", "devin", true, false)
             | ("kodade:grok", "grok", true, false)
     )
+}
+
+/// Accept identity only from one of our fixed adapter/source pairs. Hook
+/// `source` is user-supplied protocol text, so it must never become a pane
+/// identity by itself.
+fn trusted_hook_agent(source: &str, native: Option<&NativeSession>) -> Option<String> {
+    let native = native?;
+    let (agent, display) = match (source, native.source.as_str(), native.agent.as_str()) {
+        ("kodade:claude-code", "kodade:claude-code", "claude") => ("claude", "Claude Code"),
+        ("kodade:codex", "kodade:codex", "codex") => ("codex", "Codex"),
+        ("kodade:gemini-cli", "kodade:gemini-cli", "gemini") => ("gemini", "Gemini CLI"),
+        ("kodade:copilot", "kodade:copilot", "copilot") => ("copilot", "GitHub Copilot CLI"),
+        ("kodade:cursor", "kodade:cursor", "cursor") => ("cursor", "Cursor CLI"),
+        ("kodade:droid", "kodade:droid", "droid") => ("droid", "Droid"),
+        ("kodade:kimi", "kodade:kimi", "kimi") => ("kimi", "Kimi CLI"),
+        ("kodade:qwen", "kodade:qwen", "qwen") => ("qwen", "Qwen Code"),
+        ("kodade:omp", "kodade:omp", "omp") => ("omp", "OMP"),
+        ("kodade:kilo", "kodade:kilo", "kilo") => ("kilo", "Kilo Code"),
+        ("kodade:hermes", "kodade:hermes", "hermes") => ("hermes", "Hermes"),
+        ("kodade:antigravity", "kodade:antigravity", "antigravity") => {
+            ("antigravity", "Antigravity")
+        }
+        ("kodade:devin", "kodade:devin", "devin") => ("devin", "Devin"),
+        ("kodade:mastra", "kodade:mastra", "mastra") => ("mastra", "Mastra Code"),
+        ("kodade:grok", "kodade:grok", "grok") => ("grok", "Grok Build"),
+        ("kodade:opencode", "kodade:opencode", "opencode") => ("opencode", "OpenCode"),
+        ("kodade:pi", "kodade:pi", "pi") => ("pi", "Pi"),
+        _ => return None,
+    };
+    debug_assert!(!agent.is_empty());
+    Some(display.into())
 }
 
 fn native_resume_argv(native: &NativeSession) -> Option<Vec<String>> {
@@ -4179,6 +4329,23 @@ fn graphics_text(parser: &mut PtyParser, text: &[u8]) {
             let before_alt = parser.screen().alternate_screen();
             let printed = tracker.feed(normalized.byte, parser.screen(), &mut store);
             hyperlinks.feed(normalized.byte, parser.screen());
+            let tail = &mut parser.callbacks_mut().sync_tail;
+            tail.push(normalized.byte);
+            if tail.len() > 8 {
+                tail.remove(0);
+            }
+            if tail.ends_with(b"\x1b[?2026h") {
+                // `snapshot` reads callback-owned metadata. Put the state borrowed
+                // for byte-by-byte tracking back before freezing the complete frame.
+                parser.callbacks_mut().graphics = store;
+                parser.callbacks_mut().hyperlinks = hyperlinks;
+                let frame = snapshot(parser);
+                parser.callbacks_mut().sync_frozen = Some((Instant::now(), frame));
+                store = std::mem::take(&mut parser.callbacks_mut().graphics);
+                hyperlinks = std::mem::take(&mut parser.callbacks_mut().hyperlinks);
+            } else if tail.ends_with(b"\x1b[?2026l") {
+                parser.callbacks_mut().sync_frozen = None;
+            }
             parser.process(&[normalized.byte]);
             let alternate = parser.screen().alternate_screen();
             if printed > 0 {
@@ -4305,8 +4472,20 @@ fn snapshot(parser: &PtyParser) -> Screen {
         links: parser
             .callbacks()
             .hyperlinks
-            .ranges(screen.alternate_screen()),
+            .ranges(screen.alternate_screen(), screen.scrollback()),
     }
+}
+
+/// A pane's synchronized output is atomic for clients, but never indefinitely:
+/// a malformed producer is released after one second while parsing continues.
+fn snapshot_for_client(parser: &mut PtyParser) -> Screen {
+    if let Some((started, frame)) = parser.callbacks().sync_frozen.as_ref() {
+        if started.elapsed() < Duration::from_secs(1) {
+            return frame.clone();
+        }
+    }
+    parser.callbacks_mut().sync_frozen = None;
+    snapshot(parser)
 }
 
 /// Rebuild recent text and the saved visible grid before the PTY reader starts.
@@ -4532,6 +4711,7 @@ async fn serve_client(stream: UnixStream, session: Arc<Session>) -> Result<()> {
     let mut last_snapshot = Instant::now() - Duration::from_millis(16);
     let mut initialized = false;
     let mut view = session.new_client_view()?;
+    let mut clipboard_seen = session.clipboard_cursor();
     // A fresh client only hears about transitions raised after it attached, so
     // the spawn-time backlog never replays.
     let mut last_notify_seq = session.notify_high_water();
@@ -4655,6 +4835,14 @@ async fn serve_client(stream: UnixStream, session: Arc<Session>) -> Result<()> {
                     }
                     _ => {}
                 }
+                // Observe pending copies under the old focus before applying a
+                // client focus change. Hidden writes must not become visible
+                // just because the input message wins the tick race.
+                if initialized {
+                    if let Some(clipboard) = session.view_clipboard(&view, &mut clipboard_seen) {
+                        write_server(&mut writer, &clipboard).await?;
+                    }
+                }
                 let hello = matches!(message, ClientMessage::Hello { .. });
                 let kill = matches!(message, ClientMessage::KillSession);
                 let result = if initialized || hello {
@@ -4665,6 +4853,7 @@ async fn serve_client(stream: UnixStream, session: Arc<Session>) -> Result<()> {
                 match result {
                     Ok(()) if hello => {
                         initialized = true;
+                        clipboard_seen = session.clipboard_cursor();
                         write_server(&mut writer, &ServerMessage::Welcome { session: session.session_name(), version: PROTOCOL_VERSION }).await?;
                         // The first client attach sees `restored: true`; clear it
                         // afterward so later snapshots (and `ls`) report normally.
@@ -4704,6 +4893,9 @@ async fn serve_client(stream: UnixStream, session: Arc<Session>) -> Result<()> {
                     if !remaining.is_zero() { tokio::time::sleep(remaining).await; }
                     write_server(&mut writer, &ServerMessage::Layout(session.snapshot_for_client(&view)?)).await?;
                     send_notifications(&mut writer, &session, &mut last_notify_seq, subscribed).await?;
+                    if let Some(clipboard) = session.view_clipboard(&view, &mut clipboard_seen) {
+                        write_server(&mut writer, &clipboard).await?;
+                    }
                     last_snapshot = Instant::now();
                 }
                 Err(broadcast::error::RecvError::Closed) => return Ok(()),
@@ -4712,6 +4904,9 @@ async fn serve_client(stream: UnixStream, session: Arc<Session>) -> Result<()> {
                 if initialized {
                     write_server(&mut writer, &ServerMessage::Layout(session.snapshot_for_client(&view)?)).await?;
                     send_notifications(&mut writer, &session, &mut last_notify_seq, subscribed).await?;
+                    if let Some(clipboard) = session.view_clipboard(&view, &mut clipboard_seen) {
+                        write_server(&mut writer, &clipboard).await?;
+                    }
                     last_snapshot = Instant::now();
                 }
             }
@@ -4794,6 +4989,249 @@ async fn send_notifications(
 #[cfg(test)]
 mod tests {
     use base64::Engine;
+
+    #[test]
+    fn osc52_callback_keeps_only_bounded_copy_requests() {
+        let mut parser = pty_parser(2, 10, 10, PtyCallbacks::default());
+        parser.process(b"\x1b]52;c;aGk=\x07");
+        assert_eq!(
+            parser
+                .callbacks()
+                .clipboard
+                .as_ref()
+                .map(|(_, _, data)| data),
+            Some(&b"aGk=".to_vec())
+        );
+        // OSC 52 queries invoke the separate paste callback and never replace
+        // the pending copy request.
+        parser.process(b"\x1b]52;c;?\x07");
+        assert_eq!(
+            parser
+                .callbacks()
+                .clipboard
+                .as_ref()
+                .map(|(_, _, data)| data),
+            Some(&b"aGk=".to_vec())
+        );
+        parser
+            .callbacks_mut()
+            .record_clipboard(b"c", &vec![b'a'; 140_001]);
+        assert_eq!(
+            parser
+                .callbacks()
+                .clipboard
+                .as_ref()
+                .map(|(_, _, data)| data),
+            Some(&b"aGk=".to_vec())
+        );
+    }
+
+    #[tokio::test]
+    async fn pane_clipboard_is_one_shot_and_validated_for_the_attached_view() {
+        let session = Session::spawn(80, 24, "clipboard-view".into()).expect("session");
+        let view = session.new_client_view().expect("view");
+        let focused = Session::view_selection(&session.state.lock().unwrap(), Some(&view)).2;
+        let pane = session.panes.lock().unwrap()[&focused].clone();
+        pane.parser
+            .lock()
+            .unwrap()
+            .process(b"\x1b]52;c;aGVsbG8=\x07");
+        let mut seen = HashMap::new();
+        assert!(matches!(
+            session.view_clipboard(&view, &mut seen),
+            Some(ServerMessage::Clipboard { pane, text }) if pane == focused && text == "hello"
+        ));
+        assert!(session.view_clipboard(&view, &mut seen).is_none());
+        pane.parser
+            .lock()
+            .unwrap()
+            .process(b"\x1b]52;c;not-base64!\x07");
+        assert!(session.view_clipboard(&view, &mut seen).is_none());
+    }
+
+    #[tokio::test]
+    async fn real_pty_osc52_reaches_only_the_live_focused_client() {
+        let session = Arc::new(Session::spawn(80, 24, "clipboard-pty".into()).expect("session"));
+        let (client, server) = UnixStream::pair().expect("socket pair");
+        let server_task = tokio::spawn(serve_client(server, Arc::clone(&session)));
+        let (reader, mut writer) = client.into_split();
+        let mut lines = BufReader::new(reader).lines();
+        writer
+            .write_all(
+                &encode(&ClientMessage::Hello {
+                    cols: 80,
+                    rows: 24,
+                    version: PROTOCOL_VERSION,
+                })
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            next_server_message(&mut lines).await,
+            ServerMessage::Welcome { .. }
+        ));
+        assert!(matches!(
+            next_server_message(&mut lines).await,
+            ServerMessage::Layout(_)
+        ));
+        // This command executes inside the pane's actual PTY; the parser sees
+        // its OSC 52 output and the attached socket receives one copy request.
+        writer
+            .write_all(
+                &encode(&ClientMessage::Input {
+                    bytes: b"printf '\\033]52;c;aGk=\\007'\n".to_vec(),
+                })
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let clipboard = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let ServerMessage::Clipboard { text, .. } = next_server_message(&mut lines).await
+                {
+                    break text;
+                }
+            }
+        })
+        .await
+        .expect("OSC 52 delivery");
+        assert_eq!(clipboard, "hi");
+        drop(writer);
+        server_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn osc52_is_delivered_to_each_clients_currently_viewed_pane_only() {
+        let session =
+            Arc::new(Session::spawn(80, 24, "clipboard-clients".into()).expect("session"));
+        session
+            .handle(ClientMessage::SplitRight)
+            .expect("split pane");
+        let panes = session.snapshot().expect("snapshot").panes;
+        let first = panes[0].id;
+        let second = panes[1].id;
+        let (a_client, a_server) = UnixStream::pair().expect("client A socket");
+        let (b_client, b_server) = UnixStream::pair().expect("client B socket");
+        let a_task = tokio::spawn(serve_client(a_server, Arc::clone(&session)));
+        let b_task = tokio::spawn(serve_client(b_server, Arc::clone(&session)));
+        let (a_reader, mut a_writer) = a_client.into_split();
+        let (b_reader, mut b_writer) = b_client.into_split();
+        let mut a = BufReader::new(a_reader).lines();
+        let mut b = BufReader::new(b_reader).lines();
+        for writer in [&mut a_writer, &mut b_writer] {
+            writer
+                .write_all(
+                    &encode(&ClientMessage::Hello {
+                        cols: 80,
+                        rows: 24,
+                        version: PROTOCOL_VERSION,
+                    })
+                    .unwrap(),
+                )
+                .await
+                .expect("hello");
+        }
+        for reader in [&mut a, &mut b] {
+            assert!(matches!(
+                next_server_message(reader).await,
+                ServerMessage::Welcome { .. }
+            ));
+            assert!(matches!(
+                next_server_message(reader).await,
+                ServerMessage::Layout(_)
+            ));
+        }
+        // The same session is attached twice, but each connection selects a
+        // different pane. This guards against a session-global clipboard read.
+        for (writer, pane) in [(&mut a_writer, first), (&mut b_writer, second)] {
+            writer
+                .write_all(&encode(&ClientMessage::FocusPaneId { id: pane }).unwrap())
+                .await
+                .expect("focus pane");
+        }
+        assert!(matches!(
+            next_server_message(&mut a).await,
+            ServerMessage::Layout(_)
+        ));
+        assert!(matches!(
+            next_server_message(&mut b).await,
+            ServerMessage::Layout(_)
+        ));
+        a_writer
+            .write_all(
+                &encode(&ClientMessage::Input {
+                    bytes: b"printf '\\033]52;c;Y2xpZW50LWE=\\007'\n".to_vec(),
+                })
+                .unwrap(),
+            )
+            .await
+            .expect("write pane A");
+        let delivered_to_a = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let ServerMessage::Clipboard { pane, text } = next_server_message(&mut a).await {
+                    break (pane, text);
+                }
+            }
+        })
+        .await
+        .expect("clipboard for client A");
+        assert_eq!(delivered_to_a, (first, "client-a".into()));
+        let b_received_clipboard = tokio::time::timeout(Duration::from_millis(300), async {
+            loop {
+                if matches!(
+                    next_server_message(&mut b).await,
+                    ServerMessage::Clipboard { .. }
+                ) {
+                    return true;
+                }
+            }
+        })
+        .await
+        .is_ok();
+        assert!(
+            !b_received_clipboard,
+            "client B received client A's clipboard write"
+        );
+        drop(a_writer);
+        drop(b_writer);
+        a_task.await.unwrap().unwrap();
+        b_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn hidden_pane_clipboard_is_dropped_before_later_focus() {
+        let session = Session::spawn(80, 24, "clipboard-focus".into()).expect("session");
+        let first = session.snapshot().unwrap().panes[0].id;
+        session.handle(ClientMessage::SplitRight).unwrap();
+        let mut view = session.new_client_view().unwrap();
+        let (_, _, focused) = Session::view_selection(&session.state.lock().unwrap(), Some(&view));
+        let hidden = session
+            .snapshot()
+            .unwrap()
+            .panes
+            .into_iter()
+            .map(|pane| pane.id)
+            .find(|id| *id != focused)
+            .expect("second pane");
+        let pane = session.panes.lock().unwrap()[&hidden].clone();
+        pane.parser
+            .lock()
+            .unwrap()
+            .process(b"\x1b]52;c;aGlkZGVu\x07");
+        let mut seen = HashMap::new();
+        assert!(session.view_clipboard(&view, &mut seen).is_none());
+        view.focused.insert(view.tabs[&view.workspace], hidden);
+        assert!(session.view_clipboard(&view, &mut seen).is_none());
+        let first_pane = session.panes.lock().unwrap()[&first].clone();
+        first_pane
+            .parser
+            .lock()
+            .unwrap()
+            .process(b"\x1b]52;c;Y29sZA==\x07");
+        let mut cold_attach = session.clipboard_cursor();
+        assert!(session.view_clipboard(&view, &mut cold_attach).is_none());
+    }
 
     #[test]
     fn graphics_follow_bottom_row_autowrap_and_scroll_commands() {
@@ -5242,6 +5680,28 @@ mod tests {
     }
 
     #[test]
+    fn scrolled_snapshot_carries_retained_osc8_link_cells() {
+        let mut parser = pty_parser(2, 20, 100, PtyCallbacks::default());
+        parser.callbacks_mut().graphics.command(
+            b"a=T,f=24,s=1,v=1,i=9,c=1,r=1;AAAA",
+            (0, 0),
+            false,
+        );
+        graphics_text(
+            &mut parser,
+            b"\x1b]8;;https://example.test/history\x1b\\one\x1b]8;;\x1b\\\r\nplain\r\nlast",
+        );
+        parser.screen_mut().set_scrollback(1);
+        let screen = snapshot(&parser);
+        assert!(screen.links.iter().any(|link| {
+            (link.row, link.start_col, link.end_col, link.uri.as_str())
+                == (0, 0, 3, "https://example.test/history")
+        }));
+        assert_eq!(screen.graphics.len(), 1);
+        assert_eq!((screen.graphics[0].row, screen.graphics[0].col), (0, 0));
+    }
+
+    #[test]
     fn pane_synchronized_output_control_is_not_replayed_to_the_host() {
         let mut parser = pty_parser(2, 20, 100, PtyCallbacks::default());
         // Pane output is parsed into the daemon-owned screen. Even an app that
@@ -5254,6 +5714,52 @@ mod tests {
             .iter()
             .flat_map(|row| row.iter())
             .any(|run| run.text.contains("2026")));
+    }
+
+    #[test]
+    fn pane_synchronized_output_holds_then_releases_a_frame() {
+        let mut parser = pty_parser(2, 20, 100, PtyCallbacks::default());
+        parser.callbacks_mut().graphics.command(
+            b"a=T,f=24,s=1,v=1,i=10,c=1,r=1;AAAA",
+            (0, 0),
+            false,
+        );
+        graphics_text(
+            &mut parser,
+            b"\x1b]8;;https://example.test/frozen\x1b\\old\x1b]8;;\x1b\\",
+        );
+        let before = snapshot(&parser);
+        assert_eq!(
+            (
+                before.links[0].row,
+                before.links[0].start_col,
+                before.links[0].end_col
+            ),
+            (0, 0, 3)
+        );
+        assert_eq!((before.graphics[0].row, before.graphics[0].col), (0, 0));
+        graphics_text(&mut parser, b"\x1b[?2026hpartial");
+        let frozen = snapshot_for_client(&mut parser);
+        assert_eq!(frozen.contents.trim(), "old");
+        assert_eq!(frozen.links, before.links);
+        assert_eq!(frozen.graphics, before.graphics);
+        graphics_text(&mut parser, b" final\x1b[?2026l");
+        let released = snapshot_for_client(&mut parser);
+        assert_eq!(released.contents.trim(), "oldpartial final");
+        assert_eq!(released.links, before.links);
+        assert_eq!(released.graphics, before.graphics);
+    }
+
+    #[test]
+    fn pane_synchronized_output_timeout_releases_without_more_bytes() {
+        let mut parser = pty_parser(2, 20, 100, PtyCallbacks::default());
+        graphics_text(&mut parser, b"old\x1b[?2026hpartial");
+        let callbacks = parser.callbacks_mut();
+        callbacks.sync_frozen.as_mut().unwrap().0 = Instant::now() - Duration::from_secs(2);
+        assert_eq!(
+            snapshot_for_client(&mut parser).contents.trim(),
+            "oldpartial"
+        );
     }
 
     #[test]
@@ -6442,6 +6948,9 @@ mod tests {
         *pane.hook.lock().unwrap() = Some(ReportedHook {
             state: AgentStateKind::Blocked,
             source: "test".into(),
+            agent: None,
+            process_pid: None,
+            process_name: None,
             reported_at: Instant::now(),
         });
         assert!(session
@@ -6451,6 +6960,39 @@ mod tests {
                 current.agent_generation,
                 b"must-not-write",
             )
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn recognized_hook_identity_retires_after_a_non_shell_replacement() {
+        let session = Session::spawn(80, 24, "hook-wrapper-identity".into()).unwrap();
+        let pane_id = session.snapshot().unwrap().panes[0].id;
+        let pane = Arc::clone(&session.panes.lock().unwrap()[&pane_id]);
+        {
+            let mut process = pane.process.lock().unwrap();
+            process.pid = Some(100);
+            process.name = Some("node".into());
+            process.checked_at = Instant::now();
+        }
+        *pane.hook.lock().unwrap() = Some(ReportedHook {
+            state: AgentStateKind::Working,
+            source: "kodade:pi".into(),
+            agent: Some("Pi".into()),
+            process_pid: Some(100),
+            process_name: Some("node".into()),
+            reported_at: Instant::now(),
+        });
+        let pi = session.pane_snapshot(pane_id).unwrap();
+        assert_eq!(pi.agent.as_deref(), Some("Pi"));
+
+        {
+            let mut process = pane.process.lock().unwrap();
+            process.pid = Some(101);
+            process.name = Some("sleep".into());
+        }
+        assert_eq!(session.pane_snapshot(pane_id).unwrap().agent, None);
+        assert!(session
+            .prompt_agent(pane_id, "Pi", pi.agent_generation, b"must-not-write")
             .is_err());
     }
 
@@ -6904,6 +7446,7 @@ mod tests {
         session
             .open_worktree_workspace(repo.clone(), worktree.clone())
             .expect("open existing worktree workspace");
+        let worktree = worktree.canonicalize().expect("canonical worktree");
         let workspace = session
             .state
             .lock()
@@ -7010,20 +7553,20 @@ mod tests {
             .expect("spawn restored pane");
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
-            if restored
+            let ready = restored
                 .panes
                 .lock()
                 .expect("panes")
                 .values()
-                .any(|pane| pane.snapshot().0.contents.contains("per-workspace"))
-            {
+                .any(|pane| pane.snapshot().0.contents.contains("per-workspace"));
+            if ready {
                 break;
             }
             assert!(
                 Instant::now() < deadline,
-                "restored pane did not receive workspace environment"
+                "restored workspace environment did not reach its pane"
             );
-            tokio::time::sleep(Duration::from_millis(20)).await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
     }
 

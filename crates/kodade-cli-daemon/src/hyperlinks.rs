@@ -2,6 +2,7 @@
 //! state, so keep a small parallel grid whose mutations follow its controls.
 
 use kodade_cli_proto::LinkRange;
+use std::collections::VecDeque;
 use unicode_width::UnicodeWidthChar;
 
 const MAX_URI_BYTES: usize = 2048;
@@ -16,6 +17,10 @@ pub struct Tracker {
     uris: Vec<String>,
     normal: Grid,
     alternate: Grid,
+    /// Rows that vt100 retained from the normal grid. This mirrors its bounded
+    /// scrollback so a historical viewport never receives a URI from newer text.
+    history: VecDeque<Vec<Option<u16>>>,
+    history_capacity: usize,
     margins: [Option<(u16, u16)>; 2],
 }
 
@@ -72,6 +77,10 @@ fn valid_uri(uri: &str) -> bool {
 }
 
 impl Grid {
+    fn row(&self, r: u16) -> &[Option<u16>] {
+        let start = usize::from(r) * usize::from(self.cols);
+        &self.cells[start..start + usize::from(self.cols)]
+    }
     fn get(&self, r: u16, c: u16) -> Option<u16> {
         self.cells
             .get(usize::from(r) * usize::from(self.cols) + usize::from(c))
@@ -132,37 +141,47 @@ impl Grid {
         }
     }
     fn ranges(&self, uris: &[String]) -> Vec<LinkRange> {
-        let mut result = Vec::new();
-        let mut encoded = 0;
-        for row in 0..self.rows {
-            let mut col = 0;
-            while col < self.cols {
-                let Some(uri) = self.get(row, col) else {
-                    col += 1;
-                    continue;
-                };
-                let start = col;
-                col += 1;
-                while col < self.cols && self.get(row, col) == Some(uri) {
-                    col += 1;
-                }
-                let Some(uri) = uris.get(usize::from(uri)) else {
-                    continue;
-                };
-                encoded += uri.len() + 16;
-                if encoded > MAX_LINK_SNAPSHOT_BYTES {
-                    break;
-                }
-                result.push(LinkRange {
-                    row,
-                    start_col: start,
-                    end_col: col,
-                    uri: uri.clone(),
-                });
-            }
-        }
-        result
+        ranges(self.rows, self.cols, uris, |row| self.row(row).to_vec())
     }
+}
+
+fn ranges(
+    rows: u16,
+    cols: u16,
+    uris: &[String],
+    mut row_cells: impl FnMut(u16) -> Vec<Option<u16>>,
+) -> Vec<LinkRange> {
+    let mut result = Vec::new();
+    let mut encoded = 0;
+    for row in 0..rows {
+        let mut col = 0;
+        let cells = row_cells(row);
+        while col < cols {
+            let Some(uri) = cells[usize::from(col)] else {
+                col += 1;
+                continue;
+            };
+            let start = col;
+            col += 1;
+            while col < cols && cells[usize::from(col)] == Some(uri) {
+                col += 1;
+            }
+            let Some(uri) = uris.get(usize::from(uri)) else {
+                continue;
+            };
+            encoded += uri.len() + 16;
+            if encoded > MAX_LINK_SNAPSHOT_BYTES {
+                break;
+            }
+            result.push(LinkRange {
+                row,
+                start_col: start,
+                end_col: col,
+                uri: uri.clone(),
+            });
+        }
+    }
+    result
 }
 
 impl Tracker {
@@ -182,6 +201,7 @@ impl Tracker {
                 cols,
                 cells: vec![None; usize::from(rows) * usize::from(cols)],
             };
+            self.history.clear();
         }
         let alternate = screen.alternate_screen();
         let (row, col) = screen.cursor_position();
@@ -192,11 +212,6 @@ impl Tracker {
         self.parser.advance(&mut self.events, &[byte]);
         let Some(event) = self.events.0.take() else {
             return;
-        };
-        let grid = if alternate {
-            &mut self.alternate
-        } else {
-            &mut self.normal
         };
         match event {
             Event::Osc(uri) => {
@@ -216,30 +231,57 @@ impl Tracker {
             Event::Print(c) => {
                 let width = c.width().unwrap_or(0) as u16;
                 if width > 0 {
-                    let wrapped = col >= cols
-                        || (col >= cols.saturating_sub(width)
-                            && screen.cell(row, cols - 1).is_some_and(|cell| {
-                                cell.has_contents() || cell.is_wide_continuation()
-                            }));
-                    if wrapped {
-                        grid.scroll(top, bottom, 1);
+                    let wrapped = col.saturating_add(width) > cols;
+                    let (r, c) = (
+                        if wrapped {
+                            row.saturating_add(1).min(bottom)
+                        } else {
+                            row
+                        },
+                        if wrapped { 0 } else { col },
+                    );
+                    if wrapped && row == bottom {
+                        self.scroll(alternate, top, bottom, 1);
                     }
-                    let (r, c) = (row, if wrapped { 0 } else { col });
+                    let grid = if alternate {
+                        &mut self.alternate
+                    } else {
+                        &mut self.normal
+                    };
+                    // vt100 clears the other half of a replaced wide glyph.
+                    // Clear its ownership too before assigning this glyph.
+                    if screen
+                        .cell(r, c)
+                        .is_some_and(vt100::Cell::is_wide_continuation)
+                    {
+                        grid.set(r, c.saturating_sub(1), None);
+                    }
+                    if screen.cell(r, c).is_some_and(vt100::Cell::is_wide) {
+                        grid.set(r, c.saturating_add(1), None);
+                    }
+                    if width > 1
+                        && screen
+                            .cell(r, c.saturating_add(1))
+                            .is_some_and(vt100::Cell::is_wide)
+                    {
+                        grid.set(r, c.saturating_add(2), None);
+                    }
                     for x in c..c.saturating_add(width).min(cols) {
                         grid.set(r, x, self.active);
                     }
                 }
             }
             Event::Execute(b'\n' | b'\x0b' | b'\x0c') if row == bottom => {
-                grid.scroll(top, bottom, 1)
+                self.scroll(alternate, top, bottom, 1)
             }
-            Event::Esc(b'D' | b'E') if row == bottom => grid.scroll(top, bottom, 1),
-            Event::Esc(b'M') if row == top => grid.scroll(top, bottom, -1),
+            Event::Esc(b'D' | b'E') if row == bottom => self.scroll(alternate, top, bottom, 1),
+            Event::Esc(b'M') if row == top => self.scroll(alternate, top, bottom, -1),
             Event::Esc(b'c') => {
                 self.normal.clear();
                 self.alternate.clear();
                 self.active = None;
                 self.uris.clear();
+                self.history.clear();
                 self.margins = [None, None];
             }
             Event::Csi('r', p) => {
@@ -251,32 +293,41 @@ impl Tracker {
                 };
                 if start < end {
                     self.margins[usize::from(alternate)] = Some((start, end));
+                } else {
+                    self.margins[usize::from(alternate)] = None;
                 }
             }
             Event::Csi('J', p) => match p.first().copied().unwrap_or(0) {
-                2 => grid.clear(),
-                3 => {}
+                2 => self.grid_mut(alternate).clear(),
+                3 => {
+                    if !alternate {
+                        self.history.clear();
+                    }
+                }
                 0 => {
-                    grid.clear_row(row, col, cols);
+                    self.grid_mut(alternate).clear_row(row, col, cols);
                     for r in row.saturating_add(1)..rows {
-                        grid.clear_row(r, 0, cols);
+                        self.grid_mut(alternate).clear_row(r, 0, cols);
                     }
                 }
                 1 => {
                     for r in 0..row {
-                        grid.clear_row(r, 0, cols);
+                        self.grid_mut(alternate).clear_row(r, 0, cols);
                     }
-                    grid.clear_row(row, 0, col.saturating_add(1));
+                    self.grid_mut(alternate)
+                        .clear_row(row, 0, col.saturating_add(1));
                 }
                 _ => {}
             },
             Event::Csi('K', p) => match p.first().copied().unwrap_or(0) {
-                0 => grid.clear_row(row, col, cols),
-                1 => grid.clear_row(row, 0, col.saturating_add(1)),
-                2 => grid.clear_row(row, 0, cols),
+                0 => self.grid_mut(alternate).clear_row(row, col, cols),
+                1 => self
+                    .grid_mut(alternate)
+                    .clear_row(row, 0, col.saturating_add(1)),
+                2 => self.grid_mut(alternate).clear_row(row, 0, cols),
                 _ => {}
             },
-            Event::Csi('X', p) => grid.clear_row(
+            Event::Csi('X', p) => self.grid_mut(alternate).clear_row(
                 row,
                 col,
                 col.saturating_add(p.first().copied().unwrap_or(1).max(1)),
@@ -289,15 +340,12 @@ impl Tracker {
                     .max(1)
                     .min(cols.saturating_sub(col));
                 for c in col..cols {
-                    grid.set(
-                        row,
-                        c,
-                        if c + n < cols {
-                            grid.get(row, c + n)
-                        } else {
-                            None
-                        },
-                    );
+                    let value = if c + n < cols {
+                        self.grid_mut(alternate).get(row, c + n)
+                    } else {
+                        None
+                    };
+                    self.grid_mut(alternate).set(row, c, value);
                 }
             }
             Event::Csi('@', p) => {
@@ -308,23 +356,22 @@ impl Tracker {
                     .max(1)
                     .min(cols.saturating_sub(col));
                 for c in (col..cols).rev() {
-                    grid.set(
-                        row,
-                        c,
-                        if c >= col + n {
-                            grid.get(row, c - n)
-                        } else {
-                            None
-                        },
-                    );
+                    let value = if c >= col + n {
+                        self.grid_mut(alternate).get(row, c - n)
+                    } else {
+                        None
+                    };
+                    self.grid_mut(alternate).set(row, c, value);
                 }
             }
-            Event::Csi('S', p) => grid.scroll(
+            Event::Csi('S', p) => self.scroll(
+                alternate,
                 top,
                 bottom,
                 i32::from(p.first().copied().unwrap_or(1).max(1)),
             ),
-            Event::Csi('T', p) => grid.scroll(
+            Event::Csi('T', p) => self.scroll(
+                alternate,
                 top,
                 bottom,
                 -i32::from(p.first().copied().unwrap_or(1).max(1)),
@@ -332,23 +379,54 @@ impl Tracker {
             Event::Csi('L', p) => {
                 let n = p.first().copied().unwrap_or(1).max(1);
                 if (top..=bottom).contains(&row) {
-                    grid.scroll(row, bottom, -i32::from(n));
+                    self.scroll(alternate, row, bottom, -i32::from(n));
                 }
             }
             Event::Csi('M', p) => {
                 let n = p.first().copied().unwrap_or(1).max(1);
                 if (top..=bottom).contains(&row) {
-                    grid.scroll(row, bottom, i32::from(n));
+                    self.scroll(alternate, row, bottom, i32::from(n));
                 }
             }
             _ => {}
         }
     }
-    pub fn ranges(&self, alternate: bool) -> Vec<LinkRange> {
+    fn grid_mut(&mut self, alternate: bool) -> &mut Grid {
+        if alternate {
+            &mut self.alternate
+        } else {
+            &mut self.normal
+        }
+    }
+    fn scroll(&mut self, alternate: bool, top: u16, bottom: u16, amount: i32) {
+        let grid = if alternate {
+            &mut self.alternate
+        } else {
+            &mut self.normal
+        };
+        if !alternate && amount > 0 && top == 0 && bottom + 1 == grid.rows {
+            let count = (amount as u32).min(u32::from(grid.rows)) as u16;
+            self.history
+                .extend((0..count).map(|row| grid.row(row).to_vec()));
+            while self.history.len() > self.history_capacity {
+                self.history.pop_front();
+            }
+        }
+        grid.scroll(top, bottom, amount);
+    }
+    pub fn ranges(&self, alternate: bool, scrollback: usize) -> Vec<LinkRange> {
         if alternate {
             self.alternate.ranges(&self.uris)
         } else {
-            self.normal.ranges(&self.uris)
+            let start = self.history.len().saturating_sub(scrollback);
+            ranges(self.normal.rows, self.normal.cols, &self.uris, |row| {
+                let history_row = start + usize::from(row);
+                self.history.get(history_row).cloned().unwrap_or_else(|| {
+                    self.normal
+                        .row(row.saturating_sub(scrollback as u16))
+                        .to_vec()
+                })
+            })
         }
     }
     pub fn clear_alternate(&mut self) {
@@ -365,6 +443,13 @@ impl Tracker {
             cols,
             cells: vec![None; usize::from(rows) * usize::from(cols)],
         };
+        self.history.clear();
+    }
+    pub fn set_history_capacity(&mut self, capacity: usize) {
+        self.history_capacity = capacity;
+        while self.history.len() > capacity {
+            self.history.pop_front();
+        }
     }
 }
 
@@ -388,7 +473,7 @@ mod tests {
             &mut p,
             b"\x1b]8;;https://x\x1b\\link\x1b]8;;\x1b\\\rNO\n\n",
         );
-        let r = t.ranges(p.screen().alternate_screen());
+        let r = t.ranges(p.screen().alternate_screen(), p.screen().scrollback());
         assert!(r.iter().all(|x| x.uri == "https://x"));
         assert!(r.iter().any(|x| x.row == 0 && x.start_col == 2));
     }
@@ -402,28 +487,28 @@ mod tests {
             b"\x1b]8;;https://old\x1b\\abcd\x1b]8;;\x1b\\",
         );
         feed(&mut tracker, &mut parser, b"\r\x1b[2P");
-        assert_eq!(tracker.ranges(false)[0].end_col, 2);
+        assert_eq!(tracker.ranges(false, 0)[0].end_col, 2);
         feed(&mut tracker, &mut parser, b"\r\x1b[2@");
-        assert_eq!(tracker.ranges(false)[0].start_col, 2);
+        assert_eq!(tracker.ranges(false, 0)[0].start_col, 2);
         feed(&mut tracker, &mut parser, b"\r\x1b[2K");
-        assert!(tracker.ranges(false).is_empty());
+        assert!(tracker.ranges(false, 0).is_empty());
         feed(
             &mut tracker,
             &mut parser,
             b"\x1b]8;;https://new\x1b\\x\x1b]8;;\x1b\\",
         );
         tracker.resize(2, 4);
-        assert!(tracker.ranges(false).is_empty());
+        assert!(tracker.ranges(false, 0).is_empty());
         feed(&mut tracker, &mut parser, b"\x1b[?1049halt");
-        assert!(tracker.ranges(true).is_empty());
+        assert!(tracker.ranges(true, 0).is_empty());
         feed(
             &mut tracker,
             &mut parser,
             b"\x1b]8;;https://alt\x1b\\a\x1b]8;;\x1b\\",
         );
-        assert_eq!(tracker.ranges(true)[0].uri, "https://alt");
+        assert_eq!(tracker.ranges(true, 0)[0].uri, "https://alt");
         feed(&mut tracker, &mut parser, b"\x1b[?1049l");
-        assert!(tracker.ranges(false).is_empty());
+        assert!(tracker.ranges(false, 0).is_empty());
     }
 
     #[test]
@@ -436,9 +521,40 @@ mod tests {
             &mut parser,
             b"\x1b]8;;https://new\x1b\\d\x1b]8;;\x1b\\",
         );
-        let links = tracker.ranges(false);
-        assert_eq!(links.len(), 1);
-        assert_eq!((links[0].start_col, links[0].end_col), (0, 1));
-        assert_eq!(links[0].uri, "https://new");
+        let links = tracker.ranges(false, 0);
+        assert!(links.iter().any(|link| {
+            (link.row, link.start_col, link.end_col, link.uri.as_str()) == (1, 0, 1, "https://new")
+        }));
+    }
+
+    #[test]
+    fn retained_scrollback_uses_its_original_link_cells() {
+        let mut parser = vt100::Parser::new(2.try_into().unwrap(), 8.try_into().unwrap(), 4);
+        let mut tracker = Tracker::default();
+        tracker.set_history_capacity(4);
+        feed(
+            &mut tracker,
+            &mut parser,
+            b"\x1b]8;;https://first\x1b\\one\x1b]8;;\x1b\\\r\nplain\r\nlast",
+        );
+        parser.screen_mut().set_scrollback(1);
+        let links = tracker.ranges(false, parser.screen().scrollback());
+        assert!(links.iter().any(|link| {
+            (link.row, link.start_col, link.end_col, link.uri.as_str())
+                == (0, 0, 3, "https://first")
+        }));
+        assert!(links.iter().all(|link| link.row == 0));
+    }
+
+    #[test]
+    fn replacing_a_wide_link_with_one_glyph_retires_both_cells() {
+        let mut parser = vt100::Parser::new(2.try_into().unwrap(), 6.try_into().unwrap(), 0);
+        let mut tracker = Tracker::default();
+        feed(
+            &mut tracker,
+            &mut parser,
+            b"\x1b]8;;https://wide\x1b\\\xe7\x95\x8c\x1b]8;;\x1b\\\rX",
+        );
+        assert!(tracker.ranges(false, 0).is_empty());
     }
 }

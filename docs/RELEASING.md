@@ -2,6 +2,8 @@
 
 1. Bump the version in the workspace's three `Cargo.toml` package manifests.
 2. Add the release notes to the appropriate `CHANGELOG` section in `README.md`, if applicable.
+   For the next terminal release, mention the maintained parser replacement and
+   the OSC 8, synchronized-frame, and native-clipboard behavior.
 3. Commit the changes, then tag and push the release:
 
    ```sh
