@@ -4904,6 +4904,104 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn osc52_is_delivered_to_each_clients_currently_viewed_pane_only() {
+        let session =
+            Arc::new(Session::spawn(80, 24, "clipboard-clients".into()).expect("session"));
+        session
+            .handle(ClientMessage::SplitRight)
+            .expect("split pane");
+        let panes = session.snapshot().expect("snapshot").panes;
+        let first = panes[0].id;
+        let second = panes[1].id;
+        let (a_client, a_server) = UnixStream::pair().expect("client A socket");
+        let (b_client, b_server) = UnixStream::pair().expect("client B socket");
+        let a_task = tokio::spawn(serve_client(a_server, Arc::clone(&session)));
+        let b_task = tokio::spawn(serve_client(b_server, Arc::clone(&session)));
+        let (a_reader, mut a_writer) = a_client.into_split();
+        let (b_reader, mut b_writer) = b_client.into_split();
+        let mut a = BufReader::new(a_reader).lines();
+        let mut b = BufReader::new(b_reader).lines();
+        for writer in [&mut a_writer, &mut b_writer] {
+            writer
+                .write_all(
+                    &encode(&ClientMessage::Hello {
+                        cols: 80,
+                        rows: 24,
+                        version: PROTOCOL_VERSION,
+                    })
+                    .unwrap(),
+                )
+                .await
+                .expect("hello");
+        }
+        for reader in [&mut a, &mut b] {
+            assert!(matches!(
+                next_server_message(reader).await,
+                ServerMessage::Welcome { .. }
+            ));
+            assert!(matches!(
+                next_server_message(reader).await,
+                ServerMessage::Layout(_)
+            ));
+        }
+        // The same session is attached twice, but each connection selects a
+        // different pane. This guards against a session-global clipboard read.
+        for (writer, pane) in [(&mut a_writer, first), (&mut b_writer, second)] {
+            writer
+                .write_all(&encode(&ClientMessage::FocusPaneId { id: pane }).unwrap())
+                .await
+                .expect("focus pane");
+        }
+        assert!(matches!(
+            next_server_message(&mut a).await,
+            ServerMessage::Layout(_)
+        ));
+        assert!(matches!(
+            next_server_message(&mut b).await,
+            ServerMessage::Layout(_)
+        ));
+        a_writer
+            .write_all(
+                &encode(&ClientMessage::Input {
+                    bytes: b"printf '\\033]52;c;Y2xpZW50LWE=\\007'\n".to_vec(),
+                })
+                .unwrap(),
+            )
+            .await
+            .expect("write pane A");
+        let delivered_to_a = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let ServerMessage::Clipboard { pane, text } = next_server_message(&mut a).await {
+                    break (pane, text);
+                }
+            }
+        })
+        .await
+        .expect("clipboard for client A");
+        assert_eq!(delivered_to_a, (first, "client-a".into()));
+        let b_received_clipboard = tokio::time::timeout(Duration::from_millis(300), async {
+            loop {
+                if matches!(
+                    next_server_message(&mut b).await,
+                    ServerMessage::Clipboard { .. }
+                ) {
+                    return true;
+                }
+            }
+        })
+        .await
+        .is_ok();
+        assert!(
+            !b_received_clipboard,
+            "client B received client A's clipboard write"
+        );
+        drop(a_writer);
+        drop(b_writer);
+        a_task.await.unwrap().unwrap();
+        b_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
     async fn hidden_pane_clipboard_is_dropped_before_later_focus() {
         let session = Session::spawn(80, 24, "clipboard-focus".into()).expect("session");
         let first = session.snapshot().unwrap().panes[0].id;

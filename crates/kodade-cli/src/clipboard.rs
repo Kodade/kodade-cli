@@ -46,28 +46,69 @@ fn command() -> (&'static str, &'static [&'static str]) {
 
 async fn native_copy(text: &str) -> Result<()> {
     let (program, args) = command();
-    run_native(program, args, text, CLIPBOARD_TIMEOUT).await
+    run_native(program, args, &native_payload(text), CLIPBOARD_TIMEOUT).await
 }
 
-async fn run_native(program: &str, args: &[&str], text: &str, timeout: Duration) -> Result<()> {
-    let mut child = tokio::process::Command::new(program)
+fn native_payload(text: &str) -> Vec<u8> {
+    if cfg!(windows) {
+        // clip.exe consumes redirected input through the active console code
+        // page. Its documented pipe interface therefore cannot promise that
+        // UTF-8 survives unchanged. A BOM makes the UTF-16LE stream explicit.
+        let mut bytes = vec![0xff, 0xfe];
+        bytes.extend(text.encode_utf16().flat_map(u16::to_le_bytes));
+        bytes
+    } else {
+        text.as_bytes().to_vec()
+    }
+}
+
+async fn run_native(program: &str, args: &[&str], bytes: &[u8], timeout: Duration) -> Result<()> {
+    let mut command = tokio::process::Command::new(program);
+    command
         .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .kill_on_drop(true)
+        .kill_on_drop(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // A backend is allowed to fork. Give it its own group so a timeout
+        // terminates the whole backend tree instead of orphaning a writer.
+        unsafe {
+            command.as_std_mut().pre_exec(|| {
+                if libc::setpgid(0, 0) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
+    let mut child = command
         .spawn()
         .with_context(|| format!("native clipboard needs {program}"))?;
     let mut stdin = child.stdin.take().expect("piped clipboard stdin");
-    tokio::time::timeout(timeout, async {
-        stdin.write_all(text.as_bytes()).await?;
+    let result = tokio::time::timeout(timeout, async {
+        stdin.write_all(bytes).await?;
         drop(stdin);
         let status = child.wait().await?;
         anyhow::ensure!(status.success(), "{program} failed");
         Ok(())
     })
-    .await
-    .context("native clipboard write timed out")?
+    .await;
+    match result {
+        Ok(result) => result,
+        Err(_) => {
+            #[cfg(unix)]
+            if let Some(pid) = child.id() {
+                // The child became its process-group leader in pre_exec.
+                unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
+            }
+            let _ = child.start_kill();
+            let _ = tokio::time::timeout(Duration::from_millis(250), child.wait()).await;
+            anyhow::bail!("native clipboard write timed out")
+        }
+    }
 }
 
 #[cfg(test)]
@@ -97,7 +138,7 @@ mod tests {
         run_native(
             "sh",
             &["-c", &script],
-            "copied text",
+            b"copied text",
             Duration::from_secs(1),
         )
         .await
@@ -110,14 +151,60 @@ mod tests {
     #[tokio::test]
     async fn native_backend_failure_and_timeout_return_errors() {
         assert!(
-            run_native("sh", &["-c", "exit 1"], "x", Duration::from_secs(1))
+            run_native("sh", &["-c", "exit 1"], b"x", Duration::from_secs(1))
                 .await
                 .is_err()
         );
         assert!(
-            run_native("sh", &["-c", "sleep 1"], "x", Duration::from_millis(10))
+            run_native("sh", &["-c", "sleep 1"], b"x", Duration::from_millis(10))
                 .await
                 .is_err()
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn timeout_terminates_the_backend_process_group() {
+        let path =
+            std::env::temp_dir().join(format!("kodade-clipboard-child-{}", std::process::id()));
+        let command = format!("sleep 30 & echo $! > {}; wait", path.display());
+        assert!(
+            run_native("sh", &["-c", &command], b"x", Duration::from_millis(100))
+                .await
+                .is_err()
+        );
+        let pid: i32 = std::fs::read_to_string(&path)
+            .expect("backend recorded child pid")
+            .trim()
+            .parse()
+            .expect("numeric child pid");
+        let stopped = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if unsafe { libc::kill(pid, 0) } == -1 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(
+            stopped.is_ok(),
+            "clipboard backend child {pid} survived timeout"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn native_payload_preserves_unicode() {
+        let text = "Ködade 日本語 🚀";
+        let payload = native_payload(text);
+        #[cfg(windows)]
+        {
+            let mut expected = vec![0xff, 0xfe];
+            expected.extend(text.encode_utf16().flat_map(u16::to_le_bytes));
+            assert_eq!(payload, expected);
+        }
+        #[cfg(not(windows))]
+        assert_eq!(payload, text.as_bytes());
     }
 }
