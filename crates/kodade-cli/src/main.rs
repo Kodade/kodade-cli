@@ -1042,6 +1042,9 @@ async fn agent(
             pane,
             state,
             source,
+            native_agent,
+            native_session_id,
+            native_session_path,
         } => {
             commands::layout(
                 commands::request(
@@ -1049,7 +1052,13 @@ async fn agent(
                     ClientMessage::AgentState {
                         pane,
                         state,
-                        source,
+                        source: source.clone(),
+                        native_session: native_agent.map(|agent| kodade_cli_proto::NativeSession {
+                            source: source.clone(),
+                            agent,
+                            id: native_session_id,
+                            path: native_session_path,
+                        }),
                     },
                 )
                 .await?,

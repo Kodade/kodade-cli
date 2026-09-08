@@ -305,6 +305,10 @@ pub enum ClientMessage {
         pane: PaneId,
         state: AgentStateKind,
         source: String,
+        /// Optional native conversation identity reported by an agent hook.
+        /// Older clients omit this field and continue to decode normally.
+        #[serde(default)]
+        native_session: Option<NativeSession>,
     },
     /// Set (or clear) a workspace's sidebar swatch color, as a `#rrggbb` hex
     /// string. `None` clears it back to the auto-hashed fallback (#19).
@@ -512,6 +516,18 @@ pub enum AgentStateKind {
     Done,
     Idle,
     Unknown,
+}
+
+/// A native agent conversation that can be resumed independently of its cwd.
+/// Values are treated as data and are later passed as individual argv entries.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeSession {
+    pub source: String,
+    pub agent: String,
+    #[serde(default)]
+    pub id: Option<String>,
+    #[serde(default)]
+    pub path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -753,6 +769,9 @@ pub struct PaneFile {
     /// The command this pane was spawned with, if any (used for `resume_agents`).
     #[serde(default)]
     pub command: Option<Vec<String>>,
+    /// Hook-reported native conversation identity, when the agent supports it.
+    #[serde(default)]
+    pub native_session: Option<NativeSession>,
 }
 
 impl SessionFile {
@@ -1218,6 +1237,7 @@ mod tests {
                 pane,
                 state: AgentStateKind::Idle,
                 source: "test".into(),
+                native_session: None,
             },
             ClientMessage::SetWorkspaceColor {
                 id: workspace,
@@ -1383,12 +1403,14 @@ mod tests {
                             title: "codex".into(),
                             cwd: None,
                             command: None,
+                            native_session: None,
                         },
                         PaneFile {
                             id: 4,
                             title: "shell".into(),
                             cwd: None,
                             command: None,
+                            native_session: None,
                         },
                     ],
                 }],
@@ -1424,6 +1446,19 @@ mod tests {
         file.workspaces.push(second);
         let error = file.validate().expect_err("duplicate pane id accepted");
         assert!(error.to_string().contains("duplicate pane id"), "{error}");
+    }
+
+    #[test]
+    fn old_pane_file_without_native_session_decodes() {
+        let value = serde_json::json!({
+            "id": 7,
+            "title": "codex",
+            "cwd": "/tmp",
+            "command": ["codex"]
+        });
+        let pane: PaneFile = serde_json::from_value(value).expect("old pane decodes");
+        assert_eq!(pane.id, 7);
+        assert!(pane.native_session.is_none());
     }
 
     #[test]

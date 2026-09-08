@@ -83,8 +83,9 @@ On a cold start (no live daemon owns the socket) the daemon rebuilds the layout
 with **fresh panes**: each pane spawns in its saved cwd, falling back to the
 workspace root and then the pane default. Pane, tab, and workspace ids are
 re-allocated. Restored panes start as plain shells unless `[session]
-resume_agents` is enabled and a saved command matches an agent manifest that
-defines a `resume` string, in which case that resume command runs instead.
+resume_agents` is enabled and a supported integration reported an exact native
+conversation identity. Missing, invalid, or duplicate identities stay plain
+shells; restore never uses an ambiguous agent `--last` command.
 
 A file with an unknown `version` or a parse/validation error never crashes the
 daemon: it is renamed to `SESSION.json.broken`, a warning is logged to stderr,
