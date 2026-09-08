@@ -62,7 +62,7 @@ try {
     # The result is written by cmd.exe and checked from the filesystem. This
     # cannot pass merely because the terminal echoed the submitted command.
     $expected = 173 * 29
-    Invoke-Native $bin @('--session', $session, 'send', $pane, "set /a 173*29 > `"$resultPath`"") | Out-Null
+    Invoke-Native $bin @('--session', $session, 'send', $pane, "set /a 173*29 & set /a 173*29 > `"$resultPath`"") | Out-Null
     $lastScreen = ''
     for ($attempt = 0; $attempt -lt 50; $attempt++) {
         if ((Test-Path $resultPath) -and ((Get-Content -LiteralPath $resultPath -Raw).Trim() -eq "$expected")) { break }
