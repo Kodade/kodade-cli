@@ -325,7 +325,7 @@ the same `config.toml`, read by the daemon, controls restore behavior:
 
 | Setting | Default | Description |
 |---|---|---|
-| `session.resume_agents` | `false` | When `true`, a restored pane whose saved command matches an agent manifest with a `resume` string re-runs that resume command (e.g. `codex resume --last`) instead of starting a plain shell. Panes with no matching manifest always restore as shells. |
+| `session.resume_agents` | `false` | When `true`, a pane with an exact native conversation identity reported by a supported integration resumes that identity. Missing, invalid, or duplicate identities restore as plain shells; Ködade never guesses with an agent's `--last` command. |
 
 ```toml
 [session]

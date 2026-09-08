@@ -212,7 +212,8 @@ names, cwds, and zoom — never scrollback) is saved under
 `~/.local/state/kodade-cli/sessions/` (macOS: `~/Library/Application Support/…`)
 and rebuilt with fresh panes on the next cold start; a corrupt file degrades to
 a clean start and `kodade-cli ls` marks a restored session `(restored)`. Set
-`[session] resume_agents = true` to re-run an agent's resume command on restore.
+`[session] resume_agents = true` to resume panes that reported an exact native
+conversation identity; panes without one restore as shells.
 
 The CLI's dark theme uses charcoal backgrounds and off-white text with the
 Ködade orange accent `#E7A33B` and a purple-free ANSI palette. `theme = "auto"`

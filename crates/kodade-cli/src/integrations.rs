@@ -13,9 +13,9 @@ const REPORT_PREFIX: &str = "KODADE_INTEGRATION=kodade-cli;";
 const LEGACY_REPORT_PREFIX: &str = "kodade-cli agent report $KODADE_PANE ";
 
 /// Command each hook/notify entry runs; `state` is the state it reports.
-fn report_command(state: &str) -> String {
+fn report_command(state: &str, source: &str, agent: &str) -> String {
     format!(
-        "{REPORT_PREFIX} if [ -n \"${{KODADE_PANE:-}}\" ] && [ -n \"${{KODADE_SOCKET:-}}\" ]; then \"${{KODADE_BIN:-kodade-cli}}\" agent report \"$KODADE_PANE\" {state} >/dev/null 2>&1 || true; fi"
+        "{REPORT_PREFIX} if [ -n \"${{KODADE_PANE:-}}\" ] && [ -n \"${{KODADE_SOCKET:-}}\" ]; then \"${{KODADE_BIN:-kodade-cli}}\" agent report \"$KODADE_PANE\" {state} --source {source} --native-agent {agent} --hook-json >/dev/null 2>&1 || true; fi"
     )
 }
 
@@ -84,9 +84,9 @@ pub fn unintegrate_claude_code() -> Result<()> {
 /// preserves any existing `notify` command in config.toml.
 fn codex_hooks() -> Value {
     json!({
-        "Stop": [{ "hooks": [{ "type": "command", "command": report_command("done") }] }],
-        "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": report_command("working") }] }],
-        "PermissionRequest": [{ "hooks": [{ "type": "command", "command": report_command("blocked") }] }]
+        "Stop": [{ "hooks": [{ "type": "command", "command": report_command("done", "kodade:codex", "codex") }] }],
+        "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": report_command("working", "kodade:codex", "codex") }] }],
+        "PermissionRequest": [{ "hooks": [{ "type": "command", "command": report_command("blocked", "kodade:codex", "codex") }] }]
     })
 }
 
@@ -117,9 +117,9 @@ pub fn unintegrate_codex() -> Result<()> {
 /// Its notification event covers tool permission requests.
 fn gemini_hooks() -> Value {
     json!({
-        "AfterAgent": [{ "matcher": "*", "hooks": [{ "type": "command", "command": report_command("done") }] }],
-        "BeforeAgent": [{ "matcher": "*", "hooks": [{ "type": "command", "command": report_command("working") }] }],
-        "Notification": [{ "matcher": "*", "hooks": [{ "type": "command", "command": report_command("blocked") }] }]
+        "AfterAgent": [{ "matcher": "*", "hooks": [{ "type": "command", "command": report_command("done", "kodade:gemini-cli", "gemini") }] }],
+        "BeforeAgent": [{ "matcher": "*", "hooks": [{ "type": "command", "command": report_command("working", "kodade:gemini-cli", "gemini") }] }],
+        "Notification": [{ "matcher": "*", "hooks": [{ "type": "command", "command": report_command("blocked", "kodade:gemini-cli", "gemini") }] }]
     })
 }
 
@@ -221,18 +221,26 @@ fn pi_extension() -> &'static str {
     r#"// Installed by Ködade CLI. Pi 0.85.1 extension API.
 import { spawn } from "node:child_process";
 const enabled = () => process.env.KODADE_PANE && process.env.KODADE_SOCKET;
-function report(state) {
+function report(state, session, path) {
   if (!enabled()) return;
-  const child = spawn(process.env.KODADE_BIN || "kodade-cli", ["agent", "report", process.env.KODADE_PANE, state], { detached: true, stdio: "ignore" });
+  const args = ["agent", "report", process.env.KODADE_PANE, state, "--source", "kodade:pi", "--native-agent", "pi"];
+  if (typeof path === "string" && path.startsWith("/")) args.push("--native-session-path", path);
+  else if (typeof session === "string" && session.length) args.push("--native-session-id", session);
+  const child = spawn(process.env.KODADE_BIN || "kodade-cli", args, { detached: true, stdio: "ignore" });
   child.on("error", () => {});
   child.unref();
 }
 export default function (pi) {
   if (!enabled()) return;
   let tui = false;
-  pi.on("session_start", (_event, ctx) => { tui = ctx?.mode === "tui"; if (tui) report("idle"); });
-  pi.on("agent_start", () => { if (tui) report("working"); });
-  pi.on("agent_settled", () => { if (tui) report("done"); });
+  let session, path;
+  function updateSession(ctx) {
+    try { session = ctx?.sessionManager?.getSessionId?.(); } catch { session = undefined; }
+    try { path = ctx?.sessionManager?.getSessionFile?.(); } catch { path = undefined; }
+  }
+  pi.on("session_start", (_event, ctx) => { tui = ctx?.mode === "tui"; updateSession(ctx); if (tui) report("idle", session, path); });
+  pi.on("agent_start", (_event, ctx) => { updateSession(ctx); if (tui) report("working", session, path); });
+  pi.on("agent_settled", (_event, ctx) => { updateSession(ctx); if (tui) report("done", session, path); });
 }
 "#
 }
@@ -243,9 +251,11 @@ fn opencode_plugin() -> &'static str {
     r#"// Installed by Ködade CLI. OpenCode plugin API (official docs fixture).
 import { spawn } from "node:child_process";
 const enabled = () => process.env.KODADE_PANE && process.env.KODADE_SOCKET;
-function report(state) {
+function report(state, session) {
   if (!enabled()) return;
-  const child = spawn(process.env.KODADE_BIN || "kodade-cli", ["agent", "report", process.env.KODADE_PANE, state], { detached: true, stdio: "ignore" });
+  const args = ["agent", "report", process.env.KODADE_PANE, state, "--source", "kodade:opencode", "--native-agent", "opencode"];
+  if (typeof session === "string" && session.length) args.push("--native-session-id", session);
+  const child = spawn(process.env.KODADE_BIN || "kodade-cli", args, { detached: true, stdio: "ignore" });
   child.on("error", () => {});
   child.unref();
 }
@@ -253,8 +263,9 @@ export const KodadeCli = async () => ({
   event: async ({ event }) => {
     if (!enabled() || event?.type !== "session.status") return;
     const status = event.properties?.status?.type;
-    if (status === "busy" || status === "retry") report("working");
-    else if (status === "idle") report("done");
+    const session = event.properties?.sessionID || event.properties?.sessionId;
+    if (status === "busy" || status === "retry") report("working", session);
+    else if (status === "idle") report("done", session);
   },
 });
 "#
@@ -339,9 +350,9 @@ fn curl(url: &str) -> Result<String> {
 
 fn claude_hooks() -> Value {
     json!({
-        "Stop": [{ "hooks": [{ "type": "command", "command": report_command("done") }] }],
-        "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": report_command("working") }] }],
-        "Notification": [{ "hooks": [{ "type": "command", "command": report_command("blocked") }] }]
+        "Stop": [{ "hooks": [{ "type": "command", "command": report_command("done", "kodade:claude-code", "claude") }] }],
+        "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": report_command("working", "kodade:claude-code", "claude") }] }],
+        "Notification": [{ "hooks": [{ "type": "command", "command": report_command("blocked", "kodade:claude-code", "claude") }] }]
     })
 }
 
@@ -490,6 +501,24 @@ mod tests {
         assert!(opencode.contains("event.properties?.status?.type"));
         assert!(opencode.contains("status === \"busy\""));
         assert!(opencode.contains("status === \"idle\""));
+    }
+
+    #[test]
+    fn integrations_report_native_ids_as_argv_data() {
+        let claude_hooks = claude_hooks();
+        let codex_hooks = codex_hooks();
+        let claude = claude_hooks["Stop"][0]["hooks"][0]["command"]
+            .as_str()
+            .unwrap();
+        let codex = codex_hooks["Stop"][0]["hooks"][0]["command"]
+            .as_str()
+            .unwrap();
+        assert!(claude.contains("--hook-json"));
+        assert!(claude.contains("kodade:claude-code"));
+        assert!(codex.contains("--hook-json"));
+        assert!(codex.contains("--native-agent codex"));
+        assert!(pi_extension().contains("getSessionFile"));
+        assert!(opencode_plugin().contains("sessionID || event.properties?.sessionId"));
     }
 
     #[test]

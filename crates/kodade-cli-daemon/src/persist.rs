@@ -6,6 +6,8 @@
 //! cold start the daemon rebuilds that layout with fresh panes. Scrollback is
 //! never persisted (secrets risk); only structure and metadata are.
 
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 #[cfg(test)]
 use std::time::Instant;
 use std::{
@@ -97,6 +99,9 @@ pub fn quarantine(path: &Path) {
 pub fn write_session_file(path: &Path, file: &SessionFile) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).context("create session state directory")?;
+        #[cfg(unix)]
+        fs::set_permissions(parent, fs::Permissions::from_mode(0o700))
+            .context("protect session state directory")?;
     }
     let mut bytes = serde_json::to_vec_pretty(file).context("serialize session state")?;
     bytes.push(b'\n');
@@ -151,11 +156,11 @@ fn create_unique_temp(path: &Path) -> Result<(PathBuf, fs::File)> {
     for _ in 0..32 {
         let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
         let candidate = parent.join(format!(".{name}.{}.{}.tmp", std::process::id(), sequence));
-        match OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&candidate)
-        {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        match options.open(&candidate) {
             Ok(file) => return Ok((candidate, file)),
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(error) => return Err(error).context("create session state temp file"),
@@ -309,12 +314,14 @@ mod tests {
                                     title: "codex".into(),
                                     cwd: Some(PathBuf::from("/tmp")),
                                     command: Some(vec!["codex".into()]),
+                                    native_session: None,
                                 },
                                 PaneFile {
                                     id: 31,
                                     title: "shell".into(),
                                     cwd: Some(PathBuf::from("/")),
                                     command: None,
+                                    native_session: None,
                                 },
                             ],
                         },
@@ -329,6 +336,7 @@ mod tests {
                                 title: "tail".into(),
                                 cwd: None,
                                 command: None,
+                                native_session: None,
                             }],
                         },
                     ],
@@ -350,6 +358,7 @@ mod tests {
                             title: "shell".into(),
                             cwd: Some(PathBuf::from("/tmp")),
                             command: None,
+                            native_session: None,
                         }],
                     }],
                 },
@@ -435,6 +444,27 @@ mod tests {
         write_session_file(&path, &sample_file()).expect("write");
         let read = read_session_file(&path).expect("read").expect("present");
         assert_eq!(read, sample_file());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_session_state_is_private_to_the_user() {
+        let dir = std::env::temp_dir().join(format!("kodade-private-state-{}", std::process::id()));
+        let path = dir.join("sessions").join("demo.json");
+        write_session_file(&path, &sample_file()).expect("write");
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            fs::metadata(path.parent().unwrap())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
         fs::remove_dir_all(&dir).unwrap();
     }
 

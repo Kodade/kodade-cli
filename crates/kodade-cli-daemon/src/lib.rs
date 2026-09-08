@@ -12,7 +12,7 @@ mod plugins;
 mod proc;
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     env, fs,
     io::{Read, Write},
     os::unix::fs::FileTypeExt,
@@ -27,9 +27,9 @@ use std::{
 use anyhow::{anyhow, bail, Context, Result};
 use kodade_cli_proto::{
     decode, encode, schema_message, AgentInfo, AgentStateKind, CellColor, ClientMessage, Direction,
-    Event, LayoutSnapshot, LayoutTree, ManifestInfo, Notification, PaneId, PaneSnapshot, QueryKind,
-    Run, Screen, ServerMessage, SidebarTabInfo, SplitAxis, TabId, TabInfo, WorkspaceId,
-    WorkspaceInfo, ATTR_BOLD, ATTR_DIM, ATTR_INVERSE, ATTR_ITALIC, ATTR_UNDERLINE,
+    Event, LayoutSnapshot, LayoutTree, ManifestInfo, NativeSession, Notification, PaneId,
+    PaneSnapshot, QueryKind, Run, Screen, ServerMessage, SidebarTabInfo, SplitAxis, TabId, TabInfo,
+    WorkspaceId, WorkspaceInfo, ATTR_BOLD, ATTR_DIM, ATTR_INVERSE, ATTR_ITALIC, ATTR_UNDERLINE,
     PROTOCOL_VERSION,
 };
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
@@ -186,6 +186,7 @@ struct Pane {
     /// kept so persistence can record them without inspecting the live process.
     spawn_command: Option<Vec<String>>,
     spawn_cwd: Option<PathBuf>,
+    native_session: Mutex<Option<NativeSession>>,
     /// Kept so dropping the pane ends its process; otherwise the PTY reader
     /// thread never sees EOF (the daemon and the test runtime would wait forever).
     child: Mutex<Box<dyn portable_pty::Child + Send>>,
@@ -554,10 +555,7 @@ impl Session {
             hook_socket: hook_socket_path(),
             view_dispatch: Mutex::new(()),
         };
-        let manifests = session
-            .manifests
-            .lock()
-            .map_err(|_| anyhow!("manifest lock poisoned"))?;
+        let mut resumed_native_sessions = HashSet::new();
         let mut workspaces = Vec::new();
         let mut workspace_ids: HashMap<u64, WorkspaceId> = HashMap::new();
         for saved in &file.workspaces {
@@ -569,8 +567,25 @@ impl Session {
                 let mut pane_ids: HashMap<PaneId, PaneId> = HashMap::new();
                 for saved_pane in &saved_tab.panes {
                     let cwd = restore_cwd(saved_pane.cwd.clone(), saved.root.clone());
-                    let command = resume_command(saved_pane, resume_agents, &manifests);
+                    let command =
+                        resume_command(saved_pane, resume_agents, &mut resumed_native_sessions);
+                    let resumed_native = command
+                        .as_ref()
+                        .and(saved_pane.native_session.as_ref())
+                        .cloned();
                     let new_id = session.new_pane(&saved_pane.title, cwd, command)?;
+                    if let Some(native) = resumed_native {
+                        session
+                            .panes
+                            .lock()
+                            .expect("panes lock poisoned")
+                            .get(&new_id)
+                            .expect("new pane exists")
+                            .native_session
+                            .lock()
+                            .expect("native session lock poisoned")
+                            .replace(native);
+                    }
                     pane_ids.insert(PaneId(saved_pane.id), new_id);
                 }
                 let tree = remap_tree(&saved_tab.tree, &pane_ids);
@@ -618,7 +633,6 @@ impl Session {
             state.workspaces = workspaces;
             state.active_workspace = active_workspace;
         }
-        drop(manifests);
         Ok(session)
     }
 
@@ -650,6 +664,11 @@ impl Session {
                                     title: pane.title.lock().expect("title lock poisoned").clone(),
                                     cwd: pane.saved_cwd(),
                                     command: pane.spawn_command.clone(),
+                                    native_session: pane
+                                        .native_session
+                                        .lock()
+                                        .expect("native session lock poisoned")
+                                        .clone(),
                                 })
                             })
                             .collect();
@@ -2143,6 +2162,7 @@ impl Session {
                 pane,
                 state,
                 source,
+                native_session,
             } => {
                 let panes = self
                     .panes
@@ -2158,6 +2178,20 @@ impl Session {
                     source,
                     reported_at: Instant::now(),
                 });
+                drop(hook);
+                let pane = Arc::clone(pane);
+                drop(panes);
+                if let Some(native_session) = native_session.filter(valid_native_session) {
+                    // Retire the previous foreground identity before assigning
+                    // this report, so its next detection cannot erase a new ID.
+                    let manifests = self.manifests.lock().expect("manifest lock poisoned");
+                    let (detection, process) = pane.detect_fresh(&manifests, Instant::now());
+                    pane.track_agent_identity(&detection.agent, &process);
+                    *pane
+                        .native_session
+                        .lock()
+                        .expect("native session lock poisoned") = Some(native_session);
+                }
                 if changed && matches!(state, AgentStateKind::Working | AgentStateKind::Blocked) {
                     // Hook reports are authoritative lifecycle transitions even
                     // before the next snapshot updates sidebar state.
@@ -3111,6 +3145,7 @@ impl Pane {
             spawn_process,
             spawn_command: run,
             spawn_cwd: cwd,
+            native_session: Mutex::new(None),
             child: Mutex::new(child),
             process: Mutex::new(ProcessEvidence {
                 pid: None,
@@ -3306,6 +3341,14 @@ impl Pane {
             )
         });
         if *identity != next {
+            // A native session belongs to the foreground agent process. Once it
+            // exits or is replaced, do not let its old conversation resurrect.
+            if identity.is_some() {
+                *self
+                    .native_session
+                    .lock()
+                    .expect("native session lock poisoned") = None;
+            }
             *identity = next;
             self.agent_generation.fetch_add(1, Ordering::Relaxed);
         }
@@ -3385,26 +3428,104 @@ fn restore_cwd(saved: Option<PathBuf>, root: Option<PathBuf>) -> Option<PathBuf>
         .or_else(|| root.filter(|path| path.is_dir()))
 }
 
-/// The command a restored pane should run. Only when `resume_agents` is on and
-/// the saved command's program matches a manifest that defines a `resume` string
-/// do we relaunch it — with the manifest's resume command, not the raw one.
-/// Everything else restores as a plain shell (no command re-run).
+/// The command a restored pane should run. Native conversation references are
+/// explicit per pane; the old manifest `--last` fallback is deliberately not
+/// used because two agents in one cwd would otherwise restore the same session.
 fn resume_command(
     pane: &persist::PaneFile,
     resume_agents: bool,
-    manifests: &[manifest::Manifest],
+    resumed: &mut HashSet<String>,
 ) -> Option<Vec<String>> {
     if !resume_agents {
         return None;
     }
-    let command = pane.command.as_ref()?;
-    let process = command.first().and_then(|arg| proc::process_basename(arg));
-    let manifest = manifests.iter().find(|manifest| {
-        manifest.resume.is_some() && manifest.identifies(process.as_deref(), "")
-    })?;
-    let resume = manifest.resume.as_ref()?;
-    // Resume strings are simple shell words (e.g. `codex resume --last`).
-    Some(resume.split_whitespace().map(str::to_owned).collect())
+    let native = pane
+        .native_session
+        .as_ref()
+        .filter(|native| valid_native_session(native))?;
+    let argv = native_resume_argv(native)?;
+    let key = native_session_key(native);
+    resumed.insert(key).then_some(argv)
+}
+
+fn native_session_key(native: &NativeSession) -> String {
+    format!(
+        "{}\0{}\0{}",
+        native.agent,
+        native.id.as_deref().unwrap_or_default(),
+        native
+            .path
+            .as_deref()
+            .and_then(Path::to_str)
+            .unwrap_or_default()
+    )
+}
+
+fn valid_native_session(native: &NativeSession) -> bool {
+    const MAX_VALUE: usize = 4096;
+    let valid_text = |value: &str| {
+        !value.is_empty()
+            && value.len() <= MAX_VALUE
+            && !value.starts_with('-')
+            && !value
+                .chars()
+                .any(|ch| ch.is_whitespace() || ch.is_control())
+    };
+    let valid_id = native.id.as_deref().is_some_and(valid_text);
+    let valid_path = native.path.as_ref().is_some_and(|path| {
+        path.is_absolute()
+            && path.is_file()
+            && path.as_os_str().len() <= MAX_VALUE
+            && !path.to_string_lossy().chars().any(char::is_control)
+    });
+    matches!(
+        (
+            native.source.as_str(),
+            native.agent.as_str(),
+            valid_id,
+            valid_path
+        ),
+        ("kodade:claude-code", "claude", true, false)
+            | ("kodade:codex", "codex", true, false)
+            | ("kodade:gemini-cli", "gemini", true, false)
+            | ("kodade:opencode", "opencode", true, false)
+            | ("kodade:pi", "pi", true, false)
+            | ("kodade:pi", "pi", false, true)
+    )
+}
+
+fn native_resume_argv(native: &NativeSession) -> Option<Vec<String>> {
+    let id = native.id.as_ref();
+    match (
+        native.source.as_str(),
+        native.agent.as_str(),
+        id,
+        native.path.as_ref(),
+    ) {
+        ("kodade:claude-code", "claude", Some(id), None) => {
+            Some(vec!["claude".into(), "--resume".into(), id.clone()])
+        }
+        // `codex resume ID` launches the interactive TUI. `codex exec resume`
+        // is a non-interactive command and must never be used for a pane.
+        ("kodade:codex", "codex", Some(id), None) => {
+            Some(vec!["codex".into(), "resume".into(), id.clone()])
+        }
+        ("kodade:gemini-cli", "gemini", Some(id), None) => {
+            Some(vec!["gemini".into(), "--resume".into(), id.clone()])
+        }
+        ("kodade:opencode", "opencode", Some(id), None) => {
+            Some(vec!["opencode".into(), "--session".into(), id.clone()])
+        }
+        ("kodade:pi", "pi", Some(id), None) => {
+            Some(vec!["pi".into(), "--session".into(), id.clone()])
+        }
+        ("kodade:pi", "pi", None, Some(path)) => Some(vec![
+            "pi".into(),
+            "--session".into(),
+            path.to_string_lossy().into_owned(),
+        ]),
+        _ => None,
+    }
 }
 
 /// Rebuild a layout tree with re-allocated pane ids. The caller validated that
@@ -4342,6 +4463,7 @@ mod tests {
                 pane,
                 state: AgentStateKind::Working,
                 source: "test".into(),
+                native_session: None,
             })
             .expect("report working");
         session.snapshot().expect("settle working state");
@@ -4351,6 +4473,7 @@ mod tests {
                 pane,
                 state: AgentStateKind::Blocked,
                 source: "test".into(),
+                native_session: None,
             })
             .expect("report blocked");
 
@@ -4601,12 +4724,14 @@ mod tests {
                                     title: "codex".into(),
                                     cwd: Some(PathBuf::from("/tmp")),
                                     command: Some(vec!["codex".into()]),
+                                    native_session: None,
                                 },
                                 persist::PaneFile {
                                     id: 31,
                                     title: "root".into(),
                                     cwd: Some(PathBuf::from("/")),
                                     command: None,
+                                    native_session: None,
                                 },
                             ],
                         },
@@ -4621,6 +4746,7 @@ mod tests {
                                 title: "tail".into(),
                                 cwd: None,
                                 command: None,
+                                native_session: None,
                             }],
                         },
                     ],
@@ -4642,6 +4768,7 @@ mod tests {
                             title: "shell".into(),
                             cwd: Some(PathBuf::from("/tmp")),
                             command: None,
+                            native_session: None,
                         }],
                     }],
                 },
@@ -4699,53 +4826,153 @@ mod tests {
     }
 
     #[test]
-    fn resume_command_uses_manifest_resume_only_when_enabled() {
-        let manifests = vec![manifest::Manifest {
-            name: "codex".into(),
-            display: "Codex".into(),
-            process: vec!["codex".into()],
-            title: Vec::new(),
-            resume: Some("codex resume --last".into()),
-            rules: Vec::new(),
-            source: manifest::ManifestSource::Builtin,
-        }];
-        let agent = persist::PaneFile {
+    fn resume_command_uses_unique_explicit_native_sessions() {
+        let native = |id: &str| NativeSession {
+            source: "kodade:codex".into(),
+            agent: "codex".into(),
+            id: Some(id.into()),
+            path: None,
+        };
+        let agent = |id: &str| persist::PaneFile {
             id: 1,
             title: "codex".into(),
             cwd: None,
             command: Some(vec!["codex".into()]),
+            native_session: Some(native(id)),
         };
-        // resume_agents off: never re-run.
-        assert_eq!(resume_command(&agent, false, &manifests), None);
-        // On, and a manifest with a resume matches: use the resume command.
+        let mut resumed = HashSet::new();
+        assert_eq!(resume_command(&agent("one"), false, &mut resumed), None);
         assert_eq!(
-            resume_command(&agent, true, &manifests),
-            Some(vec!["codex".into(), "resume".into(), "--last".into()])
+            resume_command(&agent("one"), true, &mut resumed),
+            Some(vec!["codex".into(), "resume".into(), "one".into()])
         );
-        // A plain shell pane has no command to resume.
-        let shell = persist::PaneFile {
-            id: 2,
-            title: "shell".into(),
+        assert_eq!(
+            resume_command(&agent("two"), true, &mut resumed),
+            Some(vec!["codex".into(), "resume".into(), "two".into()])
+        );
+        // A duplicate or foreign native reference deliberately becomes a shell,
+        // never the ambiguous old manifest `resume --last` command.
+        assert_eq!(resume_command(&agent("one"), true, &mut resumed), None);
+        let invalid = persist::PaneFile {
+            id: 4,
+            title: "codex".into(),
             cwd: None,
-            command: None,
+            command: Some(vec!["codex".into()]),
+            native_session: Some(NativeSession {
+                source: "untrusted".into(),
+                agent: "codex".into(),
+                id: Some("one".into()),
+                path: None,
+            }),
         };
-        assert_eq!(resume_command(&shell, true, &manifests), None);
-        // A command with no matching manifest is left as a plain shell.
-        let unknown = persist::PaneFile {
-            id: 3,
-            title: "make".into(),
-            cwd: None,
-            command: Some(vec!["make".into()]),
-        };
-        assert_eq!(resume_command(&unknown, true, &manifests), None);
+        assert_eq!(resume_command(&invalid, true, &mut resumed), None);
+    }
+
+    #[tokio::test]
+    async fn hook_report_persists_native_identity_for_interactive_agents() {
+        let session = Session::spawn(80, 24, "native-report".into()).expect("spawn session");
+        let pane = session.snapshot().expect("snapshot").panes[0].id;
+        *session.panes.lock().expect("panes")[&pane]
+            .agent_identity
+            .lock()
+            .expect("identity") = Some("previous-agent-process".into());
+        session
+            .handle(ClientMessage::AgentState {
+                pane,
+                state: AgentStateKind::Working,
+                source: "kodade:codex".into(),
+                native_session: Some(NativeSession {
+                    source: "kodade:codex".into(),
+                    agent: "codex".into(),
+                    id: Some("thread-123".into()),
+                    path: None,
+                }),
+            })
+            .expect("report native session");
+        session
+            .snapshot()
+            .expect("next detection preserves new report");
+        let file = session.build_file();
+        assert_eq!(
+            file.workspaces[0].tabs[0].panes[0]
+                .native_session
+                .as_ref()
+                .and_then(|native| native.id.as_deref()),
+            Some("thread-123")
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_uses_each_explicit_native_session_in_the_same_cwd() {
+        let mut file = restore_fixture();
+        let panes = &mut file.workspaces[0].tabs[0].panes;
+        for (pane, id) in panes.iter_mut().take(2).zip(["first", "second"]) {
+            pane.native_session = Some(NativeSession {
+                source: "kodade:codex".into(),
+                agent: "codex".into(),
+                id: Some(id.into()),
+                path: None,
+            });
+            pane.cwd = Some(PathBuf::from("/tmp"));
+        }
+        let session = Session::restore(file, true).expect("restore");
+        let commands: Vec<_> = session
+            .panes
+            .lock()
+            .expect("panes")
+            .values()
+            .filter_map(|pane| pane.spawn_command.clone())
+            .collect();
+        assert!(commands.contains(&vec!["codex".into(), "resume".into(), "first".into()]));
+        assert!(commands.contains(&vec!["codex".into(), "resume".into(), "second".into()]));
     }
 
     #[tokio::test]
     async fn restore_without_resume_agents_starts_plain_shells() {
-        // resume_agents=false: the saved `codex` command is not re-run.
-        let session = Session::restore(restore_fixture(), false).expect("restore");
+        let mut file = restore_fixture();
+        file.workspaces[0].tabs[0].panes[0].native_session = Some(NativeSession {
+            source: "kodade:codex".into(),
+            agent: "codex".into(),
+            id: Some("previous-conversation".into()),
+            path: None,
+        });
+        let session = Session::restore(file, false).expect("restore");
         let panes = session.panes.lock().expect("pane lock");
         assert!(panes.values().all(|pane| pane.spawn_command.is_none()));
+        assert!(panes.values().all(|pane| pane
+            .native_session
+            .lock()
+            .expect("native session")
+            .is_none()));
+    }
+
+    #[tokio::test]
+    async fn duplicate_restore_does_not_leave_a_native_session_on_the_shell() {
+        let mut file = restore_fixture();
+        for pane in &mut file.workspaces[0].tabs[0].panes {
+            pane.native_session = Some(NativeSession {
+                source: "kodade:codex".into(),
+                agent: "codex".into(),
+                id: Some("same-conversation".into()),
+                path: None,
+            });
+        }
+        let session = Session::restore(file, true).expect("restore");
+        let panes = session.panes.lock().expect("panes");
+        assert_eq!(
+            panes
+                .values()
+                .filter(|pane| pane.spawn_command.is_some())
+                .count(),
+            1
+        );
+        for pane in panes.values().filter(|pane| pane.spawn_command.is_none()) {
+            assert!(pane
+                .native_session
+                .lock()
+                .expect("native session")
+                .is_none());
+        }
     }
 
     #[tokio::test]
@@ -5401,6 +5628,7 @@ mod tests {
                     pane,
                     state: AgentStateKind::Blocked,
                     source: "test".into(),
+                    native_session: None,
                 })
                 .unwrap(),
             )
@@ -5543,6 +5771,7 @@ mod tests {
                     pane,
                     state: AgentStateKind::Blocked,
                     source: "test".into(),
+                    native_session: None,
                 })
                 .unwrap(),
             )
@@ -5857,6 +6086,7 @@ mod tests {
                 pane,
                 state: AgentStateKind::Blocked,
                 source: "test".into(),
+                native_session: None,
             })
             .expect("report blocked");
         tokio::spawn(subscriber_tick(Arc::clone(&session)));
