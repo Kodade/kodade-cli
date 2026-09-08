@@ -132,6 +132,14 @@ Host kodade-unix-fixture
             Start-Sleep -Milliseconds 100
         }
         if (-not $seen) { throw 'Unix PTY output did not return through the Windows SSH bridge' }
+
+        # `agent wait` polls the pane until its hook changes it back to idle.
+        # One Windows Tunnel therefore has to accept several sequential daemon
+        # connections, rather than only the initial command connection.
+        $waitPane = (Invoke-Native $WindowsBinary @('--remote', 'kodade-unix-fixture', '--session', $session, 'run', '--', 'sh', '-c', 'sleep 1; "$KODADE_BIN" agent report "$KODADE_PANE" working --source windows-ssh-fixture; sleep 1; "$KODADE_BIN" agent report "$KODADE_PANE" idle --source windows-ssh-fixture') 45).Trim()
+        if ($waitPane -notmatch '^\d+$') { throw "remote wait fixture did not return a pane id: $waitPane" }
+        Start-Sleep -Milliseconds 1300
+        Invoke-Native $WindowsBinary @('--remote', 'kodade-unix-fixture', '--session', $session, 'agent', 'wait', $waitPane, '--state', 'idle', '--timeout', '10') 45 | Out-Null
         Invoke-Native $WindowsBinary @('--remote', 'kodade-unix-fixture', '--session', $session, 'kill-session') 45 | Out-Null
     } finally {
         $env:USERPROFILE = $previousHome
