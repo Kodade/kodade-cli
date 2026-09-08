@@ -402,14 +402,58 @@ impl Drop for ContextFile {
     }
 }
 
+const CHILD_EXIT_GRACE: Duration = Duration::from_millis(250);
+
+/// Poll without letting a process-library implementation turn pane teardown
+/// into an unbounded wait. `portable-pty`'s Unix `kill` starts with SIGHUP and
+/// can return before its SIGKILL fallback, so the caller must retain control
+/// of the final escalation.
+fn child_exited_within(child: &mut dyn portable_pty::Child, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return true,
+            // A failed status query does not establish that the process is
+            // gone. Escalate and leave the waiter with the child handle.
+            Err(_) => return false,
+            Ok(None) if Instant::now() >= deadline => return false,
+            Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+        }
+    }
+}
+
+/// End an owned PTY child without allowing a stuck wait to hold up a session
+/// close or Tokio runtime shutdown. The detached waiter still reaps a killed
+/// child once the platform reports its exit.
+fn terminate_owned_child(mut child: Box<dyn portable_pty::Child + Send>) {
+    let pid = child.process_id().and_then(|pid| i32::try_from(pid).ok());
+    let _ = child.kill();
+    if child_exited_within(&mut *child, CHILD_EXIT_GRACE) {
+        return;
+    }
+
+    #[cfg(unix)]
+    if let Some(pid) = pid {
+        // The child is ours, so PID reuse cannot occur before its wait handle
+        // is dropped. SIGKILL covers portable-pty's failed-SIGHUP path.
+        let _ = unsafe { libc::kill(pid, libc::SIGKILL) };
+        if child_exited_within(&mut *child, CHILD_EXIT_GRACE) {
+            return;
+        }
+    }
+
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
+}
+
 /// Closing a pane terminates its process so the PTY reader thread exits.
 impl Drop for Pane {
     fn drop(&mut self) {
         self.reader.shutdown();
         if let Ok(mut child) = self.child.lock() {
-            if let Some(mut child) = child.take() {
-                let _ = child.kill();
-                let _ = child.wait();
+            if let Some(child) = child.take() {
+                terminate_owned_child(child);
             }
         }
         if let Some((pid, start)) = &self.adopted_child {
@@ -6215,6 +6259,60 @@ mod tests {
         assert_eq!(pane.snapshot().1, oldest);
         pane.scroll(i16::MIN);
         assert_eq!(pane.snapshot().1, 0);
+    }
+
+    #[tokio::test]
+    async fn closing_hup_and_term_ignoring_pty_child_is_bounded_and_reaps_it() {
+        let (updates, _) = broadcast::channel(1);
+        let pane = Pane::spawn(
+            PaneId(1),
+            "stubborn",
+            40,
+            4,
+            "close-stubborn-pane".into(),
+            hook_socket_path(),
+            updates,
+            Arc::new(AtomicU64::new(0)),
+            None,
+            Some(vec![
+                "sh".into(),
+                "-c".into(),
+                "trap '' HUP TERM; printf 'READY\\n'; while :; do :; done".into(),
+            ]),
+            None,
+            None,
+            HashMap::new(),
+        )
+        .expect("spawn stubborn PTY child");
+        let ready_deadline = Instant::now() + Duration::from_secs(2);
+        while !pane.snapshot().0.contents.contains("READY") {
+            assert!(
+                Instant::now() < ready_deadline,
+                "stubborn PTY child did not install its signal traps"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let pid = pane
+            .child
+            .lock()
+            .expect("child")
+            .as_ref()
+            .and_then(|child| child.process_id())
+            .expect("PTY child has a PID") as i32;
+
+        let started = Instant::now();
+        drop(pane);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "closing a stubborn PTY child blocked for {:?}",
+            started.elapsed()
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while unsafe { libc::kill(pid, 0) } == 0 {
+            assert!(Instant::now() < deadline, "PTY child {pid} survived close");
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     #[tokio::test]
