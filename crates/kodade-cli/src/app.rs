@@ -2802,7 +2802,13 @@ mod tests {
             "palette-test",
             PathBuf::from("/tmp/kodade-test.sock"),
         );
-        let mut term = Terminal::new(CrosstermBackend::new(std::io::stdout())).unwrap();
+        let mut term = Terminal::with_options(
+            CrosstermBackend::new(std::io::stdout()),
+            ratatui::TerminalOptions {
+                viewport: ratatui::Viewport::Fixed(Rect::new(0, 0, 120, 30)),
+            },
+        )
+        .unwrap();
 
         let (client, mut daemon) = tokio::net::UnixStream::pair().unwrap();
         let (_, mut writer) = client.into_split();
@@ -2894,7 +2900,13 @@ mod tests {
         app.center = Some(CenterOverlay::Palette(palette));
         let (client, _daemon) = tokio::net::UnixStream::pair().unwrap();
         let (_, mut writer) = client.into_split();
-        let mut term = Terminal::new(CrosstermBackend::new(std::io::stdout())).unwrap();
+        let mut term = Terminal::with_options(
+            CrosstermBackend::new(std::io::stdout()),
+            ratatui::TerminalOptions {
+                viewport: ratatui::Viewport::Fixed(Rect::new(0, 0, 120, 30)),
+            },
+        )
+        .unwrap();
 
         assert_eq!(
             app.handle_center_key(KeyEvent::from(KeyCode::Enter), &mut writer, &mut term)

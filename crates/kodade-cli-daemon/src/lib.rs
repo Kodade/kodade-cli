@@ -962,8 +962,15 @@ impl Session {
             self.notify();
             return Ok(());
         }
-        // A view-changing operation becomes the PTY size arbiter. Read-only
-        // queries deliberately do not resize a session another client is using.
+        let _dispatch = self
+            .view_dispatch
+            .lock()
+            .map_err(|_| anyhow!("view dispatch lock poisoned"))?;
+        // A view-changing operation becomes the PTY size arbiter. This is
+        // under the same dispatch lock as selection staging, so another client
+        // cannot publish its dimensions between the arbitration and dispatch.
+        // Read-only queries deliberately do not resize a session another client
+        // is using.
         if !matches!(
             message,
             ClientMessage::Query(_) | ClientMessage::Subscribe | ClientMessage::ReadPane { .. }
@@ -973,10 +980,6 @@ impl Session {
                 .lock()
                 .map_err(|_| anyhow!("size lock poisoned"))? = (view.cols, view.rows);
         }
-        let _dispatch = self
-            .view_dispatch
-            .lock()
-            .map_err(|_| anyhow!("view dispatch lock poisoned"))?;
         let saved = {
             let mut state = self
                 .state
@@ -1390,6 +1393,10 @@ impl Session {
     /// while terminal applications see one coherent size instead of a resize
     /// race on every output frame.
     fn resize_for_view(&self, view: &ClientView) -> Result<()> {
+        let _dispatch = self
+            .view_dispatch
+            .lock()
+            .map_err(|_| anyhow!("view dispatch lock poisoned"))?;
         *self
             .size
             .lock()
@@ -4577,7 +4584,17 @@ mod tests {
             .await
             .expect("focus a");
         let _ = next_layout_matching(&mut a, |layout| layout.active_tab == second_tab).await;
-        assert_eq!(*session.size.lock().expect("size"), (100, 30));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if *session.size.lock().expect("size") == (100, 30) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("A's dispatched focus takes geometry ownership");
+
         drop(a_writer);
         // Disconnecting A leaves B and the panes alive.
         b_writer
