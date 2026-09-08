@@ -1,6 +1,8 @@
 //! Local daemon transport: Unix sockets on Unix, authenticated loopback on Windows.
 use anyhow::{Context, Result};
-use std::{io::Read, path::Path};
+#[cfg(windows)]
+use std::io::Read;
+use std::path::Path;
 #[cfg(unix)]
 pub use tokio::net::{UnixListener as Listener, UnixStream as Stream};
 #[cfg(unix)]

@@ -87,6 +87,22 @@ pub async fn connect_endpoint(host: &str, session: &str) -> Result<(PathBuf, Tun
         SEQUENCE.fetch_add(1, Ordering::Relaxed)
     ));
     let listener = kodade_cli_daemon::transport::bind(&record).await?;
+    let task_host = host.to_owned();
+    let task_session = session.to_owned();
+    let cleanup = record.clone();
+    let task = tokio::spawn(async move {
+        relay(listener, task_host, task_session, cleanup).await;
+    });
+    Ok((record.clone(), Tunnel { task, record }))
+}
+async fn start_bridge(
+    host: &str,
+    session: &str,
+) -> Result<(
+    Child,
+    tokio::process::ChildStdin,
+    tokio::process::ChildStdout,
+)> {
     let mut child = Command::new("ssh")
         .args(ssh_args(host, &remote(&["bridge", "-s", session])))
         .stdin(std::process::Stdio::piped())
@@ -100,28 +116,55 @@ pub async fn connect_endpoint(host: &str, session: &str) -> Result<(PathBuf, Tun
         .stdout
         .take()
         .context("SSH bridge stdout unavailable")?;
-    let cleanup = record.clone();
-    let task = tokio::spawn(async move {
-        relay(listener, child, stdin, stdout, cleanup).await;
-    });
-    Ok((record.clone(), Tunnel { task, record }))
+    Ok((child, stdin, stdout))
 }
-async fn relay(
-    listener: kodade_cli_daemon::transport::Listener,
+
+async fn relay_connection(
+    stream: kodade_cli_daemon::transport::Stream,
     mut child: Child,
     mut input: tokio::process::ChildStdin,
     mut output: tokio::process::ChildStdout,
-    record: PathBuf,
 ) {
-    if let Ok(Ok((stream, _))) = tokio::time::timeout(TIMEOUT, listener.accept()).await {
-        let (mut read, mut write) = stream.into_split();
-        tokio::select! { _ = tokio::io::copy(&mut read, &mut input) => {}, _ = tokio::io::copy(&mut output, &mut write) => {}, _ = child.wait() => {}, }
-        let _ = write.shutdown().await;
+    let (mut read, mut write) = stream.into_split();
+    tokio::select! {
+        _ = tokio::io::copy(&mut read, &mut input) => {},
+        _ = tokio::io::copy(&mut output, &mut write) => {},
+        _ = child.wait() => {},
     }
+    let _ = write.shutdown().await;
     let _ = child.start_kill();
     let _ = child.wait().await;
+}
+
+async fn relay(
+    listener: kodade_cli_daemon::transport::Listener,
+    host: String,
+    session: String,
+    record: PathBuf,
+) {
+    let mut relays = tokio::task::JoinSet::new();
+    loop {
+        tokio::select! {
+            accepted = listener.accept() => match accepted {
+                Ok((stream, _)) => {
+                    let host = host.clone();
+                    let session = session.clone();
+                    relays.spawn(async move {
+                        if let Ok((child, input, output)) = start_bridge(&host, &session).await {
+                            relay_connection(stream, child, input, output).await;
+                        }
+                    });
+                }
+                Err(_) => break,
+            },
+            Some(_) = relays.join_next(), if !relays.is_empty() => {},
+        }
+    }
+    relays.abort_all();
+    while relays.join_next().await.is_some() {}
     let _ = std::fs::remove_file(record);
 }
+
 pub async fn resolve_socket(cli: &cli::Cli) -> Result<(PathBuf, Option<Tunnel>)> {
     match cli.remote.as_deref() {
         Some(host) => {
