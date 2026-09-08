@@ -46,8 +46,46 @@ pub fn process_basename(command: &str) -> Option<String> {
 }
 
 /// Return the live program under a ConPTY's initial shell. Windows has no
-/// process-group leader API, so inspect the bounded Toolhelp snapshot and walk
-/// descendants until a non-shell child (the actual agent) appears.
+/// process-group leader API, so inspect the bounded Toolhelp snapshot. A pane
+/// spawned directly as an agent (such as `node.exe`) is its own foreground
+/// program; only a shell root needs its descendants inspected.
+#[cfg(windows)]
+#[derive(Clone)]
+struct WindowsProcessEntry {
+    pid: u32,
+    parent: u32,
+    name: String,
+}
+
+#[cfg(windows)]
+fn is_windows_shell(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "cmd.exe" | "conhost.exe"
+    )
+}
+
+#[cfg(windows)]
+fn descendant_from_entries(
+    root: u32,
+    entries: &[WindowsProcessEntry],
+) -> Option<(i32, Option<String>)> {
+    let root_entry = entries.iter().find(|entry| entry.pid == root)?;
+    if !is_windows_shell(&root_entry.name) {
+        return Some((root as i32, Some(windows_process_name(&root_entry.name))));
+    }
+    let mut queue = vec![root];
+    while let Some(parent) = queue.pop() {
+        for child in entries.iter().filter(|entry| entry.parent == parent) {
+            if !is_windows_shell(&child.name) {
+                return Some((child.pid as i32, Some(windows_process_name(&child.name))));
+            }
+            queue.push(child.pid);
+        }
+    }
+    Some((root as i32, None))
+}
+
 #[cfg(windows)]
 pub fn descendant_process(root: u32) -> Option<(i32, Option<String>)> {
     use windows_sys::Win32::{
@@ -57,12 +95,6 @@ pub fn descendant_process(root: u32) -> Option<(i32, Option<String>)> {
             TH32CS_SNAPPROCESS,
         },
     };
-    #[derive(Clone)]
-    struct Entry {
-        pid: u32,
-        parent: u32,
-        name: String,
-    }
     let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
     if snapshot == INVALID_HANDLE_VALUE {
         return None;
@@ -80,7 +112,7 @@ pub fn descendant_process(root: u32) -> Option<(i32, Option<String>)> {
                     .iter()
                     .position(|c| *c == 0)
                     .unwrap_or(entry.szExeFile.len());
-                entries.push(Entry {
+                entries.push(WindowsProcessEntry {
                     pid: entry.th32ProcessID,
                     parent: entry.th32ParentProcessID,
                     name: String::from_utf16_lossy(&entry.szExeFile[..end]),
@@ -93,27 +125,7 @@ pub fn descendant_process(root: u32) -> Option<(i32, Option<String>)> {
         }
         CloseHandle(snapshot);
     }
-    let shell = |name: &str| {
-        matches!(
-            name.to_ascii_lowercase().as_str(),
-            "cmd.exe" | "conhost.exe"
-        )
-    };
-    let mut queue = vec![root];
-    while let Some(parent) = queue.pop() {
-        for child in entries.iter().filter(|entry| entry.parent == parent) {
-            if !shell(&child.name) {
-                return Some((child.pid as i32, Some(windows_process_name(&child.name))));
-            }
-            queue.push(child.pid);
-        }
-    }
-    entries.iter().find(|entry| entry.pid == root).map(|entry| {
-        (
-            root as i32,
-            (!shell(&entry.name)).then(|| windows_process_name(&entry.name)),
-        )
-    })
+    descendant_from_entries(root, &entries)
 }
 
 /// Toolhelp exposes executable filenames (`node.exe`), while manifests and
@@ -205,5 +217,57 @@ mod tests {
         );
         // An embedded single quote closes, escapes, and reopens the quoting.
         assert_eq!(shell_command(&["it's".into()]), "'it'\\''s'");
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn Windows_direct_agent_root_is_not_replaced_by_a_reporter_child() {
+        let entries = vec![
+            WindowsProcessEntry {
+                pid: 10,
+                parent: 1,
+                name: "node.exe".into(),
+            },
+            WindowsProcessEntry {
+                pid: 11,
+                parent: 10,
+                name: "kodade-cli.exe".into(),
+            },
+        ];
+        assert_eq!(
+            descendant_from_entries(10, &entries),
+            Some((10, Some("node".into())))
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn Windows_shell_root_returns_its_agent_descendant() {
+        let entries = vec![
+            WindowsProcessEntry {
+                pid: 10,
+                parent: 1,
+                name: "cmd.exe".into(),
+            },
+            WindowsProcessEntry {
+                pid: 11,
+                parent: 10,
+                name: "conhost.exe".into(),
+            },
+            WindowsProcessEntry {
+                pid: 12,
+                parent: 11,
+                name: "node.exe".into(),
+            },
+        ];
+        assert_eq!(
+            descendant_from_entries(10, &entries),
+            Some((12, Some("node".into())))
+        );
     }
 }
