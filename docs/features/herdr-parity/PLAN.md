@@ -118,7 +118,7 @@ integration test. Additional behavioral proof:
   integration work.
 
 Still in progress: native Windows runner evidence (#36), complete live daemon
-upgrade and client reconnect (#42), bundled identification coverage (#56),
+upgrade and client reconnect (#42), terminal hyperlink/clipboard/rendering polish (#58), parser crash fixes (#59),
 and the final fresh competitive/UX/release review (#37). The graphics
 implementation has a documented supported protocol subset in docs/GRAPHICS.md;
 this ledger does not claim complete Kitty protocol coverage.
@@ -148,7 +148,7 @@ also passes with the integrated release binary.
 A fresh code comparison additionally tracks verified lifecycle adapter coverage
 (#49), structured extension context and URL handlers (#50), configured commands
 (#51), workspace environment and existing-worktree open (#52), and a discoverable
-local agent guide (#53). These are required follow-up work, not completed parity.
+local agent guide (#53). Their reviewed implementation and behavioral evidence are recorded below; the overall ledger still requires the remaining platform and terminal work.
 
 Exact conversation restore (#46) and optional screen history (#47) merged
 through PR #55 after Linux/macOS CI. Full workspace gates and both real daemon
@@ -165,7 +165,7 @@ terminal-control validation. History and layout now share one atomic private-fil
 writer; a failed publish is retried.
 
 
-The agent workflow integration (#49–53) is ready for branch review: 17
+PR #57 integrates the agent workflows (#49–53, #56): 17
 installation adapters with documented per-agent lifecycle and resume contracts;
 structured extension context scoped to the selected endpoint and pane;
 selection-aware actions, URL handlers, configured command keys/palette entries;
@@ -180,5 +180,20 @@ pass against the combined binary.
 A fresh manifest comparison found further bundled identification gaps (#56),
 including hook-backed agents without terminal-title evidence. That follow-up
 also completes Grok's lifecycle mapping from the vendor's actual event table.
-It remains explicit work until its guarded automation and shell-retirement
-fixtures pass; adapter installation alone is not full agent compatibility.
+The resulting 24 bundled manifests now include every pinned HerdR manifest and
+additional supported adapters. Real PTY automation identifies a Node-hosted
+agent without OSC title evidence and rejects guarded input after it is replaced
+by a different program. The wrapper identity is bound to the reported foreground
+PID and approved executable; absent evidence fails closed. Grok lifecycle hooks
+follow the vendor event table. This proves the tested adapter contracts and
+retirement behavior, not every future release of every agent CLI.
+
+Final integrated workflow gates pass: 241 client tests, 112 daemon tests, eight
+protocol tests, three real agent automation integration tests and one guide
+integration test. The full branch review also corrected a stdout-dependent mouse
+fixture and macOS canonical worktree-path assertion.
+
+The final source comparison additionally tracks OSC 8 pane links, synchronized
+output and native/remote clipboard behavior (#58). A real one-row wrap test
+exposed a crash in the existing parser dependency; #59 upgrades the maintained
+parser fork and adds wrapping/resize regressions before the final release.
