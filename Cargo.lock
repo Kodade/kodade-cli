@@ -817,6 +817,7 @@ dependencies = [
  "kodade-cli-daemon",
  "kodade-cli-proto",
  "libc",
+ "png",
  "ratatui",
  "regex",
  "semver",

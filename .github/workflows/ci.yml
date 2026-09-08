@@ -60,6 +60,9 @@ jobs:
       - name: Verify native Windows Unicode clipboard
         if: runner.os == 'Windows'
         run: cargo test windows_native_clipboard_roundtrips_unicode -- --ignored
+      - name: Verify native Windows image clipboard
+        if: runner.os == 'Windows'
+        run: cargo test windows_native_clipboard_reads_dib_pixels -- --ignored
       - name: Smoke native Windows daemon, loopback IPC, and ConPTY
         if: runner.os == 'Windows'
         shell: pwsh
