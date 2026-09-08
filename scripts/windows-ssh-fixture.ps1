@@ -164,14 +164,21 @@ setInterval(() => {}, 1000);
     $waitPane = (Invoke-Native $WindowsBinary @('--remote', $sshAlias, '--session', $session, 'run', '--', 'node', '-e', $nodeHook) 45).Trim()
     if ($waitPane -notmatch '^\d+$') { throw "remote wait fixture did not return a pane id: $waitPane" }
     $recognized = $false
+    $lastProbeError = ''
     for ($attempt = 0; $attempt -lt 50; $attempt++) {
         try {
             Invoke-Native $WindowsBinary @('--remote', $sshAlias, '--session', $session, 'agent', 'read', 'Pi') 45 | Out-Null
             $recognized = $true
             break
-        } catch { Start-Sleep -Milliseconds 100 }
+        } catch {
+            $lastProbeError = $_.Exception.Message
+            Start-Sleep -Milliseconds 100
+        }
     }
-    if (-not $recognized) { throw 'Node hook was not recognized through the Windows SSH bridge' }
+    if (-not $recognized) {
+        $screen = Invoke-Native $WindowsBinary @('--remote', $sshAlias, '--session', $session, 'pane', 'read', $waitPane) 45
+        throw "Node hook was not recognized through the Windows SSH bridge: $lastProbeError`npane contents: $screen"
+    }
     Invoke-Native $WindowsBinary @('--remote', $sshAlias, '--session', $session, 'agent', 'wait', 'Pi', '--state', 'idle', '--timeout', '10') 45 | Out-Null
     Invoke-Native $WindowsBinary @('--remote', $sshAlias, '--session', $session, 'kill-session') 45 | Out-Null
 } finally {
