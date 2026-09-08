@@ -4,7 +4,7 @@
 //! clap dispatcher. New modes hook in by adding a field plus a branch in
 //! `handle_key` / `handle_mouse`.
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use crossterm::{
     event::{
         self, Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
@@ -146,6 +146,9 @@ pub struct App {
     sidebar_mode: SidebarMode,
     /// Workspaces the user collapsed in the sidebar list (#19).
     collapsed: HashSet<WorkspaceId>,
+    /// Collapse state is keyed by endpoint because daemon workspace ids are
+    /// only unique within one machine.
+    collapsed_by_endpoint: BTreeMap<EndpointId, HashSet<WorkspaceId>>,
     /// Persisted UI state (collapsed workspaces, help_seen); loaded once (#19).
     ui_state: state::State,
     /// The first layout made the onboarding decision for this client lifetime.
@@ -186,6 +189,8 @@ pub struct App {
     paste_buffer: String,
     /// Agent notifications: unread stack and effect computation (#10).
     notifier: notify::Notifier,
+    /// Unread notifications retained while another endpoint is selected.
+    endpoint_notifiers: BTreeMap<EndpointId, notify::Notifier>,
     /// Notifications are keyed by endpoint so colliding pane ids can never
     /// make `NotificationJump` target another daemon.
     pending_notifications: BTreeMap<EndpointId, Vec<Notification>>,
@@ -289,6 +294,7 @@ impl App {
                 config_collapsed_mode(config)
             },
             collapsed: HashSet::new(),
+            collapsed_by_endpoint: BTreeMap::from([(EndpointId::Local, HashSet::new())]),
             ui_state,
             onboarding_decided,
             seeded_ids: HashSet::new(),
@@ -308,6 +314,7 @@ impl App {
             note: None,
             paste_buffer: String::new(),
             notifier: notify::Notifier::new(config, jump_hint),
+            endpoint_notifiers: BTreeMap::new(),
             pending_notifications: BTreeMap::new(),
             session_name: session.to_string(),
             socket,
@@ -404,8 +411,20 @@ impl App {
     }
 
     fn select_endpoint(&mut self, next: EndpointId, router: &mut Router) {
+        let previous = self.selected_endpoint.clone();
+        self.collapsed_by_endpoint
+            .insert(previous.clone(), self.collapsed.clone());
+        let replacement_notifier = self.new_notifier();
+        self.endpoint_notifiers.insert(
+            previous,
+            std::mem::replace(&mut self.notifier, replacement_notifier),
+        );
         router.select(next.clone());
         self.selected_endpoint = next.clone();
+        self.notifier = self
+            .endpoint_notifiers
+            .remove(&next)
+            .unwrap_or_else(|| self.new_notifier());
         self.copy = None;
         self.confirm = None;
         self.menu = None;
@@ -420,16 +439,12 @@ impl App {
         self.clear_selection();
         self.focused_pane = None;
         self.last_pane = None;
-        self.collapsed.clear();
+        self.collapsed = self
+            .collapsed_by_endpoint
+            .get(&next)
+            .cloned()
+            .unwrap_or_default();
         self.seeded_ids.clear();
-        let jump_hint = self
-            .config
-            .chords_for(config::Action::NotificationJump)
-            .into_iter()
-            .next()
-            .unwrap_or_else(|| "N".into());
-        self.notifier = notify::Notifier::new(&self.config, jump_hint);
-        let pending = self.pending_notifications.remove(&next).unwrap_or_default();
         if let Some((session, socket)) = self.endpoint_contexts.get(&next).cloned() {
             self.session_name = session;
             self.socket = socket;
@@ -439,6 +454,7 @@ impl App {
         } else {
             self.layout = None;
         }
+        let pending = self.replay_pending_notifications();
         let label = self
             .endpoints
             .endpoint(&next)
@@ -487,6 +503,37 @@ impl App {
                 )
             })
             .collect()
+    }
+
+    fn new_notifier(&self) -> notify::Notifier {
+        let jump_hint = self
+            .config
+            .chords_for(config::Action::NotificationJump)
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| "N".into());
+        notify::Notifier::new(&self.config, jump_hint)
+    }
+
+    fn replay_pending_notifications(&mut self) -> Vec<Notification> {
+        if self.layout.is_none() {
+            return Vec::new();
+        }
+        let pending = self
+            .pending_notifications
+            .remove(&self.selected_endpoint)
+            .unwrap_or_default();
+        for notification in &pending {
+            self.notifier.record_unseen(notification);
+        }
+        pending
+    }
+
+    fn collapse_state_key(&self) -> String {
+        match &self.selected_endpoint {
+            EndpointId::Local => self.session_name.clone(),
+            EndpointId::Machine(id) => format!("{}::machine:{id}", self.session_name),
+        }
     }
 
     /// Sets the status-bar note in the default color; clears after `NOTE_TTL`.
@@ -594,7 +641,7 @@ impl App {
     fn seed_collapsed(&mut self) {
         let Some(layout) = &self.layout else { return };
         let ids: HashSet<WorkspaceId> = layout.workspaces.iter().map(|w| w.id).collect();
-        let names = self.ui_state.collapsed_for(&self.session_name);
+        let names = self.ui_state.collapsed_for(&self.collapse_state_key());
         for workspace in &layout.workspaces {
             if self.seeded_ids.insert(workspace.id) && names.contains(&workspace.name) {
                 self.collapsed.insert(workspace.id);
@@ -603,6 +650,8 @@ impl App {
         // Drop bookkeeping for workspaces that have gone away.
         self.seeded_ids.retain(|id| ids.contains(id));
         self.collapsed.retain(|id| ids.contains(id));
+        self.collapsed_by_endpoint
+            .insert(self.selected_endpoint.clone(), self.collapsed.clone());
     }
 
     /// Persist the current collapsed set as workspace names for this session.
@@ -616,7 +665,10 @@ impl App {
             .collect();
         // Reload first so a concurrently written `help_seen` (#6) is preserved.
         self.ui_state = state::State::load();
-        self.ui_state.set_collapsed(&self.session_name, names);
+        self.ui_state
+            .set_collapsed(&self.collapse_state_key(), names);
+        self.collapsed_by_endpoint
+            .insert(self.selected_endpoint.clone(), self.collapsed.clone());
     }
 
     pub fn handle_session(&mut self, session: String) {
@@ -755,6 +807,7 @@ impl App {
                 center: self.center.as_ref().map(CenterOverlay::overlay),
                 machines: &machines,
                 endpoint_layouts: &endpoint_layouts,
+                endpoint_collapsed: &self.collapsed_by_endpoint,
             },
             &self.theme,
         )
@@ -843,6 +896,12 @@ impl App {
                     writer.mark_offline(&endpoint);
                     self.endpoints
                         .failed(&endpoint, Instant::now(), reason.clone());
+                    if endpoint == EndpointId::Local
+                        && (reason == "local endpoint disconnected"
+                            || reason == "local endpoint shut down")
+                    {
+                        return Err(anyhow!(reason.clone()));
+                    }
                 }
                 if let Update::EndpointConnected { session, socket } = &update {
                     writer.mark_online(endpoint.clone());
@@ -871,6 +930,7 @@ impl App {
                 match update {
                     Update::Layout(layout) => {
                         self.handle_layout(layout);
+                        self.replay_pending_notifications();
                         layout_changed = true;
                     }
                     Update::Session(session) => self.handle_session(session),
@@ -1422,7 +1482,7 @@ impl App {
     fn sidebar_flat(&self) -> Vec<render::SidebarRow> {
         render::sidebar_rows_for_endpoints(
             &self.endpoint_layout_rows(),
-            &self.collapsed,
+            &self.collapsed_by_endpoint,
             self.config.sidebar_agents_panel,
             &self.machine_rows(),
         )
@@ -2241,7 +2301,7 @@ impl App {
                 SidebarMode::Full => {
                     let model = render::sidebar_rows_for_endpoints(
                         &self.endpoint_layout_rows(),
-                        &self.collapsed,
+                        &self.collapsed_by_endpoint,
                         self.config.sidebar_agents_panel,
                         &self.machine_rows(),
                     );
@@ -2549,7 +2609,7 @@ impl App {
         let target = if in_sidebar && self.sidebar_mode == SidebarMode::Full {
             let model = render::sidebar_rows_for_endpoints(
                 &self.endpoint_layout_rows(),
-                &self.collapsed,
+                &self.collapsed_by_endpoint,
                 self.config.sidebar_agents_panel,
                 &self.machine_rows(),
             );
@@ -3192,6 +3252,57 @@ mod tests {
             Some(ClientMessage::FocusPaneId { id: PaneId(1) })
         );
         assert!(local_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn background_notifications_with_colliding_panes_replay_per_endpoint() {
+        let config = config::Config::default();
+        let mut app = App::new(
+            &config,
+            "notification-route-test",
+            PathBuf::from("/tmp/kodade-test.sock"),
+        );
+        let remote = EndpointId::Machine("m1".into());
+        app.endpoint_layouts
+            .insert(remote.clone(), layout_named(&["remote"]));
+        app.endpoint_contexts.insert(
+            remote.clone(),
+            ("remote".into(), PathBuf::from("/tmp/remote.sock")),
+        );
+        let notification = Notification {
+            pane: PaneId(1),
+            workspace: WorkspaceId(1),
+            tab: kodade_cli_proto::TabId(1),
+            agent: "agent".into(),
+            state: AgentStateKind::Blocked,
+            seq: 1,
+        };
+        app.notifier.record_unseen(&notification);
+        app.pending_notifications
+            .insert(remote.clone(), vec![notification.clone()]);
+
+        let (local_tx, mut local_rx) = mpsc::channel(8);
+        let (remote_tx, mut remote_rx) = mpsc::channel(8);
+        let mut router = Router::new(EndpointId::Local);
+        router.register(EndpointId::Local, local_tx);
+        router.register(remote.clone(), remote_tx);
+        router.mark_online(EndpointId::Local);
+        router.mark_online(remote.clone());
+
+        app.select_endpoint(remote.clone(), &mut router);
+        app.notification_jump(&mut router).await.unwrap();
+        assert_eq!(
+            remote_rx.recv().await,
+            Some(ClientMessage::FocusPaneId { id: PaneId(1) })
+        );
+        assert!(local_rx.try_recv().is_err());
+
+        app.select_endpoint(EndpointId::Local, &mut router);
+        app.notification_jump(&mut router).await.unwrap();
+        assert_eq!(
+            local_rx.recv().await,
+            Some(ClientMessage::FocusPaneId { id: PaneId(1) })
+        );
     }
 
     // A layout with the named workspaces; workspace i gets `WorkspaceId(i+1)`.

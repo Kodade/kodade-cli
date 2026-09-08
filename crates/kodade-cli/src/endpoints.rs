@@ -189,23 +189,31 @@ async fn connect_machine(
     commands: &mut mpsc::Receiver<ClientMessage>,
 ) -> Result<Option<String>> {
     let id = EndpointId::Machine(profile.id.clone());
-    let (socket, _tunnel) = tokio::time::timeout(
-        Duration::from_secs(12),
-        remote::connect_endpoint(&profile.target, session),
-    )
-    .await
-    .context("SSH endpoint setup timed out")??;
-    let stream = UnixStream::connect(&socket)
+    let (socket, _tunnel) = tokio::select! {
+        result = tokio::time::timeout(Duration::from_secs(12), remote::connect_endpoint(&profile.target, session)) => {
+            result.context("SSH endpoint setup timed out")??
+        }
+        command = commands.recv() => match command {
+            None => return Err(anyhow!("endpoint command channel closed")),
+            // The router only admits input for online endpoints. If a stale
+            // message races setup, discard it rather than replaying it later.
+            Some(_) => return Err(anyhow!("endpoint input discarded during setup")),
+        },
+    };
+    let stream = tokio::time::timeout(Duration::from_secs(5), UnixStream::connect(&socket))
         .await
+        .context("connect forwarded endpoint socket timed out")?
         .context("connect forwarded endpoint socket")?;
     let (reader, mut writer) = stream.into_split();
-    writer
-        .write_all(&encode(&ClientMessage::Hello {
+    write_endpoint(
+        &mut writer,
+        &ClientMessage::Hello {
             cols: *cols,
             rows: *rows,
             version: PROTOCOL_VERSION,
-        })?)
-        .await?;
+        },
+    )
+    .await?;
     let mut lines = BufReader::new(reader).lines();
     let connected_session = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
@@ -237,9 +245,7 @@ async fn connect_machine(
         ))
         .await
         .map_err(|_| anyhow!("UI closed"))?;
-    writer
-        .write_all(&encode(&ClientMessage::Subscribe)?)
-        .await?;
+    write_endpoint(&mut writer, &ClientMessage::Subscribe).await?;
     loop {
         tokio::select! {
             command = commands.recv() => {
@@ -247,10 +253,10 @@ async fn connect_machine(
                 if let ClientMessage::Resize { cols: next_cols, rows: next_rows } = command {
                     *cols = next_cols;
                     *rows = next_rows;
-                    writer.write_all(&encode(&ClientMessage::Resize { cols: next_cols, rows: next_rows })?).await?;
+                    write_endpoint(&mut writer, &ClientMessage::Resize { cols: next_cols, rows: next_rows }).await?;
                     continue;
                 }
-                writer.write_all(&encode(&command)?).await?;
+                write_endpoint(&mut writer, &command).await?;
             }
             line = lines.next_line() => {
                 let line = line?.ok_or_else(|| anyhow!("endpoint closed"))?;
@@ -270,6 +276,16 @@ async fn connect_machine(
             }
         }
     }
+}
+
+async fn write_endpoint(
+    writer: &mut tokio::net::unix::OwnedWriteHalf,
+    message: &ClientMessage,
+) -> Result<()> {
+    tokio::time::timeout(Duration::from_secs(5), writer.write_all(&encode(message)?))
+        .await
+        .context("endpoint write timed out")?
+        .context("endpoint write")
 }
 
 impl Manager {

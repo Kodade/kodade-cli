@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::OnceLock;
 
 use kodade_cli_proto::{
@@ -160,6 +160,7 @@ pub struct Ui<'a> {
     /// Client-side endpoint rows, retained even while a remote is offline.
     pub machines: &'a [(EndpointId, String, String, bool)],
     pub endpoint_layouts: &'a [(EndpointId, String, String, LayoutSnapshot)],
+    pub endpoint_collapsed: &'a BTreeMap<EndpointId, HashSet<WorkspaceId>>,
 }
 
 pub fn render(frame: &mut Frame, layout: &LayoutSnapshot, ui: &Ui, theme: &Theme) {
@@ -192,6 +193,7 @@ pub fn render(frame: &mut Frame, layout: &LayoutSnapshot, ui: &Ui, theme: &Theme
         center,
         machines,
         endpoint_layouts,
+        endpoint_collapsed,
     } = *ui;
     let areas = Layout::default()
         .direction(LayoutDirection::Horizontal)
@@ -207,6 +209,7 @@ pub fn render(frame: &mut Frame, layout: &LayoutSnapshot, ui: &Ui, theme: &Theme
             agents_panel,
             machines,
             endpoint_layouts,
+            endpoint_collapsed,
             theme,
         ),
         SidebarMode::Compact => render_sidebar_rail(frame, layout, areas[0], theme),
@@ -962,7 +965,7 @@ pub fn sidebar_rows_with_machines(
 /// is wrapped in the owning endpoint before rows are concatenated.
 pub fn sidebar_rows_for_endpoints(
     entries: &[(EndpointId, String, String, LayoutSnapshot)],
-    collapsed: &HashSet<WorkspaceId>,
+    collapsed: &BTreeMap<EndpointId, HashSet<WorkspaceId>>,
     agents_panel: bool,
     machines: &[(EndpointId, String, String, bool)],
 ) -> SidebarModel {
@@ -986,7 +989,13 @@ pub fn sidebar_rows_for_endpoints(
         model
             .workspaces
             .push(heading_row(&format!("{label} workspaces")));
-        let mut rows = sidebar_rows(layout, collapsed, agents_panel).into_flat();
+        let empty = HashSet::new();
+        let mut rows = sidebar_rows(
+            layout,
+            collapsed.get(endpoint).unwrap_or(&empty),
+            agents_panel,
+        )
+        .into_flat();
         for row in &mut rows {
             if let Some(target) = row.target.take() {
                 row.target = Some(SidebarTarget::Scoped(endpoint.clone(), Box::new(target)));
@@ -1207,6 +1216,7 @@ fn render_sidebar(
     agents_panel: bool,
     machines: &[(EndpointId, String, String, bool)],
     endpoint_layouts: &[(EndpointId, String, String, LayoutSnapshot)],
+    endpoint_collapsed: &BTreeMap<EndpointId, HashSet<WorkspaceId>>,
     theme: &Theme,
 ) {
     frame.render_widget(
@@ -1216,7 +1226,7 @@ fn render_sidebar(
     let model = if endpoint_layouts.is_empty() {
         sidebar_rows_with_machines(layout, collapsed, agents_panel, machines)
     } else {
-        sidebar_rows_for_endpoints(endpoint_layouts, collapsed, agents_panel, machines)
+        sidebar_rows_for_endpoints(endpoint_layouts, endpoint_collapsed, agents_panel, machines)
     };
     let place = sidebar_layout(area.height, &model, navigate);
     // Workspaces list (scrolled to keep the selected row visible).
@@ -1678,9 +1688,45 @@ mod tests {
             (remote_id.clone(), "Build".into(), "online".into(), false),
         ];
         let rows =
-            sidebar_rows_for_endpoints(&endpoints, &no_collapse(), true, &machines).into_flat();
+            sidebar_rows_for_endpoints(&endpoints, &BTreeMap::new(), true, &machines).into_flat();
 
         assert!(rows.iter().any(|row| {
+            row.target
+                == Some(SidebarTarget::Scoped(
+                    EndpointId::Local,
+                    Box::new(SidebarTarget::Pane(PaneId(3))),
+                ))
+        }));
+        assert!(rows.iter().any(|row| {
+            row.target
+                == Some(SidebarTarget::Scoped(
+                    remote_id.clone(),
+                    Box::new(SidebarTarget::Pane(PaneId(3))),
+                ))
+        }));
+    }
+
+    #[test]
+    fn cached_endpoint_collapse_does_not_hide_another_daemons_ids() {
+        let remote_id = EndpointId::Machine("m1".into());
+        let endpoints = vec![
+            (
+                EndpointId::Local,
+                "Local".into(),
+                "online".into(),
+                snapshot(),
+            ),
+            (
+                remote_id.clone(),
+                "Build".into(),
+                "online".into(),
+                snapshot(),
+            ),
+        ];
+        let collapsed = BTreeMap::from([(EndpointId::Local, HashSet::from([WorkspaceId(1)]))]);
+        let rows = sidebar_rows_for_endpoints(&endpoints, &collapsed, false, &[]).into_flat();
+
+        assert!(!rows.iter().any(|row| {
             row.target
                 == Some(SidebarTarget::Scoped(
                     EndpointId::Local,
@@ -2061,6 +2107,7 @@ mod tests {
             center: None,
             machines: &[],
             endpoint_layouts: &[],
+            endpoint_collapsed: &BTreeMap::new(),
         };
         let mut terminal = Terminal::new(TestBackend::new(40, 10)).expect("test terminal");
         terminal
@@ -2208,6 +2255,7 @@ mod tests {
             center: None,
             machines: &[],
             endpoint_layouts: &[],
+            endpoint_collapsed: &BTreeMap::new(),
         };
         let mut terminal = Terminal::new(TestBackend::new(80, 12)).expect("test terminal");
         terminal

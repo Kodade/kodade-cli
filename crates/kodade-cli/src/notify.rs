@@ -83,6 +83,17 @@ impl Notifier {
         effects
     }
 
+    /// Retain an alert that arrived while its endpoint was not selected. It
+    /// deliberately skips terminal effects and the focused-pane filter: the
+    /// user could not see that endpoint when the alert occurred.
+    pub fn record_unseen(&mut self, notification: &Notification) {
+        if !self.enabled || !self.on.contains(&notification.state) {
+            return;
+        }
+        self.unread.retain(|item| item.pane != notification.pane);
+        self.unread.push(notification.clone());
+    }
+
     /// Pops the most recent unread notification for `prefix N`, marking it read.
     pub fn pop_unread(&mut self) -> Option<Notification> {
         self.unread.pop()
