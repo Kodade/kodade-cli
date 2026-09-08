@@ -13,8 +13,9 @@ credential proxy. Desktop business workflows remain separate.
 - Compare implemented behavior, not feature names or staged documentation.
 - A task is complete only after its behavior has been exercised, the full
   relevant diff reviewed, all checks pass, and it is merged and pushed.
-- Overall parity is not complete while capabilities below remain missing.
-  Untested platforms and hypothetical prompt fixtures do not count as proof.
+- The final release scope is Linux/macOS; Keith explicitly deferred Windows.
+  Known terminal fidelity limits remain listed in REVIEW.md and #76. Untested
+  platforms and hypothetical prompt fixtures do not count as proof.
 
 ## Capability ledger
 
@@ -117,9 +118,9 @@ integration test. Additional behavioral proof:
   its version command successfully. Windows ZIP updates remain part of the Windows
   integration work.
 
-Still in progress: native Windows runner evidence (#36), complete live daemon
-upgrade and client reconnect (#42), terminal hyperlink/clipboard/rendering polish (#58), parser crash fixes (#59),
-and the final fresh competitive/UX/release review (#37). The graphics
+At the PR #48 checkpoint, Windows (#36), live handoff (#42), terminal polish
+(#58), parser fixes (#59), and final review (#37) were still in progress.
+The final Unix release record below supersedes that checkpoint. The graphics
 implementation has a documented supported protocol subset in docs/GRAPHICS.md;
 this ledger does not claim complete Kitty protocol coverage.
 
@@ -148,7 +149,7 @@ also passes with the integrated release binary.
 A fresh code comparison additionally tracks verified lifecycle adapter coverage
 (#49), structured extension context and URL handlers (#50), configured commands
 (#51), workspace environment and existing-worktree open (#52), and a discoverable
-local agent guide (#53). Their reviewed implementation and behavioral evidence are recorded below; the overall ledger still requires the remaining platform and terminal work.
+local agent guide (#53). Their reviewed implementation and behavioral evidence are recorded below; the remaining Unix integration is recorded below; Windows is deferred.
 
 Exact conversation restore (#46) and optional screen history (#47) merged
 through PR #55 after Linux/macOS CI. Full workspace gates and both real daemon
@@ -188,7 +189,7 @@ PID and approved executable; absent evidence fails closed. Grok lifecycle hooks
 follow the vendor event table. This proves the tested adapter contracts and
 retirement behavior, not every future release of every agent CLI.
 
-Final integrated workflow gates pass: 241 client tests, 112 daemon tests, eight
+Previous integrated workflow gates passed: 241 client tests, 112 daemon tests, eight
 protocol tests, three real agent automation integration tests and one guide
 integration test. The full branch review also corrected a stdout-dependent mouse
 fixture and macOS canonical worktree-path assertion.
@@ -197,3 +198,50 @@ The final source comparison additionally tracks OSC 8 pane links, synchronized
 output and native/remote clipboard behavior (#58). A real one-row wrap test
 exposed a crash in the existing parser dependency; #59 upgrades the maintained
 parser fork and adds wrapping/resize regressions before the final release.
+
+## v0.3.0 Unix release
+
+The release scope is Linux/macOS on arm64 and x86_64. Native Windows binaries,
+installation, upgrades, and SSH preparation remain deferred on pushed WIP
+branches; they are not part of this release's evidence.
+
+PR #75 integrates the saved Unix checkpoints from #60, #62, #65, #68 and #69.
+It preserves keyboard negotiation, partial CSI/DCS/RIS parser state, queued
+terminal replies, graphics, links, attachments, and extension context through
+transactional daemon handoff. Terminal colors use the actual interactive
+client's foreground, background, cursor and palette, including live theme
+changes and reconnects. Read-only clients cannot steal that ownership.
+
+Final source gates at `63feb82`:
+
+- `cargo fmt --check`, Clippy for all targets with warnings denied, workspace
+  tests, debug build and locked optimized release build passed on Linux arm64.
+- 478 tests passed: 264 client, 200 daemon, nine protocol and five integration.
+- Fifteen real daemon/controlling-TUI smokes passed: rollback, handoff,
+  keyboard, colors, links, graphics media/placement, compact views, selected
+  extension context, configured commands, workspace environments, exact native
+  restore, opt-in history, the executable agent guide and terminal cleanup.
+- Both isolated OpenSSH scenarios passed with the optimized release binary:
+  verified bootstrap/refusals in a home path with spaces, and combined remote
+  workspaces/images/independent tunnels/rename/cleanup.
+- Independent Standards and Spec reviews of `e34a27d...9c55365` found no
+  implementation blockers. The subsequent one-line test-fixture correction
+  includes the cursor field in endpoint color-broadcast verification.
+
+Linux and macOS CI both passed at `63feb82`, including real TUI keyboard,
+color/reconnect, link, media and handoff checks:
+[run 34235953566](https://github.com/Kodade/kodade-cli/actions/runs/34235953566).
+The following documentation commit does not change executable source.
+
+Publication requires four archives with `SHA256SUMS`, installer and updater
+proof against the published release, and Homebrew formula delivery. The
+[v0.3.0 release](https://github.com/Kodade/kodade-cli/releases/tag/v0.3.0) and
+[Homebrew formula](https://github.com/Kodade/homebrew-tap/blob/main/Formula/kodade-cli.rb)
+are the distribution records.
+
+A v0.2.1 daemon cannot hand off its running panes. Leave that session running
+and start a separately named v0.3.0 session, such as `kodade-cli -s v03`.
+`session upgrade` applies once a session is already served by a v0.3.0 Unix
+daemon. The tested Kitty subset excludes animation; styled underlines remain
+a documented follow-up in #76. This is not a claim of universal terminal
+protocol parity or compatibility with every future agent release.

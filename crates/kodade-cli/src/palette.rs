@@ -76,7 +76,7 @@ impl Palette {
             });
         }
         all.push(Item {
-            label: "agent · shell".into(),
+            label: "shell · new tab".into(),
             hint: "new tab".into(),
             search: "terminal shell new pane tab".into(),
             target: PaletteTarget::Shell,
@@ -139,6 +139,7 @@ impl Palette {
         let rows = visible.iter().map(row).collect();
         let mut overlay = Overlay::new("command center · type to filter · esc closes", rows);
         overlay.filter = Some(String::new());
+        overlay.max_visible_rows = 16;
         Self {
             all,
             visible,

@@ -31,6 +31,18 @@ pub enum Status {
     Disabled,
 }
 
+impl Status {
+    pub fn label(&self) -> String {
+        match self {
+            Self::Connecting => "connecting".into(),
+            Self::Online => "online".into(),
+            Self::Offline { retry } => format!("offline · retry {}", retry + 1),
+            Self::Attention(reason) => format!("attention · {reason}"),
+            Self::Disabled => "disabled".into(),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Endpoint {
     pub label: String,
@@ -156,6 +168,14 @@ impl Router {
         self.send_to(&self.selected, message)
     }
 
+    /// Theme colors describe this TUI, so every endpoint must retain them for
+    /// its next reconnect whether it is currently selected or not.
+    pub fn broadcast(&self, message: ClientMessage) {
+        for sender in self.senders.values() {
+            let _ = sender.try_send(message.clone());
+        }
+    }
+
     pub fn send_to(&self, endpoint: &EndpointId, message: ClientMessage) -> Result<()> {
         if !self.online.contains(endpoint) {
             *self.notice.borrow_mut() = Some("input not sent · machine is disconnected".into());
@@ -186,21 +206,27 @@ pub fn spawn_machine(
     session: String,
     cols: u16,
     rows: u16,
+    colors: Option<kodade_cli_proto::TerminalColors>,
     updates: Updates,
     commands: mpsc::Receiver<ClientMessage>,
 ) {
     tokio::spawn(async move {
         let mut commands = commands;
         let mut retry = 0u8;
-        let mut cols = cols;
-        let mut rows = rows;
+        let mut viewport = crate::local_endpoint::Viewport {
+            cols,
+            rows,
+            compact: false,
+            colors,
+        };
+        let mut view = crate::reconnect_view::View::default();
         let mut remote_session = profile.session.clone().unwrap_or(session);
         loop {
             let result = connect_machine(
                 &profile,
                 &remote_session,
-                &mut cols,
-                &mut rows,
+                &mut viewport,
+                &mut view,
                 &updates,
                 &mut commands,
             )
@@ -227,7 +253,10 @@ pub fn spawn_machine(
             loop {
                 tokio::select! {
                     _ = &mut sleep => break,
-                    message = commands.recv() => if message.is_none() { return; },
+                    message = commands.recv() => match message {
+                        Some(message) => viewport.apply(&message),
+                        None => return,
+                    },
                 }
             }
         }
@@ -237,8 +266,8 @@ pub fn spawn_machine(
 async fn connect_machine(
     profile: &MachineProfile,
     session: &str,
-    cols: &mut u16,
-    rows: &mut u16,
+    viewport: &mut crate::local_endpoint::Viewport,
+    view: &mut crate::reconnect_view::View,
     updates: &Updates,
     commands: &mut mpsc::Receiver<ClientMessage>,
 ) -> Result<Option<String>> {
@@ -250,7 +279,10 @@ async fn connect_machine(
             None => return Err(anyhow!("endpoint command channel closed")),
             // The router only admits input for online endpoints. If a stale
             // message races setup, discard it rather than replaying it later.
-            Some(_) => return Err(anyhow!("endpoint input discarded during setup")),
+            Some(message) => {
+                viewport.apply(&message);
+                return Err(anyhow!("endpoint input discarded during setup"));
+            }
         },
     };
     let stream = tokio::time::timeout(Duration::from_secs(5), UnixStream::connect(&socket))
@@ -261,8 +293,8 @@ async fn connect_machine(
     write_endpoint(
         &mut writer,
         &ClientMessage::Hello {
-            cols: *cols,
-            rows: *rows,
+            cols: viewport.cols,
+            rows: viewport.rows,
             version: PROTOCOL_VERSION,
         },
     )
@@ -288,9 +320,53 @@ async fn connect_machine(
     })
     .await
     .context("endpoint handshake timed out")??;
+    write_endpoint(
+        &mut writer,
+        &ClientMessage::SetCompactView {
+            enabled: viewport.compact,
+        },
+    )
+    .await?;
+    write_endpoint(
+        &mut writer,
+        &ClientMessage::SetTerminalColors {
+            colors: viewport.colors.clone(),
+        },
+    )
+    .await?;
+    for message in view.restore() {
+        write_endpoint(&mut writer, &message).await?;
+    }
+    // A reconnect never replays pending input, including keys queued before
+    // the renderer received the disconnect event.
+    while let Ok(message) = commands.try_recv() {
+        viewport.apply(&message);
+    }
+    write_endpoint(
+        &mut writer,
+        &ClientMessage::Resize {
+            cols: viewport.cols,
+            rows: viewport.rows,
+        },
+    )
+    .await?;
+    write_endpoint(
+        &mut writer,
+        &ClientMessage::SetTerminalColors {
+            colors: viewport.colors.clone(),
+        },
+    )
+    .await?;
+    write_endpoint(
+        &mut writer,
+        &ClientMessage::SetCompactView {
+            enabled: viewport.compact,
+        },
+    )
+    .await?;
     updates
         .send(app::Update::EndpointConnected {
-            session: connected_session,
+            session: connected_session.clone(),
             socket: socket.clone(),
         })
         .await
@@ -301,17 +377,22 @@ async fn connect_machine(
             command = commands.recv() => {
                 let command = command.ok_or_else(|| anyhow!("endpoint command channel closed"))?;
                 if let ClientMessage::Resize { cols: next_cols, rows: next_rows } = command {
-                    *cols = next_cols;
-                    *rows = next_rows;
+                    viewport.apply(&command);
                     write_endpoint(&mut writer, &ClientMessage::Resize { cols: next_cols, rows: next_rows }).await?;
                     continue;
                 }
+                viewport.apply(&command);
                 write_endpoint(&mut writer, &command).await?;
             }
             line = lines.next_line() => {
                 let line = line?.ok_or_else(|| anyhow!("endpoint closed"))?;
                 let update = match decode(line.as_bytes()) {
-                    Ok(ServerMessage::Layout(layout)) => Some(app::Update::Layout(layout)),
+                    Ok(ServerMessage::Layout(layout)) => { view.observe(&layout); Some(app::Update::Layout(layout)) },
+                    Ok(ServerMessage::Upgrading) => {
+                        updates.send(app::Update::EndpointFailed { reason: "daemon upgrading; reconnecting".into() }).await?;
+                        return Ok(Some(connected_session));
+                    }
+                    Ok(ServerMessage::Clipboard { pane, text }) => Some(app::Update::Clipboard { pane, text }),
                     Ok(ServerMessage::Welcome { session, .. }) => Some(app::Update::Session(session)),
                     Ok(ServerMessage::Notification(notification)) | Ok(ServerMessage::Event(kodade_cli_proto::Event::Notification(notification))) => Some(app::Update::Notification(notification)),
                     Ok(ServerMessage::Event(kodade_cli_proto::Event::SessionRenamed { name, socket })) => {
@@ -374,13 +455,7 @@ impl Manager {
             .map(|(id, endpoint)| SidebarMachine {
                 id: id.clone(),
                 label: endpoint.label.clone(),
-                status: match &endpoint.status {
-                    Status::Connecting => "connecting".into(),
-                    Status::Online => "online".into(),
-                    Status::Offline { retry } => format!("offline · retry {}", retry + 1),
-                    Status::Attention(reason) => format!("attention · {reason}"),
-                    Status::Disabled => "disabled".into(),
-                },
+                status: endpoint.status.label(),
             })
             .collect()
     }
@@ -507,6 +582,32 @@ mod tests {
         );
         assert!(
             matches!(machine_rx.recv().await, Some(ClientMessage::Input { bytes }) if bytes == b"remote")
+        );
+    }
+
+    #[tokio::test]
+    async fn broadcast_retains_terminal_colors_for_each_endpoint() {
+        let (local_tx, mut local_rx) = mpsc::channel(1);
+        let (machine_tx, mut machine_rx) = mpsc::channel(1);
+        let mut router = Router::new(EndpointId::Local);
+        router.register(EndpointId::Local, local_tx);
+        router.register(EndpointId::Machine("m1".into()), machine_tx);
+        let colors = kodade_cli_proto::TerminalColors {
+            foreground: [0x3f, 0x3b, 0x34],
+            background: [0xfa, 0xf9, 0xf5],
+            cursor: [0x9d, 0x57, 0x29],
+            palette: [[0x9d, 0x57, 0x29]; 16],
+        };
+
+        router.broadcast(ClientMessage::SetTerminalColors {
+            colors: Some(colors.clone()),
+        });
+
+        assert!(
+            matches!(local_rx.recv().await, Some(ClientMessage::SetTerminalColors { colors: Some(received) }) if received == colors)
+        );
+        assert!(
+            matches!(machine_rx.recv().await, Some(ClientMessage::SetTerminalColors { colors: Some(received) }) if received == colors)
         );
     }
 

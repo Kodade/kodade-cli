@@ -52,7 +52,7 @@ printf '%s\n' '{"Query":"Layout"}' | nc -U /tmp/kodade-cli-$UID/default.sock
 | `Query(Schema)` | `{"Query":"Schema"}` | `Schema` |
 | `Subscribe` | `"Subscribe"` | `Layout`, then `Event`s |
 | `ApplyLayout` | `{"ApplyLayout":{"version":1,…}}` | `Layout` |
-| `Hello` | `{"Hello":{"cols":120,"rows":40,"version":1}}` | `Welcome` + `Layout` |
+| `Hello` | `{"Hello":{"cols":120,"rows":40,"version":2}}` | `Welcome` + `Layout` |
 | `Input` | `{"Input":{"bytes":[108,115,13]}}` | `Layout` |
 | `Resize` | `{"Resize":{"cols":120,"rows":40}}` | `Layout` |
 | `SplitRight` / `SplitDown` | `"SplitRight"` | `Layout` |
@@ -68,6 +68,7 @@ printf '%s\n' '{"Query":"Layout"}' | nc -U /tmp/kodade-cli-$UID/default.sock
 | `RenamePaneId` / `RenameTabId` / `RenameWorkspaceId` | `{"RenameTabId":{"id":2,"name":"agents"}}` | `Layout` |
 | `RenameSession` | `{"RenameSession":{"name":"work"}}` | `Layout` |
 | `KillSession` | `"KillSession"` | `Shutdown` |
+| `Upgrade` | `{"Upgrade":{"binary":null}}` | `Upgrading` or `Error` |
 | `NewTab` | `"NewTab"` | `Layout` |
 | `NextTab` / `PrevTab` | `"NextTab"` | `Layout` |
 | `SelectTab` | `{"SelectTab":{"id":2}}` | `Layout` |
@@ -160,9 +161,9 @@ request; one-shot command clients can still treat the `Error` reply as failure.
 
 ## Server messages
 
-- `Welcome` — `{"Welcome":{"session":"default","version":1}}`. Sent once, in
+- `Welcome` — `{"Welcome":{"session":"default","version":2}}`. Sent once, in
   reply to `Hello`.
-- `Version` — `{"Version":{"version":1}}`. Reply to `Query(Version)`.
+- `Version` — `{"Version":{"version":2}}`. Reply to `Query(Version)`.
 - `Pane` — `{"Pane":{…PaneSnapshot…}}`. Reply to `Query(Pane)`. Unlike `Layout`,
   which only carries the active tab's panes, this reaches any pane in the
   session; an unknown id answers `Error`.
@@ -183,7 +184,7 @@ request; one-shot command clients can still treat the `Error` reply as failure.
 - `Event` — `{"Event":{…}}`. Only sent to subscribed connections (see below).
 - `Session` — `{"Session":{"version":1,…}}`. The persisted-layout view of the
   session; the same JSON `layout export` writes and `ApplyLayout` accepts.
-- `Schema` — `{"Schema":{"version":1,"client_messages":[…],"server_messages":[…]}}`.
+- `Schema` — `{"Schema":{"version":2,"client_messages":[…],"server_messages":[…]}}`.
 - `Manifests` — `{"Manifests":[{"name":"codex","source":"builtin",…}]}`.
 - `Error` — `{"Error":{"message":"pane 9 not found"}}`. The daemon closes the
   connection after an error reply.
@@ -233,10 +234,10 @@ Notes:
 version:
 
 ```json
-{"Schema":{"version":1,"client_messages":["Query","Subscribe",…],"server_messages":["Welcome","Layout",…]}}
+{"Schema":{"version":2,"client_messages":["Query","Subscribe",…],"server_messages":["Welcome","Layout",…]}}
 ```
 
-Version 1 is the current protocol (`PROTOCOL_VERSION` in `kodade-cli-proto`).
+Version 2 is the current protocol (`PROTOCOL_VERSION` in `kodade-cli-proto`).
 Both ends check it at attach time so a stale binary fails fast (#23):
 
 - The client's first message is `Hello { cols, rows, version }`. `version`
@@ -332,3 +333,41 @@ alive; disabling restores the split projection. Focus and input reapply the
 interacting client's PTY dimensions. Ködade's auto mode enables this below
 70 columns; compact headers provide previous/next pane, Switch, and Hosts
 controls, with the usual keyboard bindings available.
+
+
+## Live daemon upgrade
+
+`{"Upgrade":{"binary":null}}` replaces the daemon with the installed executable.
+An explicit absolute `binary` path selects a local replacement. Linux and macOS
+transfer the existing PTY masters; child programs are not restarted. The target
+must accept the handoff schema and socket protocol version. Failed validation,
+import, or preparation leaves the source daemon and its panes running.
+
+The source pauses PTY readers and rejects mutations while it transfers layout,
+bounded terminal state, graphics, and attachment ownership. The replacement
+binds private sockets before the source publishes them. A final ownership
+release follows the target's preparation acknowledgement; until release, target
+readers remain paused and failed transactions can restore the source aliases.
+
+After successful release the source sends the unit message `"Upgrading"` to
+attached clients, closes their connections, and exits. Ködade clients reconnect
+to the same public socket, restore their own selection/viewport/scroll offsets,
+and resubscribe. Queued input and in-flight requests are not replayed. Other
+clients should repeat `Hello` and `Subscribe` and explicitly restore their view.
+An upgrade is distinct from `"Shutdown"`, which means the session was stopped.
+
+The bounded transfer supports up to 64 PTYs, a 128 MiB serialized runtime,
+128 KiB of formatted screen state per pane, and a 64 KiB ANSI history tail per
+pane. Complete logical history rows are retained within that budget. Oversized
+screen/runtime state refuses the upgrade and resumes the source. Pending input
+sequences and image transfers retain their bounded parser state.
+
+At the CLI, use `kodade-cli session upgrade` after installing an update, or
+`kodade-cli --remote HOST session upgrade` for a Unix host. Supplying `--binary`
+through `--remote` is rejected; install the desired binary on the host first.
+
+Live runtime transfer also retains each workspace environment, exact native
+conversation reference, guarded hook process identity, notification sequence,
+and the active history-persistence setting. Daemon-owned extension context
+files remain readable by the existing child and transfer cleanup ownership only
+after the final release; a rejected importer cannot delete the source file.

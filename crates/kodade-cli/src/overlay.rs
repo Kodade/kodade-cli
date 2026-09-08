@@ -57,6 +57,7 @@ pub struct Overlay {
     pub filter: Option<String>,
     pub rows: Vec<OverlayRow>,
     pub selected: usize,
+    pub max_visible_rows: u16,
 }
 
 impl Overlay {
@@ -66,6 +67,7 @@ impl Overlay {
             filter: None,
             rows,
             selected: 0,
+            max_visible_rows: u16::MAX,
         }
     }
 
@@ -156,7 +158,10 @@ pub fn overlay_key(overlay: &mut Overlay, key: KeyEvent) -> OverlayEvent {
 
 /// The centered box the overlay occupies inside `area`.
 pub fn overlay_rect(area: Rect, overlay: &Overlay) -> Rect {
-    let rows = overlay.rows.len() as u16;
+    let rows = overlay
+        .rows
+        .len()
+        .min(usize::from(overlay.max_visible_rows)) as u16;
     let chrome = if overlay.filter.is_some() { 4 } else { 3 };
     let width = area.width.saturating_sub(4).clamp(8, 72);
     let height = area

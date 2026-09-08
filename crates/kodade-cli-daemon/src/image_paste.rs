@@ -1,6 +1,7 @@
 //! Private, bounded PNG attachments retained until the session stops.
 use anyhow::{bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD, Engine};
+use serde::{Deserialize, Serialize};
 use std::{
     fs,
     io::{Cursor, Write},
@@ -43,11 +44,14 @@ pub fn validate_png(bytes: &[u8]) -> Result<(u32, u32)> {
 
 #[derive(Default)]
 pub struct Inbox(Mutex<Option<Directory>>);
-struct Directory {
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct Directory {
     path: PathBuf,
     count: usize,
     next: usize,
     bytes: usize,
+    #[serde(skip)]
+    owned: bool,
 }
 
 impl Inbox {
@@ -59,9 +63,10 @@ impl Inbox {
         validate_png(&bytes)?;
         let mut state = self.0.lock().expect("image inbox lock");
         if state.is_none() {
-            let nonce = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)?
-                .as_nanos();
+            let mut random = [0_u8; 16];
+            getrandom::getrandom(&mut random)
+                .map_err(|error| anyhow::anyhow!("image directory nonce: {error}"))?;
+            let nonce: String = random.iter().map(|byte| format!("{byte:02x}")).collect();
             let path =
                 std::env::temp_dir().join(format!("kodade-images-{}-{nonce}", std::process::id()));
             fs::DirBuilder::new()
@@ -73,6 +78,7 @@ impl Inbox {
                 count: 0,
                 next: 0,
                 bytes: 0,
+                owned: true,
             });
         }
         let directory = state.as_mut().expect("created inbox");
@@ -119,8 +125,42 @@ impl Inbox {
     }
     pub fn clear(&self) {
         let directory = self.0.lock().expect("image inbox lock").take();
-        if let Some(directory) = directory {
+        if let Some(directory) = directory.filter(|directory| directory.owned) {
             let _ = fs::remove_dir_all(directory.path);
+        }
+    }
+
+    pub(crate) fn snapshot(&self) -> Option<Directory> {
+        self.0.lock().expect("image inbox lock").clone()
+    }
+
+    /// Stage access to the source's attachments without taking deletion rights.
+    pub(crate) fn import(directory: Option<Directory>) -> Result<Self> {
+        let Some(mut directory) = directory else {
+            return Ok(Self::default());
+        };
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let metadata = fs::symlink_metadata(&directory.path)?;
+        if directory.path.parent() != Some(std::env::temp_dir().as_path())
+            || !directory
+                .path
+                .file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with("kodade-images-"))
+            || !metadata.file_type().is_dir()
+            || metadata.uid() != unsafe { libc::geteuid() }
+            || metadata.permissions().mode() & 0o777 != 0o700
+            || directory.count > 64
+            || directory.bytes > MAX_DECODED
+        {
+            bail!("invalid handoff attachment directory");
+        }
+        directory.owned = false;
+        Ok(Self(Mutex::new(Some(directory))))
+    }
+
+    pub(crate) fn take_ownership(&self) {
+        if let Some(directory) = self.0.lock().expect("image inbox lock").as_mut() {
+            directory.owned = true;
         }
     }
 }
@@ -133,6 +173,41 @@ impl Drop for Inbox {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn staged_handoff_cannot_delete_source_attachments_but_committed_owner_can() {
+        let mut bytes = Vec::new();
+        {
+            let mut encoder = png::Encoder::new(&mut bytes, 1, 1);
+            encoder.set_color(png::ColorType::Rgb);
+            encoder.set_depth(png::BitDepth::Eight);
+            encoder
+                .write_header()
+                .unwrap()
+                .write_image_data(&[255, 0, 0])
+                .unwrap();
+        }
+        let source = Inbox::default();
+        let path = source.save(&STANDARD.encode(bytes)).unwrap();
+        let snapshot: Option<Directory> =
+            serde_json::from_slice(&serde_json::to_vec(&source.snapshot()).unwrap()).unwrap();
+        let staged = Inbox::import(snapshot.clone()).unwrap();
+        drop(staged);
+        assert!(
+            path.is_file(),
+            "failed target must leave source attachment intact"
+        );
+        let committed = Inbox::import(snapshot).unwrap();
+        committed.take_ownership();
+        let second = committed
+            .save(&STANDARD.encode(fs::read(&path).unwrap()))
+            .unwrap();
+        assert_ne!(path, second, "import must retain the filename sequence");
+        assert_eq!(fs::read(&path).unwrap(), fs::read(&second).unwrap());
+        drop(committed);
+        assert!(!path.parent().unwrap().exists());
+    }
+
     #[test]
     fn png_inbox_rejects_corruption_and_retains_private_files_until_cleanup() {
         let mut bytes = Vec::new();

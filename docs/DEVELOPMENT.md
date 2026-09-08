@@ -5,9 +5,9 @@ Ködade CLI is a Rust workspace with three crates:
 - `kodade-cli-proto` owns the shared client and server message types and JSON
   encoding/decoding (a single `lib.rs`).
 - `kodade-cli-daemon` owns sessions, PTYs, terminal parsing, screen state,
-  agent detection, and the Unix socket server. Its modules are `lib.rs` (the
-  session and socket server), `agent.rs`, `manifest.rs`, `layout.rs`,
-  `proc.rs`, `git.rs`, and `persist.rs`.
+  agent detection, and the Unix socket server. The session and socket server
+  live in `lib.rs`; graphics, hyperlinks, terminal modes/replay, live handoff,
+  PTY writes, history, process identity, and persistence have dedicated modules.
 - `kodade-cli` owns the `kodade-cli` binary and its thin ratatui/crossterm TUI.
   Its modules are `main.rs`, `cli.rs`, `app.rs`, `config.rs`, `mode.rs`,
   `render.rs`, `input.rs`, `commands.rs`, `help.rs`, `keys.rs`, `notify.rs`,
@@ -76,8 +76,9 @@ The daemon persists a session's layout so a restart (logout, crash, or
 
 The file records `"version": 1`, the active workspace, and every workspace →
 tab → pane: names, roots, zoom, the pane tree, each pane's title, its live cwd,
-and the command it was spawned with. **Scrollback is never persisted** (secrets
-risk); only layout and metadata are.
+and the command it was spawned with. Terminal output is not persisted by
+default. Explicitly enabling `[session] pane_history = true` adds bounded,
+private screen replay; see [configuration](CONFIG.md#session-persistence).
 
 Writes are debounced ~500 ms and driven by a `layout_generation` counter that
 only layout-changing mutations advance — PTY output never triggers a write. The
@@ -122,7 +123,15 @@ background color, and attribute bits (bold, italic, underline, dim, inverse);
 colors are `Default`, `Indexed(u8)`, or `Rgb`. Wide characters are emitted once
 and their continuation cell dropped, so a run's display width equals the
 columns it covers. `Screen` also carries the cursor position and visibility and
-the pane's bracketed-paste and mouse-reporting modes.
+the pane's bracketed-paste and mouse-reporting modes. It carries bounded OSC 8
+link ranges for visible cells too. Pane DECSYNC (`CSI ? 2026 h/l`) freezes the
+last complete screen for at most one second, including link and graphics
+metadata, so malformed pane output cannot indefinitely hold an attached client.
+
+The daemon uses the maintained `atuin-vt100` fork under the existing `vt100`
+dependency alias. Keep parser dimensions at the daemon boundary as
+`NonZeroU16`; `terminal_size` is the single conversion point for PTY requests
+and protects the parser from zero-sized resize input.
 
 Socket paths are selected in this order:
 
@@ -176,7 +185,7 @@ IDs, never a directory-wide “last session” lookup.
 
 ## Protocol versioning (#23)
 
-`kodade-cli-proto` exports `PROTOCOL_VERSION: u32` (currently `1`). Both ends
+`kodade-cli-proto` exports `PROTOCOL_VERSION: u32` (currently `2`). Both ends
 check it at attach time so a stale binary fails fast with a clear message
 instead of misbehaving. Bump it whenever a client and daemon can no longer
 understand each other. The handshake, the `Query(Version)` probe, and the
@@ -266,3 +275,24 @@ Terminal modes are owned by `terminal::TerminalModes`; cleanup runs after detach
 failed setup, UI errors, and before panic reporting. `python3 scripts/tui-smoke-test.py`
 exercises a real controlling PTY, detach, a broken transport, and restoration of
 termios, alternate screen, bracketed paste, and cursor visibility.
+`python3 scripts/terminal-links-tui-smoke.py` exercises labeled OSC 8 links in
+history and live output, link retirement after a same-text overwrite, and a
+child pane's synchronized-output freeze/release path.
+
+
+## Live daemon handoff
+
+`session upgrade` uses a private Unix socket to transfer PTY descriptors with
+SCM_RIGHTS. `handoff.rs` bounds and authenticates the transport; the source
+transaction owns alias rollback and target termination. Readers stop at
+poll/read boundaries and only the final ownership release lets the target read
+or delete adopted resources. Client transports retain acknowledged view state
+and discard queued input on reconnect. `terminal_replay.rs` exports cloned
+terminal grids, preserving live buffers and a bounded ANSI history tail.
+
+After building, `python3 scripts/smoke-test.py` checks two upgrades with original
+process identity and computed output, failed real import and lost commit
+acknowledgement rollback, and the original hook alias after rename.
+`python3 scripts/handoff-tui-smoke.py` verifies an attached client's independent
+pane focus and actual shell execution through two upgrades, then terminal-mode
+restoration on detach. Both fixtures own their temporary sessions and cleanup.

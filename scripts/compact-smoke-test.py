@@ -120,7 +120,9 @@ with tempfile.TemporaryDirectory(prefix="kc-") as directory:
         wide.settimeout(5)
         wide.connect(str(root / "run/kodade-cli/compact.sock"))
         reader = wide.makefile("rb")
-        send({"Hello": {"cols": 120, "rows": 30, "version": 1}})
+        send({"Query": "Version"})
+        protocol = reply("Version")["version"]
+        send({"Hello": {"cols": 120, "rows": 30, "version": protocol}})
         reply("Welcome")
         send({"SetCompactView": {"enabled": False}})
         send({"Query": "Layout"})

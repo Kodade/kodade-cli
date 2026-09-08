@@ -90,6 +90,11 @@ contexts = ["selection"]
         wait("pane id", pane_id.exists)
         private = Path(pane_path.read_text())
         assert private.exists(), private
+        if "--handoff" in sys.argv[2:]:
+            original_context = private.read_bytes()
+            for _ in range(2):
+                cli("session", "upgrade")
+                assert private.read_bytes() == original_context, "upgrade removed or changed live action context"
         # A computed PTY write must still run while the action pane sleeps.
         # This takes the daemon's public SendKeys route rather than relying on
         # whichever pane the new action focused in the TUI.

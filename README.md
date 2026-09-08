@@ -1,26 +1,33 @@
 # Ködade CLI
 
-Ködade CLI is a terminal workspace for running agent CLIs such as Claude Code,
-Codex, and other programs that run in a terminal. Workspaces contain tabs, and
-tabs contain panes. It is the terminal-native companion to the
+Keep your coding agents, shells, and remote projects in one terminal workspace.
+Ködade CLI remembers your panes, shows which agents need attention, and gives
+you the same controls at the keyboard or from a script.
+
+- **Find the next action.** Press `ctrl+b`, then `space` to search commands,
+  launch an agent, switch projects, or open settings.
+- **Work across machines.** Keep local and saved SSH workspaces together, with
+  independent focus and reconnects for each attached client.
+- **Automate with a clear target.** Start, read, prompt, and wait for a specific
+  agent. Exact conversation references prevent an accidental resume into the
+  wrong conversation.
+- **Make it yours.** Add local extensions, selected-text actions, command
+  shortcuts, workspace variables, and Git worktrees.
+
+A Rust binary with a persistent local daemon. No account or hosted service.
+Ködade CLI also works independently of the
 [Ködade desktop app](https://github.com/Kodade/kodade).
 
 ## Status
 
-Prebuilt binaries for macOS and Linux (arm64/x86_64) are published on the
-releases page, installable with the command below.
+v0.3.0 supports macOS and Linux on arm64 and x86_64. Distribution uses Homebrew
+and [standalone GitHub releases](https://github.com/Kodade/kodade-cli/releases)
+with checksums.
+Native Windows binaries and Windows installation support remain deferred.
 
-### v0.2.1
+### What’s in v0.3.0
 
-- Dark theme with charcoal backgrounds, off-white text, and the existing orange accents.
-- Stable scrollback while new output arrives, plus prefixed PageUp/PageDown scrolling.
-- Shift-wheel local history override and immediate copy-mode wheel scrolling.
-
-After upgrading, start a new session to use the updated daemon. Existing
-sessions keep their running daemon until stopped; save work in those panes
-before stopping them.
-
-Current development also includes:
+The release brings the everyday workspace flows together:
 
 - Local and saved SSH machines in one workspace, with independent reconnects.
 - A command center (`prefix space`) and attention history (`prefix A`).
@@ -30,11 +37,32 @@ Current development also includes:
 - Exact native conversation restore and opt-in terminal history after a cold restart.
 - An offline [agent automation guide](docs/AGENT-GUIDE.md), available with `kodade-cli agent guide`.
 - Terminal images, PNG paste, and a focused view for narrow terminals.
+- OSC 8 links open their exact target from live output or local history; terminal
+  frames stay atomic where synchronized output is supported.
+- Local copies use the platform clipboard when available and retain OSC 52 for
+  SSH, remote panes, and terminals without a native clipboard tool.
+- Live daemon upgrade for an already-running v0.3.0 Unix session, preserving
+  its pane processes while attached clients reconnect.
+- Negotiated keyboard input and theme-aware terminal color queries, preserved
+  through reconnects and live upgrades.
 - Verified stable/preview updates for standalone installations.
 
-These changes are being validated for the next release. See the
-[competitive delivery ledger](docs/features/herdr-parity/PLAN.md) for shipped
-work, behavioral evidence, and the remaining gaps.
+### Moving from v0.2.1
+
+A v0.2.1 daemon cannot perform a live handoff: it does not understand the
+v0.3.0 upgrade request. Installing the new binary does not stop that daemon or
+its panes. Keep the existing session open, then start a separate v0.3.0 session
+with a new name, for example `kodade-cli -s v03`. Move work only when you are
+ready; do not kill the v0.2.1 session to migrate it.
+
+Once a session is already running v0.3.0 on macOS or Linux, run
+`kodade-cli -s SESSION session upgrade` to replace its daemon without restarting
+its panes. The operation rolls back if the replacement cannot prepare itself.
+Attached Ködade clients reconnect with their saved view; queued input is not
+replayed.
+
+See the [competitive delivery ledger](docs/features/herdr-parity/PLAN.md) for
+reviewed evidence and known terminal compatibility limits.
 
 ## Install
 
@@ -95,6 +123,7 @@ The default prefix is `ctrl+b`. After the prefix, the default actions are:
 
 | Key | Action |
 |---|---|
+| `space` / `A` | Command center / attention history |
 | `%` / `"` | Split right / down |
 | `x` / `c` | Close pane / new tab |
 | `n` | Navigate mode |
@@ -149,11 +178,12 @@ panel below the workspaces lists agent panes by urgency, and each workspace
 carries a color swatch (right-click → `Color…`, or an auto-hashed fallback). See
 [docs/CONFIG.md](docs/CONFIG.md#settings).
 
-Dragging inside a pane selects text and copies it on release
-(`mouse.copy_on_select`, OSC 52 so it works over SSH); double-click selects a
-word, triple-click a line, and ctrl/cmd-click opens the URL under the pointer
-with `ui.link_command`. Panes running a mouse-aware program (vim, lazygit,
-htop) get the events themselves unless `mouse.passthrough = false`. Hold
+Dragging inside a pane selects text and copies it on release (the local platform
+clipboard when available, otherwise OSC 52 so it works over SSH); double-click
+selects a word, triple-click a line, and ctrl/cmd-click opens the URL under the
+pointer with `ui.link_command`. OSC 8 labels use their exact target, including
+in local history. Panes running a mouse-aware program (vim, lazygit, htop) get
+the events themselves unless `mouse.passthrough = false`. Hold
 `shift` while wheeling to inspect Ködade CLI's local history; once history is
 open, wheel down returns to live output before wheel events return to the
 application. `prefix PageUp` and `prefix PageDown` provide the same local
@@ -181,14 +211,15 @@ pane keeps that pane's normal local-history behavior.
 | `H` `M` `L` | Cursor to viewport top / middle / bottom |
 | `v` / `V` / `ctrl+v` | Char / line / block selection anchor |
 | `/` `?` then `n` `N` | Search forward / back (case-insensitive), step matches |
-| `y` | Copy the selection (or current line) via OSC 52 and the paste buffer |
+| `y` | Copy the selection (or current line) to the local clipboard, with OSC 52 fallback |
 | `e` | Open the buffer in `$EDITOR` (fallback `vi`) in a new split |
 | `esc` | Clear search, then the selection, then exit; `q` exits |
 
-Copying sends the selection through OSC 52, including over SSH; copy payloads
-are limited to 100 KB. The buffer is refetched (throttled) while the pane keeps
-producing output. Copy mode draws plain text — the frozen cell colors of the
-live screen are not reproduced there.
+Copying uses the local platform clipboard when available. It falls back to OSC
+52 for SSH, remote panes, and unavailable clipboard tools; payloads are limited
+to 100 KB. The buffer is refetched (throttled) while the pane keeps producing
+output. Copy mode draws plain text — the frozen cell colors of the live screen
+are not reproduced there.
 
 Paste is bracketed so a program can tell it from typing. Pasted text is
 sanitized by default (`paste.sanitize`): CRLF is normalized, embedded escape

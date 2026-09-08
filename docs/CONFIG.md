@@ -518,50 +518,29 @@ The optional `[ansi]` table has sixteen keys: `black`, `red`, `green`,
 
 `[ansi]` drives pane colors: the 16 basic colors a program prints inside a pane
 are drawn from this palette, so themes restyle terminal output without touching
-the program. Colors 16–255 use the terminal's own 256-color cube and 24-bit
-colors are passed through unchanged. A cell with no color set uses `text` on
-`bg`.
+the program. Colors 16–255 use Ködade's fixed standard xterm 256-color cube,
+and 24-bit colors are passed through unchanged. A cell with no color set uses
+`text` on `bg`.
 
-The complete built-in `kodade-dark` theme:
+An attached interactive client reports its `text`, `bg`, cursor, and 16 ANSI
+colors to the daemon for read-only terminal queries. Pane programs can query
+OSC 10, OSC 11, OSC 12, and every OSC 4 entry: slots 0–15 use the attached
+theme and slots 16–255 use the fixed standard xterm palette. Read-only clients
+do not replace a pane's query colors. A nonempty `NO_COLOR` disables these
+answers because the client is not emitting the reported theme colors. Theme
+changes and reconnects update each endpoint. Programs cannot mutate the
+client theme through OSC color setters.
 
-```toml
-name = "kodade-dark"
-accent = "#E7A33B"
-border = "#3a3733"
-text = "#d6d2c9"
-dim = "#a5a096"
-blocked = "#d97a80"
-working = "#a8c87f"
-done = "#E7A33B"
-idle = "#a5a096"
-tabbar_bg = "#232120"
-status_bg = "#232120"
+Pane rendering supports basic underlines. Styled underlines (double, curly,
+dotted, and dashed) and independent underline colors are not preserved.
+Capability queries therefore do not advertise `Su`, `Smulx`, or `Setulc`.
 
-bg = "#2a2825"
-surface = "#232120"
-selection = "#454038"
-cursor = "#e2b86e"
-menu_bg = "#232120"
-menu_fg = "#d6d2c9"
-tab_active_fg = "#E7A33B"
-tab_active_bg = "#38352f"
-sidebar_bg = "#232120"
+The complete built-in [`kodade-dark` theme](../crates/kodade-cli/themes/kodade-dark.toml)
+is the canonical example. Copy it to your themes directory, change `name`, and
+edit its fields to create a custom theme.
 
-[ansi]
-black = "#2a2825"
-red = "#d97a80"
-green = "#a8c87f"
-yellow = "#e2b86e"
-blue = "#7fa3e0"
-magenta = "#d98a5b"
-cyan = "#7fc4d6"
-white = "#d6d2c9"
-bright_black = "#a5a096"
-bright_red = "#e5949a"
-bright_green = "#bcd89a"
-bright_yellow = "#efce8f"
-bright_blue = "#9db9e8"
-bright_magenta = "#e5a67d"
-bright_cyan = "#9dd4e2"
-bright_white = "#f0ece3"
-```
+### Terminal environment inside panes
+
+Panes default to `TERM=xterm-256color` and `COLORTERM=truecolor`, so programs
+use Ködade's terminal capabilities even when the outer terminal has a custom
+terminfo name. An explicit workspace environment can override these defaults.

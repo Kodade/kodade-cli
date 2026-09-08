@@ -2,9 +2,9 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::OnceLock;
 
 use kodade_cli_proto::{
-    AgentInfo, AgentStateKind, CellColor, LayoutSnapshot, LayoutTree, PaneId, Run, Screen, TabId,
-    TabInfo, WorkspaceId, WorkspaceInfo, ATTR_BOLD, ATTR_DIM, ATTR_INVERSE, ATTR_ITALIC,
-    ATTR_UNDERLINE,
+    standard_xterm_rgb, AgentInfo, AgentStateKind, CellColor, LayoutSnapshot, LayoutTree, PaneId,
+    Run, Screen, TabId, TabInfo, WorkspaceId, WorkspaceInfo, ATTR_BOLD, ATTR_DIM, ATTR_INVERSE,
+    ATTR_ITALIC, ATTR_UNDERLINE,
 };
 use ratatui::{
     layout::{Constraint, Direction as LayoutDirection, Layout, Rect},
@@ -701,14 +701,16 @@ fn run_span<'a>(run: &'a Run, theme: &Theme) -> Span<'a> {
 }
 
 /// Indexed colors 0–15 come from the theme `[ansi]` palette (#8); 16–255 use
-/// the terminal's own 256-color cube.
+/// the fixed xterm extension so clients cannot change pane appearance.
 fn cell_color(color: CellColor, theme: &Theme) -> Option<Color> {
     match color {
         CellColor::Default => None,
         CellColor::Indexed(index) if (index as usize) < theme.ansi.len() => {
             Some(theme.ansi[index as usize])
         }
-        CellColor::Indexed(index) => Some(Color::Indexed(index)),
+        CellColor::Indexed(index) => {
+            standard_xterm_rgb(index).map(|[red, green, blue]| Color::Rgb(red, green, blue))
+        }
         CellColor::Rgb(r, g, b) => Some(Color::Rgb(r, g, b)),
     }
 }
@@ -1028,6 +1030,28 @@ pub fn sidebar_rows_for_endpoints(
     agents_panel: bool,
     machines: &[(EndpointId, String, String, bool)],
 ) -> SidebarModel {
+    if entries.len() == 1
+        && entries[0].0 == EndpointId::Local
+        && entries[0].1 == "Local"
+        && entries[0].2 == "online"
+        && machines
+            .iter()
+            .all(|(id, _, _, _)| *id == EndpointId::Local)
+    {
+        let (endpoint, _label, _status, layout) = &entries[0];
+        let empty = HashSet::new();
+        let mut model = sidebar_rows(
+            layout,
+            collapsed.get(endpoint).unwrap_or(&empty),
+            agents_panel,
+        );
+        for row in model.workspaces.iter_mut().chain(model.agents.iter_mut()) {
+            if let Some(target) = row.target.take() {
+                row.target = Some(SidebarTarget::Scoped(endpoint.clone(), Box::new(target)));
+            }
+        }
+        return model;
+    }
     let mut model = SidebarModel {
         workspaces: vec![heading_row("machines")],
         agents: Vec::new(),
@@ -1111,10 +1135,12 @@ fn agents_panel_rows(layout: &LayoutSnapshot) -> Vec<SidebarRow> {
         .workspaces
         .iter()
         .flat_map(|workspace| {
-            workspace
-                .tabs
-                .iter()
-                .flat_map(move |tab| tab.agents.iter().map(move |agent| (workspace, tab, agent)))
+            workspace.tabs.iter().flat_map(move |tab| {
+                tab.agents
+                    .iter()
+                    .filter(|agent| agent.detected)
+                    .map(move |agent| (workspace, tab, agent))
+            })
         })
         .collect();
     if agents.is_empty() {
@@ -1631,6 +1657,7 @@ mod tests {
                             name: "Codex".into(),
                             state: AgentStateKind::Blocked,
                             state_age_secs: 245,
+                            detected: true,
                         }],
                     }],
                 },
@@ -1723,6 +1750,30 @@ mod tests {
             .into_flat()
             .iter()
             .any(|row| matches!(row.target, Some(SidebarTarget::Pane(_)))));
+    }
+
+    #[test]
+    fn simple_local_sidebar_keeps_offline_machine_discovery() {
+        let endpoints = vec![(
+            EndpointId::Local,
+            "Local".into(),
+            "online".into(),
+            snapshot(),
+        )];
+        let mut machines = vec![(EndpointId::Local, "Local".into(), "online".into(), true)];
+        let simple = sidebar_rows_for_endpoints(&endpoints, &BTreeMap::new(), true, &machines);
+        assert_eq!(simple.workspaces[0].label, "workspaces");
+        assert!(!simple
+            .workspaces
+            .iter()
+            .any(|row| matches!(row.target, Some(SidebarTarget::Endpoint(_)))));
+        let remote = EndpointId::Machine("offline".into());
+        machines.push((remote.clone(), "Build".into(), "offline".into(), false));
+        let connected = sidebar_rows_for_endpoints(&endpoints, &BTreeMap::new(), true, &machines);
+        assert!(connected
+            .workspaces
+            .iter()
+            .any(|row| row.target == Some(SidebarTarget::Endpoint(remote.clone()))));
     }
 
     #[test]
@@ -1862,12 +1913,25 @@ mod tests {
             name: "Claude".into(),
             state: AgentStateKind::Working,
             state_age_secs: 30,
+            detected: true,
         }];
         let model = sidebar_rows(&layout, &no_collapse(), true);
         assert_eq!(model.agents[0].kind, SidebarKind::Heading);
         // Blocked outranks working.
         assert_eq!(model.agents[1].target, Some(SidebarTarget::Pane(PaneId(3))));
         assert_eq!(model.agents[2].target, Some(SidebarTarget::Pane(PaneId(9))));
+    }
+
+    #[test]
+    fn plain_shells_stay_in_the_tree_but_not_the_agents_panel() {
+        let mut layout = snapshot();
+        layout.workspaces[0].tabs[0].agents[0].detected = false;
+        let model = sidebar_rows(&layout, &no_collapse(), true);
+        assert!(model
+            .workspaces
+            .iter()
+            .any(|row| row.target == Some(SidebarTarget::Pane(PaneId(3)))));
+        assert!(model.agents.is_empty());
     }
 
     #[test]
@@ -1888,6 +1952,7 @@ mod tests {
                 name: format!("a{i}"),
                 state: AgentStateKind::Working,
                 state_age_secs: i,
+                detected: true,
             })
             .collect();
         let model = sidebar_rows(&layout, &no_collapse(), true);
@@ -1911,6 +1976,7 @@ mod tests {
                 name: format!("a{i}"),
                 state: AgentStateKind::Working,
                 state_age_secs: i,
+                detected: true,
             })
             .collect();
         let model = sidebar_rows(&layout, &no_collapse(), true);
@@ -2042,12 +2108,16 @@ mod tests {
         };
         let lines = pane_lines(&screen, &theme, None);
         let spans = &lines[0].spans;
-        // 0–15 come from the theme palette; 16+ stay terminal-indexed.
+        // 0–15 come from the theme palette; 16+ are fixed xterm RGB.
         assert_eq!(spans[0].style.fg, Some(theme.ansi[2]));
         assert_eq!(spans[0].style.bg, Some(theme.bg));
         assert!(spans[0].style.add_modifier.contains(Modifier::BOLD));
-        assert_eq!(spans[1].style.fg, Some(Color::Indexed(200)));
+        assert_eq!(spans[1].style.fg, Some(Color::Rgb(255, 0, 215)));
         assert_eq!(spans[1].style.bg, Some(Color::Rgb(1, 2, 3)));
+        assert_eq!(
+            cell_color(CellColor::Indexed(21), &theme),
+            Some(Color::Rgb(0, 0, 255))
+        );
         assert_eq!(
             spans[1].style.add_modifier,
             Modifier::ITALIC | Modifier::UNDERLINED | Modifier::DIM | Modifier::REVERSED
@@ -2128,6 +2198,8 @@ mod tests {
                 bracketed_paste: false,
                 mouse_reporting: false,
                 graphics: Vec::new(),
+                links: Vec::new(),
+                keyboard: Default::default(),
             },
             agent: None,
             agent_generation: 0,
@@ -2182,7 +2254,7 @@ mod tests {
         assert_eq!(first.fg, theme.ansi[1]);
         let cursor = &buffer[(3, 2)];
         assert_eq!(cursor.symbol(), "k");
-        assert_eq!(cursor.bg, theme.cursor);
+        assert_eq!(cursor.bg, Color::Rgb(0xe2, 0xb8, 0x6e));
     }
 
     #[test]

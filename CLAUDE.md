@@ -8,12 +8,14 @@ binary that a Ködade user can run over SSH or in any terminal and manage
 several agent panes without the desktop app.
 
 ## Status
-v0.2.1 is the latest published version. The development branch adds reliable
-independent clients, command/attention palettes, guarded agent automation,
-machine workspaces, extensions, live integrations, images, compact views, and
-verified updates. The competitive delivery ledger and remaining acceptance
-gates live in docs/features/herdr-parity/PLAN.md. Release process:
-docs/RELEASING.md. Updated 2026-09-08.
+v0.3.0 supports Linux/macOS on arm64 and x86_64. It adds independent clients,
+command/attention palettes, guarded agent automation, machine workspaces,
+extensions, live integrations, images, compact views, verified updates,
+theme-aware terminal queries, and Unix live daemon handoff. Windows remains
+deferred. Graphics has a bounded Kitty subset; underline rendering is basic
+only. Existing v0.2.1 daemons require a separately named v0.3.0 session.
+The competitive ledger and release evidence live in
+docs/features/herdr-parity/PLAN.md; release process: docs/RELEASING.md.
 
 ## Commands
 ```bash

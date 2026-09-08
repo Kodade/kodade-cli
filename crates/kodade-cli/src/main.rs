@@ -3,6 +3,7 @@ mod atomic_file;
 mod attention;
 mod automation;
 mod cli;
+mod clipboard;
 mod commands;
 mod config;
 mod connection;
@@ -15,6 +16,7 @@ mod image_paste;
 mod input;
 mod integrations;
 mod keys;
+mod local_endpoint;
 mod machines;
 mod mode;
 mod notify;
@@ -23,6 +25,7 @@ mod palette;
 mod paste;
 mod picker;
 mod plugins;
+mod reconnect_view;
 mod remote;
 mod render;
 mod selection;
@@ -34,8 +37,7 @@ mod update;
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{CommandFactory, FromArgMatches};
 use kodade_cli_proto::{
-    decode, encode, ClientMessage, Direction, Event, QueryKind, ServerMessage, SplitAxis,
-    PROTOCOL_VERSION,
+    decode, encode, ClientMessage, Direction, QueryKind, ServerMessage, SplitAxis, PROTOCOL_VERSION,
 };
 use ratatui::{backend::CrosstermBackend, Terminal};
 use std::{path::Path, time::Duration};
@@ -215,8 +217,31 @@ async fn main() -> Result<()> {
         Some(cli::Command::Plugin { command }) => {
             plugins::command(&socket, &session, remote.is_some(), command).await
         }
-        Some(cli::Command::Daemon { session: name }) => {
-            kodade_cli_daemon::run(name.unwrap_or(session)).await
+        Some(cli::Command::Daemon {
+            session: name,
+            import,
+            handoff_token,
+            staged_socket,
+            staged_hook,
+            hook_socket,
+        }) => {
+            let name = name.unwrap_or(session);
+            let handoff_token =
+                handoff_token.or_else(|| std::env::var("KODADE_HANDOFF_TOKEN").ok());
+            match (
+                import,
+                handoff_token,
+                staged_socket,
+                staged_hook,
+                hook_socket,
+            ) {
+                (Some(import), Some(token), Some(socket), Some(hook), Some(final_hook)) => {
+                    kodade_cli_daemon::run_import(name, import, token, socket, hook, final_hook)
+                        .await
+                }
+                (None, None, None, None, None) => kodade_cli_daemon::run(name).await,
+                _ => bail!("incomplete daemon handoff arguments"),
+            }
         }
         Some(cli::Command::Session { command }) => {
             session_command(remote.as_deref(), &socket, &session, command).await
@@ -861,6 +886,16 @@ async fn session_command(
             )?;
             Ok(())
         }
+        cli::SessionCommand::Upgrade { binary } => {
+            match commands::request(socket, ClientMessage::Upgrade { binary }).await? {
+                ServerMessage::Upgrading => Ok(()),
+                ServerMessage::Error { message } => bail!(message),
+                other => bail!(
+                    "unexpected upgrade reply: {}",
+                    kodade_cli_proto::server_message_name(&other)
+                ),
+            }
+        }
     }
 }
 
@@ -1445,6 +1480,11 @@ async fn tui(
             enabled: state.compact_enabled(cols),
         })?)
         .await?;
+    writer
+        .write_all(&encode(&ClientMessage::SetTerminalColors {
+            colors: state.theme_colors(),
+        })?)
+        .await?;
     // Subscribe so the TUI learns about session-level changes (a rename moves
     // the socket under it). Subscribed connections receive notifications as
     // `Event::Notification` instead of `ServerMessage::Notification`.
@@ -1452,7 +1492,7 @@ async fn tui(
         .write_all(&encode(&ClientMessage::Subscribe)?)
         .await?;
     let (tx, mut rx) = mpsc::channel(64);
-    let (command_tx, mut command_rx) = mpsc::channel(64);
+    let (command_tx, command_rx) = mpsc::channel(64);
     let mut router = endpoints::Router::new(endpoints::EndpointId::Local);
     router.register(endpoints::EndpointId::Local, command_tx);
     router.mark_online(endpoints::EndpointId::Local);
@@ -1466,60 +1506,23 @@ async fn tui(
             session.to_string(),
             state.pane_cols(cols),
             rows,
+            state.theme_colors(),
             router.updates(id.clone(), tx.clone()),
             machine_rx,
         );
     }
-    let writer_updates = router.updates(endpoints::EndpointId::Local, tx.clone());
-    tokio::spawn(async move {
-        while let Some(message) = command_rx.recv().await {
-            let Ok(encoded) = encode(&message) else {
-                break;
-            };
-            if !matches!(
-                tokio::time::timeout(Duration::from_secs(5), writer.write_all(&encoded)).await,
-                Ok(Ok(()))
-            ) {
-                let _ = writer_updates
-                    .send(app::Update::EndpointFailed {
-                        reason: "local endpoint disconnected".into(),
-                    })
-                    .await;
-                break;
-            }
-        }
-    });
-    let reader_tx = router.updates(endpoints::EndpointId::Local, tx.clone());
-    tokio::spawn(async move {
-        while let Ok(Some(line)) = lines.next_line().await {
-            let update = match decode(line.as_bytes()) {
-                Ok(ServerMessage::Layout(layout)) => app::Update::Layout(layout),
-                Ok(ServerMessage::Welcome { session, .. }) => app::Update::Session(session),
-                Ok(ServerMessage::Notification(notification)) => {
-                    app::Update::Notification(notification)
-                }
-                Ok(ServerMessage::Event(Event::Notification(notification))) => {
-                    app::Update::Notification(notification)
-                }
-                Ok(ServerMessage::Event(Event::SessionRenamed { name, socket })) => {
-                    app::Update::SessionRenamed { name, socket }
-                }
-                Ok(ServerMessage::Error { message }) => app::Update::RequestError(message),
-                Ok(ServerMessage::Shutdown) => app::Update::EndpointFailed {
-                    reason: "local endpoint shut down".into(),
-                },
-                _ => continue,
-            };
-            if reader_tx.send(update).await.is_err() {
-                break;
-            }
-        }
-        let _ = reader_tx
-            .send(app::Update::EndpointFailed {
-                reason: "local endpoint disconnected".into(),
-            })
-            .await;
-    });
+    local_endpoint::spawn(
+        local_endpoint::Connection { lines, writer },
+        socket.to_path_buf(),
+        local_endpoint::Viewport {
+            cols: state.pane_cols(cols),
+            rows,
+            compact: state.compact_enabled(cols),
+            colors: state.theme_colors(),
+        },
+        router.updates(endpoints::EndpointId::Local, tx.clone()),
+        command_rx,
+    );
     let _modes = terminal::TerminalModes::enter(config.mouse)?;
     let mut term = Terminal::new(CrosstermBackend::new(std::io::stdout()))?;
     state.run(&mut term, &mut router, &mut rx, &tx).await

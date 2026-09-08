@@ -211,7 +211,40 @@ fn plugin_version_gt(required: &str, current: &str) -> Result<bool> {
 /// Wire protocol version. Bumped whenever a client and daemon can no longer
 /// understand each other. Both ends compare it at attach time (see `Hello` /
 /// `Welcome`) so a stale binary fails fast instead of misbehaving (#23).
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
+
+/// Colors the attached client actually uses when rendering a pane. The daemon
+/// retains these only for read-only terminal color queries from that pane.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TerminalColors {
+    pub foreground: [u8; 3],
+    pub background: [u8; 3],
+    /// The cursor color painted by the attached client theme.
+    pub cursor: [u8; 3],
+    pub palette: [[u8; 3]; 16],
+}
+
+/// The fixed xterm 256-color extension. Slots 0–15 remain client-theme
+/// configurable, while 16–255 render and answer queries identically for every
+/// attached client.
+pub fn standard_xterm_rgb(index: u8) -> Option<[u8; 3]> {
+    match index {
+        16..=231 => {
+            const LEVELS: [u8; 6] = [0, 95, 135, 175, 215, 255];
+            let slot = index - 16;
+            Some([
+                LEVELS[(slot / 36) as usize],
+                LEVELS[((slot / 6) % 6) as usize],
+                LEVELS[(slot % 6) as usize],
+            ])
+        }
+        232..=255 => {
+            let gray = 8 + 10 * (index - 232);
+            Some([gray; 3])
+        }
+        _ => None,
+    }
+}
 
 // No `Eq`: `ApplyLayout` carries the split ratios, which are floats.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -243,6 +276,11 @@ pub enum ClientMessage {
     /// the shared tab tree and its other PTYs intact.
     SetCompactView {
         enabled: bool,
+    },
+    /// Report the rendering colors for this interactive client. This never
+    /// changes terminal colors; it only enables accurate OSC read queries.
+    SetTerminalColors {
+        colors: Option<TerminalColors>,
     },
     SplitRight,
     SplitDown,
@@ -282,6 +320,10 @@ pub enum ClientMessage {
         name: String,
     },
     KillSession,
+    /// Replace this daemon with a freshly started binary while keeping its PTYs.
+    Upgrade {
+        binary: Option<PathBuf>,
+    },
     NewTab,
     NextTab,
     PrevTab,
@@ -465,6 +507,12 @@ pub struct ManifestInfo {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ServerMessage {
+    /// A pane requested an OSC 52 clipboard write. This is delivered only to
+    /// the attached client currently viewing that pane.
+    Clipboard {
+        pane: PaneId,
+        text: String,
+    },
     ImagePasted {
         pane: PaneId,
         path: PathBuf,
@@ -513,6 +561,8 @@ pub enum ServerMessage {
     Error {
         message: String,
     },
+    /// The daemon has committed a live handoff. Attached clients reconnect.
+    Upgrading,
     Shutdown,
 }
 
@@ -677,6 +727,13 @@ pub struct AgentInfo {
     /// Seconds the current state has held, for sidebar age labels.
     #[serde(default)]
     pub state_age_secs: u64,
+    /// False for ordinary shells; omitted by older servers means detected.
+    #[serde(default = "default_agent_info_detected")]
+    pub detected: bool,
+}
+
+fn default_agent_info_detected() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -738,7 +795,7 @@ pub const ATTR_DIM: u8 = 8;
 pub const ATTR_INVERSE: u8 = 16;
 
 /// A terminal cell color. `Indexed(0..16)` is mapped through the client theme's
-/// `[ansi]` palette; higher indices use the standard xterm 256-color cube.
+/// `[ansi]` palette; indices 16–255 use `standard_xterm_rgb`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum CellColor {
     #[default]
@@ -770,6 +827,27 @@ pub struct Screen {
     pub mouse_reporting: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub graphics: Vec<ImagePlacement>,
+    /// OSC 8 targets attached to visible terminal cells. Older daemons omit it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub links: Vec<LinkRange>,
+    #[serde(default)]
+    pub keyboard: KeyboardModes,
+}
+
+/// Per-pane input protocols negotiated by the program in that pane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct KeyboardModes {
+    pub kitty_flags: u8,
+    pub modify_other_keys: u8,
+}
+
+/// An exclusive horizontal OSC 8 link range in one visible terminal row.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LinkRange {
+    pub row: u16,
+    pub start_col: u16,
+    pub end_col: u16,
+    pub uri: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -796,6 +874,9 @@ pub struct ImagePlacement {
     pub source_y: u32,
     pub source_width: u32,
     pub source_height: u32,
+    /// Pixel displacement from the placement cell's upper-left corner.
+    pub x_offset: u32,
+    pub y_offset: u32,
     pub z: i32,
 }
 
@@ -971,6 +1052,7 @@ pub const CLIENT_MESSAGE_NAMES: &[&str] = &[
     "Input",
     "Resize",
     "SetCompactView",
+    "SetTerminalColors",
     "SplitRight",
     "SplitDown",
     "ClosePane",
@@ -983,6 +1065,7 @@ pub const CLIENT_MESSAGE_NAMES: &[&str] = &[
     "PromptAgent",
     "RenamePaneId",
     "KillSession",
+    "Upgrade",
     "RenameSession",
     "NewTab",
     "NextTab",
@@ -1018,6 +1101,7 @@ pub const CLIENT_MESSAGE_NAMES: &[&str] = &[
 
 /// Every `ServerMessage` variant name (see [`CLIENT_MESSAGE_NAMES`]).
 pub const SERVER_MESSAGE_NAMES: &[&str] = &[
+    "Clipboard",
     "ImagePasted",
     "Welcome",
     "Layout",
@@ -1031,6 +1115,7 @@ pub const SERVER_MESSAGE_NAMES: &[&str] = &[
     "Schema",
     "Manifests",
     "Error",
+    "Upgrading",
     "Shutdown",
 ];
 
@@ -1045,6 +1130,7 @@ pub fn client_message_name(message: &ClientMessage) -> &'static str {
         ClientMessage::Input { .. } => "Input",
         ClientMessage::Resize { .. } => "Resize",
         ClientMessage::SetCompactView { .. } => "SetCompactView",
+        ClientMessage::SetTerminalColors { .. } => "SetTerminalColors",
         ClientMessage::SplitRight => "SplitRight",
         ClientMessage::SplitDown => "SplitDown",
         ClientMessage::ClosePane => "ClosePane",
@@ -1057,6 +1143,7 @@ pub fn client_message_name(message: &ClientMessage) -> &'static str {
         ClientMessage::PromptAgent { .. } => "PromptAgent",
         ClientMessage::RenamePaneId { .. } => "RenamePaneId",
         ClientMessage::KillSession => "KillSession",
+        ClientMessage::Upgrade { .. } => "Upgrade",
         ClientMessage::RenameSession { .. } => "RenameSession",
         ClientMessage::NewTab => "NewTab",
         ClientMessage::NextTab => "NextTab",
@@ -1094,6 +1181,7 @@ pub fn client_message_name(message: &ClientMessage) -> &'static str {
 /// Variant name of a server message (see [`client_message_name`]).
 pub fn server_message_name(message: &ServerMessage) -> &'static str {
     match message {
+        ServerMessage::Clipboard { .. } => "Clipboard",
         ServerMessage::ImagePasted { .. } => "ImagePasted",
         ServerMessage::Welcome { .. } => "Welcome",
         ServerMessage::Layout(_) => "Layout",
@@ -1107,6 +1195,7 @@ pub fn server_message_name(message: &ServerMessage) -> &'static str {
         ServerMessage::Schema { .. } => "Schema",
         ServerMessage::Manifests(_) => "Manifests",
         ServerMessage::Error { .. } => "Error",
+        ServerMessage::Upgrading => "Upgrading",
         ServerMessage::Shutdown => "Shutdown",
     }
 }
@@ -1157,6 +1246,7 @@ mod tests {
                         name: "zsh".into(),
                         state: AgentStateKind::Idle,
                         state_age_secs: 12,
+                        detected: true,
                     }],
                 }],
             }],
@@ -1186,6 +1276,8 @@ mod tests {
                     bracketed_paste: true,
                     mouse_reporting: false,
                     graphics: Vec::new(),
+                    links: Vec::new(),
+                    keyboard: KeyboardModes::default(),
                 },
                 agent: None,
                 agent_generation: 0,
@@ -1263,6 +1355,14 @@ mod tests {
             ClientMessage::Input { bytes: vec![1] },
             ClientMessage::Resize { cols: 80, rows: 24 },
             ClientMessage::SetCompactView { enabled: true },
+            ClientMessage::SetTerminalColors {
+                colors: Some(TerminalColors {
+                    foreground: [1, 2, 3],
+                    background: [4, 5, 6],
+                    cursor: [7, 8, 9],
+                    palette: [[7, 8, 9]; 16],
+                }),
+            },
             ClientMessage::SplitRight,
             ClientMessage::SplitDown,
             ClientMessage::ClosePane,
@@ -1291,6 +1391,7 @@ mod tests {
                 name: "a".into(),
             },
             ClientMessage::KillSession,
+            ClientMessage::Upgrade { binary: None },
             ClientMessage::RenameSession { name: "a".into() },
             ClientMessage::NewTab,
             ClientMessage::NextTab,
@@ -1380,6 +1481,10 @@ mod tests {
             seq: 1,
         };
         vec![
+            ServerMessage::Clipboard {
+                pane: PaneId(1),
+                text: "copied".into(),
+            },
             ServerMessage::ImagePasted {
                 pane: PaneId(1),
                 path: "/tmp/image.png".into(),
@@ -1451,6 +1556,7 @@ mod tests {
             ServerMessage::Error {
                 message: "boom".into(),
             },
+            ServerMessage::Upgrading,
             ServerMessage::Shutdown,
         ]
     }
@@ -1574,6 +1680,16 @@ mod tests {
         let pane: PaneFile = serde_json::from_value(value).expect("old pane decodes");
         assert_eq!(pane.id, 7);
         assert!(pane.native_session.is_none());
+    }
+
+    #[test]
+    fn standard_xterm_palette_uses_stable_cube_and_gray_endpoints() {
+        assert_eq!(standard_xterm_rgb(16), Some([0, 0, 0]));
+        assert_eq!(standard_xterm_rgb(21), Some([0, 0, 255]));
+        assert_eq!(standard_xterm_rgb(231), Some([255, 255, 255]));
+        assert_eq!(standard_xterm_rgb(232), Some([8, 8, 8]));
+        assert_eq!(standard_xterm_rgb(255), Some([238, 238, 238]));
+        assert_eq!(standard_xterm_rgb(15), None);
     }
 
     #[test]

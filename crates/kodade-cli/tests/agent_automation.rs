@@ -14,6 +14,7 @@ struct Harness {
     root: PathBuf,
     runtime: PathBuf,
     state: PathBuf,
+    node_hook_ready: PathBuf,
     session: String,
     daemon: Child,
 }
@@ -34,12 +35,14 @@ impl Harness {
         let state = root.join("state");
         fs::create_dir_all(&runtime).expect("create runtime directory");
         fs::create_dir_all(&state).expect("create state directory");
+        let node_hook_ready = root.join("node-hook-ready");
         let session = "automation".to_owned();
         let daemon = Command::new(BIN)
             .env("HOME", &root)
             .env("SHELL", "/bin/sh")
             .env("XDG_RUNTIME_DIR", &runtime)
             .env("XDG_STATE_HOME", &state)
+            .env("KODADE_TEST_NODE_HOOK_READY", &node_hook_ready)
             .args(["-s", &session, "daemon"])
             .spawn()
             .expect("start daemon");
@@ -47,6 +50,7 @@ impl Harness {
             root,
             runtime,
             state,
+            node_hook_ready,
             session,
             daemon,
         };
@@ -99,6 +103,21 @@ impl Harness {
         );
     }
 
+    fn wait_for_node_hook_ready(&self) {
+        let deadline = Instant::now() + Duration::from_secs(8);
+        loop {
+            if let Ok(result) = fs::read_to_string(&self.node_hook_ready) {
+                assert_eq!(result, "ready", "initial Node hook report failed: {result}");
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "initial Node hook report did not finish within 8 seconds"
+            );
+            thread::sleep(Duration::from_millis(25));
+        }
+    }
+
     fn pane_id(&self, target: &str) -> u64 {
         let output = self.command(["agent", "read", target, "--json"]);
         assert!(output.status.success(), "agent read must succeed");
@@ -133,6 +152,7 @@ fn run_bounded(command: &mut Command, timeout: Duration) -> Output {
 
 impl Drop for Harness {
     fn drop(&mut self) {
+        let _ = self.command(["kill-session"]);
         let _ = self.daemon.kill();
         let _ = self.daemon.wait();
         let _ = fs::remove_dir_all(&self.root);
@@ -229,6 +249,38 @@ fn prompt_wait_requires_new_lifecycle_and_rejects_bad_targets() {
     assert!(String::from_utf8_lossy(&replaced.stderr).contains("replaced while waiting"));
 }
 
+fn node_hook_script(on_input: &str) -> String {
+    format!(
+        r#"exec node -e '
+const {{ spawn, spawnSync }} = require("child_process");
+const fs = require("fs");
+const ready = process.env.KODADE_TEST_NODE_HOOK_READY;
+const publish = value => {{
+  fs.writeFileSync(`${{ready}}.tmp`, value);
+  fs.renameSync(`${{ready}}.tmp`, ready);
+}};
+const report = state => spawnSync(
+  process.env.KODADE_BIN,
+  ["-s", process.env.KODADE_SESSION, "agent", "report", process.env.KODADE_PANE,
+   state, "--source", "kodade:pi", "--native-agent", "pi"],
+  {{ encoding: "utf8" }},
+);
+const initial = report("working");
+if (initial.error || initial.status !== 0) {{
+  publish(JSON.stringify({{
+    status: initial.status,
+    error: initial.error?.message,
+    stdout: initial.stdout,
+    stderr: initial.stderr,
+  }}));
+  process.exit(1);
+}}
+publish("ready");
+{on_input}
+'"#
+    )
+}
+
 #[test]
 fn hook_backed_node_agent_needs_no_osc_title() {
     let harness = Harness::new();
@@ -236,9 +288,21 @@ fn hook_backed_node_agent_needs_no_osc_title() {
     // adapters, but the foreground process is Node and never writes OSC.
     harness.start(
         "hook-pi",
-        "exec node -e 'const { spawnSync } = require(\"child_process\"); const report = state => spawnSync(process.env.KODADE_BIN, [\"-s\", process.env.KODADE_SESSION, \"agent\", \"report\", process.env.KODADE_PANE, state, \"--source\", \"kodade:pi\", \"--native-agent\", \"pi\"]); report(\"working\"); process.stdin.on(\"data\", () => report(\"done\")); setTimeout(() => {}, 10000);'",
+        &node_hook_script(
+            "process.stdin.on(\"data\", () => report(\"done\")); setTimeout(() => {}, 10000);",
+        ),
     );
+    harness.wait_for_node_hook_ready();
     harness.wait_for_agent("Pi");
+    for _ in 0..2 {
+        let upgraded = harness.command(["session", "upgrade"]);
+        assert!(
+            upgraded.status.success(),
+            "upgrade failed: {}",
+            String::from_utf8_lossy(&upgraded.stderr)
+        );
+        harness.wait_for_agent("Pi");
+    }
     thread::sleep(Duration::from_millis(2100));
     let output = harness.command([
         "agent",
@@ -264,8 +328,9 @@ fn hook_identity_does_not_survive_a_node_to_sleep_replacement() {
     // Guarded automation must not paste into that replacement process.
     harness.start(
         "hook-pi-replacement",
-        "exec node -e 'const { spawn, spawnSync } = require(\"child_process\"); const report = state => spawnSync(process.env.KODADE_BIN, [\"-s\", process.env.KODADE_SESSION, \"agent\", \"report\", process.env.KODADE_PANE, state, \"--source\", \"kodade:pi\", \"--native-agent\", \"pi\"]); report(\"working\"); process.stdin.once(\"data\", () => { spawn(\"sleep\", [\"10\"], { stdio: \"inherit\" }); process.exit(0); });'",
+        &node_hook_script("process.stdin.once(\"data\", () => { spawn(\"sleep\", [\"10\"], { stdio: \"inherit\" }); process.exit(0); });"),
     );
+    harness.wait_for_node_hook_ready();
     harness.wait_for_agent("Pi");
     let pane = harness.pane_id("Pi").to_string();
     assert!(harness

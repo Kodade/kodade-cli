@@ -33,6 +33,46 @@ pub fn command_of(pid: i32) -> Option<String> {
     parse_ps_args(&String::from_utf8_lossy(&output.stdout))
 }
 
+/// Kernel start-time identity for a PID. A daemon that adopts a PTY cannot
+/// `waitpid` its original child, so later cleanup compares this value before
+/// signalling a potentially reused PID.
+pub fn start_identity(pid: i32) -> Option<String> {
+    #[cfg(target_os = "linux")]
+    {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        let end = stat.rfind(')')?;
+        let ticks = stat[end + 2..].split_whitespace().nth(19)?;
+        Some(ticks.to_owned())
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::uninit();
+        let size = std::mem::size_of::<libc::proc_bsdinfo>() as i32;
+        let read = unsafe {
+            libc::proc_pidinfo(
+                pid,
+                libc::PROC_PIDTBSDINFO,
+                0,
+                info.as_mut_ptr().cast(),
+                size,
+            )
+        };
+        if read != size {
+            return None;
+        }
+        let info = unsafe { info.assume_init() };
+        Some(format!(
+            "{}:{}",
+            info.pbi_start_tvsec, info.pbi_start_tvusec
+        ))
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
 /// Program basename for detection: strips the path and any login-shell `-`
 /// prefix (argv0 of a login shell is reported as `-zsh`).
 pub fn process_basename(command: &str) -> Option<String> {
@@ -74,6 +114,15 @@ fn parse_ps_args(output: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn current_process_has_a_stable_kernel_start_identity() {
+        let pid = std::process::id() as i32;
+        let first = start_identity(pid).expect("kernel process identity");
+        assert!(!first.is_empty());
+        assert_eq!(start_identity(pid).as_deref(), Some(first.as_str()));
+        assert!(start_identity(-1).is_none());
+    }
 
     #[test]
     fn parses_lsof_cwd_field() {
