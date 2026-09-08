@@ -260,19 +260,22 @@ state, so detection does not depend on screen strings alone.
   `PreInvocation` → working and `Stop` → done. Antigravity documents the hook
   configuration, lifecycle events, and `conversationId`, but not an ID-resume CLI contract,
   so Ködade does not persist a native session identity for restore.
-
-
-The remaining registry names are not installed as lifecycle integrations yet.
-Devin's public docs describe hosted integrations but no local CLI hook/session
- contract.
-Grok documents hook discovery under `~/.grok/hooks`, but this release's public
-hook page was not available as a stable payload contract; its documented
-[status line](https://docs.x.ai/build/features/status-line) does expose a
-`session_id`, but is a display callback and cannot author `blocked` state.
-Mastra Code exposes `/hooks` and project configuration, but its public site
-currently does not specify a hook JSON payload or thread-resume CLI argument.
-No Ködade adapter is written for those tools until their vendors publish those
-contracts.
+- `integrate devin [--write]` — merges Devin's documented Claude-compatible
+  lifecycle events into `$XDG_CONFIG_HOME/devin/config.json` (or
+  `~/.config/devin/config.json`). It reports `SessionStart` → idle,
+  prompt/tool events → working, permission requests → blocked, and
+  `Stop`/`SessionEnd` → done. Devin's published hook payload has no verified
+  native session ID, so this adapter deliberately does not claim an ID resume.
+- `integrate mastra [--write]` — merges Mastra Code's flat command entries
+  into `~/.mastracode/hooks.json`: session start → idle, prompt/agent/tool
+  events → working, permission requests → blocked, and agent end/stop → done.
+  Its documented `session_id` is retained for exact restoration with
+  `mastracode --thread ID`.
+- `integrate grok [--write]` — writes Ködade's self-contained `SessionStart`
+  configuration to `~/.grok/hooks/kodade-cli.json` (or
+  `$GROK_HOME/hooks/kodade-cli.json`). Grok merges hook files in that
+  directory, so it does not modify any user hook file. The documented
+  `session_id` restores exactly with `grok --resume ID`.
 
 Merges are idempotent and never remove unrelated keys or hooks. A previously
 installed Ködade report hook for the same event is upgraded in place (matched

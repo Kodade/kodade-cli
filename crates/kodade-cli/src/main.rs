@@ -451,6 +451,27 @@ async fn main() -> Result<()> {
                     integrations::integrate_antigravity(write)
                 }
             }
+            cli::IntegrateCommand::Devin { write, remove } => {
+                if remove {
+                    integrations::unintegrate_devin()
+                } else {
+                    integrations::integrate_devin(write)
+                }
+            }
+            cli::IntegrateCommand::Mastra { write, remove } => {
+                if remove {
+                    integrations::unintegrate_mastra()
+                } else {
+                    integrations::integrate_mastra(write)
+                }
+            }
+            cli::IntegrateCommand::Grok { write, remove } => {
+                if remove {
+                    integrations::unintegrate_grok()
+                } else {
+                    integrations::integrate_grok(write)
+                }
+            }
         },
         Some(cli::Command::Tab { command }) => tab(&socket, command).await,
         Some(cli::Command::Workspace { command }) => workspace(&socket, command).await,
@@ -1177,6 +1198,7 @@ fn hook_session_id(source: &str, agent: Option<&str>) -> Result<Option<String>> 
         | ("kodade:droid", Some("droid"))
         | ("kodade:kimi", Some("kimi"))
         | ("kodade:qwen", Some("qwen")) => "session_id",
+        ("kodade:grok", Some("grok")) | ("kodade:mastra", Some("mastra")) => "session_id",
         _ => return Ok(None),
     };
     Ok(value
