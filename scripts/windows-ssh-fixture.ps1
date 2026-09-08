@@ -151,9 +151,9 @@ Host $sshAlias
     # `agent wait` polls the pane until its hook changes it back to idle.
     # One Windows Tunnel therefore has to accept several sequential daemon
     # connections, rather than only the initial command connection.
-    $waitPane = (Invoke-Native $WindowsBinary @('--remote', $sshAlias, '--session', $session, 'run', '--', 'sh', '-c', 'sleep 1; "$KODADE_BIN" agent report "$KODADE_PANE" working --source windows-ssh-fixture; sleep 1; "$KODADE_BIN" agent report "$KODADE_PANE" idle --source windows-ssh-fixture') 45).Trim()
+    $waitPane = (Invoke-Native $WindowsBinary @('--remote', $sshAlias, '--session', $session, 'run', '--', 'sh', '-c', 'sleep 2; "$KODADE_BIN" agent report "$KODADE_PANE" working --source windows-ssh-fixture; sleep 4; "$KODADE_BIN" agent report "$KODADE_PANE" idle --source windows-ssh-fixture') 45).Trim()
     if ($waitPane -notmatch '^\d+$') { throw "remote wait fixture did not return a pane id: $waitPane" }
-    Start-Sleep -Milliseconds 1300
+    Start-Sleep -Milliseconds 2500
     Invoke-Native $WindowsBinary @('--remote', $sshAlias, '--session', $session, 'agent', 'wait', $waitPane, '--state', 'idle', '--timeout', '10') 45 | Out-Null
     Invoke-Native $WindowsBinary @('--remote', $sshAlias, '--session', $session, 'kill-session') 45 | Out-Null
 } finally {
