@@ -68,10 +68,38 @@ pub async fn resolve_socket(cli: &cli::Cli) -> Result<(PathBuf, Option<Tunnel>)>
 /// Directory Ködade CLI keeps its sockets and control paths in (the parent of
 /// the local session socket).
 fn runtime_dir() -> PathBuf {
-    kodade_cli_daemon::socket_path("default")
+    let normal = kodade_cli_daemon::socket_path("default")
         .parent()
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from("/tmp"))
+        .join("ssh");
+    // OpenSSH expands %C to 40 bytes and appends a temporary suffix. Leave
+    // room under both macOS's 104-byte and Linux's 108-byte sockaddr limits.
+    if normal.as_os_str().len() <= 35 {
+        normal
+    } else {
+        PathBuf::from(format!("/tmp/kodade-ssh-{}", unsafe { libc::geteuid() }))
+    }
+}
+
+fn ensure_runtime_dir() -> Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+    let path = runtime_dir();
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&path)?;
+    let metadata = std::fs::symlink_metadata(&path)?;
+    if !metadata.is_dir()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.permissions().mode() & 0o077 != 0
+    {
+        bail!(
+            "SSH runtime directory {} must be owned by you with mode 700",
+            path.display()
+        );
+    }
+    Ok(())
 }
 
 static FORWARD_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -81,7 +109,7 @@ struct ForwardPath(PathBuf);
 
 impl ForwardPath {
     fn allocate(host: &str, session: &str) -> Result<Self> {
-        std::fs::create_dir_all(runtime_dir()).context("create SSH runtime directory")?;
+        ensure_runtime_dir()?;
         for _ in 0..100 {
             let path = local_socket_path(host, session);
             let directory = path.parent().expect("socket directory");
@@ -238,7 +266,7 @@ async fn ssh_output(args: &[String]) -> Result<std::process::Output> {
 async fn connect(host: &str, session: &str) -> Result<(PathBuf, Tunnel)> {
     validate_host(host)?;
     crate::cli::session_name(session).map_err(anyhow::Error::msg)?;
-    std::fs::create_dir_all(runtime_dir()).context("create SSH runtime directory")?;
+    ensure_runtime_dir()?;
     let control = control_path();
     let control = control.to_string_lossy().to_string();
 
@@ -246,7 +274,8 @@ async fn connect(host: &str, session: &str) -> Result<(PathBuf, Tunnel)> {
     let probe = ssh_output(&version_args(&control, host)).await?;
     if !probe.status.success() {
         bail!(
-            "kodade-cli not found on {host}. Install it there with:\n    {INSTALL_HINT}\n(phase 2 will auto-install; for now install manually)"
+            "could not run kodade-cli on {host}: {}\nIf it is missing, install it there with:\n    {INSTALL_HINT}",
+            String::from_utf8_lossy(&probe.stderr).trim()
         );
     }
 
@@ -304,7 +333,7 @@ async fn connect(host: &str, session: &str) -> Result<(PathBuf, Tunnel)> {
 pub async fn run_session(host: &str, session: &str, command: &cli::SessionCommand) -> Result<()> {
     validate_host(host)?;
     crate::cli::session_name(session).map_err(anyhow::Error::msg)?;
-    std::fs::create_dir_all(runtime_dir()).context("create SSH runtime directory")?;
+    ensure_runtime_dir()?;
     let control = control_path();
     let control = control.to_string_lossy().to_string();
     let (remote_args, prefix): (Vec<&str>, bool) = match command {
@@ -351,7 +380,7 @@ pub async fn run_session(host: &str, session: &str, command: &cli::SessionComman
 /// Diagnose a remote endpoint without installing or starting its daemon.
 pub async fn run_doctor(host: &str, session: &str, json: bool) -> Result<()> {
     validate_host(host)?;
-    std::fs::create_dir_all(runtime_dir()).context("create SSH runtime directory")?;
+    ensure_runtime_dir()?;
     let control = control_path().to_string_lossy().into_owned();
     let mut args = vec!["doctor", "-s", session];
     if json {
