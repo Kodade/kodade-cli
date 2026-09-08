@@ -470,6 +470,25 @@ impl App {
             .collect()
     }
 
+    fn endpoint_layout_rows(&self) -> Vec<(EndpointId, String, String, LayoutSnapshot)> {
+        self.endpoint_layouts
+            .iter()
+            .map(|(id, layout)| {
+                let endpoint = self.endpoints.endpoint(id);
+                (
+                    id.clone(),
+                    endpoint
+                        .map(|item| item.label.clone())
+                        .unwrap_or_else(|| "endpoint".into()),
+                    endpoint
+                        .map(|item| format!("{:?}", item.status))
+                        .unwrap_or_default(),
+                    layout.clone(),
+                )
+            })
+            .collect()
+    }
+
     /// Sets the status-bar note in the default color; clears after `NOTE_TTL`.
     fn set_note(&mut self, text: impl Into<String>) {
         let color = self.theme.done;
@@ -703,6 +722,7 @@ impl App {
             .as_deref()
             .or_else(|| self.confirm.as_ref().map(|c| c.message.as_str()));
         let machines = self.machine_rows();
+        let endpoint_layouts = self.endpoint_layout_rows();
         render::render(
             frame,
             layout,
@@ -734,6 +754,7 @@ impl App {
                 picker: self.picker.as_ref(),
                 center: self.center.as_ref().map(CenterOverlay::overlay),
                 machines: &machines,
+                endpoint_layouts: &endpoint_layouts,
             },
             &self.theme,
         )
@@ -1370,6 +1391,16 @@ impl App {
                         self.select_endpoint(id, writer);
                         self.navigate = None;
                     }
+                    render::SidebarTarget::Scoped(endpoint, inner)
+                        if matches!(*inner, render::SidebarTarget::Workspace(_)) =>
+                    {
+                        self.select_endpoint(endpoint, writer);
+                        let render::SidebarTarget::Workspace(id) = *inner else {
+                            unreachable!("guarded workspace target")
+                        };
+                        self.toggle_collapsed(id);
+                        write(writer, &ClientMessage::SelectWorkspace { id }).await?;
+                    }
                     other => {
                         self.activate_sidebar(writer, other).await?;
                         self.navigate = None;
@@ -1386,18 +1417,16 @@ impl App {
         Ok(())
     }
 
-    /// Flat sidebar rows (workspaces then agents) for the current layout.
+    /// Flat sidebar rows for every endpoint cache. The endpoint wraps all
+    /// daemon-local ids so collision-free input routing is preserved.
     fn sidebar_flat(&self) -> Vec<render::SidebarRow> {
-        match &self.layout {
-            Some(layout) => render::sidebar_rows_with_machines(
-                layout,
-                &self.collapsed,
-                self.config.sidebar_agents_panel,
-                &self.machine_rows(),
-            )
-            .into_flat(),
-            None => Vec::new(),
-        }
+        render::sidebar_rows_for_endpoints(
+            &self.endpoint_layout_rows(),
+            &self.collapsed,
+            self.config.sidebar_agents_panel,
+            &self.machine_rows(),
+        )
+        .into_flat()
     }
 
     /// First selectable (non-heading) row index, if any.
@@ -2210,9 +2239,8 @@ impl App {
         if mouse.column < content_area.x {
             match self.sidebar_mode {
                 SidebarMode::Full => {
-                    let layout = self.layout.as_ref().expect("layout present");
-                    let model = render::sidebar_rows_with_machines(
-                        layout,
+                    let model = render::sidebar_rows_for_endpoints(
+                        &self.endpoint_layout_rows(),
                         &self.collapsed,
                         self.config.sidebar_agents_panel,
                         &self.machine_rows(),
@@ -2220,12 +2248,7 @@ impl App {
                     let place = render::sidebar_layout(size.height, &model, self.navigate);
                     if let Some((_, row)) = render::sidebar_row_at(&model, &place, mouse.row) {
                         if let Some(target) = row.target.clone() {
-                            match target {
-                                render::SidebarTarget::Endpoint(id) => {
-                                    self.select_endpoint(id, writer)
-                                }
-                                target => write(writer, &sidebar_message(target)).await?,
-                            }
+                            self.activate_sidebar(writer, target).await?;
                         }
                     }
                 }
@@ -2524,9 +2547,8 @@ impl App {
         );
         let in_sidebar = mouse.column < content.x;
         let target = if in_sidebar && self.sidebar_mode == SidebarMode::Full {
-            let layout = self.layout.as_ref().expect("layout present");
-            let model = render::sidebar_rows_with_machines(
-                layout,
+            let model = render::sidebar_rows_for_endpoints(
+                &self.endpoint_layout_rows(),
                 &self.collapsed,
                 self.config.sidebar_agents_panel,
                 &self.machine_rows(),
@@ -2535,7 +2557,9 @@ impl App {
             render::sidebar_row_at(&model, &place, mouse.row)
                 .and_then(|(_, row)| row.target.clone())
                 .and_then(|target| match target {
-                    render::SidebarTarget::Endpoint(_) => None,
+                    render::SidebarTarget::Endpoint(_) | render::SidebarTarget::Scoped(_, _) => {
+                        None
+                    }
                     render::SidebarTarget::Workspace(id) => Some(mode::MenuTarget::Workspace(id)),
                     render::SidebarTarget::Tab(id) => Some(mode::MenuTarget::Tab(id)),
                     render::SidebarTarget::Pane(id) => Some(mode::MenuTarget::Pane(id)),
@@ -2567,7 +2591,15 @@ impl App {
         writer: &mut Router,
         target: render::SidebarTarget,
     ) -> Result<()> {
-        write(writer, &sidebar_message(target)).await
+        match target {
+            render::SidebarTarget::Endpoint(id) => self.select_endpoint(id, writer),
+            render::SidebarTarget::Scoped(endpoint, inner) => {
+                self.select_endpoint(endpoint, writer);
+                write(writer, &sidebar_message(*inner)).await?;
+            }
+            target => write(writer, &sidebar_message(target)).await?,
+        }
+        Ok(())
     }
 
     // Runs the highlighted menu action and closes the menu.
@@ -2854,8 +2886,8 @@ fn expand_tilde(token: &str, home: Option<&Path>) -> PathBuf {
 // Selecting a sidebar row means focusing its workspace, tab, or pane.
 fn sidebar_message(target: render::SidebarTarget) -> ClientMessage {
     match target {
-        render::SidebarTarget::Endpoint(_) => {
-            ClientMessage::Query(kodade_cli_proto::QueryKind::Layout)
+        render::SidebarTarget::Endpoint(_) | render::SidebarTarget::Scoped(_, _) => {
+            unreachable!("endpoint targets are handled before encoding")
         }
         render::SidebarTarget::Workspace(id) => ClientMessage::SelectWorkspace { id },
         render::SidebarTarget::Tab(id) => ClientMessage::SelectTab { id },
@@ -3123,7 +3155,43 @@ mod tests {
         let (tx, rx) = mpsc::channel(8);
         let mut router = Router::new(EndpointId::Local);
         router.register(EndpointId::Local, tx);
+        router.mark_online(EndpointId::Local);
         (router, rx)
+    }
+
+    #[tokio::test]
+    async fn cached_sidebar_target_routes_colliding_pane_to_owning_endpoint() {
+        let config = config::Config::default();
+        let mut app = App::new(
+            &config,
+            "sidebar-route-test",
+            PathBuf::from("/tmp/kodade-test.sock"),
+        );
+        let (local_tx, mut local_rx) = mpsc::channel(8);
+        let (remote_tx, mut remote_rx) = mpsc::channel(8);
+        let remote = EndpointId::Machine("m1".into());
+        let mut router = Router::new(EndpointId::Local);
+        router.register(EndpointId::Local, local_tx);
+        router.register(remote.clone(), remote_tx);
+        router.mark_online(EndpointId::Local);
+        router.mark_online(remote.clone());
+
+        app.activate_sidebar(
+            &mut router,
+            render::SidebarTarget::Scoped(
+                remote.clone(),
+                Box::new(render::SidebarTarget::Pane(PaneId(1))),
+            ),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(router.selected(), &remote);
+        assert_eq!(
+            remote_rx.recv().await,
+            Some(ClientMessage::FocusPaneId { id: PaneId(1) })
+        );
+        assert!(local_rx.try_recv().is_err());
     }
 
     // A layout with the named workspaces; workspace i gets `WorkspaceId(i+1)`.

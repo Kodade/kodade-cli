@@ -138,13 +138,15 @@ pub fn spawn_machine(
         let id = EndpointId::Machine(profile.id.clone());
         let mut commands = commands;
         let mut retry = 0u8;
+        let mut cols = cols;
+        let mut rows = rows;
         let mut remote_session = profile.session.clone().unwrap_or(session);
         loop {
             let result = connect_machine(
                 &profile,
                 &remote_session,
-                cols,
-                rows,
+                &mut cols,
+                &mut rows,
                 &updates,
                 &mut commands,
             )
@@ -181,8 +183,8 @@ pub fn spawn_machine(
 async fn connect_machine(
     profile: &MachineProfile,
     session: &str,
-    cols: u16,
-    rows: u16,
+    cols: &mut u16,
+    rows: &mut u16,
     updates: &mpsc::Sender<(EndpointId, app::Update)>,
     commands: &mut mpsc::Receiver<ClientMessage>,
 ) -> Result<Option<String>> {
@@ -199,8 +201,8 @@ async fn connect_machine(
     let (reader, mut writer) = stream.into_split();
     writer
         .write_all(&encode(&ClientMessage::Hello {
-            cols,
-            rows,
+            cols: *cols,
+            rows: *rows,
             version: PROTOCOL_VERSION,
         })?)
         .await?;
@@ -242,6 +244,12 @@ async fn connect_machine(
         tokio::select! {
             command = commands.recv() => {
                 let command = command.ok_or_else(|| anyhow!("endpoint command channel closed"))?;
+                if let ClientMessage::Resize { cols: next_cols, rows: next_rows } = command {
+                    *cols = next_cols;
+                    *rows = next_rows;
+                    writer.write_all(&encode(&ClientMessage::Resize { cols: next_cols, rows: next_rows })?).await?;
+                    continue;
+                }
                 writer.write_all(&encode(&command)?).await?;
             }
             line = lines.next_line() => {
