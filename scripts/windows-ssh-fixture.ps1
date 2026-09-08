@@ -74,7 +74,7 @@ try {
     Invoke-Native 'wsl.exe' @('--import', $distro, $distroRoot, $rootfs, '--version', '1') 60 | Out-Null
 
     Write-Host 'installing Unix OpenSSH server'
-    Invoke-Wsl @('sh', '-lc', 'apk add --no-cache openssh')
+    Invoke-Wsl @('sh', '-lc', 'apk add --no-cache nodejs openssh')
     # A freshly imported Alpine rootfs has no host keys. Generate them before
     # the foreground sshd starts so it can bind rather than exiting silently.
     Invoke-Wsl @('ssh-keygen', '-A')
@@ -148,13 +148,31 @@ Host $sshAlias
     }
     if (-not $seen) { throw 'Unix PTY output did not return through the Windows SSH bridge' }
 
-    # `agent wait` polls the pane until its hook changes it back to idle.
-    # One Windows Tunnel therefore has to accept several sequential daemon
-    # connections, rather than only the initial command connection.
-    $waitPane = (Invoke-Native $WindowsBinary @('--remote', $sshAlias, '--session', $session, 'run', '--', 'sh', '-c', 'sleep 2; "$KODADE_BIN" agent report "$KODADE_PANE" working --source windows-ssh-fixture; sleep 4; "$KODADE_BIN" agent report "$KODADE_PANE" idle --source windows-ssh-fixture') 45).Trim()
+    # Use a live Node wrapper and the same trusted Pi hook identity as the
+    # native smoke. This proves `agent wait` only accepts a current adapter
+    # process, rather than turning an arbitrary remote shell into an agent.
+    $nodeHook = @'
+const { spawnSync } = require("child_process");
+const report = state => spawnSync(process.env.KODADE_BIN, ["agent", "report", process.env.KODADE_PANE, state, "--source", "kodade:pi", "--native-agent", "pi"]);
+setTimeout(() => report("working"), 1000);
+setTimeout(() => report("idle"), 5000);
+setInterval(() => {}, 1000);
+'@
+    # `agent wait` polls through several bridge connections until the adapter
+    # transitions to idle. First observe the live adapter rather than guessing
+    # when the WSL process group has made Node its foreground process.
+    $waitPane = (Invoke-Native $WindowsBinary @('--remote', $sshAlias, '--session', $session, 'run', '--', 'node', '-e', $nodeHook) 45).Trim()
     if ($waitPane -notmatch '^\d+$') { throw "remote wait fixture did not return a pane id: $waitPane" }
-    Start-Sleep -Milliseconds 2500
-    Invoke-Native $WindowsBinary @('--remote', $sshAlias, '--session', $session, 'agent', 'wait', $waitPane, '--state', 'idle', '--timeout', '10') 45 | Out-Null
+    $recognized = $false
+    for ($attempt = 0; $attempt -lt 50; $attempt++) {
+        try {
+            Invoke-Native $WindowsBinary @('--remote', $sshAlias, '--session', $session, 'agent', 'read', 'Pi') 45 | Out-Null
+            $recognized = $true
+            break
+        } catch { Start-Sleep -Milliseconds 100 }
+    }
+    if (-not $recognized) { throw 'Node hook was not recognized through the Windows SSH bridge' }
+    Invoke-Native $WindowsBinary @('--remote', $sshAlias, '--session', $session, 'agent', 'wait', 'Pi', '--state', 'idle', '--timeout', '10') 45 | Out-Null
     Invoke-Native $WindowsBinary @('--remote', $sshAlias, '--session', $session, 'kill-session') 45 | Out-Null
 } finally {
     if ($null -ne $sshProcess -and -not $sshProcess.HasExited) {
