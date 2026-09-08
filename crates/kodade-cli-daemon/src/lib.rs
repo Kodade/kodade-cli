@@ -2,6 +2,9 @@
 
 mod agent;
 mod git;
+#[cfg(unix)]
+#[allow(dead_code)] // Wired into the upgrade command after the runtime importer lands.
+mod handoff;
 mod layout;
 mod manifest;
 mod persist;
@@ -180,7 +183,7 @@ struct Pane {
     spawn_cwd: Option<PathBuf>,
     /// Kept so dropping the pane ends its process; otherwise the PTY reader
     /// thread never sees EOF (the daemon and the test runtime would wait forever).
-    child: Mutex<Box<dyn portable_pty::Child + Send>>,
+    child: Mutex<Option<Box<dyn portable_pty::Child + Send>>>,
     process: Mutex<ProcessEvidence>,
     // Tracks the current detected state and its start as one atomic transition,
     // so concurrent snapshots cannot publish the same change twice.
@@ -196,8 +199,10 @@ struct Pane {
 impl Drop for Pane {
     fn drop(&mut self) {
         if let Ok(mut child) = self.child.lock() {
-            let _ = child.kill();
-            let _ = child.wait();
+            if let Some(mut child) = child.take() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
         }
     }
 }
@@ -3010,7 +3015,7 @@ impl Pane {
             spawn_process,
             spawn_command: run,
             spawn_cwd: cwd,
-            child: Mutex::new(child),
+            child: Mutex::new(Some(child)),
             process: Mutex::new(ProcessEvidence {
                 pid: None,
                 name: None,
