@@ -1159,6 +1159,8 @@ impl App {
             return self.handle_prefix_key(key, writer, term).await;
         } else if config::normalize_key(key) == self.config.prefix {
             self.prefix = true;
+        } else if let Some(command) = self.config.command(key, true).cloned() {
+            return self.run_configured_command(command, writer).await;
         } else if let Some(action) = self.config.global_action(key) {
             // Global chords (ctrl/alt, no `prefix+`) fire before the pane sees the key.
             return self.run_action(action, writer, term).await;
@@ -1686,6 +1688,9 @@ impl App {
             .await?;
             return Ok(Flow::Continue);
         }
+        if let Some(command) = self.config.command(key, false).cloned() {
+            return self.run_configured_command(command, writer).await;
+        }
         let Some(action) = self.config.action(key) else {
             // An unbound key after the prefix: nudge toward the help overlay.
             let chord = config::render_chord(config::normalize_key(key));
@@ -1693,6 +1698,104 @@ impl App {
             return Ok(Flow::Continue);
         };
         self.run_action(action, writer, term).await
+    }
+
+    async fn run_configured_command(
+        &mut self,
+        command: config::ConfiguredCommand,
+        writer: &mut Router,
+    ) -> Result<Flow> {
+        if self.remote_endpoint {
+            self.set_note(" configured commands are local-only for remote sessions");
+            return Ok(Flow::Continue);
+        }
+        let context = self.plugin_context(None);
+        if !context.supports_contexts(&command.contexts) {
+            self.set_note(format!(" command {} is not applicable here", command.label));
+            return Ok(Flow::Continue);
+        }
+        let cwd = command
+            .cwd
+            .clone()
+            .or(context.cwd.clone())
+            .unwrap_or_else(|| PathBuf::from("."));
+        if command.pane {
+            let workspace = context.workspace.clone().unwrap_or_default();
+            let pane = context.pane.clone().unwrap_or_default();
+            let args = crate::plugins::pane_command_with_context(
+                "configured-command",
+                &cwd,
+                &command.command,
+                Some(&command.label),
+                &workspace,
+                &pane,
+                &context,
+            )?;
+            write(
+                writer,
+                &ClientMessage::NewPane {
+                    workspace: None,
+                    tab: None,
+                    split: None,
+                    command: Some(args),
+                    name: Some(command.label),
+                },
+            )
+            .await?;
+            return Ok(Flow::Continue);
+        }
+        let plugin = crate::plugins::LoadedPlugin {
+            manifest: kodade_cli_proto::PluginManifest {
+                manifest_version: 1,
+                id: "configured-command".into(),
+                name: "Configured command".into(),
+                version: "1".into(),
+                min_kodade_version: None,
+                build: None,
+                actions: vec![],
+                startup: vec![],
+                events: vec![],
+                panes: vec![],
+                link_handlers: vec![],
+            },
+            installed: crate::plugins::InstalledPlugin {
+                path: cwd,
+                linked: true,
+                enabled: true,
+                version: "1".into(),
+            },
+        };
+        let action = kodade_cli_proto::PluginAction {
+            id: command.label.clone(),
+            name: command.label.clone(),
+            command: command.command,
+            description: String::new(),
+            pane: false,
+            contexts: command.contexts,
+        };
+        let session = self.session_name.clone();
+        let socket = self.socket.clone();
+        let results = self.plugin_result_tx.clone();
+        let label = command.label.clone();
+        tokio::spawn(async move {
+            let note = match crate::plugins::run_action_with_context(
+                &plugin,
+                &action,
+                &context,
+                &session,
+                &socket,
+                Duration::from_secs(30),
+            )
+            .await
+            {
+                Ok(status) if status.success() => format!(" command {label} complete"),
+                Ok(status) => format!(" command {label} failed: {status}"),
+                Err(error) => format!(" command {label} failed: {error}"),
+            };
+            let _ = results.send(note);
+        });
+        self.set_note(format!(" command {} started", command.label));
+        Ok(Flow::Continue)
     }
 
     // Runs a bound action, whether it came from the prefix table or a global chord.
@@ -2189,6 +2292,12 @@ impl App {
             }
             palette::PaletteTarget::PluginUnavailable(error) => {
                 self.set_note(format!(" plugin registry error: {error}"));
+            }
+            palette::PaletteTarget::ConfiguredCommand(index) => {
+                if let Some(command) = self.config.commands.get(index).cloned() {
+                    return self.run_configured_command(command, writer).await;
+                }
+                self.set_note(" configured command is stale; reload config");
             }
         }
         Ok(Flow::Continue)

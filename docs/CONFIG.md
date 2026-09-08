@@ -272,6 +272,33 @@ ordinary interactive tab.
 `reload_config` re-reads this file and the theme in place, and `settings`
 opens the [settings menu](#settings-menu).
 
+## Configured commands
+
+Use `[[commands]]` for named local tasks without installing a plugin. Commands
+are read only from your config file, appear in the command center, and can use
+a prefixed key or a global modified chord. `contexts` limits discovery to the
+current workspace, tab, pane, or text selection. `cwd` overrides the focused
+pane directory; `pane = true` opens a normal terminal pane.
+
+```toml
+[[commands]]
+label = "format"
+key = "prefix+f"
+command = "cargo fmt"
+contexts = ["workspace"]
+
+[[commands]]
+label = "explain selection"
+key = "ctrl+alt+e"
+command = "my-tool explain"
+contexts = ["selection"]
+cwd = "/tmp/project"
+```
+
+Background commands receive the same bounded private JSON context file as
+extensions in `KODADE_PLUGIN_CONTEXT`; values are data and are never inserted
+into shell source. Reload config to replace command bindings.
+
 `paste_buffer` re-sends the last paste (or copy-mode yank, or mouse selection) into the focused
 pane; it reports `paste buffer empty` when nothing has been copied yet. See
 [Paste](#paste).

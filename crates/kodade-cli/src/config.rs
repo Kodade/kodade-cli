@@ -723,23 +723,37 @@ impl Config {
         let mut config = Self::default();
         for command in &file.commands {
             if command.label.trim().is_empty() || command.command.trim().is_empty() {
-                config.warnings.push("configured command needs label and command".into());
+                config
+                    .warnings
+                    .push("configured command needs label and command".into());
                 continue;
             }
             match parse_binding(&command.key) {
                 Ok(binding) => {
                     let index = config.commands.len();
-                    let target = if binding.global { &mut config.command_globals } else { &mut config.command_bindings };
+                    let target = if binding.global {
+                        &mut config.command_globals
+                    } else {
+                        &mut config.command_bindings
+                    };
                     // Built-in actions keep precedence; the warning makes an ignored
                     // custom chord explicit rather than silently changing navigation.
-                    if (binding.global && config.globals.contains_key(&binding.key)) || (!binding.global && config.bindings.contains_key(&binding.key)) || target.contains_key(&binding.key) {
-                        config.warnings.push(format!("configured command {} key is already bound", command.label));
+                    if (binding.global && config.globals.contains_key(&binding.key))
+                        || (!binding.global && config.bindings.contains_key(&binding.key))
+                        || target.contains_key(&binding.key)
+                    {
+                        config.warnings.push(format!(
+                            "configured command {} key is already bound",
+                            command.label
+                        ));
                     } else {
                         target.insert(binding.key, index);
                         config.commands.push(command.clone());
                     }
                 }
-                Err(error) => config.warnings.push(format!("configured command {}: {error}", command.label)),
+                Err(error) => config
+                    .warnings
+                    .push(format!("configured command {}: {error}", command.label)),
             }
         }
         if let Some(theme) = file.theme {
@@ -1068,8 +1082,13 @@ impl Config {
     }
 
     pub fn command(&self, key: KeyEvent, global: bool) -> Option<&ConfiguredCommand> {
-        let map = if global { &self.command_globals } else { &self.command_bindings };
-        map.get(&normalize_key(key)).and_then(|index| self.commands.get(*index))
+        let map = if global {
+            &self.command_globals
+        } else {
+            &self.command_bindings
+        };
+        map.get(&normalize_key(key))
+            .and_then(|index| self.commands.get(*index))
     }
 
     pub fn resolve_theme(&self) -> Theme {
@@ -1786,6 +1805,43 @@ red = \"#abcdef\"
             Config::default().global_action(parse_key_chord("ctrl+alt+v").unwrap()),
             None
         );
+    }
+
+    #[test]
+    fn configured_commands_parse_with_scopes_and_preserve_builtin_precedence() {
+        let file: FileConfig = toml::from_str(
+            r#"
+[[commands]]
+label = "format"
+key = "prefix+f"
+command = "cargo fmt"
+contexts = ["workspace", "selection"]
+cwd = "/tmp/project"
+
+[[commands]]
+label = "reserved"
+key = "prefix+c"
+command = "false"
+"#,
+        )
+        .unwrap();
+        let config = Config::from_file(file);
+        let command = config
+            .command(parse_key_chord("f").unwrap(), false)
+            .unwrap();
+        assert_eq!(command.label, "format");
+        assert_eq!(
+            command.cwd.as_deref(),
+            Some(std::path::Path::new("/tmp/project"))
+        );
+        assert_eq!(command.contexts.len(), 2);
+        assert!(config
+            .command(parse_key_chord("c").unwrap(), false)
+            .is_none());
+        assert!(config
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("reserved")));
     }
 
     #[test]
