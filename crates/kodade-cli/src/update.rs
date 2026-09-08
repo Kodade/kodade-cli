@@ -638,7 +638,8 @@ mod tests {
 
         install_archive(&archive, &digest, &destination).unwrap();
         running.wait().unwrap();
-        let deadline = Instant::now() + Duration::from_secs(5);
+        // The detached helper retries a busy executable for up to ten seconds.
+        let deadline = Instant::now() + Duration::from_secs(15);
         while Instant::now() < deadline
             && !matches!(fs::read(&destination), Ok(bytes) if bytes == b"updated executable")
         {
