@@ -75,7 +75,11 @@ fn descendant_from_entries(
         return Some((root as i32, Some(windows_process_name(&root_entry.name))));
     }
     let mut queue = vec![root];
+    let mut visited = std::collections::HashSet::new();
     while let Some(parent) = queue.pop() {
+        if !visited.insert(parent) {
+            continue;
+        }
         for child in entries.iter().filter(|entry| entry.parent == parent) {
             if !is_windows_shell(&child.name) {
                 return Some((child.pid as i32, Some(windows_process_name(&child.name))));
@@ -263,6 +267,11 @@ mod windows_tests {
                 pid: 12,
                 parent: 11,
                 name: "node.exe".into(),
+            },
+            WindowsProcessEntry {
+                pid: 13,
+                parent: 12,
+                name: "kodade-cli.exe".into(),
             },
         ];
         assert_eq!(
