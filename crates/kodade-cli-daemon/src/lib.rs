@@ -1789,6 +1789,16 @@ impl Session {
         })
     }
 
+    fn discard_pending_clipboards(&self) {
+        if let Ok(panes) = self.panes.lock() {
+            for pane in panes.values() {
+                if let Ok(mut parser) = pane.parser.lock() {
+                    parser.callbacks_mut().clipboard = None;
+                }
+            }
+        }
+    }
+
     /// Queues a notification with the next sequence number, capping the ring at
     /// 64 so a long-lived session never grows the queue without bound.
     fn push_notification(
@@ -4613,6 +4623,9 @@ async fn serve_client(stream: UnixStream, session: Arc<Session>) -> Result<()> {
                 match result {
                     Ok(()) if hello => {
                         initialized = true;
+                        // A newly attached client must never replay a pane's
+                        // historical OSC 52 request into a fresh host clipboard.
+                        session.discard_pending_clipboards();
                         write_server(&mut writer, &ServerMessage::Welcome { session: session.session_name(), version: PROTOCOL_VERSION }).await?;
                         // The first client attach sees `restored: true`; clear it
                         // afterward so later snapshots (and `ls`) report normally.
@@ -4790,6 +4803,94 @@ mod tests {
             .lock()
             .unwrap()
             .process(b"\x1b]52;c;not-base64!\x07");
+        assert!(session.take_view_clipboard(&view).is_none());
+    }
+
+    #[tokio::test]
+    async fn real_pty_osc52_reaches_only_the_live_focused_client() {
+        let session = Arc::new(Session::spawn(80, 24, "clipboard-pty".into()).expect("session"));
+        let (client, server) = UnixStream::pair().expect("socket pair");
+        let server_task = tokio::spawn(serve_client(server, Arc::clone(&session)));
+        let (reader, mut writer) = client.into_split();
+        let mut lines = BufReader::new(reader).lines();
+        writer
+            .write_all(
+                &encode(&ClientMessage::Hello {
+                    cols: 80,
+                    rows: 24,
+                    version: PROTOCOL_VERSION,
+                })
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            next_server_message(&mut lines).await,
+            ServerMessage::Welcome { .. }
+        ));
+        assert!(matches!(
+            next_server_message(&mut lines).await,
+            ServerMessage::Layout(_)
+        ));
+        // This command executes inside the pane's actual PTY; the parser sees
+        // its OSC 52 output and the attached socket receives one copy request.
+        writer
+            .write_all(
+                &encode(&ClientMessage::Input {
+                    bytes: b"printf '\\033]52;c;aGk=\\007'\n".to_vec(),
+                })
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let clipboard = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let ServerMessage::Clipboard { text, .. } = next_server_message(&mut lines).await
+                {
+                    break text;
+                }
+            }
+        })
+        .await
+        .expect("OSC 52 delivery");
+        assert_eq!(clipboard, "hi");
+        drop(writer);
+        server_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn hidden_pane_clipboard_waits_for_focus_and_cold_attach_discards_it() {
+        let session = Session::spawn(80, 24, "clipboard-focus".into()).expect("session");
+        let first = session.snapshot().unwrap().panes[0].id;
+        session.handle(ClientMessage::SplitRight).unwrap();
+        let mut view = session.new_client_view().unwrap();
+        let (_, _, focused) = Session::view_selection(&session.state.lock().unwrap(), Some(&view));
+        let hidden = session
+            .snapshot()
+            .unwrap()
+            .panes
+            .into_iter()
+            .map(|pane| pane.id)
+            .find(|id| *id != focused)
+            .expect("second pane");
+        let pane = session.panes.lock().unwrap()[&hidden].clone();
+        pane.parser
+            .lock()
+            .unwrap()
+            .process(b"\x1b]52;c;aGlkZGVu\x07");
+        assert!(session.take_view_clipboard(&view).is_none());
+        view.focused.insert(view.tabs[&view.workspace], hidden);
+        assert!(matches!(
+            session.take_view_clipboard(&view),
+            Some(ServerMessage::Clipboard { pane, text }) if pane == hidden && text == "hidden"
+        ));
+        let first_pane = session.panes.lock().unwrap()[&first].clone();
+        first_pane
+            .parser
+            .lock()
+            .unwrap()
+            .process(b"\x1b]52;c;Y29sZA==\x07");
+        session.discard_pending_clipboards();
         assert!(session.take_view_clipboard(&view).is_none());
     }
 

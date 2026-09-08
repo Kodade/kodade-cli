@@ -46,6 +46,10 @@ fn command() -> (&'static str, &'static [&'static str]) {
 
 async fn native_copy(text: &str) -> Result<()> {
     let (program, args) = command();
+    run_native(program, args, text, CLIPBOARD_TIMEOUT).await
+}
+
+async fn run_native(program: &str, args: &[&str], text: &str, timeout: Duration) -> Result<()> {
     let mut child = tokio::process::Command::new(program)
         .args(args)
         .stdin(Stdio::piped())
@@ -55,7 +59,7 @@ async fn native_copy(text: &str) -> Result<()> {
         .spawn()
         .with_context(|| format!("native clipboard needs {program}"))?;
     let mut stdin = child.stdin.take().expect("piped clipboard stdin");
-    tokio::time::timeout(CLIPBOARD_TIMEOUT, async {
+    tokio::time::timeout(timeout, async {
         stdin.write_all(text.as_bytes()).await?;
         drop(stdin);
         let status = child.wait().await?;
@@ -82,5 +86,37 @@ mod tests {
     fn remote_copy_never_selects_a_native_program() {
         assert!(!use_native(true));
         assert!(use_native(false));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn native_backend_writes_the_exact_stdin_payload() {
+        let path = std::env::temp_dir().join(format!("kodade-clipboard-{}", std::process::id()));
+        let script = format!("cat > {}", path.display());
+        run_native(
+            "sh",
+            &["-c", &script],
+            "copied text",
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("clipboard command");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "copied text");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn native_backend_failure_and_timeout_return_errors() {
+        assert!(
+            run_native("sh", &["-c", "exit 1"], "x", Duration::from_secs(1))
+                .await
+                .is_err()
+        );
+        assert!(
+            run_native("sh", &["-c", "sleep 1"], "x", Duration::from_millis(10))
+                .await
+                .is_err()
+        );
     }
 }
