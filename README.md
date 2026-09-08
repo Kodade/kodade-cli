@@ -225,10 +225,21 @@ for the installed version. The scripting commands are:
 - `kodade-cli events [--json]` — stream session events until interrupted.
 - `kodade-cli completion zsh|bash|fish` — print a completion script.
 - `kodade-cli agent ls` — list recognized agents and states.
-- `kodade-cli agent attach PANE` — focus a pane and attach the TUI.
-- `kodade-cli agent rename PANE NAME` — rename a pane.
-- `kodade-cli agent explain PANE` — print a pane's state, reason, and the bottom-8-line window it matched.
-- `kodade-cli agent wait PANE --state STATE [--timeout S]` — block until a pane
+- `kodade-cli agent start [-w WS] [-t TAB] [--name NAME] -- CMD…` — start an
+  agent in a **new** pane; it never types into an existing shell.
+- `kodade-cli agent read TARGET [--scrollback] [--lines N] [--json]` — read a
+  recognized agent by pane id, unique agent name or pane title, or `current`.
+- `kodade-cli agent prompt TARGET TEXT [--wait|--until STATE] [--timeout S]` —
+  sanitize and bracket-paste a prompt, then submit it after rejecting blocked
+  and non-agent targets. Waiting requires fresh activity before accepting a
+  settled state, so stale `idle`/`done` values cannot produce a false success.
+  Each prompt is an ordered, 64 KiB-max PTY submission.
+- `kodade-cli agent send-keys TARGET KEYS…` / `agent focus TARGET` — drive or
+  select a recognized agent by the same target syntax.
+- `kodade-cli agent attach TARGET` — focus a recognized agent and attach the TUI.
+- `kodade-cli agent rename TARGET NAME` — rename a recognized agent pane.
+- `kodade-cli agent explain TARGET` — print an agent's state, reason, and the bottom-8-line window it matched.
+- `kodade-cli agent wait TARGET --state STATE [--timeout S]` — block until an agent
   reaches a state; exits 0 when it does and 2 on timeout.
 - `kodade-cli agent report PANE STATE` — report an agent state to the daemon.
 - `kodade-cli agent update-manifests` — opt-in refresh of agent-detection manifests from GitHub.
@@ -263,11 +274,10 @@ kodade-cli ls --json | jq '.panes[] | {id: .id, state: .state}'
 kodade-cli events --json | jq -r 'select(.AgentStateChanged) | .AgentStateChanged.pane'
 ```
 
-`pane wait-output PANE --match TEXT` waits for text on a pane's **visible
-screen** (not its scrollback), so text that has already scrolled off is not
-matched. The match is a plain substring, not a regular expression — Ködade CLI
-ships without a regex dependency, so `--match` is documented as text rather than
-`REGEX`. Both waits work on panes in background tabs and workspaces.
+`pane wait-output PANE --match TEXT` waits for text on a pane's visible screen;
+`--scrollback` searches the durable history too. `--regex` treats `TEXT` as a
+regular expression (invalid patterns fail before polling). Both waits work on
+panes in background tabs and workspaces.
 
 `pane send-keys` accepts tmux-style key names — `Enter`, `Escape`, `Tab`,
 `Space`, `BSpace`, arrows, `Home`, `End`, `PageUp`, `PageDown`, `Insert`,

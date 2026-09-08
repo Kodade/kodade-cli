@@ -56,6 +56,7 @@ printf '%s\n' '{"Query":"Layout"}' | nc -U /tmp/kodade-cli-$UID/default.sock
 | `FocusPaneId` | `{"FocusPaneId":{"id":3}}` | `Layout` |
 | `FocusPaneCycle` | `{"FocusPaneCycle":{"forward":true}}` | `Layout` |
 | `SendToPane` | `{"SendToPane":{"id":3,"bytes":[121,13]}}` | `Layout` |
+| `PromptAgent` | `{"PromptAgent":{"pane":3,"expected_agent":"Codex","expected_generation":1,"bytes":[121]}}` | `Pane` |
 | `RenamePane` / `RenameTab` / `RenameWorkspace` | `{"RenameTab":{"name":"agents"}}` | `Layout` |
 | `RenamePaneId` / `RenameTabId` / `RenameWorkspaceId` | `{"RenameTabId":{"id":2,"name":"agents"}}` | `Layout` |
 | `RenameSession` | `{"RenameSession":{"name":"work"}}` | `Layout` |
@@ -107,6 +108,15 @@ answers `Error` and changes nothing.
 Messages that act on "the focused pane" (`ClosePane`, `ZoomPane`, `SwapPane`,
 `ResizePane`, `BreakPane`, …) have no id argument: send `FocusPaneId` first.
 That is exactly what `kodade-cli pane kill|zoom|swap|resize` does.
+
+`PromptAgent` is the guarded automation write used by `agent prompt`. The
+daemon re-detects the pane immediately before writing and requires both the
+recognized agent label and `PaneSnapshot.agent_generation` to match; it rejects
+blocked, exited, or replaced agents without writing any bytes. Its `bytes`
+payload is one ordered PTY submission and is capped at 64 KiB.
+The check uses a fresh foreground-process probe; a process may still exit in
+the kernel interval between that probe and the PTY write, so automation should
+surface the command's result and retry only after resolving the target again.
 
 ## Server messages
 

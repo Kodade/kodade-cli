@@ -192,6 +192,8 @@ mod tests {
                 scroll_offset: 0,
                 screen: Default::default(),
                 agent: Some("codex".into()),
+                agent_generation: 1,
+                activity_revision: 0,
                 state: AgentStateKind::Blocked,
                 state_reason: String::new(),
                 state_age_secs: 0,

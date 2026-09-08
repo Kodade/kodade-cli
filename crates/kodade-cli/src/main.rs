@@ -1,4 +1,5 @@
 mod app;
+mod automation;
 mod cli;
 mod commands;
 mod config;
@@ -16,7 +17,7 @@ mod selection;
 mod settings;
 mod state;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use clap::Parser;
 use crossterm::{
     event::{DisableBracketedPaste, EnableBracketedPaste},
@@ -98,7 +99,14 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Some(cli::Command::Agent { command }) => {
-            agent(&socket, &session, &config::Config::load(), command).await
+            agent(
+                &socket,
+                &session,
+                remote.as_deref(),
+                &config::Config::load(),
+                command,
+            )
+            .await
         }
         Some(cli::Command::Pane { command }) => pane(&socket, command).await,
         Some(cli::Command::Send {
@@ -331,17 +339,41 @@ async fn pane(socket: &Path, command: cli::PaneCommand) -> Result<()> {
         cli::PaneCommand::WaitOutput {
             pane,
             text,
+            regex,
+            scrollback,
             timeout,
         } => {
-            let reached = commands::poll_pane(socket, pane, timeout, |snapshot| {
-                snapshot.screen.contents.contains(&text)
-            })
-            .await?;
+            let matcher = commands::output_matcher(&text, regex)?;
+            // `poll_pane` only exposes screen snapshots. Output waits need the
+            // daemon's durable history when requested, so read through the
+            // same pane-id seam instead.
+            let reached = wait_output(socket, pane, &matcher, scrollback, timeout).await?;
             if !reached {
                 std::process::exit(2);
             }
             Ok(())
         }
+    }
+}
+
+/// Wait for a literal or regex match in a pane's visible screen or durable
+/// scrollback. The pane id is never re-resolved, so replacement fails safely.
+async fn wait_output(
+    socket: &Path,
+    pane: kodade_cli_proto::PaneId,
+    matcher: &commands::OutputMatcher,
+    scrollback: bool,
+    timeout: Option<u64>,
+) -> Result<bool> {
+    let deadline = timeout.map(|secs| std::time::Instant::now() + Duration::from_secs(secs));
+    loop {
+        if matcher.matches(&commands::read_pane(socket, pane, scrollback, None).await?) {
+            return Ok(true);
+        }
+        if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+            return Ok(false);
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
     }
 }
 
@@ -620,6 +652,7 @@ fn config_command(command: cli::ConfigCommand) {
 async fn agent(
     socket: &Path,
     session: &str,
+    remote: Option<&str>,
     config: &config::Config,
     command: cli::AgentCommand,
 ) -> Result<()> {
@@ -637,36 +670,114 @@ async fn agent(
             }
             Ok(())
         }
-        cli::AgentCommand::Attach { pane } => {
-            commands::layout(
-                commands::request(socket, ClientMessage::FocusPaneId { id: pane }).await?,
-            )?;
+        cli::AgentCommand::Start {
+            workspace,
+            tab,
+            name,
+            json,
+            command,
+        } => {
+            let (workspace, tab) = resolve_target(socket, workspace, tab).await?;
+            let pane = automation::start(socket, workspace, tab, name, command).await?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&pane)?);
+            } else {
+                println!("{}", pane.id.0);
+            }
+            Ok(())
+        }
+        cli::AgentCommand::Read {
+            target,
+            lines,
+            scrollback,
+            json,
+        } => {
+            let target = contextual_agent_target(&target, session, remote)?;
+            let (pane, text) = automation::read(socket, &target, scrollback, lines).await?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(
+                        &serde_json::json!({ "pane": pane, "text": text })
+                    )?
+                );
+            } else {
+                println!("{text}");
+            }
+            Ok(())
+        }
+        cli::AgentCommand::SendKeys {
+            target,
+            keys,
+            literal,
+        } => {
+            let target = contextual_agent_target(&target, session, remote)?;
+            automation::send_keys(socket, &target, &keys, literal).await?;
+            Ok(())
+        }
+        cli::AgentCommand::Prompt {
+            target,
+            text,
+            wait,
+            until,
+            timeout,
+            json,
+        } => {
+            let target = contextual_agent_target(&target, session, remote)?;
+            match automation::prompt(socket, &target, &text, wait, until, timeout).await? {
+                automation::PromptOutcome::Sent(pane)
+                | automation::PromptOutcome::Settled(pane) => {
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&pane)?);
+                    }
+                    Ok(())
+                }
+                automation::PromptOutcome::TimedOut => {
+                    std::process::exit(2);
+                }
+            }
+        }
+        cli::AgentCommand::Focus { target, json } => {
+            let target = contextual_agent_target(&target, session, remote)?;
+            let pane = automation::focus(socket, &target).await?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&pane)?);
+            }
+            Ok(())
+        }
+        cli::AgentCommand::Attach { target } => {
+            let target = contextual_agent_target(&target, session, remote)?;
+            automation::focus(socket, &target).await?;
             attach(socket, session, config).await
         }
-        cli::AgentCommand::Rename { pane, name } => {
+        cli::AgentCommand::Rename { target, name } => {
+            let target = contextual_agent_target(&target, session, remote)?;
+            let pane = automation::agent_target(socket, &target).await?;
             commands::layout(
-                commands::request(socket, ClientMessage::RenamePaneId { id: pane, name }).await?,
+                commands::request(socket, ClientMessage::RenamePaneId { id: pane.id, name })
+                    .await?,
             )?;
             Ok(())
         }
-        cli::AgentCommand::Explain { pane, json } => {
-            let layout =
-                commands::layout(commands::request(socket, commands::layout_query()).await?)?;
-            let pane = commands::find_pane(&layout, pane)?;
+        cli::AgentCommand::Explain { target, json } => {
+            let target = contextual_agent_target(&target, session, remote)?;
+            let pane = automation::agent_target(socket, &target).await?;
             if json {
-                println!("{}", serde_json::to_string_pretty(pane)?);
+                println!("{}", serde_json::to_string_pretty(&pane)?);
             } else {
-                println!("{}", commands::format_explain(pane));
+                println!("{}", commands::format_explain(&pane));
             }
             Ok(())
         }
         cli::AgentCommand::Wait {
-            pane,
+            target,
             state,
             timeout,
         } => {
+            let target = contextual_agent_target(&target, session, remote)?;
+            let pane = automation::agent_target(socket, &target).await?;
             let reached =
-                commands::poll_pane(socket, pane, timeout, |snapshot| snapshot.state == state)
+                commands::poll_pane(socket, pane.id, timeout, |snapshot| snapshot.state == state)
                     .await?;
             if !reached {
                 std::process::exit(2);
@@ -693,6 +804,28 @@ async fn agent(
             Ok(())
         }
     }
+}
+
+/// `current` is only meaningful inside a pane Ködade spawned. Reading its
+/// inherited identity prevents a shell command from accidentally targeting the
+/// TUI's globally focused pane, and rejects a different session or remote.
+fn contextual_agent_target(target: &str, session: &str, remote: Option<&str>) -> Result<String> {
+    if target != "current" {
+        return Ok(target.into());
+    }
+    if remote.is_some() {
+        bail!("`current` cannot be used with --remote; pass an explicit pane target")
+    }
+    let inherited_session = std::env::var("KODADE_SESSION")
+        .map_err(|_| anyhow!("`current` requires KODADE_PANE inside a Ködade pane"))?;
+    if inherited_session != session {
+        bail!("`current` belongs to session '{inherited_session}', not '{session}'")
+    }
+    let pane = std::env::var("KODADE_PANE")
+        .map_err(|_| anyhow!("`current` requires KODADE_PANE inside a Ködade pane"))?;
+    pane.parse::<u64>()
+        .map_err(|_| anyhow!("KODADE_PANE is not a valid pane id"))?;
+    Ok(pane)
 }
 
 /// `worktree` subcommands: add, remove, and list git-worktree workspaces (#22).
