@@ -156,6 +156,14 @@ impl Router {
         self.send_to(&self.selected, message)
     }
 
+    /// Theme colors describe this TUI, so every endpoint must retain them for
+    /// its next reconnect whether it is currently selected or not.
+    pub fn broadcast(&self, message: ClientMessage) {
+        for sender in self.senders.values() {
+            let _ = sender.try_send(message.clone());
+        }
+    }
+
     pub fn send_to(&self, endpoint: &EndpointId, message: ClientMessage) -> Result<()> {
         if !self.online.contains(endpoint) {
             *self.notice.borrow_mut() = Some("input not sent · machine is disconnected".into());
@@ -233,7 +241,10 @@ pub fn spawn_machine(
             loop {
                 tokio::select! {
                     _ = &mut sleep => break,
-                    message = commands.recv() => if message.is_none() { return; },
+                    message = commands.recv() => match message {
+                        Some(message) => viewport.apply(&message),
+                        None => return,
+                    },
                 }
             }
         }
@@ -248,12 +259,6 @@ async fn connect_machine(
     updates: &Updates,
     commands: &mut mpsc::Receiver<ClientMessage>,
 ) -> Result<Option<String>> {
-    let crate::local_endpoint::Viewport {
-        cols,
-        rows,
-        compact,
-        ..
-    } = viewport;
     let (socket, _tunnel) = tokio::select! {
         result = tokio::time::timeout(Duration::from_secs(12), remote::connect_endpoint(&profile.target, session)) => {
             result.context("SSH endpoint setup timed out")??
@@ -262,7 +267,10 @@ async fn connect_machine(
             None => return Err(anyhow!("endpoint command channel closed")),
             // The router only admits input for online endpoints. If a stale
             // message races setup, discard it rather than replaying it later.
-            Some(_) => return Err(anyhow!("endpoint input discarded during setup")),
+            Some(message) => {
+                viewport.apply(&message);
+                return Err(anyhow!("endpoint input discarded during setup"));
+            }
         },
     };
     let stream = tokio::time::timeout(Duration::from_secs(5), UnixStream::connect(&socket))
@@ -273,8 +281,8 @@ async fn connect_machine(
     write_endpoint(
         &mut writer,
         &ClientMessage::Hello {
-            cols: *cols,
-            rows: *rows,
+            cols: viewport.cols,
+            rows: viewport.rows,
             version: PROTOCOL_VERSION,
         },
     )
@@ -302,7 +310,9 @@ async fn connect_machine(
     .context("endpoint handshake timed out")??;
     write_endpoint(
         &mut writer,
-        &ClientMessage::SetCompactView { enabled: *compact },
+        &ClientMessage::SetCompactView {
+            enabled: viewport.compact,
+        },
     )
     .await?;
     write_endpoint(
@@ -318,23 +328,13 @@ async fn connect_machine(
     // A reconnect never replays pending input, including keys queued before
     // the renderer received the disconnect event.
     while let Ok(message) = commands.try_recv() {
-        match message {
-            ClientMessage::Resize {
-                cols: next_cols,
-                rows: next_rows,
-            } => {
-                *cols = next_cols;
-                *rows = next_rows;
-            }
-            ClientMessage::SetCompactView { enabled } => *compact = enabled,
-            _ => {}
-        }
+        viewport.apply(&message);
     }
     write_endpoint(
         &mut writer,
         &ClientMessage::Resize {
-            cols: *cols,
-            rows: *rows,
+            cols: viewport.cols,
+            rows: viewport.rows,
         },
     )
     .await?;
@@ -347,7 +347,9 @@ async fn connect_machine(
     .await?;
     write_endpoint(
         &mut writer,
-        &ClientMessage::SetCompactView { enabled: *compact },
+        &ClientMessage::SetCompactView {
+            enabled: viewport.compact,
+        },
     )
     .await?;
     updates
@@ -363,14 +365,11 @@ async fn connect_machine(
             command = commands.recv() => {
                 let command = command.ok_or_else(|| anyhow!("endpoint command channel closed"))?;
                 if let ClientMessage::Resize { cols: next_cols, rows: next_rows } = command {
-                    *cols = next_cols;
-                    *rows = next_rows;
+                    viewport.apply(&command);
                     write_endpoint(&mut writer, &ClientMessage::Resize { cols: next_cols, rows: next_rows }).await?;
                     continue;
                 }
-                if let ClientMessage::SetCompactView { enabled } = command {
-                    *compact = enabled;
-                }
+                viewport.apply(&command);
                 write_endpoint(&mut writer, &command).await?;
             }
             line = lines.next_line() => {
@@ -577,6 +576,31 @@ mod tests {
         );
         assert!(
             matches!(machine_rx.recv().await, Some(ClientMessage::Input { bytes }) if bytes == b"remote")
+        );
+    }
+
+    #[tokio::test]
+    async fn broadcast_retains_terminal_colors_for_each_endpoint() {
+        let (local_tx, mut local_rx) = mpsc::channel(1);
+        let (machine_tx, mut machine_rx) = mpsc::channel(1);
+        let mut router = Router::new(EndpointId::Local);
+        router.register(EndpointId::Local, local_tx);
+        router.register(EndpointId::Machine("m1".into()), machine_tx);
+        let colors = kodade_cli_proto::TerminalColors {
+            foreground: [0x3f, 0x3b, 0x34],
+            background: [0xfa, 0xf9, 0xf5],
+            palette: [[0x9d, 0x57, 0x29]; 16],
+        };
+
+        router.broadcast(ClientMessage::SetTerminalColors {
+            colors: Some(colors.clone()),
+        });
+
+        assert!(
+            matches!(local_rx.recv().await, Some(ClientMessage::SetTerminalColors { colors: Some(received) }) if received == colors)
+        );
+        assert!(
+            matches!(machine_rx.recv().await, Some(ClientMessage::SetTerminalColors { colors: Some(received) }) if received == colors)
         );
     }
 
