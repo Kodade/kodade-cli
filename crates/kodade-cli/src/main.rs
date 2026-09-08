@@ -9,6 +9,7 @@ mod connection;
 mod doctor;
 mod endpoints;
 mod graphics;
+mod guide;
 mod help;
 mod image_paste;
 mod input;
@@ -50,6 +51,14 @@ async fn main() -> Result<()> {
     let explicit_session =
         matches.value_source("session") == Some(clap::parser::ValueSource::CommandLine);
     let mut args = cli::Cli::from_arg_matches(&matches)?;
+    if matches!(
+        args.command,
+        Some(cli::Command::Agent {
+            command: cli::AgentCommand::Guide
+        })
+    ) {
+        return guide::print();
+    }
     connection::inherited_context(
         &mut args,
         explicit_session,
@@ -899,6 +908,7 @@ async fn agent(
     command: cli::AgentCommand,
 ) -> Result<()> {
     match command {
+        cli::AgentCommand::Guide => guide::print(),
         cli::AgentCommand::Ls { json } => {
             let layout =
                 commands::layout(commands::request(socket, commands::layout_query()).await?)?;
