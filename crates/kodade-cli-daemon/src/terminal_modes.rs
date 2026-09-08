@@ -25,6 +25,8 @@ pub(crate) struct HandoffState {
     replies: Vec<u8>,
     #[serde(default)]
     pending: Vec<u8>,
+    #[serde(default)]
+    reset_escaped: bool,
 }
 
 impl HandoffState {
@@ -82,6 +84,7 @@ impl Modes {
             // this copied queue once before it begins reading.
             replies: self.replies.clone(),
             pending: self.pending.bytes.clone(),
+            reset_escaped: self.reset_escaped,
         };
         state.validate()?;
         Ok(state)
@@ -96,6 +99,7 @@ impl Modes {
             alternate_keyboard_stack: state.alternate_keyboard_stack,
             replies: state.replies,
             pending: PendingSequence::from_bytes(state.pending.clone()),
+            reset_escaped: state.reset_escaped,
             ..Self::default()
         };
         // vte's parser is intentionally not serializable. Replaying only the
@@ -505,6 +509,19 @@ mod tests {
             target.feed(*byte);
         }
         assert_eq!(target.take_replies(), b"\x1bP1+r5463=31\x1b\\");
+    }
+
+    #[test]
+    fn handoff_keeps_a_pending_ris_reset() {
+        let mut source = Modes::default();
+        source.csi((24, 80), (0, 0), false, Some(b'>'), &[&[3]], 'u');
+        source.feed(0x1b);
+
+        let state = source.capture_handoff().unwrap();
+        let mut target = Modes::restore_handoff(state).unwrap();
+        target.feed(b'c');
+
+        assert_eq!(target.keyboard(false).kitty_flags, 0);
     }
 
     #[test]
