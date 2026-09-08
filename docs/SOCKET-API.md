@@ -252,3 +252,14 @@ state without hard-coding anything:
 ```bash
 "$KODADE_BIN" agent report "$KODADE_PANE" blocked -s "$KODADE_SESSION"
 ```
+
+### CLI endpoint selection
+
+Without an explicit endpoint flag, the CLI uses its inherited `KODADE_SESSION`
+and `KODADE_SOCKET`. `--session NAME` overrides both, `--socket PATH` selects a
+socket directly, and `--remote HOST` selects an SSH host. `session path` prints
+the resolved socket. Session names are validated before deriving paths: 1–64
+bytes, no path separators or control characters, and neither `.` nor `..`.
+
+`doctor --json` probes `Query(Version)` without starting the daemon. Its JSON
+contains `version`, `session`, `socket`, and `checks` (`name`, `status`, `detail`).

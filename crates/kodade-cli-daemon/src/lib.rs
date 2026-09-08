@@ -171,6 +171,22 @@ impl PaneState {
     }
 }
 
+/// Validate downloaded detection rules against the same schema used at startup.
+pub fn validate_agent_manifest(source: &str) -> Result<String> {
+    let manifest: manifest::Manifest = toml::from_str(source).context("parse agent manifest")?;
+    if manifest.name.trim().is_empty() || manifest.display.trim().is_empty() {
+        bail!("agent manifest needs a name and display label");
+    }
+    if manifest
+        .rules
+        .iter()
+        .any(|rule| rule.any.is_empty() || rule.any.iter().any(|needle| needle.trim().is_empty()))
+    {
+        bail!("agent manifest rules need nonempty match text");
+    }
+    Ok(manifest.name)
+}
+
 pub fn socket_path(session: &str) -> PathBuf {
     socket_dir().join(format!("{session}.sock"))
 }

@@ -25,7 +25,8 @@ pub struct Cli {
         long = "session",
         global = true,
         value_name = "NAME",
-        default_value = DEFAULT_SESSION
+        default_value = DEFAULT_SESSION,
+        value_parser = session_name
     )]
     pub session: String,
 
@@ -33,6 +34,10 @@ pub struct Cli {
     /// instead of the local one (#23). Requires `kodade-cli` on the remote host.
     #[arg(long = "remote", global = true, value_name = "USER@HOST")]
     pub remote: Option<String>,
+
+    /// Use this daemon socket directly (overrides inherited pane context).
+    #[arg(long, global = true, value_name = "PATH", conflicts_with = "remote")]
+    pub socket: Option<PathBuf>,
 
     #[command(subcommand)]
     pub command: Option<Command>,
@@ -43,7 +48,14 @@ pub enum Command {
     /// Run the session daemon (started automatically when attaching).
     Daemon {
         /// Session name; defaults to the global --session value.
+        #[arg(value_parser = session_name)]
         session: Option<String>,
+    },
+    /// Diagnose configuration, tools, and daemon health without starting a session.
+    #[command(visible_alias = "status")]
+    Doctor {
+        #[arg(long)]
+        json: bool,
     },
     /// List workspaces, tabs, panes, and their states.
     Ls {
@@ -347,12 +359,12 @@ pub enum SessionCommand {
     },
     /// Stop a session (defaults to the current one).
     Kill {
-        #[arg(value_name = "NAME")]
+        #[arg(value_name = "NAME", value_parser = session_name)]
         name: Option<String>,
     },
     /// Rename the current session; its socket and state file move with it.
     Rename {
-        #[arg(value_name = "NAME")]
+        #[arg(value_name = "NAME", value_parser = session_name)]
         name: String,
     },
 }
@@ -478,6 +490,8 @@ pub enum WorktreeCommand {
 
 #[derive(Debug, Subcommand, PartialEq, Eq)]
 pub enum ConfigCommand {
+    /// Write a documented starter configuration when no file exists.
+    Init,
     /// Print the path of the config file.
     Path,
     /// Print the effective configuration as TOML.
@@ -514,6 +528,11 @@ pub enum IntegrateCommand {
 }
 
 // Pane ids are plain integers on the wire; keep the error message script-friendly.
+pub fn session_name(value: &str) -> Result<String, String> {
+    kodade_cli_daemon::validate_session_name(value).map_err(|error| error.to_string())?;
+    Ok(value.to_owned())
+}
+
 fn pane_id(value: &str) -> Result<PaneId, String> {
     value
         .parse()
@@ -530,6 +549,33 @@ fn agent_state(value: &str) -> Result<AgentStateKind, String> {
 mod tests {
     use super::*;
     use clap::CommandFactory;
+
+    #[test]
+    fn rejects_invalid_session_names_before_any_socket_access() {
+        for name in [
+            "../outside",
+            "a/b",
+            "a\\b",
+            "line\nbreak",
+            ".",
+            "..",
+            "",
+            &"x".repeat(65),
+        ] {
+            assert!(
+                Cli::try_parse_from(["kodade-cli", "-s", name, "session", "path"]).is_err(),
+                "{name:?}"
+            );
+            assert!(
+                Cli::try_parse_from(["kodade-cli", "session", "rename", name]).is_err(),
+                "{name:?}"
+            );
+            assert!(
+                Cli::try_parse_from(["kodade-cli", "daemon", name]).is_err(),
+                "{name:?}"
+            );
+        }
+    }
 
     fn parse(args: &[&str]) -> Cli {
         Cli::try_parse_from(args).expect("arguments parse")

@@ -10,7 +10,7 @@ then `working`, `done`, `idle`, and `unknown`.
 - `working`: The agent is actively producing output, or a hook or manifest
   explicitly reports this state.
 - `done`: The agent's turn finished. Lifecycle "turn ended" hooks report this
-  (`Stop` for Claude Code and Gemini CLI, `notify` for Codex), so it marks a
+  (`Stop` for Claude Code, `AfterAgent` for Gemini CLI, `notify` for Codex), so it marks a
   completed turn rather than a decayed working state. The current built-in
   manifests do not define a `done` screen rule. A hook-reported `done`
   *sticks*: unlike the other states it has no TTL and stays until the pane
@@ -204,22 +204,29 @@ state, so detection does not depend on screen strings alone.
   `Notification` → blocked). Without `--write` it prints the snippet. The
   `Stop` event fires when the agent's turn ends, so it reports `done` (which
   then sticks) rather than `idle`.
-- `integrate gemini-cli [--write]` — Gemini CLI exposes Claude-compatible
-  hooks (it even ships `gemini hooks migrate`), so the same three events are
-  merged into `~/.gemini/settings.json`.
+- `integrate gemini-cli [--write]` — installs Gemini's `BeforeAgent` → working,
+  `AfterAgent` → done, and `Notification` → blocked in `~/.gemini/settings.json`,
+  following its [official hook events](https://geminicli.com/docs/hooks/).
+  Earlier Ködade hooks under Claude event names are removed while unrelated
+  hooks and their matcher metadata are preserved.
 - `integrate codex [--write] [--force]` — Codex uses a single top-level
   `notify` program. Codex fires `notify` only when a turn completes, so this
   merges `notify = ["sh", "-c", "<report done>"]` into
   `~/.codex/config.toml` with `toml_edit`, preserving comments. Codex appends a
   JSON payload as the program's last argument (`$0` for `sh -c`), which the
-  report command ignores. If a `notify` entry already exists, Ködade refuses to
-  overwrite it and prints instructions instead — pass `--force` to replace it.
+  report command ignores. An existing Ködade entry is refreshed idempotently;
+  an unrelated `notify` entry is preserved unless `--force` is supplied.
 
 Merges are idempotent and never remove unrelated keys or hooks. A previously
 installed Ködade report hook for the same event is upgraded in place (matched
 on the `kodade-cli agent report $KODADE_PANE ` command prefix), so users who
 installed the earlier `Stop` → `idle` hook are migrated to `done` without a
 duplicate.
+
+Configuration updates are atomic and preserve existing file permissions and
+symlinks. Refreshing manifests uses the canonical `Kodade/kodade-cli` repository,
+validates filenames and the daemon's full manifest schema before writing, and
+bounds each download. A malformed download cannot replace working manifests.
 
 ### `agent update-manifests`
 

@@ -63,6 +63,13 @@ Run `kodade-cli` to attach to the default session; it starts the daemon when
 needed. Use `kodade-cli -s SESSION` for a named session. Detach with the prefix
 followed by `d`, and reattach by running `kodade-cli` again.
 
+For scripts, `new`, `run`, and new-tab/workspace commands also start a missing
+local daemon. `kodade-cli doctor` (alias `status`, with `--json` for scripts)
+checks your configuration, shell, optional tools, and daemon without starting
+a session. `kodade-cli config init` writes a small editable configuration and
+preserves any existing file. Startup errors return within ten seconds and
+point to the daemon log beside its socket.
+
 The default prefix is `ctrl+b`. After the prefix, the default actions are:
 
 | Key | Action |
@@ -234,8 +241,10 @@ for the installed version. The scripting commands are:
 - `kodade-cli agent update-manifests` — opt-in refresh of agent-detection manifests from GitHub.
 - `kodade-cli send PANE TEXT` — send text followed by a newline (`--no-newline` is also supported).
 - `kodade-cli kill-session` — stop the current session.
-- `kodade-cli config path|show|validate` — print the config path, the effective
-  config as TOML, or check the file (exits non-zero on problems).
+- `kodade-cli config init|path|show|validate` — create a starter config, print
+  its path or effective TOML, or validate it (non-zero on problems).
+- `kodade-cli doctor [--json]` — diagnose configuration, installed tools, and
+  daemon health; `status` is an alias.
 
 Text and names may start with `-` (`kodade-cli send 1 -y`), and `--` forces
 the next value through verbatim when it collides with a flag
@@ -284,7 +293,10 @@ starts a new empty session.
 
 Panes a session spawns get `KODADE_PANE`, `KODADE_SESSION`, `KODADE_SOCKET`,
 and `KODADE_BIN` in their environment, which is everything a custom agent needs
-to report its own state. The socket protocol itself — framing, every message,
+to report its own state. Commands inherit that session and socket automatically;
+explicit `-s`, `--remote`, or `--socket PATH` selects another endpoint. Session
+names are limited to 64 bytes and exclude path separators and control characters.
+The socket protocol itself — framing, every message,
 the `Subscribe` event stream, and the schema query — is documented in
 [docs/SOCKET-API.md](docs/SOCKET-API.md).
 

@@ -10,6 +10,7 @@
 use std::{
     path::{Path, PathBuf},
     process::Stdio,
+    sync::atomic::{AtomicU64, Ordering},
     time::{Duration, Instant},
 };
 
@@ -31,7 +32,7 @@ const TUNNEL_TIMEOUT: Duration = Duration::from_secs(10);
 /// cheap.
 pub struct Tunnel {
     child: tokio::process::Child,
-    local_socket: PathBuf,
+    endpoint: ForwardPath,
 }
 
 impl Drop for Tunnel {
@@ -40,7 +41,8 @@ impl Drop for Tunnel {
         // master is left for `ControlPersist` to reap so re-running `--remote`
         // reconnects without a fresh handshake.
         let _ = self.child.start_kill();
-        let _ = std::fs::remove_file(&self.local_socket);
+        // ForwardPath owns only this instance's exclusively allocated directory.
+        let _ = &self.endpoint;
     }
 }
 
@@ -50,7 +52,12 @@ impl Drop for Tunnel {
 /// here so `--remote` applies uniformly (#23).
 pub async fn resolve_socket(cli: &cli::Cli) -> Result<(PathBuf, Option<Tunnel>)> {
     match cli.remote.as_deref() {
-        None => Ok((kodade_cli_daemon::socket_path(&cli.session), None)),
+        None => Ok((
+            cli.socket
+                .clone()
+                .unwrap_or_else(|| kodade_cli_daemon::socket_path(&cli.session)),
+            None,
+        )),
         Some(host) => {
             let (socket, tunnel) = connect(host, &cli.session).await?;
             Ok((socket, Some(tunnel)))
@@ -67,14 +74,70 @@ fn runtime_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("/tmp"))
 }
 
-/// A filesystem-safe token for a `user@host` string.
-fn host_token(host: &str) -> String {
-    host.replace(['@', '/', ':', ' '], "-")
+static FORWARD_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+/// Every forward owns a short, private directory, even for the same host/session.
+struct ForwardPath(PathBuf);
+
+impl ForwardPath {
+    fn allocate(host: &str, session: &str) -> Result<Self> {
+        std::fs::create_dir_all(runtime_dir()).context("create SSH runtime directory")?;
+        for _ in 0..100 {
+            let path = local_socket_path(host, session);
+            let directory = path.parent().expect("socket directory");
+            let mut builder = std::fs::DirBuilder::new();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt;
+                builder.mode(0o700);
+            }
+            match builder.create(directory) {
+                Ok(()) => return Ok(Self(path)),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error).context("reserve SSH forwarding directory"),
+            }
+        }
+        bail!("could not reserve an SSH forwarding socket")
+    }
 }
 
-/// Path of the forwarded local socket for a given host/session.
-fn local_socket_path(host: &str, session: &str) -> PathBuf {
-    runtime_dir().join(format!("remote-{}-{session}.sock", host_token(host)))
+impl Drop for ForwardPath {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+        if let Some(parent) = self.0.parent() {
+            let _ = std::fs::remove_dir(parent);
+        }
+    }
+}
+
+fn local_socket_path(_host: &str, _session: &str) -> PathBuf {
+    let sequence = FORWARD_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    runtime_dir()
+        .join(format!("remote-{}-{sequence}", std::process::id()))
+        .join("s.sock")
+}
+
+/// OpenSSH joins remote argv into a shell command; quote nonliteral words.
+fn remote_word(word: &str) -> String {
+    if !word.is_empty()
+        && word
+            .bytes()
+            .all(|ch| ch.is_ascii_alphanumeric() || b"_./:@%+-".contains(&ch))
+    {
+        word.into()
+    } else {
+        format!("'{}'", word.replace('\'', "'\\''"))
+    }
+}
+
+fn validate_host(host: &str) -> Result<()> {
+    if host.is_empty()
+        || host.starts_with('-')
+        || host.chars().any(|ch| ch.is_whitespace() || ch.is_control())
+    {
+        bail!("invalid SSH target: use an SSH host alias or USER@HOST");
+    }
+    Ok(())
 }
 
 /// The SSH control-master socket template (`%C` expands to a per-connection
@@ -113,7 +176,7 @@ pub fn socket_path_args(control_path: &str, host: &str, session: &str) -> Vec<St
         "session".into(),
         "path".into(),
         "-s".into(),
-        session.to_string(),
+        remote_word(session),
     ]);
     args
 }
@@ -121,10 +184,12 @@ pub fn socket_path_args(control_path: &str, host: &str, session: &str) -> Vec<St
 /// `ssh -f <control-opts> HOST kodade-cli daemon NAME` — starts the remote
 /// daemon detached when one is not already running.
 pub fn start_daemon_args(control_path: &str, host: &str, session: &str) -> Vec<String> {
-    let mut args = vec!["-f".to_string()];
-    args.extend(control_opts(control_path));
+    let mut args = control_opts(control_path);
     args.push(host.to_string());
-    args.extend(["kodade-cli".into(), "daemon".into(), session.to_string()]);
+    args.push(format!(
+        "nohup kodade-cli daemon {} </dev/null >/dev/null 2>&1 &",
+        remote_word(session)
+    ));
     args
 }
 
@@ -135,6 +200,8 @@ pub fn tunnel_args(control_path: &str, host: &str, local: &str, remote: &str) ->
         "-N".to_string(),
         "-L".to_string(),
         format!("{local}:{remote}"),
+        "-o".into(),
+        "ExitOnForwardFailure=yes".into(),
     ];
     args.extend(control_opts(control_path));
     args.push(host.to_string());
@@ -147,23 +214,31 @@ pub fn run_args(control_path: &str, host: &str, remote_args: &[&str]) -> Vec<Str
     let mut args = control_opts(control_path);
     args.push(host.to_string());
     args.push("kodade-cli".into());
-    args.extend(remote_args.iter().map(|arg| arg.to_string()));
+    args.extend(remote_args.iter().map(|arg| remote_word(arg)));
     args
 }
 
 /// Run an `ssh` invocation, returning its captured stdout on success.
 async fn ssh_output(args: &[String]) -> Result<std::process::Output> {
-    Command::new("ssh")
-        .args(args)
-        .stdin(Stdio::null())
-        .output()
-        .await
-        .context("run ssh")
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        Command::new("ssh")
+            .args(args)
+            .kill_on_drop(true)
+            .stdin(Stdio::null())
+            .output(),
+    )
+    .await
+    .context("SSH command timed out after 30s")?
+    .context("run ssh")
 }
 
 /// Set up (or reuse) the SSH forward for `host`/`session` and return the local
 /// socket plus the tunnel guard.
 async fn connect(host: &str, session: &str) -> Result<(PathBuf, Tunnel)> {
+    validate_host(host)?;
+    crate::cli::session_name(session).map_err(anyhow::Error::msg)?;
+    std::fs::create_dir_all(runtime_dir()).context("create SSH runtime directory")?;
     let control = control_path();
     let control = control.to_string_lossy().to_string();
 
@@ -185,16 +260,13 @@ async fn connect(host: &str, session: &str) -> Result<(PathBuf, Tunnel)> {
         bail!("could not read the remote socket path from {host}");
     }
     let remote_socket = String::from_utf8_lossy(&path_out.stdout).trim().to_string();
-    if remote_socket.is_empty() {
-        bail!("{host} returned an empty socket path");
+    if !remote_socket.starts_with('/') || remote_socket.contains(['\n', '\r', ':']) {
+        bail!("{host} returned an invalid Unix socket path");
     }
 
     // (c) Forward the remote socket to a fresh local one.
-    let local_socket = local_socket_path(host, session);
-    let _ = std::fs::remove_file(&local_socket);
-    if let Some(parent) = local_socket.parent() {
-        std::fs::create_dir_all(parent).context("create local socket directory")?;
-    }
+    let endpoint = ForwardPath::allocate(host, session)?;
+    let local_socket = endpoint.0.clone();
     let child = Command::new("ssh")
         .args(tunnel_args(
             &control,
@@ -205,16 +277,16 @@ async fn connect(host: &str, session: &str) -> Result<(PathBuf, Tunnel)> {
         .stdin(Stdio::null())
         .spawn()
         .context("start ssh tunnel")?;
-    let tunnel = Tunnel {
-        child,
-        local_socket: local_socket.clone(),
-    };
+    let mut tunnel = Tunnel { child, endpoint };
 
     // (d) Wait for the forwarded socket to accept a connection.
     let deadline = Instant::now() + TUNNEL_TIMEOUT;
     loop {
         if UnixStream::connect(&local_socket).await.is_ok() {
             return Ok((local_socket, tunnel));
+        }
+        if let Some(status) = tunnel.child.try_wait()? {
+            bail!("SSH tunnel to {host} exited with {status}");
         }
         if Instant::now() >= deadline {
             bail!(
@@ -230,6 +302,9 @@ async fn connect(host: &str, session: &str) -> Result<(PathBuf, Tunnel)> {
 /// control connection. `session ls` output is prefixed with `host:` so it is
 /// clear which machine each session belongs to (#23, item 3).
 pub async fn run_session(host: &str, session: &str, command: &cli::SessionCommand) -> Result<()> {
+    validate_host(host)?;
+    crate::cli::session_name(session).map_err(anyhow::Error::msg)?;
+    std::fs::create_dir_all(runtime_dir()).context("create SSH runtime directory")?;
     let control = control_path();
     let control = control.to_string_lossy().to_string();
     let (remote_args, prefix): (Vec<&str>, bool) = match command {
@@ -273,9 +348,45 @@ pub async fn run_session(host: &str, session: &str, command: &cli::SessionComman
     Ok(())
 }
 
+/// Diagnose a remote endpoint without installing or starting its daemon.
+pub async fn run_doctor(host: &str, session: &str, json: bool) -> Result<()> {
+    validate_host(host)?;
+    std::fs::create_dir_all(runtime_dir()).context("create SSH runtime directory")?;
+    let control = control_path().to_string_lossy().into_owned();
+    let mut args = vec!["doctor", "-s", session];
+    if json {
+        args.push("--json");
+    }
+    let output = ssh_output(&run_args(&control, host, &args)).await?;
+    use std::io::Write;
+    std::io::stdout().write_all(&output.stdout)?;
+    std::io::stderr().write_all(&output.stderr)?;
+    if !output.status.success() {
+        bail!("remote diagnostics failed on {host}");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn concurrent_tunnels_never_share_a_local_socket() {
+        assert_ne!(
+            local_socket_path("user@host", "work"),
+            local_socket_path("user@host", "work")
+        );
+    }
+
+    #[test]
+    fn remote_shell_preserves_session_arguments_literally() {
+        let session = "work; printf injected";
+        let args = socket_path_args("/tmp/cm-%C", "host", session);
+        let remote = &args[args.iter().position(|arg| arg == "host").unwrap() + 1..];
+        let rendered = remote.join(" ");
+        assert!(rendered.ends_with("'work; printf injected'"), "{rendered}");
+    }
 
     #[test]
     fn command_builders_carry_control_options_and_targets() {
@@ -310,8 +421,11 @@ mod tests {
 
         // The daemon starter forwards detached (`-f`) and names the session.
         let start = start_daemon_args(cp, host, "work");
-        assert_eq!(start.first().map(String::as_str), Some("-f"));
-        assert!(start.windows(2).any(|w| w == ["daemon", "work"]));
+        assert!(start
+            .last()
+            .unwrap()
+            .contains("nohup kodade-cli daemon work"));
+        assert!(start.last().unwrap().ends_with("2>&1 &"));
 
         // The forward is Unix-to-Unix: `-N -L local:remote`.
         let tunnel = tunnel_args(cp, host, "/tmp/local.sock", "/run/remote.sock");
@@ -335,7 +449,13 @@ mod tests {
         let name = c.file_name().unwrap().to_string_lossy().into_owned();
         assert!(!name.contains('@'));
         assert!(!name.contains(':'));
-        assert!(name.starts_with("remote-"));
-        assert!(name.ends_with("work.sock"));
+        assert_eq!(name, "s.sock");
+        assert!(c
+            .parent()
+            .unwrap()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("remote-"));
     }
 }
