@@ -518,15 +518,14 @@ The optional `[ansi]` table has sixteen keys: `black`, `red`, `green`,
 
 `[ansi]` drives pane colors: the 16 basic colors a program prints inside a pane
 are drawn from this palette, so themes restyle terminal output without touching
-the program. Colors 16–255 use the terminal's own 256-color cube and 24-bit
-colors are passed through unchanged. A cell with no color set uses `text` on
-`bg`.
+the program. Colors 16–255 use Ködade's fixed standard xterm 256-color cube,
+and 24-bit colors are passed through unchanged. A cell with no color set uses
+`text` on `bg`.
 
-An attached interactive client reports its `text`, `bg`, and 16 ANSI colors to
-the daemon for read-only terminal queries. Pane programs can therefore query
-OSC 10, OSC 11, and known OSC 4 entries without changing the palette. OSC 12
-and palette entries 16–255 remain unanswered because Ködade does not own a
-host cursor color or the host terminal's extended palette. Read-only clients
+An attached interactive client reports its `text`, `bg`, cursor, and 16 ANSI
+colors to the daemon for read-only terminal queries. Pane programs can query
+OSC 10, OSC 11, OSC 12, and every OSC 4 entry: slots 0–15 use the attached
+theme and slots 16–255 use the fixed standard xterm palette. Read-only clients
 do not replace a pane's query colors. A nonempty `NO_COLOR` disables these
 answers because the client is not emitting the reported theme colors.
 

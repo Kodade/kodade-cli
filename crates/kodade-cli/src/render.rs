@@ -2,9 +2,9 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::OnceLock;
 
 use kodade_cli_proto::{
-    AgentInfo, AgentStateKind, CellColor, LayoutSnapshot, LayoutTree, PaneId, Run, Screen, TabId,
-    TabInfo, WorkspaceId, WorkspaceInfo, ATTR_BOLD, ATTR_DIM, ATTR_INVERSE, ATTR_ITALIC,
-    ATTR_UNDERLINE,
+    standard_xterm_rgb, AgentInfo, AgentStateKind, CellColor, LayoutSnapshot, LayoutTree, PaneId,
+    Run, Screen, TabId, TabInfo, WorkspaceId, WorkspaceInfo, ATTR_BOLD, ATTR_DIM, ATTR_INVERSE,
+    ATTR_ITALIC, ATTR_UNDERLINE,
 };
 use ratatui::{
     layout::{Constraint, Direction as LayoutDirection, Layout, Rect},
@@ -701,14 +701,16 @@ fn run_span<'a>(run: &'a Run, theme: &Theme) -> Span<'a> {
 }
 
 /// Indexed colors 0–15 come from the theme `[ansi]` palette (#8); 16–255 use
-/// the terminal's own 256-color cube.
+/// the fixed xterm extension so clients cannot change pane appearance.
 fn cell_color(color: CellColor, theme: &Theme) -> Option<Color> {
     match color {
         CellColor::Default => None,
         CellColor::Indexed(index) if (index as usize) < theme.ansi.len() => {
             Some(theme.ansi[index as usize])
         }
-        CellColor::Indexed(index) => Some(Color::Indexed(index)),
+        CellColor::Indexed(index) => {
+            standard_xterm_rgb(index).map(|[red, green, blue]| Color::Rgb(red, green, blue))
+        }
         CellColor::Rgb(r, g, b) => Some(Color::Rgb(r, g, b)),
     }
 }
@@ -2106,12 +2108,16 @@ mod tests {
         };
         let lines = pane_lines(&screen, &theme, None);
         let spans = &lines[0].spans;
-        // 0–15 come from the theme palette; 16+ stay terminal-indexed.
+        // 0–15 come from the theme palette; 16+ are fixed xterm RGB.
         assert_eq!(spans[0].style.fg, Some(theme.ansi[2]));
         assert_eq!(spans[0].style.bg, Some(theme.bg));
         assert!(spans[0].style.add_modifier.contains(Modifier::BOLD));
-        assert_eq!(spans[1].style.fg, Some(Color::Indexed(200)));
+        assert_eq!(spans[1].style.fg, Some(Color::Rgb(255, 0, 215)));
         assert_eq!(spans[1].style.bg, Some(Color::Rgb(1, 2, 3)));
+        assert_eq!(
+            cell_color(CellColor::Indexed(21), &theme),
+            Some(Color::Rgb(0, 0, 255))
+        );
         assert_eq!(
             spans[1].style.add_modifier,
             Modifier::ITALIC | Modifier::UNDERLINED | Modifier::DIM | Modifier::REVERSED
@@ -2248,7 +2254,7 @@ mod tests {
         assert_eq!(first.fg, theme.ansi[1]);
         let cursor = &buffer[(3, 2)];
         assert_eq!(cursor.symbol(), "k");
-        assert_eq!(cursor.bg, theme.cursor);
+        assert_eq!(cursor.bg, Color::Rgb(0xe2, 0xb8, 0x6e));
     }
 
     #[test]

@@ -219,7 +219,31 @@ pub const PROTOCOL_VERSION: u32 = 2;
 pub struct TerminalColors {
     pub foreground: [u8; 3],
     pub background: [u8; 3],
+    /// The cursor color painted by the attached client theme.
+    pub cursor: [u8; 3],
     pub palette: [[u8; 3]; 16],
+}
+
+/// The fixed xterm 256-color extension. Slots 0–15 remain client-theme
+/// configurable, while 16–255 render and answer queries identically for every
+/// attached client.
+pub fn standard_xterm_rgb(index: u8) -> Option<[u8; 3]> {
+    match index {
+        16..=231 => {
+            const LEVELS: [u8; 6] = [0, 95, 135, 175, 215, 255];
+            let slot = index - 16;
+            Some([
+                LEVELS[(slot / 36) as usize],
+                LEVELS[((slot / 6) % 6) as usize],
+                LEVELS[(slot % 6) as usize],
+            ])
+        }
+        232..=255 => {
+            let gray = 8 + 10 * (index - 232);
+            Some([gray; 3])
+        }
+        _ => None,
+    }
 }
 
 // No `Eq`: `ApplyLayout` carries the split ratios, which are floats.
@@ -771,7 +795,7 @@ pub const ATTR_DIM: u8 = 8;
 pub const ATTR_INVERSE: u8 = 16;
 
 /// A terminal cell color. `Indexed(0..16)` is mapped through the client theme's
-/// `[ansi]` palette; higher indices use the standard xterm 256-color cube.
+/// `[ansi]` palette; indices 16–255 use `standard_xterm_rgb`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum CellColor {
     #[default]
@@ -1335,6 +1359,7 @@ mod tests {
                 colors: Some(TerminalColors {
                     foreground: [1, 2, 3],
                     background: [4, 5, 6],
+                    cursor: [7, 8, 9],
                     palette: [[7, 8, 9]; 16],
                 }),
             },
@@ -1655,6 +1680,16 @@ mod tests {
         let pane: PaneFile = serde_json::from_value(value).expect("old pane decodes");
         assert_eq!(pane.id, 7);
         assert!(pane.native_session.is_none());
+    }
+
+    #[test]
+    fn standard_xterm_palette_uses_stable_cube_and_gray_endpoints() {
+        assert_eq!(standard_xterm_rgb(16), Some([0, 0, 0]));
+        assert_eq!(standard_xterm_rgb(21), Some([0, 0, 255]));
+        assert_eq!(standard_xterm_rgb(231), Some([255, 255, 255]));
+        assert_eq!(standard_xterm_rgb(232), Some([8, 8, 8]));
+        assert_eq!(standard_xterm_rgb(255), Some([238, 238, 238]));
+        assert_eq!(standard_xterm_rgb(15), None);
     }
 
     #[test]

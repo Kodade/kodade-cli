@@ -1380,6 +1380,7 @@ impl Theme {
         kodade_cli_proto::TerminalColors {
             foreground: rgb(self.text),
             background: rgb(self.bg),
+            cursor: rgb(self.cursor),
             palette: self.ansi.map(rgb),
         }
     }
@@ -1636,6 +1637,7 @@ mod tests {
         assert_eq!(theme.ansi[8], theme.dim);
         assert_eq!(theme.ansi[15], Color::Rgb(0xFA, 0xFA, 0xFA));
         assert_eq!(theme.terminal_colors().foreground, [0xE8, 0xE8, 0xE8]);
+        assert_eq!(theme.terminal_colors().cursor, [0xe2, 0xb8, 0x6e]);
         assert_eq!(theme.terminal_colors().palette[2], [0xa8, 0xc8, 0x7f]);
     }
 
