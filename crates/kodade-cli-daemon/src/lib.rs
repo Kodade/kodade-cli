@@ -5541,7 +5541,7 @@ async fn serve_client(stream: UnixStream, session: Arc<Session>) -> Result<()> {
                                 return Ok(());
                             }
                             Err(error) => {
-                                write_server(&mut writer, &ServerMessage::Error { message: error.to_string() }).await?;
+                                write_server(&mut writer, &ServerMessage::Error { message: format!("{error:#}") }).await?;
                                 continue;
                             }
                         }

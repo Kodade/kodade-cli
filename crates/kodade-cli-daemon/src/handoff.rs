@@ -541,6 +541,9 @@ fn accept_with_timeout(
     }
 }
 fn configure(stream: &UnixStream, timeout: Duration) -> io::Result<()> {
+    // BSD accept inherits the listener's nonblocking mode. The authenticated
+    // handshake is blocking with deadlines on both sides, including macOS.
+    stream.set_nonblocking(false)?;
     stream.set_read_timeout(Some(timeout))?;
     stream.set_write_timeout(Some(timeout))
 }
@@ -586,6 +589,19 @@ mod tests {
         fs::create_dir(&path).unwrap();
         path
     }
+    #[test]
+    fn handshake_waits_for_delayed_bytes_on_an_inherited_nonblocking_stream() {
+        let (mut reader, mut writer) = UnixStream::pair().unwrap();
+        reader.set_nonblocking(true).unwrap();
+        configure(&reader, Duration::from_secs(1)).unwrap();
+        let sender = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            writer.write_all(b"ready\n").unwrap();
+        });
+        assert_eq!(line(&mut reader, 32).unwrap(), "ready");
+        sender.join().unwrap();
+    }
+
     #[test]
     fn private_listener_is_owner_only() {
         let path = directory().join("handoff.sock");
