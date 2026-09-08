@@ -283,6 +283,7 @@ async fn main() -> Result<()> {
                         split: None,
                         command: Some(command),
                         name,
+                        context: None,
                     },
                 )
                 .await?,
@@ -312,6 +313,7 @@ async fn main() -> Result<()> {
                         split: Some(axis),
                         command: (!command.is_empty()).then_some(command),
                         name: None,
+                        context: None,
                     },
                 )
                 .await?,
@@ -330,6 +332,7 @@ async fn main() -> Result<()> {
                         split: None,
                         command: None,
                         name,
+                        context: None,
                     },
                 )
                 .await?,
@@ -712,6 +715,7 @@ async fn tab(socket: &Path, command: cli::TabCommand) -> Result<()> {
                         split: None,
                         command: None,
                         name,
+                        context: None,
                     },
                 )
                 .await?,

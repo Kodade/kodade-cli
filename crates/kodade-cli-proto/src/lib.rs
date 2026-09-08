@@ -30,6 +30,8 @@ pub struct PluginManifest {
     pub events: Vec<PluginEventHook>,
     #[serde(default)]
     pub panes: Vec<PluginPane>,
+    #[serde(default)]
+    pub link_handlers: Vec<PluginLinkHandler>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -41,6 +43,29 @@ pub struct PluginAction {
     pub description: String,
     #[serde(default)]
     pub pane: bool,
+    /// Where this action is meaningful. An empty list preserves the original
+    /// always-available action behavior.
+    #[serde(default)]
+    pub contexts: Vec<PluginActionContext>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PluginActionContext {
+    Global,
+    Workspace,
+    Tab,
+    Pane,
+    Selection,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginLinkHandler {
+    pub id: String,
+    pub title: String,
+    /// A regular expression matched against a ctrl-clicked URL.
+    pub pattern: String,
+    pub action: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -52,6 +77,37 @@ pub struct PluginHook {
 pub struct PluginEventHook {
     pub event: String,
     pub command: String,
+}
+
+/// Data supplied to an extension command. It travels with `NewPane` so the
+/// daemon can own the private context file for the entire pane lifetime.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InvocationContext {
+    pub endpoint: String,
+    pub workspace: Option<String>,
+    pub workspace_id: Option<String>,
+    pub tab: Option<String>,
+    pub tab_id: Option<String>,
+    pub pane: Option<String>,
+    pub cwd: Option<PathBuf>,
+    pub selected_text: Option<String>,
+    pub clicked_url: Option<String>,
+}
+
+impl InvocationContext {
+    pub fn supports(&self, action: &PluginAction) -> bool {
+        action.contexts.is_empty()
+            || action.contexts.iter().all(|scope| match scope {
+                PluginActionContext::Global => true,
+                PluginActionContext::Workspace => self.workspace_id.is_some(),
+                PluginActionContext::Tab => self.tab_id.is_some(),
+                PluginActionContext::Pane => self.pane.is_some(),
+                PluginActionContext::Selection => self
+                    .selected_text
+                    .as_ref()
+                    .is_some_and(|text| !text.is_empty()),
+            })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -89,6 +145,22 @@ pub fn validate_plugin_manifest(manifest: &PluginManifest, current_version: &str
             || !action_ids.insert(&action.id)
         {
             bail!("plugin actions need unique ids, names, and commands");
+        }
+    }
+    let action_ids: std::collections::HashSet<_> = manifest
+        .actions
+        .iter()
+        .map(|action| action.id.as_str())
+        .collect();
+    let mut handler_ids = std::collections::HashSet::new();
+    for handler in &manifest.link_handlers {
+        if !plugin_id(&handler.id)
+            || handler.title.trim().is_empty()
+            || handler.pattern.trim().is_empty()
+            || !action_ids.contains(handler.action.as_str())
+            || !handler_ids.insert(&handler.id)
+        {
+            bail!("plugin link handlers need unique ids, a pattern, and a known action");
         }
     }
     if manifest
@@ -259,6 +331,9 @@ pub enum ClientMessage {
         /// Run this command through the login shell instead of an interactive one.
         command: Option<Vec<String>>,
         name: Option<String>,
+        /// Extension context whose private file is created and held by the
+        /// daemon only after this request is accepted.
+        context: Option<Box<InvocationContext>>,
     },
     SelectWorkspace {
         id: WorkspaceId,
@@ -1227,6 +1302,7 @@ mod tests {
                 split: None,
                 command: None,
                 name: None,
+                context: None,
             },
             ClientMessage::SelectWorkspace { id: workspace },
             ClientMessage::RenamePane { name: "a".into() },

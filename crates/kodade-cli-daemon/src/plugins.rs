@@ -303,6 +303,7 @@ mod tests {
             }],
             events: Vec::new(),
             panes: Vec::<PluginPane>::new(),
+            link_handlers: vec![],
         };
         assert!(validate_manifest(&manifest, "demo", "1.0.0").is_err());
     }
@@ -319,6 +320,7 @@ mod tests {
             startup: vec![],
             events: vec![],
             panes: vec![],
+            link_handlers: vec![],
         };
         assert!(validate_manifest(&manifest, "demo", "1.0.0").is_err());
     }

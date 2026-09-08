@@ -36,6 +36,7 @@ pub async fn start(
                 split: None,
                 command: Some(command),
                 name,
+                context: None,
             },
         )
         .await?,
