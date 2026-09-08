@@ -55,3 +55,4 @@ vte = "0.15"
 unicode-width = "0.2"
 # Validate PNG uploads with bounded decompression before retaining attachments.
 png = "0.18"
+getrandom = "0.2"

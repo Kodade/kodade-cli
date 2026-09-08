@@ -319,12 +319,15 @@ where
     }
     let (binary, release_version) = verified_release_binary(os, arch, fetch)?;
     let expected_sha256 = format!("{:x}", sha2::Sha256::digest(&binary));
-    tokio::time::timeout(
+    upload_binary(
+        &control,
+        host,
+        &binary,
+        &expected_sha256,
+        &release_version,
         Duration::from_secs(45),
-        upload_binary(&control, host, &binary, &expected_sha256, &release_version),
     )
-    .await
-    .context("remote install timed out")??;
+    .await?;
     let installed = ssh_output(&version_args(&control, host)).await?;
     if !installed.status.success() || !remote_version_is_compatible(&installed.stdout) {
         bail!("remote install on {host} did not produce a compatible kodade-cli");
@@ -363,8 +366,9 @@ async fn upload_binary(
     binary: &[u8],
     expected_sha256: &str,
     expected_version: &str,
+    deadline: Duration,
 ) -> Result<()> {
-    let mut child = Command::new("ssh")
+    let child = Command::new("ssh")
         .args(upload_args(
             control,
             host,
@@ -378,20 +382,39 @@ async fn upload_binary(
         .kill_on_drop(true)
         .spawn()
         .context("start remote install")?;
+    upload_to_child(child, binary, deadline, host).await
+}
+
+// Drain diagnostics while uploading: a remote process may fill stderr before
+// reading stdin. One deadline covers both backpressure and process completion.
+async fn upload_to_child(
+    mut child: tokio::process::Child,
+    binary: &[u8],
+    deadline: Duration,
+    host: &str,
+) -> Result<()> {
     use tokio::io::AsyncWriteExt;
     let mut stdin = child
         .stdin
         .take()
         .context("remote install stdin unavailable")?;
-    stdin
-        .write_all(binary)
+    let write = async move {
+        stdin
+            .write_all(binary)
+            .await
+            .context("upload verified remote binary")?;
+        drop(stdin);
+        Ok::<_, anyhow::Error>(())
+    };
+    let wait = async move {
+        child
+            .wait_with_output()
+            .await
+            .context("wait for remote install")
+    };
+    let (_, output) = tokio::time::timeout(deadline, async { tokio::try_join!(write, wait) })
         .await
-        .context("upload verified remote binary")?;
-    drop(stdin);
-    let output = child
-        .wait_with_output()
-        .await
-        .context("wait for remote install")?;
+        .context("remote install timed out")??;
     if !output.status.success() {
         bail!(
             "remote install failed on {host}: {}",
@@ -590,6 +613,50 @@ pub async fn run_doctor(host: &str, session: &str, json: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    fn upload_test_child(command: &str) -> tokio::process::Child {
+        Command::new("sh")
+            .args(["-c", command])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn remote_upload_deadline_includes_a_peer_that_never_reads() {
+        let child = upload_test_child("exec sleep 30");
+        let start = std::time::Instant::now();
+        let error = upload_to_child(
+            child,
+            &vec![0; 2 * 1024 * 1024],
+            Duration::from_millis(100),
+            "fixture",
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("timed out"), "{error:#}");
+        assert!(start.elapsed() < Duration::from_secs(2));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn remote_upload_drains_stderr_before_the_peer_reads_stdin() {
+        let child =
+            upload_test_child("dd if=/dev/zero bs=65536 count=8 1>&2 2>/dev/null; cat >/dev/null");
+        upload_to_child(
+            child,
+            &vec![0; 2 * 1024 * 1024],
+            Duration::from_secs(5),
+            "fixture",
+        )
+        .await
+        .unwrap();
+    }
 
     #[test]
     fn concurrent_tunnels_never_share_a_local_socket() {
