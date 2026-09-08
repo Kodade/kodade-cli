@@ -53,6 +53,7 @@ impl TerminalModes {
         let mut stdout = std::io::stdout();
         execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
         if supports_keyboard_enhancement().unwrap_or(false) {
+            KEYBOARD_ENHANCED.store(true, Ordering::Release);
             execute!(
                 stdout,
                 PushKeyboardEnhancementFlags(
@@ -61,7 +62,6 @@ impl TerminalModes {
                         | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES,
                 ),
             )?;
-            KEYBOARD_ENHANCED.store(true, Ordering::Release);
         }
         if mouse {
             execute!(stdout, EnableMouseCapture)?;

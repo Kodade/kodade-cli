@@ -144,6 +144,7 @@ pub struct App {
     local_session: String,
     catalog_checked: Instant,
     prefix: bool,
+    forwarded_keys: HashSet<(KeyCode, KeyModifiers)>,
     rename: bool,
     /// The `prefix W` workspace prompt reuses the rename text buffer (`name`).
     new_workspace: bool,
@@ -305,6 +306,7 @@ impl App {
             graphics: crate::graphics::Renderer::default(),
             image_clipboard: crate::image_paste::Clipboard::default(),
             prefix: false,
+            forwarded_keys: HashSet::new(),
             rename: false,
             new_workspace: false,
             worktree_new: false,
@@ -1160,15 +1162,30 @@ impl App {
         writer: &mut Router,
         term: &mut Term,
     ) -> Result<Flow> {
-        let keyboard = self.focused_keyboard();
         if key.kind == KeyEventKind::Release {
-            if keyboard.kitty_flags & 2 != 0 {
-                if let Some(bytes) = bytes_for_mode(key, keyboard) {
+            let owned = self.forwarded_keys.remove(&(key.code, key.modifiers));
+            let modal = self.prefix
+                || self.rename
+                || self.new_workspace
+                || self.worktree_new
+                || self.worktree_confirm.is_some()
+                || self.confirm.is_some()
+                || self.copy.is_some()
+                || self.menu.is_some()
+                || self.help.is_some()
+                || self.center.is_some()
+                || self.settings.is_some()
+                || self.picker.is_some()
+                || self.navigate.is_some()
+                || self.resize;
+            if owned && !modal {
+                if let Some(bytes) = bytes_for_mode(key, self.focused_keyboard()) {
                     write(writer, &ClientMessage::Input { bytes }).await?;
                 }
             }
             return Ok(Flow::Continue);
         }
+        let keyboard = self.focused_keyboard();
         // Any keystroke ends a mouse selection (#12).
         self.clear_selection();
         if self.worktree_confirm.is_some() {
@@ -1211,6 +1228,9 @@ impl App {
             }
             if let Some(bytes) = bytes_for_mode(key, keyboard) {
                 write(writer, &ClientMessage::Input { bytes }).await?;
+                if key.kind == KeyEventKind::Press {
+                    self.forwarded_keys.insert((key.code, key.modifiers));
+                }
             }
         } else if let Some(bytes) = bytes_for_mode(key, keyboard) {
             write(writer, &ClientMessage::Input { bytes }).await?;
@@ -3554,6 +3574,9 @@ pub fn bytes(k: KeyEvent) -> Option<Vec<u8>> {
 /// Encode only modes a pane explicitly negotiated; legacy terminals retain the
 /// historical bytes above.
 pub fn bytes_for_mode(k: KeyEvent, modes: KeyboardModes) -> Option<Vec<u8>> {
+    if k.kind == KeyEventKind::Release && modes.kitty_flags & 2 == 0 {
+        return None;
+    }
     if modes.kitty_flags & 1 != 0 {
         let code = match k.code {
             KeyCode::Char(c) => c as u32,
@@ -3561,6 +3584,11 @@ pub fn bytes_for_mode(k: KeyEvent, modes: KeyboardModes) -> Option<Vec<u8>> {
             KeyCode::Tab => 9,
             KeyCode::Backspace => 127,
             KeyCode::Esc => 27,
+            KeyCode::Up => 57352,
+            KeyCode::Down => 57353,
+            KeyCode::Right => 57351,
+            KeyCode::Left => 57350,
+            _ if k.kind == KeyEventKind::Release => return None,
             _ => return bytes(k),
         };
         let encoded = match k.code {
@@ -3570,11 +3598,8 @@ pub fn bytes_for_mode(k: KeyEvent, modes: KeyboardModes) -> Option<Vec<u8>> {
             KeyCode::Esc => true,
             _ => !k.modifiers.is_empty(),
         };
-        if !encoded {
+        if !encoded && k.kind != KeyEventKind::Release {
             return bytes(k);
-        }
-        if k.kind == KeyEventKind::Release && modes.kitty_flags & 2 == 0 {
-            return None;
         }
         let mut modifier = 1;
         if k.modifiers.contains(KeyModifiers::SHIFT) {
@@ -3586,10 +3611,14 @@ pub fn bytes_for_mode(k: KeyEvent, modes: KeyboardModes) -> Option<Vec<u8>> {
         if k.modifiers.contains(KeyModifiers::CONTROL) {
             modifier += 4;
         }
-        let event = match k.kind {
-            KeyEventKind::Press => "",
-            KeyEventKind::Repeat => ":2",
-            KeyEventKind::Release => ":3",
+        let event = if modes.kitty_flags & 2 == 0 {
+            ""
+        } else {
+            match k.kind {
+                KeyEventKind::Press => "",
+                KeyEventKind::Repeat => ":2",
+                KeyEventKind::Release => ":3",
+            }
         };
         return Some(format!("\x1b[{code};{modifier}{event}u").into_bytes());
     }
@@ -3599,7 +3628,11 @@ pub fn bytes_for_mode(k: KeyEvent, modes: KeyboardModes) -> Option<Vec<u8>> {
         _ => false,
     };
     if modify_other_keys {
-        if let KeyCode::Char(c) = k.code {
+        if let Some(c) = match k.code {
+            KeyCode::Char(c) => Some(c as u32),
+            KeyCode::Enter => Some(13),
+            _ => None,
+        } {
             let mut modifier = 1;
             if k.modifiers.contains(KeyModifiers::SHIFT) {
                 modifier += 1;
@@ -3610,7 +3643,7 @@ pub fn bytes_for_mode(k: KeyEvent, modes: KeyboardModes) -> Option<Vec<u8>> {
             if k.modifiers.contains(KeyModifiers::CONTROL) {
                 modifier += 4;
             }
-            return Some(format!("\x1b[27;{modifier};{}~", c as u32).into_bytes());
+            return Some(format!("\x1b[27;{modifier};{c}~").into_bytes());
         }
     }
     bytes(k)

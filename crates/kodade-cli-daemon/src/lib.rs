@@ -208,8 +208,10 @@ impl vt100::Callbacks for PtyCallbacks {
             c,
         );
     }
-    fn unhandled_osc(&mut self, _: &mut vt100::Screen, params: &[&[u8]]) {
-        self.terminal_modes.osc(params);
+    fn unhandled_escape(&mut self, _: &mut vt100::Screen, i1: Option<u8>, _: Option<u8>, c: u8) {
+        if i1.is_none() && c == b'c' {
+            self.terminal_modes = terminal_modes::Modes::default();
+        }
     }
 }
 impl PtyCallbacks {
