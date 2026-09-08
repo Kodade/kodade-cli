@@ -71,6 +71,9 @@ try {
 
     Write-Host 'installing Unix OpenSSH server'
     Invoke-Wsl @('sh', '-lc', 'apk add --no-cache openssh')
+    # A freshly imported Alpine rootfs has no host keys. Generate them before
+    # the foreground sshd starts so it can bind rather than exiting silently.
+    Invoke-Wsl @('ssh-keygen', '-A')
     # WSL imports keep their filesystem opaque to Windows. Copy through the
     # distro's mounted Windows path so the running Unix instance sees the binary.
     if ($LinuxBinary -notmatch '^([A-Za-z]):\\(.*)$') { throw "cannot map Windows fixture path into WSL: $LinuxBinary" }
