@@ -6699,6 +6699,7 @@ mod tests {
         session
             .open_worktree_workspace(repo.clone(), worktree.clone())
             .expect("open existing worktree workspace");
+        let worktree = worktree.canonicalize().expect("canonical worktree");
         let workspace = session
             .state
             .lock()
