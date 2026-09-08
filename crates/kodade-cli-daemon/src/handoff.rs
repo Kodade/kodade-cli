@@ -615,11 +615,15 @@ mod tests {
     fn rejects_an_unauthenticated_importer_before_sending_manifest() {
         let path = directory().join("handoff.sock");
         let listener = bind_listener(&path).unwrap();
+        let (done, hold_peer) = std::sync::mpsc::channel();
         let peer = thread::spawn({
             let path = path.clone();
             move || {
                 let mut stream = UnixStream::connect(path).unwrap();
                 stream.write_all(b"wrong\n").unwrap();
+                // Keep the unauthorized peer connected until authentication is
+                // checked; an early disconnect exercises a different error.
+                let _ = hold_peer.recv_timeout(Duration::from_secs(2));
             }
         });
         let error = accept_and_validate_with_timeout(
@@ -629,6 +633,7 @@ mod tests {
             Duration::from_secs(1),
         )
         .unwrap_err();
+        let _ = done.send(());
         peer.join().unwrap();
         assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
     }

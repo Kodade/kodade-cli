@@ -13,6 +13,7 @@ mod manifest;
 mod persist;
 mod plugins;
 mod proc;
+mod pty_io;
 mod terminal_replay;
 
 use std::{
@@ -4115,23 +4116,16 @@ impl Pane {
         if let Ok(exe) = env::current_exe() {
             command.env("KODADE_BIN", exe);
         }
-        let child = pair
-            .slave
-            .spawn_command(command)
-            .context("spawn login shell in PTY")?;
-        let writer = Arc::new(Mutex::new(pair.master.take_writer()?));
-        // `dup` gives the poll loop its own descriptor. We must not toggle
-        // O_NONBLOCK on a cloned open-file description because that would also
-        // change the PTY writer used for pane input.
         let master_fd = pair
             .master
             .as_raw_fd()
             .ok_or_else(|| anyhow!("PTY master has no Unix descriptor"))?;
-        let reader_fd = unsafe { libc::fcntl(master_fd, libc::F_DUPFD_CLOEXEC, 0) };
-        if reader_fd < 0 {
-            return Err(std::io::Error::last_os_error()).context("duplicate PTY reader");
-        }
-        let reader = unsafe { fs::File::from_raw_fd(reader_fd) };
+        let (reader, writer) = pty_io::pair(master_fd)?;
+        let writer = Arc::new(Mutex::new(writer));
+        let child = pair
+            .slave
+            .spawn_command(command)
+            .context("spawn login shell in PTY")?;
         let mut restored_parser =
             PtyParser::new_with_callbacks(rows, cols, 10_000, PtyCallbacks::default());
         if let Some(replay) = replay.as_ref() {
@@ -4306,18 +4300,11 @@ impl Pane {
         output_generation: Arc<AtomicU64>,
     ) -> Result<Self> {
         let master: Box<dyn MasterPty + Send> = Box::new(handoff::ImportedMaster::from_raw_fd(fd));
-        let writer = Arc::new(Mutex::new(master.take_writer()?));
-        let reader_fd = libc::fcntl(
-            master
-                .as_raw_fd()
-                .ok_or_else(|| anyhow!("imported master has no fd"))?,
-            libc::F_DUPFD_CLOEXEC,
-            0,
-        );
-        if reader_fd < 0 {
-            return Err(std::io::Error::last_os_error()).context("duplicate imported PTY reader");
-        }
-        let reader = fs::File::from_raw_fd(reader_fd);
+        let master_fd = master
+            .as_raw_fd()
+            .ok_or_else(|| anyhow!("imported master has no fd"))?;
+        let (reader, writer) = pty_io::pair(master_fd)?;
+        let writer = Arc::new(Mutex::new(writer));
         let mut parser = PtyParser::new_with_callbacks(
             runtime.rows,
             runtime.cols,
@@ -5028,6 +5015,14 @@ fn read_pty(
             }
             let count = match reader.read(&mut bytes) {
                 Ok(count) => count,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                    ) =>
+                {
+                    continue
+                }
                 Err(_) => break,
             };
             if count == 0 {
@@ -6231,7 +6226,11 @@ mod tests {
             Some(vec!["sh".into(), "-c".into(), "i=0; while [ $i -lt 40 ]; do printf 'tick-%s\\n' \"$i\"; i=$((i+1)); sleep 0.03; done".into()]),
             None, None, HashMap::new(),
         ).expect("spawn ticker");
-        tokio::time::sleep(Duration::from_millis(120)).await;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !pane.snapshot().0.contents.contains("tick-") {
+            assert!(Instant::now() < deadline, "ticker did not start");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         pane.reader
             .pause(Duration::from_secs(1))
             .expect("reader acknowledges pause");
@@ -6243,12 +6242,14 @@ mod tests {
             "reader consumed output after acknowledging pause"
         );
         pane.reader.resume();
-        tokio::time::sleep(Duration::from_millis(120)).await;
-        assert_ne!(
-            pane.snapshot().0.contents,
-            before,
-            "reader did not catch buffered output after resume"
-        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while pane.snapshot().0.contents == before {
+            assert!(
+                Instant::now() < deadline,
+                "reader did not catch buffered output after resume"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 
     #[test]
@@ -7902,21 +7903,24 @@ mod tests {
                 })
                 .expect("spawn pane");
         }
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        let contents: Vec<_> = session
-            .panes
-            .lock()
-            .expect("panes")
-            .values()
-            .map(|pane| pane.snapshot().0.contents)
-            .collect();
-        assert_eq!(
-            contents
-                .iter()
-                .filter(|text| text.contains("per-workspace"))
-                .count(),
-            2
-        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let ready = session
+                .panes
+                .lock()
+                .expect("panes")
+                .values()
+                .filter(|pane| pane.snapshot().0.contents.contains("per-workspace"))
+                .count();
+            if ready == 2 {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "workspace environment did not reach both panes"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         assert_eq!(
             session
                 .build_file()
