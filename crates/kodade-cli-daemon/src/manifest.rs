@@ -36,7 +36,7 @@ pub struct Manifest {
     pub process: Vec<String>,
     #[serde(default)]
     pub title: Vec<String>,
-    /// Command that resumes the agent's last session, e.g. `codex resume --last`.
+    /// Metadata command that opens an agent's resume surface, e.g. `codex resume`.
     #[serde(default)]
     pub resume: Option<String>,
     #[serde(default, rename = "rule")]

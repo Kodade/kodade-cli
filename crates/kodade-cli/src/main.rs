@@ -9,6 +9,7 @@ mod connection;
 mod doctor;
 mod endpoints;
 mod graphics;
+mod guide;
 mod help;
 mod image_paste;
 mod input;
@@ -51,6 +52,14 @@ async fn main() -> Result<()> {
     let explicit_session =
         matches.value_source("session") == Some(clap::parser::ValueSource::CommandLine);
     let mut args = cli::Cli::from_arg_matches(&matches)?;
+    if matches!(
+        args.command,
+        Some(cli::Command::Agent {
+            command: cli::AgentCommand::Guide
+        })
+    ) {
+        return guide::print();
+    }
     connection::inherited_context(
         &mut args,
         explicit_session,
@@ -236,7 +245,7 @@ async fn main() -> Result<()> {
         Some(cli::Command::Session { command }) => {
             session_command(remote.as_deref(), &socket, &session, command).await
         }
-        Some(cli::Command::Machine { command }) => machine(command),
+        Some(cli::Command::Machine { command }) => machine(command).await,
         Some(cli::Command::Worktree { command }) => worktree(&socket, command).await,
         Some(cli::Command::Ls { json }) => {
             let layout =
@@ -280,7 +289,7 @@ async fn main() -> Result<()> {
         }
         // `new` is the alias of `workspace new`.
         Some(cli::Command::New { workspace, path }) => {
-            new_workspace(&socket, workspace, path).await
+            new_workspace(&socket, workspace, path, Vec::new()).await
         }
         Some(cli::Command::Run {
             workspace,
@@ -298,6 +307,7 @@ async fn main() -> Result<()> {
                         split: None,
                         command: Some(command),
                         name,
+                        context: None,
                     },
                 )
                 .await?,
@@ -327,6 +337,7 @@ async fn main() -> Result<()> {
                         split: Some(axis),
                         command: (!command.is_empty()).then_some(command),
                         name: None,
+                        context: None,
                     },
                 )
                 .await?,
@@ -345,6 +356,7 @@ async fn main() -> Result<()> {
                         split: None,
                         command: None,
                         name,
+                        context: None,
                     },
                 )
                 .await?,
@@ -398,6 +410,41 @@ async fn main() -> Result<()> {
                     integrations::integrate_codex(write, force)
                 }
             }
+            cli::IntegrateCommand::Copilot { write, remove } => {
+                if remove {
+                    integrations::unintegrate_copilot()
+                } else {
+                    integrations::integrate_copilot(write)
+                }
+            }
+            cli::IntegrateCommand::Cursor { write, remove } => {
+                if remove {
+                    integrations::unintegrate_cursor()
+                } else {
+                    integrations::integrate_cursor(write)
+                }
+            }
+            cli::IntegrateCommand::Droid { write, remove } => {
+                if remove {
+                    integrations::unintegrate_droid()
+                } else {
+                    integrations::integrate_droid(write)
+                }
+            }
+            cli::IntegrateCommand::Kimi { write, remove } => {
+                if remove {
+                    integrations::unintegrate_kimi()
+                } else {
+                    integrations::integrate_kimi(write)
+                }
+            }
+            cli::IntegrateCommand::Qwen { write, remove } => {
+                if remove {
+                    integrations::unintegrate_qwen()
+                } else {
+                    integrations::integrate_qwen(write)
+                }
+            }
             cli::IntegrateCommand::OpenCode { write, remove } => {
                 if remove {
                     integrations::unintegrate_opencode()
@@ -410,6 +457,55 @@ async fn main() -> Result<()> {
                     integrations::unintegrate_pi()
                 } else {
                     integrations::integrate_pi(write)
+                }
+            }
+            cli::IntegrateCommand::Omp { write, remove } => {
+                if remove {
+                    integrations::unintegrate_omp()
+                } else {
+                    integrations::integrate_omp(write)
+                }
+            }
+            cli::IntegrateCommand::Kilo { write, remove } => {
+                if remove {
+                    integrations::unintegrate_kilo()
+                } else {
+                    integrations::integrate_kilo(write)
+                }
+            }
+            cli::IntegrateCommand::Hermes { write, remove } => {
+                if remove {
+                    integrations::unintegrate_hermes()
+                } else {
+                    integrations::integrate_hermes(write)
+                }
+            }
+            cli::IntegrateCommand::Antigravity { write, remove } => {
+                if remove {
+                    integrations::unintegrate_antigravity()
+                } else {
+                    integrations::integrate_antigravity(write)
+                }
+            }
+            cli::IntegrateCommand::Devin { write, remove } => {
+                if remove {
+                    integrations::unintegrate_devin()
+                } else {
+                    integrations::integrate_devin(write)
+                }
+            }
+            cli::IntegrateCommand::Mastra { write, remove } => {
+                if remove {
+                    integrations::unintegrate_mastra()
+                } else {
+                    integrations::integrate_mastra(write)
+                }
+            }
+            cli::IntegrateCommand::Grok { write, remove } => {
+                if remove {
+                    integrations::unintegrate_grok()
+                } else {
+                    integrations::integrate_grok(write)
                 }
             }
         },
@@ -430,7 +526,7 @@ async fn main() -> Result<()> {
     }
 }
 
-fn machine(command: cli::MachineCommand) -> Result<()> {
+async fn machine(command: cli::MachineCommand) -> Result<()> {
     let mut catalog = machines::load()?;
     match command {
         cli::MachineCommand::List { json } => {
@@ -456,10 +552,25 @@ fn machine(command: cli::MachineCommand) -> Result<()> {
             target,
             label,
             session,
+            install,
         } => {
+            // Validate catalog constraints before an explicit preparation, but
+            // don't save until the remote is known usable.
+            let mut candidate = machines::Catalog {
+                machines: catalog.machines.clone(),
+            };
+            candidate.add(label.clone(), target.clone(), session.clone())?;
+            if install {
+                remote::prepare_machine(&target, true).await?;
+            }
             let profile = catalog.add(label, target, session)?;
             println!("{}", profile.id);
             machines::save(&catalog)?;
+        }
+        cli::MachineCommand::Prepare { id, install } => {
+            let profile = catalog.get_mut(&id)?.clone();
+            remote::prepare_machine(&profile.target, install).await?;
+            println!("prepared {} ({})", profile.label, profile.target);
         }
         cli::MachineCommand::Rename { id, label } => {
             catalog.get_mut(&id)?.label = label;
@@ -656,6 +767,7 @@ async fn tab(socket: &Path, command: cli::TabCommand) -> Result<()> {
                         split: None,
                         command: None,
                         name,
+                        context: None,
                     },
                 )
                 .await?,
@@ -697,7 +809,9 @@ async fn workspace(socket: &Path, command: cli::WorkspaceCommand) -> Result<()> 
             Ok(())
         }
         // Same idempotent create-or-select as the top-level `new` alias.
-        cli::WorkspaceCommand::New { name, path } => new_workspace(socket, name, path).await,
+        cli::WorkspaceCommand::New { name, path, env } => {
+            new_workspace(socket, name, path, env).await
+        }
         cli::WorkspaceCommand::Close { workspace } => {
             let id = resolve_workspace_name(socket, &workspace).await?;
             commands::layout(
@@ -814,14 +928,26 @@ async fn new_workspace(
     socket: &Path,
     name: String,
     path: Option<std::path::PathBuf>,
+    env: Vec<(String, String)>,
 ) -> Result<()> {
     let layout = commands::layout(commands::request(socket, commands::layout_query()).await?)?;
     if let Ok(id) = commands::resolve_workspace(&layout, &name) {
+        if !env.is_empty() {
+            bail!("workspace '{name}' already exists; --env only applies when creating a workspace")
+        }
         commands::request(socket, ClientMessage::SelectWorkspace { id }).await?;
         println!("{}", id.0);
     } else {
         let reply = commands::layout(
-            commands::request(socket, ClientMessage::NewWorkspace { name, root: path }).await?,
+            commands::request(
+                socket,
+                ClientMessage::NewWorkspace {
+                    name,
+                    root: path,
+                    env: env.into_iter().collect(),
+                },
+            )
+            .await?,
         )?;
         println!("{}", reply.active_workspace.0);
     }
@@ -918,6 +1044,7 @@ async fn agent(
     command: cli::AgentCommand,
 ) -> Result<()> {
     match command {
+        cli::AgentCommand::Guide => guide::print(),
         cli::AgentCommand::Ls { json } => {
             let layout =
                 commands::layout(commands::request(socket, commands::layout_query()).await?)?;
@@ -1076,14 +1203,29 @@ async fn agent(
             pane,
             state,
             source,
+            native_agent,
+            native_session_id,
+            native_session_path,
+            hook_json,
         } => {
+            let native_session_id = if hook_json {
+                hook_session_id(&source, native_agent.as_deref())?
+            } else {
+                native_session_id
+            };
             commands::layout(
                 commands::request(
                     socket,
                     ClientMessage::AgentState {
                         pane,
                         state,
-                        source,
+                        source: source.clone(),
+                        native_session: native_agent.map(|agent| kodade_cli_proto::NativeSession {
+                            source: source.clone(),
+                            agent,
+                            id: native_session_id,
+                            path: native_session_path,
+                        }),
                     },
                 )
                 .await?,
@@ -1091,6 +1233,49 @@ async fn agent(
             Ok(())
         }
     }
+}
+
+fn hook_session_id(source: &str, agent: Option<&str>) -> Result<Option<String>> {
+    use std::io::{IsTerminal, Read};
+    if std::io::stdin().is_terminal() {
+        return Ok(None);
+    }
+    let mut payload = Vec::with_capacity(4096);
+    std::io::stdin()
+        .take(65_537)
+        .read_to_end(&mut payload)
+        .context("read hook payload")?;
+    if payload.len() > 65_536 {
+        bail!("hook payload exceeds 64 KiB");
+    }
+    let value: serde_json::Value =
+        serde_json::from_slice(&payload).context("parse hook payload")?;
+    Ok(hook_session_id_from_value(&value, source, agent))
+}
+
+fn hook_session_id_from_value(
+    value: &serde_json::Value,
+    source: &str,
+    agent: Option<&str>,
+) -> Option<String> {
+    let key = match (source, agent) {
+        ("kodade:codex", Some("codex")) => "session_id",
+        ("kodade:claude-code", Some("claude")) | ("kodade:gemini-cli", Some("gemini")) => {
+            "session_id"
+        }
+        ("kodade:copilot", Some("copilot")) => "sessionId",
+        ("kodade:cursor", Some("cursor"))
+        | ("kodade:droid", Some("droid"))
+        | ("kodade:kimi", Some("kimi"))
+        | ("kodade:qwen", Some("qwen"))
+        | ("kodade:devin", Some("devin")) => "session_id",
+        ("kodade:grok", Some("grok")) => "sessionId",
+        _ => return None,
+    };
+    value
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
 }
 
 fn print_manifests(message: ServerMessage, json: bool) -> Result<()> {
@@ -1149,6 +1334,8 @@ async fn worktree(socket: &Path, command: cli::WorktreeCommand) -> Result<()> {
         cli::WorktreeCommand::Add {
             branch,
             from,
+            base,
+            path,
             workspace,
         } => {
             let layout =
@@ -1164,14 +1351,53 @@ async fn worktree(socket: &Path, command: cli::WorktreeCommand) -> Result<()> {
                 .find(|item| item.id == ws)
                 .and_then(|item| item.root.clone())
                 .ok_or_else(|| anyhow!("workspace has no root directory to branch from"))?;
+            let path = path.map(|path| {
+                if path.is_absolute() {
+                    path
+                } else {
+                    repo_root.join(path)
+                }
+            });
             let reply = commands::layout(
                 commands::request(
                     socket,
                     ClientMessage::NewWorktreeWorkspace {
                         repo_root,
                         branch,
-                        from,
+                        from: base.or(from),
+                        path,
                     },
+                )
+                .await?,
+            )?;
+            println!("{}", reply.active_workspace.0);
+            Ok(())
+        }
+        cli::WorktreeCommand::Open { path, workspace } => {
+            let layout =
+                commands::layout(commands::request(socket, commands::layout_query()).await?)?;
+            let ws = workspace
+                .as_deref()
+                .map(|name| commands::resolve_workspace(&layout, name))
+                .transpose()?
+                .unwrap_or(layout.active_workspace);
+            let repo_root = layout
+                .workspaces
+                .iter()
+                .find(|item| item.id == ws)
+                .and_then(|item| item.root.clone())
+                .ok_or_else(|| {
+                    anyhow!("workspace has no root directory to open a worktree from")
+                })?;
+            let path = if path.is_absolute() {
+                path
+            } else {
+                repo_root.join(path)
+            };
+            let reply = commands::layout(
+                commands::request(
+                    socket,
+                    ClientMessage::OpenWorktreeWorkspace { repo_root, path },
                 )
                 .await?,
             )?;
@@ -1341,7 +1567,37 @@ fn init_config() -> Result<()> {
                 path.display()
             )
         })?;
-    file.write_all(b"# K\xc3\xb6dade CLI configuration. Unspecified settings keep their defaults.\n# Run kodade-cli keys to inspect live bindings; prefix space opens the command center.\ntheme = \"auto\"\n\n[sidebar]\nwidth = 24\n\n[notify]\nonly_when_unfocused = true\n")?;
+    file.write_all(b"# K\xc3\xb6dade CLI configuration. Unspecified settings keep their defaults.\n# Run kodade-cli keys to inspect live bindings; prefix space opens the command center.\ntheme = \"auto\"\n\n# Off by default: retain a bounded private screen replay after a cold restart.\n[session]\npane_history = false\n\n[sidebar]\nwidth = 24\n\n[notify]\nonly_when_unfocused = true\n")?;
     println!("created {}", path.display());
     Ok(())
+}
+
+#[cfg(test)]
+mod hook_payload_tests {
+    use super::*;
+
+    #[test]
+    fn grok_uses_the_documented_top_level_camel_case_session_id() {
+        let payload = serde_json::json!({
+            "sessionId": "grok-root",
+            "toolInput": { "sessionId": "nested-decoy" },
+            "session_id": "snake-decoy",
+        });
+        assert_eq!(
+            hook_session_id_from_value(&payload, "kodade:grok", Some("grok")),
+            Some("grok-root".into())
+        );
+    }
+
+    #[test]
+    fn devin_uses_the_documented_top_level_snake_case_session_id() {
+        let payload = serde_json::json!({
+            "session_id": "devin-root",
+            "tool_input": { "session_id": "nested-decoy" },
+        });
+        assert_eq!(
+            hook_session_id_from_value(&payload, "kodade:devin", Some("devin")),
+            Some("devin-root".into())
+        );
+    }
 }

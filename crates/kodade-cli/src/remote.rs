@@ -15,9 +15,11 @@ use std::{
 };
 
 use anyhow::{bail, Context, Result};
+use sha2::Digest;
 use tokio::{net::UnixStream, process::Command};
 
 use crate::cli;
+use crate::update;
 
 /// Install one-liner shown when the remote host has no `kodade-cli` on its PATH.
 /// Mirrors README's install section.
@@ -26,6 +28,7 @@ const INSTALL_HINT: &str =
 
 /// How long to wait for the forwarded local socket to accept a connection.
 const TUNNEL_TIMEOUT: Duration = Duration::from_secs(10);
+const REMOTE_INSTALL: &str = "\"$HOME/.local/bin/kodade-cli\"";
 
 /// A live SSH forward. Dropping it stops forwarding and removes the local
 /// socket file; the control master lingers (`ControlPersist`) so a reconnect is
@@ -194,8 +197,17 @@ fn control_opts(control_path: &str) -> Vec<String> {
 pub fn version_args(control_path: &str, host: &str) -> Vec<String> {
     let mut args = control_opts(control_path);
     args.push(host.to_string());
-    args.extend(["kodade-cli".into(), "--version".into()]);
+    args.push(remote_binary_command(&["--version"]));
     args
+}
+
+fn remote_binary_command(args: &[&str]) -> String {
+    let args = args
+        .iter()
+        .map(|arg| remote_word(arg))
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!("if [ -x {REMOTE_INSTALL} ]; then exec {REMOTE_INSTALL} {args}; else exec kodade-cli {args}; fi")
 }
 
 /// `ssh <control-opts> HOST kodade-cli session path -s NAME` — asks for the
@@ -203,13 +215,7 @@ pub fn version_args(control_path: &str, host: &str) -> Vec<String> {
 pub fn socket_path_args(control_path: &str, host: &str, session: &str) -> Vec<String> {
     let mut args = control_opts(control_path);
     args.push(host.to_string());
-    args.extend([
-        "kodade-cli".into(),
-        "session".into(),
-        "path".into(),
-        "-s".into(),
-        remote_word(session),
-    ]);
+    args.push(remote_binary_command(&["session", "path", "-s", session]));
     args
 }
 
@@ -219,8 +225,8 @@ pub fn start_daemon_args(control_path: &str, host: &str, session: &str) -> Vec<S
     let mut args = control_opts(control_path);
     args.push(host.to_string());
     args.push(format!(
-        "nohup kodade-cli daemon {} </dev/null >/dev/null 2>&1 &",
-        remote_word(session)
+        "nohup sh -c {} </dev/null >/dev/null 2>&1 &",
+        remote_word(&remote_binary_command(&["daemon", session])),
     ));
     args
 }
@@ -245,9 +251,184 @@ pub fn tunnel_args(control_path: &str, host: &str, local: &str, remote: &str) ->
 pub fn run_args(control_path: &str, host: &str, remote_args: &[&str]) -> Vec<String> {
     let mut args = control_opts(control_path);
     args.push(host.to_string());
-    args.push("kodade-cli".into());
-    args.extend(remote_args.iter().map(|arg| remote_word(arg)));
+    args.push(remote_binary_command(remote_args));
     args
+}
+
+fn probe_args(control_path: &str, host: &str) -> Vec<String> {
+    let mut args = control_opts(control_path);
+    args.push(host.into());
+    args.push("uname -s; uname -m; if [ -x \"$HOME/.local/bin/kodade-cli\" ]; then printf '%s\\n' \"$HOME/.local/bin/kodade-cli\"; else command -v kodade-cli || true; fi".into());
+    args
+}
+
+fn upload_args(
+    control_path: &str,
+    host: &str,
+    expected_bytes: usize,
+    expected_sha256: &str,
+    expected_version: &str,
+) -> Vec<String> {
+    let mut args = control_opts(control_path);
+    args.push(host.into());
+    // Values originate from a verified local artifact / package metadata, and
+    // are constrained to digits or a semantic version before interpolation.
+    args.push(format!(
+        "set -eu; umask 077; dest=\"$HOME/.local/bin/kodade-cli\"; dir=\"${{dest%/*}}\"; mkdir -p \"$dir\"; tmp=$(mktemp \"$dir/.kodade-cli.XXXXXX\"); trap 'rm -f \"$tmp\"' EXIT HUP INT TERM; cat >\"$tmp\"; bytes=$(wc -c <\"$tmp\" | tr -d '[:space:]'); [ \"$bytes\" = \"{expected_bytes}\" ]; if command -v sha256sum >/dev/null 2>&1; then actual=$(sha256sum \"$tmp\" | awk '{{print $1}}'); else actual=$(shasum -a 256 \"$tmp\" | awk '{{print $1}}'); fi; [ \"$actual\" = \"{expected_sha256}\" ]; chmod 755 \"$tmp\"; LC_ALL=C \"$tmp\" --version | grep -Fx \"kodade-cli {expected_version}\" >/dev/null; mv -f \"$tmp\" \"$dest\"; trap - EXIT"
+    ));
+    args
+}
+
+/// Explicitly prepare a remote Unix host. No reconnect path calls this: it
+/// only runs from `machine add --install` or `machine prepare --install`.
+pub async fn prepare_machine(host: &str, install: bool) -> Result<()> {
+    prepare_machine_with_fetch(host, install, update::fetch).await
+}
+
+/// Keeps release retrieval replaceable only inside this module's tests. Every
+/// caller still flows through release metadata selection, SHA256 validation,
+/// archive extraction, and remote staged verification.
+async fn prepare_machine_with_fetch<F>(host: &str, install: bool, fetch: F) -> Result<()>
+where
+    F: Fn(&str) -> Result<Vec<u8>>,
+{
+    validate_host(host)?;
+    ensure_runtime_dir()?;
+    let control = control_path().to_string_lossy().into_owned();
+    let probe = ssh_output(&probe_args(&control, host)).await?;
+    if !probe.status.success() {
+        bail!(
+            "could not probe {host}: {}",
+            String::from_utf8_lossy(&probe.stderr).trim()
+        );
+    }
+    let lines = String::from_utf8_lossy(&probe.stdout);
+    let mut fields = lines.lines();
+    let os = fields
+        .next()
+        .context("remote probe did not report an operating system")?;
+    let arch = fields
+        .next()
+        .context("remote probe did not report an architecture")?;
+    let version = ssh_output(&version_args(&control, host)).await?;
+    if version.status.success() && remote_version_is_compatible(&version.stdout) {
+        return Ok(());
+    }
+    if !install {
+        bail!("{host} has no compatible kodade-cli; run `kodade-cli machine prepare {host} --install` (or add with --install)");
+    }
+    let (binary, release_version) = verified_release_binary(os, arch, fetch)?;
+    let expected_sha256 = format!("{:x}", sha2::Sha256::digest(&binary));
+    tokio::time::timeout(
+        Duration::from_secs(45),
+        upload_binary(&control, host, &binary, &expected_sha256, &release_version),
+    )
+    .await
+    .context("remote install timed out")??;
+    let installed = ssh_output(&version_args(&control, host)).await?;
+    if !installed.status.success() || !remote_version_is_compatible(&installed.stdout) {
+        bail!("remote install on {host} did not produce a compatible kodade-cli");
+    }
+    Ok(())
+}
+
+fn verified_release_binary<F>(os: &str, arch: &str, fetch: F) -> Result<(Vec<u8>, String)>
+where
+    F: Fn(&str) -> Result<Vec<u8>>,
+{
+    let metadata = String::from_utf8(fetch(update::metadata_url("stable"))?)?;
+    let release = update::select_release("stable", &metadata)?;
+    let version = release.tag_name.trim_start_matches('v').to_owned();
+    if version != env!("CARGO_PKG_VERSION") {
+        bail!(
+            "published release {} does not match local kodade-cli {}",
+            release.tag_name,
+            env!("CARGO_PKG_VERSION")
+        );
+    }
+    let asset = update::platform_asset_for(&version, os_to_target(os)?, arch_to_target(arch)?)?;
+    let sums = String::from_utf8(fetch(update::release_asset_url(&release, "SHA256SUMS")?)?)?;
+    let archive_url = update::release_asset_url(&release, &asset)
+        .with_context(|| format!("published release is missing {asset}"))?;
+    let archive = fetch(archive_url)?;
+    Ok((
+        update::verified_binary(&archive, &update::checksum(&sums, &asset)?)?,
+        version,
+    ))
+}
+
+async fn upload_binary(
+    control: &str,
+    host: &str,
+    binary: &[u8],
+    expected_sha256: &str,
+    expected_version: &str,
+) -> Result<()> {
+    let mut child = Command::new("ssh")
+        .args(upload_args(
+            control,
+            host,
+            binary.len(),
+            expected_sha256,
+            expected_version,
+        ))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .context("start remote install")?;
+    use tokio::io::AsyncWriteExt;
+    let mut stdin = child
+        .stdin
+        .take()
+        .context("remote install stdin unavailable")?;
+    stdin
+        .write_all(binary)
+        .await
+        .context("upload verified remote binary")?;
+    drop(stdin);
+    let output = child
+        .wait_with_output()
+        .await
+        .context("wait for remote install")?;
+    if !output.status.success() {
+        bail!(
+            "remote install failed on {host}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+fn remote_version_is_compatible(stdout: &[u8]) -> bool {
+    let Ok(text) = std::str::from_utf8(stdout) else {
+        return false;
+    };
+    let Some(remote) = text.trim().strip_prefix("kodade-cli ") else {
+        return false;
+    };
+    let Ok(remote) = semver::Version::parse(remote) else {
+        return false;
+    };
+    let local =
+        semver::Version::parse(env!("CARGO_PKG_VERSION")).expect("package version is semver");
+    remote == local
+}
+
+fn os_to_target(value: &str) -> Result<&'static str> {
+    match value {
+        "Linux" => Ok("linux"),
+        "Darwin" => Ok("macos"),
+        _ => bail!("remote OS {value:?} has no standalone preparation artifact"),
+    }
+}
+fn arch_to_target(value: &str) -> Result<&'static str> {
+    match value {
+        "x86_64" | "amd64" => Ok("x86_64"),
+        "aarch64" | "arm64" => Ok("aarch64"),
+        _ => bail!("remote architecture {value:?} has no standalone preparation artifact"),
+    }
 }
 
 /// Run an `ssh` invocation, returning its captured stdout on success.
@@ -424,7 +605,7 @@ mod tests {
         let args = socket_path_args("/tmp/cm-%C", "host", session);
         let remote = &args[args.iter().position(|arg| arg == "host").unwrap() + 1..];
         let rendered = remote.join(" ");
-        assert!(rendered.ends_with("'work; printf injected'"), "{rendered}");
+        assert!(rendered.contains("'work; printf injected'"), "{rendered}");
     }
 
     #[test]
@@ -447,8 +628,7 @@ mod tests {
                 "-o",
                 "ControlPersist=60",
                 "user@host",
-                "kodade-cli",
-                "--version",
+                "if [ -x \"$HOME/.local/bin/kodade-cli\" ]; then exec \"$HOME/.local/bin/kodade-cli\" --version; else exec kodade-cli --version; fi",
             ]
         );
 
@@ -456,18 +636,16 @@ mod tests {
             socket_path_args(cp, host, "work")
                 .last()
                 .map(String::as_str),
-            Some("work")
+            Some("if [ -x \"$HOME/.local/bin/kodade-cli\" ]; then exec \"$HOME/.local/bin/kodade-cli\" session path -s work; else exec kodade-cli session path -s work; fi")
         );
         assert!(socket_path_args(cp, host, "work")
-            .windows(2)
-            .any(|w| w == ["session", "path"]));
+            .last()
+            .unwrap()
+            .contains("session path"));
 
         // The daemon starter forwards detached (`-f`) and names the session.
         let start = start_daemon_args(cp, host, "work");
-        assert!(start
-            .last()
-            .unwrap()
-            .contains("nohup kodade-cli daemon work"));
+        assert!(start.last().unwrap().contains("nohup sh -c"));
         assert!(start.last().unwrap().ends_with("2>&1 &"));
 
         // The forward is Unix-to-Unix: `-N -L local:remote`.
@@ -478,7 +656,85 @@ mod tests {
         assert_eq!(tunnel.last().map(String::as_str), Some("user@host"));
 
         let run = run_args(cp, host, &["session", "ls"]);
-        assert_eq!(&run[run.len() - 3..], ["kodade-cli", "session", "ls"]);
+        assert!(run.last().unwrap().contains("kodade-cli session ls"));
+    }
+
+    #[test]
+    fn remote_install_upload_is_staged_and_never_touches_system_paths() {
+        let command = upload_args("/tmp/cm-%C", "buildbox", 42, &"a".repeat(64), "0.2.1")
+            .last()
+            .unwrap()
+            .clone();
+        assert!(command.contains("dest=\"$HOME/.local/bin/kodade-cli\""));
+        assert!(command.contains("mktemp \"$dir/.kodade-cli.XXXXXX\""));
+        assert!(command.contains("[ \"$bytes\" = \"42\" ]"));
+        assert!(command.contains("[ \"$actual\" = \""));
+        assert!(command.contains("chmod 755 \"$tmp\""));
+        assert!(command.contains("mv -f \"$tmp\" \"$dest\""));
+        assert!(command.contains("--version | grep -Fx \"kodade-cli 0.2.1\""));
+        assert!(!command.contains("/usr/bin"));
+    }
+
+    #[test]
+    fn remote_platform_probe_accepts_released_unix_names() {
+        assert_eq!(os_to_target("Linux").unwrap(), "linux");
+        assert_eq!(arch_to_target("arm64").unwrap(), "aarch64");
+        assert!(os_to_target("FreeBSD").is_err());
+        assert!(arch_to_target("riscv64").is_err());
+    }
+
+    #[test]
+    fn remote_version_requires_exact_local_cli_version() {
+        let local = env!("CARGO_PKG_VERSION");
+        assert!(remote_version_is_compatible(
+            format!("kodade-cli {local}\n").as_bytes()
+        ));
+        assert!(!remote_version_is_compatible(b"foreign-tool 0.2.1\n"));
+        assert!(!remote_version_is_compatible(
+            format!("kodade-cli {local}\nextra output\n").as_bytes()
+        ));
+        assert!(!remote_version_is_compatible(b"kodade-cli unparseable\n"));
+    }
+
+    #[test]
+    fn fixture_release_version_mismatch_stops_before_artifact_fetch() {
+        use std::cell::Cell;
+
+        let other = if env!("CARGO_PKG_VERSION") == "0.0.0" {
+            "0.0.1"
+        } else {
+            "0.0.0"
+        };
+        let calls = Cell::new(0);
+        let error = verified_release_binary("Linux", "x86_64", |url| {
+            calls.set(calls.get() + 1);
+            assert_eq!(url, update::metadata_url("stable"));
+            Ok(format!(r#"{{"tag_name":"v{other}"}}"#).into_bytes())
+        })
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("does not match local kodade-cli"));
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn fixture_download_rejects_a_bad_checksum_before_remote_upload() {
+        let metadata = br#"{"tag_name":"v0.2.1","assets":[{"name":"SHA256SUMS","browser_download_url":"sums"},{"name":"kodade-cli-0.2.1-x86_64-unknown-linux-gnu.tar.gz","browser_download_url":"archive"}]}"#;
+        let error = verified_release_binary("Linux", "x86_64", |url| match url {
+            "https://api.github.com/repos/Kodade/kodade-cli/releases/latest" => {
+                Ok(metadata.to_vec())
+            }
+            "sums" => Ok(format!(
+                "{}  kodade-cli-0.2.1-x86_64-unknown-linux-gnu.tar.gz\n",
+                "0".repeat(64)
+            )
+            .into_bytes()),
+            "archive" => Ok(b"fixture archive".to_vec()),
+            _ => bail!("unexpected fixture URL {url}"),
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("checksum mismatch"));
     }
 
     #[test]

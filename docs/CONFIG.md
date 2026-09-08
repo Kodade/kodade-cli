@@ -272,6 +272,33 @@ ordinary interactive tab.
 `reload_config` re-reads this file and the theme in place, and `settings`
 opens the [settings menu](#settings-menu).
 
+## Configured commands
+
+Use `[[commands]]` for named local tasks without installing a plugin. Commands
+are read only from your config file, appear in the command center, and can use
+a prefixed key or a global modified chord. `contexts` limits discovery to the
+current workspace, tab, pane, or text selection. `cwd` overrides the focused
+pane directory; `pane = true` opens a normal terminal pane.
+
+```toml
+[[commands]]
+label = "format"
+key = "prefix+f"
+command = "cargo fmt"
+contexts = ["workspace"]
+
+[[commands]]
+label = "explain selection"
+key = "ctrl+alt+e"
+command = "my-tool explain"
+contexts = ["selection"]
+cwd = "/tmp/project"
+```
+
+Background commands receive the same bounded private JSON context file as
+extensions in `KODADE_PLUGIN_CONTEXT`; values are data and are never inserted
+into shell source. Reload config to replace command bindings.
+
 `paste_buffer` re-sends the last paste (or copy-mode yank, or mouse selection) into the focused
 pane; it reports `paste buffer empty` when nothing has been copied yet. See
 [Paste](#paste).
@@ -320,17 +347,25 @@ The last paste (or copy-mode yank, or mouse selection) is kept in an internal bu
 ## Session persistence
 
 The daemon persists each session's layout and restores it on a cold start (see
-[DEVELOPMENT.md](DEVELOPMENT.md#session-persistence-and-restore)). One key in
-the same `config.toml`, read by the daemon, controls restore behavior:
+[DEVELOPMENT.md](DEVELOPMENT.md#session-persistence-and-restore)). The daemon reads these settings from the same `config.toml` at startup:
 
 | Setting | Default | Description |
 |---|---|---|
-| `session.resume_agents` | `false` | When `true`, a restored pane whose saved command matches an agent manifest with a `resume` string re-runs that resume command (e.g. `codex resume --last`) instead of starting a plain shell. Panes with no matching manifest always restore as shells. |
+| `session.resume_agents` | `false` | When `true`, a pane with an exact native conversation identity reported by a supported integration resumes that identity. Missing, invalid, or duplicate identities restore as plain shells; Ködade never guesses with an agent's `--last` command. |
+| `session.pane_history` | `false` | When `true`, retain a formatted active screen and recent plain text within 64 KiB per pane (2 MiB per session total) for cold-restart replay. It is private local state, never written by default. Native agent resume takes precedence. |
 
 ```toml
 [session]
 resume_agents = true
+pane_history = true
 ```
+
+History is sampled at most once every two seconds and stored beside the layout
+as `SESSION.history.json`. It can contain anything shown in the terminal.
+Turning the setting off removes prior replay on the next daemon start;
+`kill-session` removes it immediately. Screens larger than 512 columns or rows,
+or a formatted frame that exceeds the pane budget, are omitted.
+
 
 ## Git worktrees
 

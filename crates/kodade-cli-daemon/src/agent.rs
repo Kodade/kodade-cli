@@ -148,7 +148,7 @@ mod tests {
             display: "Codex".into(),
             process: vec!["codex".into()],
             title: vec![],
-            resume: Some("codex resume --last".into()),
+            resume: Some("codex resume".into()),
             rules: vec![Rule {
                 state: ManifestState::Blocked,
                 any: vec!["y/n".into()],

@@ -113,6 +113,10 @@ pub(crate) struct PaneRuntime {
     #[serde(default)]
     pub(crate) spawn_command: Option<Vec<String>>,
     #[serde(default)]
+    pub(crate) native_session: Option<kodade_cli_proto::NativeSession>,
+    #[serde(default)]
+    pub(crate) context_file: Option<std::path::PathBuf>,
+    #[serde(default)]
     pub(crate) cwd: Option<std::path::PathBuf>,
     #[serde(default)]
     pub(crate) agent_identity: Option<String>,
@@ -152,6 +156,11 @@ pub(crate) struct HandoffManifest {
     pub(crate) attachments: Option<crate::image_paste::Directory>,
     #[serde(default)]
     pub(crate) notify_seq: u64,
+    #[serde(default)]
+    pub(crate) notifications: Vec<kodade_cli_proto::Notification>,
+    #[serde(default)]
+    pub(crate) pane_history: bool,
+    pub(crate) size: (u16, u16),
 }
 
 impl HandoffManifest {
@@ -166,6 +175,9 @@ impl HandoffManifest {
             panes,
             attachments: None,
             notify_seq: 0,
+            notifications: Vec::new(),
+            pane_history: false,
+            size: (80, 24),
         })
     }
 
@@ -178,6 +190,9 @@ impl HandoffManifest {
         }
         if self.panes.len() > MAX_HANDOFF_FDS {
             return Err(data("handoff contains too many PTYs"));
+        }
+        if self.notifications.len() > 64 || self.size.0 == 0 || self.size.1 == 0 {
+            return Err(data("invalid live runtime metadata"));
         }
         for pane in &self.panes {
             if pane.rows == 0

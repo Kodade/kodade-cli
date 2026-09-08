@@ -9,6 +9,21 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand, ValueEnum};
 use kodade_cli_proto::{AgentStateKind, Direction, PaneId};
 
+fn env_assignment(value: &str) -> Result<(String, String), String> {
+    let (key, value) = value
+        .split_once('=')
+        .ok_or_else(|| "environment must be KEY=VALUE".to_owned())?;
+    let mut chars = key.chars();
+    match chars.next() {
+        Some(first) if first == '_' || first.is_ascii_alphabetic() => {}
+        _ => return Err("environment key must be a shell-style identifier".into()),
+    }
+    if !chars.all(|character| character == '_' || character.is_ascii_alphanumeric()) {
+        return Err("environment key must be a shell-style identifier".into());
+    }
+    Ok((key.into(), value.into()))
+}
+
 pub const DEFAULT_SESSION: &str = "default";
 
 #[derive(Debug, Parser, PartialEq, Eq)]
@@ -363,6 +378,9 @@ pub enum WorkspaceCommand {
         name: String,
         #[arg(value_name = "PATH")]
         path: Option<PathBuf>,
+        /// Environment inherited by panes created in this workspace (KEY=VALUE).
+        #[arg(long = "env", value_name = "KEY=VALUE", value_parser = env_assignment)]
+        env: Vec<(String, String)>,
     },
     /// Close a workspace and its tabs.
     Close {
@@ -432,6 +450,16 @@ pub enum MachineCommand {
         label: String,
         #[arg(long = "remote-session")]
         session: Option<String>,
+        /// Download and install a verified standalone binary when the host needs one.
+        #[arg(long)]
+        install: bool,
+    },
+    /// Check a saved host and optionally install a verified standalone binary.
+    Prepare {
+        #[arg(value_name = "PROFILE")]
+        id: String,
+        #[arg(long)]
+        install: bool,
     },
     Rename {
         id: String,
@@ -485,6 +513,8 @@ impl From<DirectionArg> for Direction {
 
 #[derive(Debug, Subcommand, PartialEq, Eq)]
 pub enum AgentCommand {
+    /// Print the versioned local automation guide without connecting to a session.
+    Guide,
     /// List recognized agents and their states.
     Ls {
         /// Print the matching pane snapshots as JSON.
@@ -612,6 +642,19 @@ pub enum AgentCommand {
         /// Name recorded as the source of the report.
         #[arg(long, value_name = "NAME", default_value = "cli")]
         source: String,
+        /// Canonical agent name associated with a native conversation id.
+        #[arg(long, value_name = "AGENT")]
+        native_agent: Option<String>,
+        /// Agent-native conversation id reported by an integration hook.
+        #[arg(long, value_name = "ID", conflicts_with = "native_session_path")]
+        native_session_id: Option<String>,
+        /// Agent-native session path reported by an integration hook.
+        #[arg(long, value_name = "PATH", conflicts_with = "native_session_id")]
+        native_session_path: Option<PathBuf>,
+        /// Read one bounded JSON hook payload from a pipe and extract this
+        /// integration's documented native session field.
+        #[arg(long)]
+        hook_json: bool,
     },
 }
 
@@ -625,7 +668,21 @@ pub enum WorktreeCommand {
         /// Base ref for a new branch (defaults to the repo's current HEAD).
         #[arg(long = "from", value_name = "REF")]
         from: Option<String>,
+        /// Alias for --from, naming the starting ref explicitly.
+        #[arg(long, value_name = "REF", conflicts_with = "from")]
+        base: Option<String>,
+        /// Explicit directory for the new checkout.
+        #[arg(long, value_name = "PATH")]
+        path: Option<PathBuf>,
         /// Workspace whose root repo to branch from (defaults to the active one).
+        #[arg(short = 'w', long = "workspace", value_name = "NAME")]
+        workspace: Option<String>,
+    },
+    /// Open an existing linked worktree without creating or copying it.
+    Open {
+        #[arg(value_name = "PATH")]
+        path: PathBuf,
+        /// Workspace whose root repo owns the worktree (defaults to active).
         #[arg(short = 'w', long = "workspace", value_name = "NAME")]
         workspace: Option<String>,
     },
@@ -692,6 +749,41 @@ pub enum IntegrateCommand {
         #[arg(long, conflicts_with = "write")]
         remove: bool,
     },
+    /// GitHub Copilot CLI lifecycle hooks.
+    Copilot {
+        #[arg(long)]
+        write: bool,
+        #[arg(long, conflicts_with = "write")]
+        remove: bool,
+    },
+    /// Cursor lifecycle hooks.
+    Cursor {
+        #[arg(long)]
+        write: bool,
+        #[arg(long, conflicts_with = "write")]
+        remove: bool,
+    },
+    /// Factory Droid lifecycle hooks.
+    Droid {
+        #[arg(long)]
+        write: bool,
+        #[arg(long, conflicts_with = "write")]
+        remove: bool,
+    },
+    /// Kimi Code lifecycle hooks.
+    Kimi {
+        #[arg(long)]
+        write: bool,
+        #[arg(long, conflicts_with = "write")]
+        remove: bool,
+    },
+    /// Qwen Code lifecycle hooks.
+    Qwen {
+        #[arg(long)]
+        write: bool,
+        #[arg(long, conflicts_with = "write")]
+        remove: bool,
+    },
     /// OpenCode local plugin (official API documented; fixture-tested here).
     OpenCode {
         #[arg(long)]
@@ -701,6 +793,55 @@ pub enum IntegrateCommand {
     },
     /// Pi global extension (verified against installed Pi 0.85.1 docs).
     Pi {
+        #[arg(long)]
+        write: bool,
+        #[arg(long, conflicts_with = "write")]
+        remove: bool,
+    },
+    /// Oh My Pi global extension.
+    Omp {
+        #[arg(long)]
+        write: bool,
+        #[arg(long, conflicts_with = "write")]
+        remove: bool,
+    },
+    /// Kilo global lifecycle plugin.
+    Kilo {
+        #[arg(long)]
+        write: bool,
+        #[arg(long, conflicts_with = "write")]
+        remove: bool,
+    },
+    /// Hermes global lifecycle plugin.
+    Hermes {
+        #[arg(long)]
+        write: bool,
+        #[arg(long, conflicts_with = "write")]
+        remove: bool,
+    },
+    /// Antigravity CLI lifecycle hooks.
+    Antigravity {
+        #[arg(long)]
+        write: bool,
+        #[arg(long, conflicts_with = "write")]
+        remove: bool,
+    },
+    /// Devin CLI lifecycle hooks.
+    Devin {
+        #[arg(long)]
+        write: bool,
+        #[arg(long, conflicts_with = "write")]
+        remove: bool,
+    },
+    /// Mastra Code lifecycle hooks.
+    Mastra {
+        #[arg(long)]
+        write: bool,
+        #[arg(long, conflicts_with = "write")]
+        remove: bool,
+    },
+    /// Grok CLI session hook.
+    Grok {
         #[arg(long)]
         write: bool,
         #[arg(long, conflicts_with = "write")]
@@ -851,6 +992,10 @@ mod tests {
                     pane: PaneId(7),
                     state: AgentStateKind::Working,
                     source: "hook".into(),
+                    native_agent: None,
+                    native_session_id: None,
+                    native_session_path: None,
+                    hook_json: false,
                 }
             })
         );
@@ -868,6 +1013,41 @@ mod tests {
                     pane: PaneId(7),
                     state: AgentStateKind::Idle,
                     source: "cli".into(),
+                    native_agent: None,
+                    native_session_id: None,
+                    native_session_path: None,
+                    hook_json: false,
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn report_accepts_native_conversation_identity() {
+        let cli = parse(&[
+            "kodade-cli",
+            "agent",
+            "report",
+            "7",
+            "working",
+            "--source",
+            "kodade:codex",
+            "--native-agent",
+            "codex",
+            "--native-session-id",
+            "thread-7",
+        ]);
+        assert_eq!(
+            cli.command,
+            Some(Command::Agent {
+                command: AgentCommand::Report {
+                    pane: PaneId(7),
+                    state: AgentStateKind::Working,
+                    source: "kodade:codex".into(),
+                    native_agent: Some("codex".into()),
+                    native_session_id: Some("thread-7".into()),
+                    native_session_path: None,
+                    hook_json: false,
                 }
             })
         );
@@ -1015,6 +1195,8 @@ mod tests {
                 command: WorktreeCommand::Add {
                     branch: "feat-a".into(),
                     from: Some("main".into()),
+                    base: None,
+                    path: None,
                     workspace: None,
                 }
             })
@@ -1084,6 +1266,24 @@ mod tests {
                     write: true,
                     remove: false
                 }
+            })
+        );
+        assert_eq!(
+            parse(&["kodade-cli", "integrate", "devin", "--write"]).command,
+            Some(Command::Integrate {
+                target: IntegrateCommand::Devin {
+                    write: true,
+                    remove: false,
+                },
+            })
+        );
+        assert_eq!(
+            parse(&["kodade-cli", "integrate", "mastra", "--remove"]).command,
+            Some(Command::Integrate {
+                target: IntegrateCommand::Mastra {
+                    write: false,
+                    remove: true,
+                },
             })
         );
         assert_eq!(
@@ -1319,6 +1519,7 @@ mod tests {
                 command: WorkspaceCommand::New {
                     name: "repo".into(),
                     path: Some(PathBuf::from("/tmp/repo")),
+                    env: vec![],
                 }
             })
         );
@@ -1469,7 +1670,8 @@ mod tests {
                 command: MachineCommand::Add {
                     target: "buildbox".into(),
                     label: "Build".into(),
-                    session: Some("agents".into())
+                    session: Some("agents".into()),
+                    install: false,
                 }
             })
         );

@@ -1,7 +1,7 @@
 use std::{collections::HashMap, fmt::Write as _, fs, io::Write, path::PathBuf};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use kodade_cli_proto::{AgentStateKind, ClientMessage, Direction};
+use kodade_cli_proto::{AgentStateKind, ClientMessage, Direction, SessionSettings};
 use ratatui::style::Color;
 use serde::Deserialize;
 
@@ -9,6 +9,8 @@ const CONFIG_DIR: &str = ".config/kodade-cli";
 
 #[derive(Debug, Clone)]
 pub struct Config {
+    /// Shared daemon settings. The client preserves them in validation/show.
+    pub session: SessionSettings,
     pub theme: ThemeChoice,
     pub mouse: bool,
     /// `[sidebar] show` (alias: top-level `sidebar = true`): show the sidebar
@@ -60,9 +62,25 @@ pub struct Config {
     bindings: HashMap<KeyEvent, Action>,
     /// Chords that fire on their own (ctrl/alt chords without `prefix+`).
     globals: HashMap<KeyEvent, Action>,
+    pub commands: Vec<ConfiguredCommand>,
+    command_bindings: HashMap<KeyEvent, usize>,
+    command_globals: HashMap<KeyEvent, usize>,
     named_theme: Option<String>,
     /// Problems found while loading; printed by `load` and `config validate`.
     pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ConfiguredCommand {
+    pub label: String,
+    pub key: String,
+    pub command: String,
+    #[serde(default)]
+    pub pane: bool,
+    #[serde(default)]
+    pub cwd: Option<PathBuf>,
+    #[serde(default)]
+    pub contexts: Vec<kodade_cli_proto::PluginActionContext>,
 }
 
 /// A right-side status bar widget (#11).
@@ -368,6 +386,7 @@ impl Action {
             Self::NewWorkspace => ClientMessage::NewWorkspace {
                 name: "workspace".into(),
                 root: None,
+                env: HashMap::new(),
             },
             Self::FocusUp => ClientMessage::FocusPane {
                 direction: Direction::Up,
@@ -452,6 +471,8 @@ impl Action {
 
 #[derive(Debug, Deserialize, Default)]
 struct FileConfig {
+    #[serde(default)]
+    session: Option<SessionSettings>,
     theme: Option<String>,
     mouse: Option<Section<MouseTable>>,
     /// Bare `sidebar = true` (0.1 shape) or a `[sidebar]` table (#19).
@@ -461,6 +482,8 @@ struct FileConfig {
     keys: Option<HashMap<String, Chords>>,
     status: Option<StatusFile>,
     ui: Option<UiFile>,
+    #[serde(default)]
+    commands: Vec<ConfiguredCommand>,
     /// Anything this version does not know: reported as a warning so typos
     /// like `sidbar = true` do not silently do nothing.
     #[serde(flatten)]
@@ -637,6 +660,7 @@ impl Default for Config {
             );
         }
         Self {
+            session: SessionSettings::default(),
             theme: ThemeChoice::Auto,
             mouse: true,
             sidebar: true,
@@ -663,6 +687,9 @@ impl Default for Config {
             bindings,
             // Defaults are all prefixed; global chords are opt-in per config.
             globals: HashMap::new(),
+            commands: Vec::new(),
+            command_bindings: HashMap::new(),
+            command_globals: HashMap::new(),
             named_theme: None,
             warnings: Vec::new(),
         }
@@ -700,6 +727,44 @@ impl Config {
 
     fn from_file(file: FileConfig) -> Self {
         let mut config = Self::default();
+        if let Some(session) = file.session {
+            config.session = session;
+        }
+        for command in &file.commands {
+            if command.label.trim().is_empty() || command.command.trim().is_empty() {
+                config
+                    .warnings
+                    .push("configured command needs label and command".into());
+                continue;
+            }
+            match parse_binding(&command.key) {
+                Ok(binding) => {
+                    let index = config.commands.len();
+                    let target = if binding.global {
+                        &mut config.command_globals
+                    } else {
+                        &mut config.command_bindings
+                    };
+                    // Built-in actions keep precedence; the warning makes an ignored
+                    // custom chord explicit rather than silently changing navigation.
+                    if (binding.global && config.globals.contains_key(&binding.key))
+                        || (!binding.global && config.bindings.contains_key(&binding.key))
+                        || target.contains_key(&binding.key)
+                    {
+                        config.warnings.push(format!(
+                            "configured command {} key is already bound",
+                            command.label
+                        ));
+                    } else {
+                        target.insert(binding.key, index);
+                        config.commands.push(command.clone());
+                    }
+                }
+                Err(error) => config
+                    .warnings
+                    .push(format!("configured command {}: {error}", command.label)),
+            }
+        }
         if let Some(theme) = file.theme {
             config.set_theme(&theme);
         }
@@ -958,6 +1023,9 @@ impl Config {
     pub fn to_toml(&self) -> String {
         let mut out = String::new();
         let _ = writeln!(out, "theme = {}", toml_string(self.theme_name()));
+        let _ = writeln!(out, "\n[session]");
+        let _ = writeln!(out, "resume_agents = {}", self.session.resume_agents);
+        let _ = writeln!(out, "pane_history = {}", self.session.pane_history);
         let _ = writeln!(out, "\n[sidebar]");
         let _ = writeln!(out, "show = {}", self.sidebar);
         let _ = writeln!(out, "width = {}", self.sidebar_width);
@@ -1023,6 +1091,16 @@ impl Config {
     /// Action bound to an unprefixed global chord.
     pub fn global_action(&self, key: KeyEvent) -> Option<Action> {
         self.globals.get(&normalize_key(key)).copied()
+    }
+
+    pub fn command(&self, key: KeyEvent, global: bool) -> Option<&ConfiguredCommand> {
+        let map = if global {
+            &self.command_globals
+        } else {
+            &self.command_bindings
+        };
+        map.get(&normalize_key(key))
+            .and_then(|index| self.commands.get(*index))
     }
 
     pub fn resolve_theme(&self) -> Theme {
@@ -1739,6 +1817,43 @@ red = \"#abcdef\"
             Config::default().global_action(parse_key_chord("ctrl+alt+v").unwrap()),
             None
         );
+    }
+
+    #[test]
+    fn configured_commands_parse_with_scopes_and_preserve_builtin_precedence() {
+        let file: FileConfig = toml::from_str(
+            r#"
+[[commands]]
+label = "format"
+key = "prefix+f"
+command = "cargo fmt"
+contexts = ["workspace", "selection"]
+cwd = "/tmp/project"
+
+[[commands]]
+label = "reserved"
+key = "prefix+c"
+command = "false"
+"#,
+        )
+        .unwrap();
+        let config = Config::from_file(file);
+        let command = config
+            .command(parse_key_chord("f").unwrap(), false)
+            .unwrap();
+        assert_eq!(command.label, "format");
+        assert_eq!(
+            command.cwd.as_deref(),
+            Some(std::path::Path::new("/tmp/project"))
+        );
+        assert_eq!(command.contexts.len(), 2);
+        assert!(config
+            .command(parse_key_chord("c").unwrap(), false)
+            .is_none());
+        assert!(config
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("reserved")));
     }
 
     #[test]

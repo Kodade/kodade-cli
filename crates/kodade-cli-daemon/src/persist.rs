@@ -6,6 +6,8 @@
 //! cold start the daemon rebuilds that layout with fresh panes. Scrollback is
 //! never persisted (secrets risk); only structure and metadata are.
 
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 #[cfg(test)]
 use std::time::Instant;
 use std::{
@@ -95,26 +97,32 @@ pub fn quarantine(path: &Path) {
 /// same-directory temp file, syncs its content, then renames it over the old
 /// state and syncs the directory. A concurrent writer's temp is never reused.
 pub fn write_session_file(path: &Path, file: &SessionFile) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).context("create session state directory")?;
-    }
     let mut bytes = serde_json::to_vec_pretty(file).context("serialize session state")?;
     bytes.push(b'\n');
-    let (temp, mut temp_file) = create_unique_temp(path)?;
+    write_private_file(path, &bytes).context("publish session state")
+}
+
+/// Atomically publish private terminal data with owner-only permissions.
+pub fn write_private_file(path: &Path, bytes: &[u8]) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).context("create private state directory")?;
+        #[cfg(unix)]
+        {
+            fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
+        }
+    }
+    let (temp, mut file) = create_unique_temp(path)?;
     let mut cleanup = TempGuard::new(temp.clone());
-    temp_file
-        .write_all(&bytes)
-        .context("write session state temp file")?;
-    temp_file
-        .sync_all()
-        .context("sync session state temp file")?;
-    drop(temp_file);
-    fs::rename(&temp, path).context("commit session state file")?;
-    // The rename consumed our pathname. Do not race a future writer that could
-    // create a new file at the same temp path before this scope ends.
+    #[cfg(unix)]
+    {
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    }
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    drop(file);
+    fs::rename(&temp, path)?;
     cleanup.disarm();
-    sync_parent(path)?;
-    Ok(())
+    sync_parent(path)
 }
 
 /// Removes a temp file only while this writer still owns that pathname.
@@ -151,11 +159,11 @@ fn create_unique_temp(path: &Path) -> Result<(PathBuf, fs::File)> {
     for _ in 0..32 {
         let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
         let candidate = parent.join(format!(".{name}.{}.{}.tmp", std::process::id(), sequence));
-        match OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&candidate)
-        {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        match options.open(&candidate) {
             Ok(file) => return Ok((candidate, file)),
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(error) => return Err(error).context("create session state temp file"),
@@ -180,6 +188,7 @@ pub fn remove_session_file(name: &str) {
     if let Some(path) = session_file_path(name) {
         let _ = fs::remove_file(&path);
         let _ = fs::remove_file(path.with_extension("json.tmp"));
+        crate::history::remove_for_session(name);
     }
 }
 
@@ -190,15 +199,9 @@ pub fn remove_session_file(name: &str) {
 #[derive(Debug, Default, Deserialize)]
 struct DaemonConfig {
     #[serde(default)]
-    session: SessionConfig,
+    session: kodade_cli_proto::SessionSettings,
     #[serde(default)]
     worktrees: WorktreesConfig,
-}
-
-#[derive(Debug, Default, Deserialize)]
-struct SessionConfig {
-    #[serde(default)]
-    resume_agents: bool,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -240,16 +243,18 @@ fn expand_tilde(token: &str, home: Option<&std::path::Path>) -> PathBuf {
 /// Whether restored agent panes should re-run their resume command. Any read or
 /// parse failure is treated as `false` (the safe default).
 pub fn resume_agents_setting() -> bool {
+    session_settings().resume_agents
+}
+
+pub fn session_settings() -> kodade_cli_proto::SessionSettings {
     let Some(home) = dirs::home_dir() else {
-        return false;
+        return Default::default();
     };
-    let path = home.join(".config/kodade-cli/config.toml");
-    let Ok(text) = fs::read_to_string(path) else {
-        return false;
-    };
-    toml::from_str::<DaemonConfig>(&text)
-        .map(|config| config.session.resume_agents)
-        .unwrap_or(false)
+    fs::read_to_string(home.join(".config/kodade-cli/config.toml"))
+        .ok()
+        .and_then(|text| toml::from_str::<DaemonConfig>(&text).ok())
+        .map(|config| config.session)
+        .unwrap_or_default()
 }
 
 /// Number of debounced writes produced by change events at the given instants.
@@ -290,6 +295,7 @@ mod tests {
                     name: "one".into(),
                     root: Some(PathBuf::from("/tmp")),
                     color: Some("#e7a33b".into()),
+                    env: Default::default(),
                     active_tab: 20,
                     tabs: vec![
                         TabFile {
@@ -309,12 +315,14 @@ mod tests {
                                     title: "codex".into(),
                                     cwd: Some(PathBuf::from("/tmp")),
                                     command: Some(vec!["codex".into()]),
+                                    native_session: None,
                                 },
                                 PaneFile {
                                     id: 31,
                                     title: "shell".into(),
                                     cwd: Some(PathBuf::from("/")),
                                     command: None,
+                                    native_session: None,
                                 },
                             ],
                         },
@@ -329,6 +337,7 @@ mod tests {
                                 title: "tail".into(),
                                 cwd: None,
                                 command: None,
+                                native_session: None,
                             }],
                         },
                     ],
@@ -338,6 +347,7 @@ mod tests {
                     name: "two".into(),
                     root: None,
                     color: None,
+                    env: Default::default(),
                     active_tab: 22,
                     tabs: vec![TabFile {
                         id: 22,
@@ -350,6 +360,7 @@ mod tests {
                             title: "shell".into(),
                             cwd: Some(PathBuf::from("/tmp")),
                             command: None,
+                            native_session: None,
                         }],
                     }],
                 },
@@ -435,6 +446,27 @@ mod tests {
         write_session_file(&path, &sample_file()).expect("write");
         let read = read_session_file(&path).expect("read").expect("present");
         assert_eq!(read, sample_file());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_session_state_is_private_to_the_user() {
+        let dir = std::env::temp_dir().join(format!("kodade-private-state-{}", std::process::id()));
+        let path = dir.join("sessions").join("demo.json");
+        write_session_file(&path, &sample_file()).expect("write");
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            fs::metadata(path.parent().unwrap())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
         fs::remove_dir_all(&dir).unwrap();
     }
 

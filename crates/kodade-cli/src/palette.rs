@@ -25,6 +25,7 @@ pub enum PaletteTarget {
         pane: bool,
     },
     PluginUnavailable(String),
+    ConfiguredCommand(usize),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -44,7 +45,15 @@ pub struct Palette {
 }
 
 impl Palette {
+    #[cfg(test)]
     pub fn new(config: &Config) -> Self {
+        Self::with_plugin_context(config, &crate::plugins::InvocationContext::default())
+    }
+
+    pub fn with_plugin_context(
+        config: &Config,
+        context: &crate::plugins::InvocationContext,
+    ) -> Self {
         let mut all = Vec::new();
         // These are the reliable, documented entry commands for the most-used
         // bundled manifests. We send them to the attached daemon rather than
@@ -72,7 +81,7 @@ impl Palette {
             search: "terminal shell new pane tab".into(),
             target: PaletteTarget::Shell,
         });
-        match crate::plugins::palette_actions() {
+        match crate::plugins::palette_actions_for(context) {
             Ok(actions) => {
                 for item in actions {
                     all.push(Item {
@@ -98,6 +107,19 @@ impl Palette {
                 search: "plugin registry error".into(),
                 target: PaletteTarget::PluginUnavailable(error.to_string()),
             }),
+        }
+        for (index, command) in config
+            .commands
+            .iter()
+            .enumerate()
+            .filter(|(_, command)| context.supports_contexts(&command.contexts))
+        {
+            all.push(Item {
+                label: format!("command · {}", command.label),
+                hint: if command.pane { "open pane" } else { "run" }.into(),
+                search: format!("command {} {}", command.label, command.command),
+                target: PaletteTarget::ConfiguredCommand(index),
+            });
         }
         for (name, action) in Config::actions() {
             let hint = config

@@ -42,6 +42,11 @@ credential proxy. Desktop business workflows remain separate.
 | Verified remote bootstrap | Missing | [#45](https://github.com/Kodade/kodade-cli/issues/45) |
 | Exact native conversation restore | Manifest `resume --last` can select the wrong session | [#46](https://github.com/Kodade/kodade-cli/issues/46) |
 | Optional screen replay after cold restart | Live scrollback only | [#47](https://github.com/Kodade/kodade-cli/issues/47) |
+| Complete lifecycle adapters and exact native IDs | Uneven installed hooks | [#49](https://github.com/Kodade/kodade-cli/issues/49), [#56](https://github.com/Kodade/kodade-cli/issues/56) |
+| Selection/context-aware extensions and URL handlers | Missing | [#50](https://github.com/Kodade/kodade-cli/issues/50) |
+| Named configured commands and shortcuts | Missing | [#51](https://github.com/Kodade/kodade-cli/issues/51) |
+| Workspace environments and existing worktree open | Missing | [#52](https://github.com/Kodade/kodade-cli/issues/52) |
+| Discoverable local automation guide | Missing | [#53](https://github.com/Kodade/kodade-cli/issues/53) |
 
 HerdR implementation references: `src/cli/{machine,agent,plugin,status}.rs`,
 `src/client/endpoint/`, `src/client/shell/`, `src/app/api/plugins/`,
@@ -87,8 +92,8 @@ Merged to main through PRs #39 and #44: reliability and independent views
 live manifest reload (#34), and terminal cleanup (#38). Linux and macOS CI
 passed. This does not establish native Windows or universal agent compatibility.
 
-The next integration branch combines machines (#32), images (#35), narrow
-views (#40), and Unix standalone updates (#41). Its full workspace gates pass:
+PR #48 merged machines (#32), images (#35), narrow views (#40), and Unix
+standalone updates (#41) after Linux and macOS CI passed. Its workspace gates passed:
 214 client tests, 93 daemon tests, 7 protocol tests, and the agent automation
 integration test. Additional behavioral proof:
 
@@ -113,9 +118,8 @@ integration test. Additional behavioral proof:
   integration work.
 
 Still in progress: native Windows runner evidence (#36), complete live daemon
-upgrade and client reconnect (#42), real remote bootstrap failure fixtures
-(#45), exact native conversation restore (#46), optional cold screen replay
-(#47), and the final fresh competitive/UX/release review (#37). The graphics
+upgrade and client reconnect (#42), bundled identification coverage (#56),
+and the final fresh competitive/UX/release review (#37). The graphics
 implementation has a documented supported protocol subset in docs/GRAPHICS.md;
 this ledger does not claim complete Kitty protocol coverage.
 
@@ -133,3 +137,48 @@ this ledger does not claim complete Kitty protocol coverage.
   no hosted marketplace or account system is needed for their capabilities.
 - Remove the stale README implementation-milestone table. Put current behavior
   and shortcuts in front of users, with detailed engineering status here.
+
+Remote bootstrap (#45) merged through PR #54 after Linux/macOS CI, with 220 client, 93 daemon,
+7 protocol tests and the agent automation integration test passing. A real
+isolated SSH fixture installs a checksum-verified binary into a home path with
+spaces and proves checksum refusal, incompatible-release refusal and truncated
+upload all preserve the prior executable. The combined SSH/image/machine smoke
+also passes with the integrated release binary.
+
+A fresh code comparison additionally tracks verified lifecycle adapter coverage
+(#49), structured extension context and URL handlers (#50), configured commands
+(#51), workspace environment and existing-worktree open (#52), and a discoverable
+local agent guide (#53). These are required follow-up work, not completed parity.
+
+Exact conversation restore (#46) and optional screen history (#47) merged
+through PR #55 after Linux/macOS CI. Full workspace gates and both real daemon
+restart smokes pass.
+Native restore runs the generated hook reporter, preserves two distinct IDs in
+one directory across two restarts, and clears disabled/duplicate/retired references.
+Retiring an agent in a hidden pane marks the persisted layout dirty.
+
+Screen replay is off by default. The smoke restores a frame taller and wider than
+the daemon's initial 80x24 size and proves rename/disable/kill cleanup and default
+output privacy. Review also fixed long Unicode history discarding the active
+frame, metadata/history identity drift, per-pane/total encoding budgets, and
+terminal-control validation. History and layout now share one atomic private-file
+writer; a failed publish is retried.
+
+
+The agent workflow integration (#49–53) is ready for branch review: 17
+installation adapters with documented per-agent lifecycle and resume contracts;
+structured extension context scoped to the selected endpoint and pane;
+selection-aware actions, URL handlers, configured command keys/palette entries;
+workspace environments, existing linked worktree open, and a local `agent guide`.
+Real controlling-terminal fixtures execute selected-text actions and shortcuts,
+show a slow pane action allows another pane command to complete, and verify
+context file cleanup when the owning pane closes. Real Git/PTY fixtures exercise
+isolated workspace variables, nondefault worktree paths and dirty-checkout
+preservation. Native restore, history, and the executable guide example also
+pass against the combined binary.
+
+A fresh manifest comparison found further bundled identification gaps (#56),
+including hook-backed agents without terminal-title evidence. That follow-up
+also completes Grok's lifecycle mapping from the vendor's actual event table.
+It remains explicit work until its guarded automation and shell-retirement
+fixtures pass; adapter installation alone is not full agent compatibility.

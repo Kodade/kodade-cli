@@ -19,6 +19,7 @@ use ratatui::{backend::CrosstermBackend, layout::Rect, style::Color, Frame, Term
 #[cfg(test)]
 use ratatui::{TerminalOptions, Viewport};
 use std::{
+    collections::HashMap,
     collections::{BTreeMap, HashSet},
     io::Write,
     path::{Path, PathBuf},
@@ -214,6 +215,9 @@ pub struct App {
     /// Live mouse selection and whether the button is still held (#12).
     selection: Option<Selection>,
     selecting: bool,
+    /// The most recently completed mouse selection stays available to the
+    /// command center until the next selection replaces it.
+    selected_text: Option<(EndpointId, PaneId, String)>,
     /// Last left click (when, column, row, count) for double/triple clicks (#12).
     last_click: Option<(Instant, u16, u16, u8)>,
     /// Runtime mouse capture; `prefix m` toggles it without touching the
@@ -337,6 +341,7 @@ impl App {
             last_title: String::new(),
             selection: None,
             selecting: false,
+            selected_text: None,
             last_click: None,
             mouse_capture: config.mouse,
             theme: config.resolve_theme(),
@@ -1155,6 +1160,8 @@ impl App {
             return self.handle_prefix_key(key, writer, term).await;
         } else if config::normalize_key(key) == self.config.prefix {
             self.prefix = true;
+        } else if let Some(command) = self.config.command(key, true).cloned() {
+            return self.run_configured_command(command, writer).await;
         } else if let Some(action) = self.config.global_action(key) {
             // Global chords (ctrl/alt, no `prefix+`) fire before the pane sees the key.
             return self.run_action(action, writer, term).await;
@@ -1217,7 +1224,15 @@ impl App {
                     focused_cwd.as_deref(),
                     dirs::home_dir().as_deref(),
                 );
-                write(writer, &ClientMessage::NewWorkspace { name, root }).await?;
+                write(
+                    writer,
+                    &ClientMessage::NewWorkspace {
+                        name,
+                        root,
+                        env: HashMap::new(),
+                    },
+                )
+                .await?;
                 self.new_workspace = false;
             }
             KeyCode::Esc => {
@@ -1257,6 +1272,7 @@ impl App {
                                 repo_root,
                                 branch,
                                 from,
+                                path: None,
                             },
                         )
                         .await?;
@@ -1510,6 +1526,7 @@ impl App {
                 split: Some(SplitAxis::Vertical),
                 command: Some(vec![editor, path.to_string_lossy().into_owned()]),
                 name: Some("editor".into()),
+                context: None,
             },
         )
         .await?;
@@ -1681,6 +1698,9 @@ impl App {
             .await?;
             return Ok(Flow::Continue);
         }
+        if let Some(command) = self.config.command(key, false).cloned() {
+            return self.run_configured_command(command, writer).await;
+        }
         let Some(action) = self.config.action(key) else {
             // An unbound key after the prefix: nudge toward the help overlay.
             let chord = config::render_chord(config::normalize_key(key));
@@ -1688,6 +1708,104 @@ impl App {
             return Ok(Flow::Continue);
         };
         self.run_action(action, writer, term).await
+    }
+
+    async fn run_configured_command(
+        &mut self,
+        command: config::ConfiguredCommand,
+        writer: &mut Router,
+    ) -> Result<Flow> {
+        if self.remote_endpoint {
+            self.set_note(" configured commands are local-only for remote sessions");
+            return Ok(Flow::Continue);
+        }
+        let context = self.plugin_context(None);
+        if !context.supports_contexts(&command.contexts) {
+            self.set_note(format!(" command {} is not applicable here", command.label));
+            return Ok(Flow::Continue);
+        }
+        let cwd = command
+            .cwd
+            .clone()
+            .or(context.cwd.clone())
+            .unwrap_or_else(|| PathBuf::from("."));
+        if command.pane {
+            let workspace = context.workspace.clone().unwrap_or_default();
+            let pane = context.pane.clone().unwrap_or_default();
+            let args = crate::plugins::pane_command(
+                "configured-command",
+                &cwd,
+                &command.command,
+                Some(&command.label),
+                &workspace,
+                &pane,
+            );
+            write(
+                writer,
+                &ClientMessage::NewPane {
+                    workspace: None,
+                    tab: None,
+                    split: None,
+                    command: Some(args),
+                    name: Some(command.label),
+                    context: Some(Box::new(context)),
+                },
+            )
+            .await?;
+            return Ok(Flow::Continue);
+        }
+        let plugin = crate::plugins::LoadedPlugin {
+            manifest: kodade_cli_proto::PluginManifest {
+                manifest_version: 1,
+                id: "configured-command".into(),
+                name: "Configured command".into(),
+                version: "1".into(),
+                min_kodade_version: None,
+                build: None,
+                actions: vec![],
+                startup: vec![],
+                events: vec![],
+                panes: vec![],
+                link_handlers: vec![],
+            },
+            installed: crate::plugins::InstalledPlugin {
+                path: cwd,
+                linked: true,
+                enabled: true,
+                version: "1".into(),
+            },
+        };
+        let action = kodade_cli_proto::PluginAction {
+            id: command.label.clone(),
+            name: command.label.clone(),
+            command: command.command,
+            description: String::new(),
+            pane: false,
+            contexts: command.contexts,
+        };
+        let session = self.session_name.clone();
+        let socket = self.socket.clone();
+        let results = self.plugin_result_tx.clone();
+        let label = command.label.clone();
+        tokio::spawn(async move {
+            let note = match crate::plugins::run_action_with_context(
+                &plugin,
+                &action,
+                &context,
+                &session,
+                &socket,
+                Duration::from_secs(30),
+            )
+            .await
+            {
+                Ok(status) if status.success() => format!(" command {label} complete"),
+                Ok(status) => format!(" command {label} failed: {status}"),
+                Err(error) => format!(" command {label} failed: {error}"),
+            };
+            let _ = results.send(note);
+        });
+        self.set_note(format!(" command {} started", command.label));
+        Ok(Flow::Continue)
     }
 
     // Runs a bound action, whether it came from the prefix table or a global chord.
@@ -1756,7 +1874,9 @@ impl App {
                 }
             }
             config::Action::CommandCenter => {
-                self.center = Some(CenterOverlay::Palette(palette::Palette::new(&self.config)));
+                self.center = Some(CenterOverlay::Palette(
+                    palette::Palette::with_plugin_context(&self.config, &self.plugin_context(None)),
+                ));
             }
             config::Action::Attention => {
                 if let Some(layout) = &self.layout {
@@ -2000,7 +2120,12 @@ impl App {
                 }
                 _ => {
                     self.dismiss_onboarding();
-                    self.center = Some(CenterOverlay::Palette(palette::Palette::new(&self.config)));
+                    self.center = Some(CenterOverlay::Palette(
+                        palette::Palette::with_plugin_context(
+                            &self.config,
+                            &self.plugin_context(None),
+                        ),
+                    ));
                     return Ok(Flow::Continue);
                 }
             }
@@ -2069,6 +2194,7 @@ impl App {
                         split: None,
                         command: Some(command),
                         name: Some(name),
+                        context: None,
                     },
                 )
                 .await?;
@@ -2082,6 +2208,7 @@ impl App {
                         split: None,
                         command: None,
                         name: None,
+                        context: None,
                     },
                 )
                 .await?;
@@ -2104,6 +2231,13 @@ impl App {
                         return Ok(Flow::Continue);
                     }
                 };
+                let plugin_for_run = live_plugin.clone();
+                let action_for_run = live_action.clone();
+                let context = self.plugin_context(None);
+                if !context.supports(&live_action) {
+                    self.set_note(format!(" plugin {plugin}/{action} is not applicable here"));
+                    return Ok(Flow::Continue);
+                }
                 let directory = live_plugin.installed.path;
                 let command = live_action.command;
                 let pane = live_action.pane;
@@ -2131,6 +2265,7 @@ impl App {
                                 &focused_pane,
                             )),
                             name: Some(format!("plugin · {plugin} · {action}")),
+                            context: Some(Box::new(context)),
                         },
                     )
                     .await?;
@@ -2138,28 +2273,19 @@ impl App {
                     let session = self.session_name.clone();
                     let socket = self.socket.clone();
                     let result_tx = self.plugin_result_tx.clone();
+                    let context = context.clone();
                     let note = format!(" plugin {plugin}/{action} started");
                     // A palette action must never own the UI task: child stdio
                     // stays off the raw terminal and completion is reaped in
                     // the background.
                     tokio::spawn(async move {
-                        let mut child = tokio::process::Command::new("sh");
-                        child
-                            .args(["-lc", &command])
-                            .current_dir(&directory)
-                            .env("KODADE_PLUGIN", &plugin)
-                            .env("KODADE_ACTION", &action)
-                            .env("KODADE_SESSION", session)
-                            .env("KODADE_SOCKET", socket)
-                            .env("KODADE_WORKSPACE", workspace)
-                            .env("KODADE_PANE", focused_pane)
-                            .stdin(Stdio::null())
-                            .stdout(Stdio::null())
-                            .stderr(Stdio::null());
-                        let message = match crate::plugins::run_bounded_command(
-                            &mut child,
+                        let message = match crate::plugins::run_action_with_context(
+                            &plugin_for_run,
+                            &action_for_run,
+                            &context,
+                            &session,
+                            &socket,
                             Duration::from_secs(30),
-                            "plugin action",
                         )
                         .await
                         {
@@ -2176,6 +2302,12 @@ impl App {
             }
             palette::PaletteTarget::PluginUnavailable(error) => {
                 self.set_note(format!(" plugin registry error: {error}"));
+            }
+            palette::PaletteTarget::ConfiguredCommand(index) => {
+                if let Some(command) = self.config.commands.get(index).cloned() {
+                    return self.run_configured_command(command, writer).await;
+                }
+                self.set_note(" configured command is stale; reload config");
             }
         }
         Ok(Flow::Continue)
@@ -2460,7 +2592,7 @@ impl App {
             }
             MouseEventKind::Up(MouseButton::Left) => {
                 self.drag = None;
-                self.finish_selection(term)?;
+                self.finish_selection(Some(term))?;
             }
             MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
                 let area = self.content_area(term)?;
@@ -2610,7 +2742,8 @@ impl App {
                 .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER)
             {
                 self.clear_selection();
-                self.open_link(id, row as usize, col as usize);
+                self.open_link(id, row as usize, col as usize, writer)
+                    .await?;
                 return Ok(());
             }
             let mode = match self.click_count(mouse.column, mouse.row) {
@@ -2697,7 +2830,7 @@ impl App {
 
     // Mouse up: a plain click clears, a real drag copies when
     // `mouse.copy_on_select` is on and always fills the paste buffer.
-    fn finish_selection(&mut self, term: &mut Term) -> Result<()> {
+    fn finish_selection(&mut self, term: Option<&mut Term>) -> Result<()> {
         self.selecting = false;
         let Some(selection) = self.selection.clone() else {
             return Ok(());
@@ -2716,7 +2849,9 @@ impl App {
         }
         // Always fill the internal buffer so `prefix ]` can re-paste it (#21).
         self.paste_buffer = text.clone();
+        self.selected_text = Some((self.selected_endpoint.clone(), selection.pane, text.clone()));
         if self.config.copy_on_select {
+            let term = term.ok_or_else(|| anyhow!("terminal unavailable for selection copy"))?;
             let (payload, truncated) = mode::osc52(&text);
             execute!(term.backend_mut(), crossterm::style::Print(payload))?;
             term.backend_mut().flush()?;
@@ -2747,14 +2882,93 @@ impl App {
     }
 
     // Ctrl/cmd-click: open the URL under the pointer with `ui.link_command`.
-    fn open_link(&mut self, pane: PaneId, row: usize, col: usize) {
+    async fn open_link(
+        &mut self,
+        pane: PaneId,
+        row: usize,
+        col: usize,
+        writer: &mut Router,
+    ) -> Result<()> {
         let url = self
             .pane_screen(pane)
             .and_then(|screen| selection::link_at(screen, row, col));
         let Some(url) = url else {
             self.set_note(" no link here");
-            return;
+            return Ok(());
         };
+        // Plugin executables are local. A URL from a remote endpoint must not
+        // accidentally carry that endpoint's filesystem context into a local
+        // extension, so preserve the normal opener there.
+        if !self.remote_endpoint {
+            match crate::plugins::link_handler(&url) {
+                Ok(Some((plugin, handler, action))) => {
+                    let context = self.plugin_context(Some(url.clone()));
+                    if context.supports(&action) {
+                        if action.pane {
+                            let workspace = context.workspace.clone().unwrap_or_default();
+                            let focused = context.pane.clone().unwrap_or_default();
+                            let command = crate::plugins::pane_command(
+                                &plugin.manifest.id,
+                                &plugin.installed.path,
+                                &action.command,
+                                Some(&action.id),
+                                &workspace,
+                                &focused,
+                            );
+                            write(
+                                writer,
+                                &ClientMessage::NewPane {
+                                    workspace: None,
+                                    tab: None,
+                                    split: None,
+                                    command: Some(command),
+                                    name: Some(format!(
+                                        "plugin · {} · {}",
+                                        plugin.manifest.id, action.name
+                                    )),
+                                    context: Some(Box::new(context)),
+                                },
+                            )
+                            .await?;
+                            self.set_note(format!(" plugin {} handling {}", handler.title, url));
+                            return Ok(());
+                        }
+                        let session = self.session_name.clone();
+                        let socket = self.socket.clone();
+                        let results = self.plugin_result_tx.clone();
+                        let plugin_id = plugin.manifest.id.clone();
+                        let action_id = action.id.clone();
+                        tokio::spawn(async move {
+                            let message = match crate::plugins::run_action_with_context(
+                                &plugin,
+                                &action,
+                                &context,
+                                &session,
+                                &socket,
+                                Duration::from_secs(30),
+                            )
+                            .await
+                            {
+                                Ok(status) if status.success() => {
+                                    format!(" plugin {plugin_id}/{action_id} complete")
+                                }
+                                Ok(status) => {
+                                    format!(" plugin {plugin_id}/{action_id} failed: {status}")
+                                }
+                                Err(error) => {
+                                    format!(" plugin {plugin_id}/{action_id} failed: {error}")
+                                }
+                            };
+                            let _ = results.send(message);
+                        });
+                        self.set_note(format!(" plugin {} handling {}", handler.title, url));
+                        return Ok(());
+                    }
+                }
+                Err(error) => self.set_note(format!(" plugin URL handler unavailable: {error}")),
+                Ok(None) => {}
+            }
+        }
         // Detached: the opener owns the URL from here, we never wait on it.
         let spawned = Command::new(&self.config.link_command)
             .arg(&url)
@@ -2769,6 +2983,7 @@ impl App {
             }
             Err(error) => self.set_note(format!(" open failed: {error}")),
         }
+        Ok(())
     }
 
     // The newest screen for a pane, if it is still in the layout.
@@ -3000,6 +3215,32 @@ impl App {
             .tabs
             .iter()
             .find(|tab| tab.id == layout.active_tab)
+    }
+
+    fn plugin_context(&self, clicked_url: Option<String>) -> crate::plugins::InvocationContext {
+        let layout = self.layout.as_ref();
+        let workspace = self.active_workspace();
+        let pane = layout.and_then(|layout| layout.panes.iter().find(|pane| pane.focused));
+        crate::plugins::InvocationContext {
+            endpoint: match &self.selected_endpoint {
+                EndpointId::Local => "local".into(),
+                EndpointId::Machine(id) => format!("machine:{id}"),
+            },
+            workspace: workspace.map(|workspace| workspace.name.clone()),
+            workspace_id: workspace.map(|workspace| workspace.id.0.to_string()),
+            tab: self.active_tab().map(|tab| tab.name.clone()),
+            tab_id: layout.map(|layout| layout.active_tab.0.to_string()),
+            pane: pane.map(|pane| pane.id.0.to_string()),
+            cwd: pane.and_then(|pane| pane.cwd.clone()),
+            selected_text: self.selected_text.as_ref().and_then(
+                |(endpoint, selected_pane, text)| {
+                    (endpoint == &self.selected_endpoint
+                        && pane.is_some_and(|pane| pane.id == *selected_pane))
+                    .then(|| text.clone())
+                },
+            ),
+            clicked_url,
+        }
     }
 
     // Terminal area left for panes once the sidebar is subtracted.
@@ -3262,7 +3503,8 @@ mod tests {
 
     #[test]
     fn auto_hide_collapses_at_80_columns_and_restores_when_widened() {
-        let config = config::Config::default();
+        let mut config = config::Config::default();
+        config.copy_on_select = false;
         let mut app = App::new(&config, "work", PathBuf::from("/tmp/kodade-test.sock"));
         // Default auto_hide_below is 100 columns; 80 is under it.
         app.apply_auto_hide(80);
@@ -3658,6 +3900,86 @@ mod tests {
             zoomed: false,
             restored: false,
         }
+    }
+
+    #[tokio::test]
+    async fn configured_command_starts_without_blocking_the_tui() {
+        let config = config::Config::default();
+        let mut app = App::new(
+            &config,
+            "command-test",
+            PathBuf::from("/tmp/kodade-test.sock"),
+        );
+        let (mut writer, mut daemon) = test_router();
+        app.run_configured_command(
+            config::ConfiguredCommand {
+                label: "fixture".into(),
+                key: "prefix+f".into(),
+                command: "true".into(),
+                pane: false,
+                cwd: None,
+                contexts: vec![],
+            },
+            &mut writer,
+        )
+        .await
+        .unwrap();
+        assert!(app.note().unwrap().0.contains("fixture started"));
+        assert!(daemon.try_recv().is_err());
+    }
+
+    #[test]
+    fn mouse_selection_reaches_command_context_only_for_its_endpoint_and_pane() {
+        let mut config = config::Config::default();
+        config.copy_on_select = false;
+        let mut app = App::new(
+            &config,
+            "selection-test",
+            PathBuf::from("/tmp/kodade-test.sock"),
+        );
+        let screen = Screen {
+            contents: "selected".into(),
+            rows: vec![vec![kodade_cli_proto::Run {
+                text: "selected".into(),
+                fg: kodade_cli_proto::CellColor::Default,
+                bg: kodade_cli_proto::CellColor::Default,
+                attrs: 0,
+            }]],
+            ..Default::default()
+        };
+        let mut layout = layout_named(&["work"]);
+        layout.tabs = vec![kodade_cli_proto::TabInfo {
+            id: kodade_cli_proto::TabId(1),
+            name: "tab".into(),
+            active: true,
+            state: AgentStateKind::Idle,
+        }];
+        layout.panes = vec![kodade_cli_proto::PaneSnapshot {
+            id: PaneId(1),
+            title: "shell".into(),
+            focused: true,
+            scroll_offset: 0,
+            screen: screen.clone(),
+            agent: None,
+            agent_generation: 0,
+            activity_revision: 0,
+            state: AgentStateKind::Idle,
+            state_reason: String::new(),
+            state_age_secs: 0,
+            cwd: Some(PathBuf::from("/tmp/work")),
+        }];
+        app.layout = Some(layout);
+        let mut selection = Selection::new(PaneId(1), (0, 0), SelectionMode::Char, &screen);
+        selection.set_head((0, 7), &screen);
+        app.selection = Some(selection);
+        app.selecting = true;
+        app.finish_selection(None).unwrap();
+        assert_eq!(
+            app.plugin_context(None).selected_text.as_deref(),
+            Some("selected")
+        );
+        app.selected_endpoint = EndpointId::Machine("other".into());
+        assert_eq!(app.plugin_context(None).selected_text, None);
     }
 
     #[test]

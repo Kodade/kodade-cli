@@ -64,7 +64,7 @@ name = "example-agent"
 # Human-readable label shown for a detected agent.
 display = "Example Agent"
 
-# Optional: command that resumes the agent's last session (metadata only).
+# Optional metadata command that opens the agent's resume surface.
 resume = "example-agent --continue"
 
 # Exact foreground process basenames that identify the agent.
@@ -108,7 +108,7 @@ only — no screen rules — until a real session confirms their prompt strings.
 Verified:
 
 - Claude Code (`claude-code.toml`) — blocked/working rules, `resume = "claude --continue"`
-- Codex (`codex.toml`) — blocked/working rules, `resume = "codex resume --last"`
+- Codex (`codex.toml`) — blocked/working rules, `resume = "codex resume"`
 - Grok Build (`grok.toml`) — blocked rule, `resume = "grok --continue"`
 - OpenCode (`opencode.toml`) — blocked/working rules
 - Gemini CLI (`gemini-cli.toml`) — blocked rule, `resume = "gemini --resume latest"`
@@ -134,10 +134,11 @@ Ködade hosts).
 
 ### `resume`
 
-A manifest may set an optional `resume` string — the command that resumes the
-agent's most recent session (for example `codex resume --last`). Session
-restore uses it to relaunch an agent where it left off. It is metadata only and
-does not affect state detection.
+A manifest may set an optional `resume` string — a metadata command that opens
+the agent's resume surface (for example `codex resume`). It does not select a
+session and does not participate in restoration or state detection. Restoring
+a saved pane requires an integration-reported native ID and that agent's exact
+ID-based command.
 
 ### The `y/n` caveat
 
@@ -216,6 +217,67 @@ state, so detection does not depend on screen strings alone.
   for the workspace under its normal trust/settings policy; if it does not run
   the commands, Ködade continues with process and screen detection. Use
   `integrate codex --remove` to remove only Ködade's marked commands.
+- `integrate copilot [--write]` — writes Ködade's separate, versioned user hook
+  file at `~/.copilot/hooks/kodade-cli.json` (or `$COPILOT_HOME/hooks/kodade-cli.json`):
+  `userPromptSubmitted` → working, `agentStop` → done, and `permissionRequest` /
+  `errorOccurred` → blocked. Copilot documents those
+  events and its `sessionId` payload in its [hooks reference](https://docs.github.com/en/copilot/reference/hooks-reference), and resumes the exact reported ID with `copilot --resume=ID`.
+- `integrate cursor [--write]` — merges `sessionStart` and
+  `beforeSubmitPrompt` → working plus `stop`/`sessionEnd` → done into
+  `~/.cursor/hooks.json`. Cursor documents that user hooks receive JSON on
+  stdin and provides the `session_id` payload and `cursor-agent --resume ID`
+  command in its [hooks](https://prod.cursor.com/docs/hooks) and [CLI parameter](https://docs.cursor.com/en/cli/reference/parameters) references.
+- `integrate droid [--write]` — merges `SessionStart`/`UserPromptSubmit` →
+  working, `Stop` → done, and permission notifications → blocked into
+  `~/.factory/hooks.json`. Factory documents the file, events, JSON
+  `session_id`, and `droid --resume ID` in its [hooks](https://docs.factory.ai/harness/hooks) and [CLI reference](https://docs.factory.ai/droid-cli/cli-reference).
+- `integrate kimi [--write]` — appends a clearly marked managed `[[hooks]]`
+  block to `~/.kimi-code/config.toml`: start/prompt → working, `Stop` → done,
+  and permission notifications → blocked. Reinstalling replaces only that
+  block; `--remove` deletes it. Kimi documents the TOML hook configuration and
+  JSON `session_id` payload in its [hooks reference](https://github.com/MoonshotAI/kimi-cli/blob/main/docs/en/customization/hooks.md), and resumes exact sessions with `kimi --session ID` in its [command reference](https://github.com/MoonshotAI/kimi-code/blob/main/docs/en/reference/kimi-command.md).
+- `integrate qwen [--write]` — merges `SessionStart`/`UserPromptSubmit` →
+  working, `Stop` → done, and `PermissionRequest` → blocked into
+  `~/.qwen/settings.json`. Qwen documents the hook event/payload contract and
+  `qwen --resume ID` in its [hooks](https://github.com/QwenLM/qwen-code/blob/main/docs/users/features/hooks.md) and [headless reference](https://github.com/QwenLM/qwen-code/blob/main/docs/users/features/headless.md).
+- `integrate omp [--write]` — writes a Pi-compatible extension below OMP's
+  configured agent directory (normally `~/.omp/agent/extensions`). It reports
+  `session_start` → idle and `agent_start`/`agent_settled` → working/done with
+  the session ID or session file. OMP's local CLI help documents
+  `--resume=<id-or-path>`; the installed extension is fixture-tested here.
+- `integrate kilo [--write]` — writes an auto-loaded global plugin at
+  `~/.config/kilo/plugin/`. It reports Kilo's documented session and
+  permission events as working/done/blocked. Kilo documents the global plugin
+  location and lifecycle events in its [plugin reference](https://github.com/Kilo-Org/kilocode/blob/main/packages/kilo-docs/pages/automate/extending/plugins.md).
+  Its public CLI documentation only guarantees workspace-level `--continue`,
+  so Ködade intentionally does not persist a Kilo native ID for restore.
+- `integrate hermes [--write]` — writes a Python plugin under
+  `~/.hermes/plugins/kodade_cli_agent_state/`. It reports documented
+  `session_id` lifecycle callbacks and restores an exact conversation with
+  `hermes --resume ID`, as specified in Hermes' [hooks](https://github.com/NousResearch/hermes-agent/blob/main/website/docs/user-guide/features/hooks.md)
+  and [sessions](https://github.com/NousResearch/hermes-agent/blob/main/website/docs/user-guide/sessions.md) references.
+- `integrate antigravity [--write]` — installs a Ködade-owned block in
+  `~/.gemini/config/hooks.json` (or `$ANTIGRAVITY_CLI_CONFIG_DIR/hooks.json`). It reports
+  `PreInvocation` → working and `Stop` → done. Antigravity documents the hook
+  configuration, lifecycle events, and `conversationId`, but not an ID-resume CLI contract,
+  so Ködade does not persist a native session identity for restore.
+- `integrate devin [--write]` — merges Devin's documented Claude-compatible
+  lifecycle events into `$XDG_CONFIG_HOME/devin/config.json` (or
+  `~/.config/devin/config.json`). It reports `SessionStart` → idle,
+  prompt/tool events → working, permission requests → blocked, and
+  `Stop`/`SessionEnd` → done. The [Devin hook payload](https://docs.devin.ai/cli/extensibility/hooks/overview)
+  supplies stable root `session_id` values, which Ködade stores and restores
+  with [`devin --resume SESSION_ID`](https://docs.devin.ai/cli/reference/commands).
+- `integrate mastra [--write]` — merges Mastra Code's flat command entries
+  into `~/.mastracode/hooks.json`: session start → idle, prompt/agent/tool
+  events → working, permission requests → blocked, and agent end/stop → done.
+  The vendor documents a `session_id` hook field, but no CLI thread-resume
+  argument; Ködade therefore keeps it out of native restore metadata.
+- `integrate grok [--write]` — writes Ködade's self-contained `SessionStart`
+  configuration to `~/.grok/hooks/kodade-cli.json` (or
+  `$GROK_HOME/hooks/kodade-cli.json`). Grok merges hook files in that
+  directory, so it does not modify any user hook file. The documented
+  `sessionId` restores exactly with `grok --resume ID`.
 
 Merges are idempotent and never remove unrelated keys or hooks. A previously
 installed Ködade report hook for the same event is upgraded in place (matched

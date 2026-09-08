@@ -25,7 +25,10 @@ Current development also includes:
 - Local and saved SSH machines in one workspace, with independent reconnects.
 - A command center (`prefix space`) and attention history (`prefix A`).
 - Guarded agent launch/prompt/wait automation and live integration reloads.
-- Local extensions with command actions, event hooks, and terminal panes.
+- Local extensions with selected-text context, URL handlers, event hooks, and terminal panes.
+- [Configured command shortcuts](docs/CONFIG.md#configured-commands), workspace environments, and existing worktree open.
+- Exact native conversation restore and opt-in terminal history after a cold restart.
+- An offline [agent automation guide](docs/AGENT-GUIDE.md), available with `kodade-cli agent guide`.
 - Terminal images, PNG paste, and a focused view for narrow terminals.
 - Verified stable/preview updates for standalone installations.
 
@@ -208,11 +211,15 @@ writes your choices back to `config.toml` without disturbing comments. See
 [docs/CONFIG.md](docs/CONFIG.md) for all bindings and configuration.
 
 Sessions survive a daemon restart: the layout (workspaces, tabs, pane trees,
-names, cwds, and zoom — never scrollback) is saved under
+names, cwds, and zoom) is saved under
 `~/.local/state/kodade-cli/sessions/` (macOS: `~/Library/Application Support/…`)
 and rebuilt with fresh panes on the next cold start; a corrupt file degrades to
 a clean start and `kodade-cli ls` marks a restored session `(restored)`. Set
-`[session] resume_agents = true` to re-run an agent's resume command on restore.
+`[session] resume_agents = true` to resume panes that reported an exact native
+conversation identity; panes without one restore as shells.
+`[session] pane_history = true` additionally retains a bounded local screen replay
+after a cold restart; it is off by default and does not imply that the original
+process survived.
 
 The CLI's dark theme uses charcoal backgrounds and off-white text with the
 Ködade orange accent `#E7A33B` and a purple-free ANSI palette. `theme = "auto"`
@@ -221,7 +228,9 @@ background; `tokyo-night` and custom themes are also available. See the
 [Themes](docs/CONFIG.md#themes) section for the schema.
 
 Run `kodade-cli --help` for the full command list and `kodade-cli --version`
-for the installed version. The scripting commands are:
+for the installed version. `kodade-cli agent guide` prints the bundled
+[automation guide](docs/AGENT-GUIDE.md), including targeting, guarded prompts,
+waits, remote endpoints, and exit codes. The scripting commands are:
 
 - `kodade-cli ls` — list sessions, workspaces, tabs, panes, and states.
 - `kodade-cli new -w NAME [PATH]` — create a workspace with an optional root
@@ -240,7 +249,8 @@ for the installed version. The scripting commands are:
 - `kodade-cli tab ls|new|close|rename|select` — tabs of the active workspace
   (TAB is a name or an id).
 - `kodade-cli workspace ls|new|close|rename|select|color WS HEX|off` —
-  workspaces (WS is a name or an id); `new` is the same as the top-level `new`,
+  workspaces (WS is a name or an id); `workspace new NAME [PATH] --env KEY=VALUE`
+  persists explicit environment for every future pane in that workspace.
   and `color` sets the sidebar swatch.
 - `kodade-cli session ls|path|kill [NAME]|rename NAME` — every session on this
   machine; `ls` probes each socket and marks it `(restored)` or `(dead)`, and
@@ -249,11 +259,13 @@ for the installed version. The scripting commands are:
 - `kodade-cli layout export [FILE]|apply FILE` — save and restore a layout.
   **`apply` runs the commands saved in the file** (through the login shell, in
   each pane's saved directory), so only apply layout files you trust.
-- `kodade-cli worktree add BRANCH [--from REF] [-w NAME]` — `git worktree add`
+- `kodade-cli worktree add BRANCH [--from REF|--base REF] [--path PATH] [-w NAME]` — `git worktree add`
   a branch on the workspace's repo and open a `repo:branch` workspace rooted in
   it (prints the new workspace id). `worktree list` shows every branch workspace
   with its root and parent; `worktree remove WS|BRANCH [--keep]` closes it and
-  removes the worktree unless `--keep`.
+  removes the worktree unless `--keep`. `worktree open PATH [-w NAME]` opens an
+  existing linked checkout after verifying its owning repository; it never copies
+  or deletes that checkout.
 - `kodade-cli events [--json]` — stream session events until interrupted.
 - `kodade-cli completion zsh|bash|fish` — print a completion script.
 - `kodade-cli agent ls` — list recognized agents and states.

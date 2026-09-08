@@ -74,10 +74,39 @@ pub fn main_worktree_root(root: &Path) -> Option<PathBuf> {
     common_git.parent().map(Path::to_path_buf)
 }
 
+/// Main checkout that owns `root`, whether `root` is that checkout or a linked
+/// worktree beneath it.
+pub fn worktree_owner(root: &Path) -> Option<PathBuf> {
+    main_worktree_root(root).or_else(|| repo_root(root))
+}
+
+/// Ask Git for registered worktrees instead of trusting a hand-written `.git`
+/// file. Both paths are canonicalized before comparison.
+pub fn registered_worktree(repo: &Path, path: &Path) -> bool {
+    let Ok(target) = path.canonicalize() else {
+        return false;
+    };
+    let Ok(output) = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["worktree", "list", "--porcelain"])
+        .output()
+    else {
+        return false;
+    };
+    output.status.success()
+        && String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter_map(|line| line.strip_prefix("worktree "))
+            .filter_map(|candidate| Path::new(candidate).canonicalize().ok())
+            .any(|candidate| candidate == target)
+}
+
 /// `git -C <repo> worktree add` for `branch` into `dest`. When `branch` already
 /// exists it is checked out into the new worktree; otherwise it is created with
 /// `-b` from `from` (defaulting to the current HEAD).
 pub fn worktree_add(repo: &Path, branch: &str, from: Option<&str>, dest: &Path) -> Result<()> {
+    validate_worktree_branch(branch)?;
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("create worktree parent directory {}", parent.display()))?;
@@ -93,6 +122,21 @@ pub fn worktree_add(repo: &Path, branch: &str, from: Option<&str>, dest: &Path) 
         }
     }
     run(command, "git worktree add")
+}
+
+/// Reject path-like branch names that could escape the configured worktree
+/// base before `worktree_add` creates its parent directories. Git performs the
+/// full ref-name validation afterwards.
+fn validate_worktree_branch(branch: &str) -> Result<()> {
+    if branch.is_empty()
+        || Path::new(branch).is_absolute()
+        || Path::new(branch)
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        bail!("worktree branch must be a relative name without '..'");
+    }
+    Ok(())
 }
 
 /// `git -C <repo> worktree remove` for `dest`. `force` drops uncommitted changes;
