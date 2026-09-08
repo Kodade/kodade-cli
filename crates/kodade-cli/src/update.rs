@@ -101,7 +101,13 @@ fn write_channel(path: &Path, channel: &str) -> Result<()> {
 }
 
 pub fn platform_asset(version: &str) -> Result<String> {
-    let target = match (std::env::consts::OS, std::env::consts::ARCH) {
+    platform_asset_for(version, std::env::consts::OS, std::env::consts::ARCH)
+}
+
+/// The release asset for a Unix host reported over SSH. Windows remote
+/// bootstrap follows the native distribution work tracked separately.
+pub fn platform_asset_for(version: &str, os: &str, arch: &str) -> Result<String> {
+    let target = match (os, arch) {
         ("linux", "x86_64") => "x86_64-unknown-linux-gnu",
         ("linux", "aarch64") => "aarch64-unknown-linux-gnu",
         ("macos", "aarch64") => "aarch64-apple-darwin",
@@ -164,6 +170,13 @@ pub fn verify(bytes: &[u8], expected: &str) -> Result<()> {
         bail!("release checksum mismatch");
     }
     Ok(())
+}
+
+/// Verify a published archive before extracting the executable for a remote
+/// install. The caller owns transport and atomic replacement on that host.
+pub fn verified_binary(archive: &[u8], expected: &str) -> Result<Vec<u8>> {
+    verify(archive, expected)?;
+    Ok(extract_binary(archive)?.0)
 }
 
 /// Extract the one executable from a verified archive and atomically replace
@@ -394,6 +407,15 @@ mod tests {
             "https://example.test/sums"
         );
         assert!(release_asset_url(&release, "missing").is_err());
+    }
+
+    #[test]
+    fn remote_platform_assets_match_unix_release_names() {
+        assert_eq!(
+            platform_asset_for("1.2.3", "linux", "aarch64").unwrap(),
+            "kodade-cli-1.2.3-aarch64-unknown-linux-gnu.tar.gz"
+        );
+        assert!(platform_asset_for("1.2.3", "windows", "x86_64").is_err());
     }
 
     #[test]

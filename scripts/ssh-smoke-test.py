@@ -122,7 +122,7 @@ def main() -> None:
             "#!/usr/bin/env python3\n"
             "import os, sys\n"
             f"shim = 'env PATH={bin_dir}:/usr/local/bin:/usr/bin:/bin kodade-cli'\n"
-            "args = [arg.replace('nohup kodade-cli ', 'nohup ' + shim + ' ') if arg.startswith('nohup kodade-cli ') else (shim if arg == 'kodade-cli' else arg) for arg in sys.argv[1:]]\n"
+            f"args = [('PATH={bin_dir}:/usr/local/bin:/usr/bin:/bin; export PATH; ' + arg) if (arg.startswith('if [ -x ') or arg.startswith('nohup sh -c ')) else (arg.replace('nohup kodade-cli ', 'nohup ' + shim + ' ') if arg.startswith('nohup kodade-cli ') else (shim if arg == 'kodade-cli' else arg)) for arg in sys.argv[1:]]\n"
             f"os.execv('{SSH}', ['{SSH}', '-F', '{ssh_config}', *args])\n",
         )
         executable(

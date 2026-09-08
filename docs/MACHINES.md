@@ -6,7 +6,7 @@ and collapse state. OpenSSH uses your existing host aliases, keys, agent, and
 host-key configuration.
 
 ```sh
-kodade-cli machine add buildbox --label Build --remote-session agents
+kodade-cli machine add buildbox --label Build --remote-session agents --install
 kodade-cli machine list
 kodade-cli
 ```
@@ -38,7 +38,15 @@ The file is validated and written atomically. An omitted remote session uses
 the local session name. For one-shot commands or a single remote attachment,
 use `kodade-cli --remote buildbox -s agents ...`; that mode does not load the
 local machine catalog. `machine list --json` exposes the saved catalog for
-scripts. The remote host needs a compatible Ködade binary available on PATH.
+scripts. `--install` probes the remote Unix OS and architecture, downloads a
+matching published standalone archive, verifies `SHA256SUMS`, then uploads it
+to `~/.local/bin/kodade-cli` with a staged atomic rename. It never changes
+OpenSSH credentials, shell PATH, or package-managed binaries. To prepare an
+existing profile, run `kodade-cli machine prepare Build --install`. Without
+`--install`, preparation reports the missing binary and changes nothing.
+Prepared binaries use their absolute user-owned path, so non-login SSH PATH
+settings do not affect future connections. Linux and macOS x86_64/aarch64
+release archives are supported; Windows preparation awaits native archives.
 
 Verification includes separate localhost OpenSSH client/server environments,
 concurrent tunnels, a real controlling PTY switching between colliding local
