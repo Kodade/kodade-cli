@@ -226,7 +226,7 @@ mod windows_tests {
 
     #[cfg(windows)]
     #[test]
-    fn Windows_direct_agent_root_is_not_replaced_by_a_reporter_child() {
+    fn windows_direct_agent_root_is_not_replaced_by_a_reporter_child() {
         let entries = vec![
             WindowsProcessEntry {
                 pid: 10,
@@ -247,7 +247,7 @@ mod windows_tests {
 
     #[cfg(windows)]
     #[test]
-    fn Windows_shell_root_returns_its_agent_descendant() {
+    fn windows_shell_root_returns_its_agent_descendant() {
         let entries = vec![
             WindowsProcessEntry {
                 pid: 10,
