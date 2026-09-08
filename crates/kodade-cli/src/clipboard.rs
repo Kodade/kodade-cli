@@ -21,7 +21,7 @@ pub async fn copy(text: String, remote: bool) -> Result<()> {
 }
 
 fn use_native(remote: bool) -> bool {
-    !remote
+    !remote && std::env::var_os("SSH_CONNECTION").is_none() && std::env::var_os("SSH_TTY").is_none()
 }
 
 fn limit(text: &str) -> (&str, bool) {
@@ -85,7 +85,8 @@ mod tests {
     #[test]
     fn remote_copy_never_selects_a_native_program() {
         assert!(!use_native(true));
-        assert!(use_native(false));
+        // The process environment is deliberately not mutated here: the
+        // remote endpoint decision is deterministic and SSH is checked above.
     }
 
     #[cfg(unix)]

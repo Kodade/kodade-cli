@@ -172,7 +172,7 @@ struct StoredSelection {
 #[derive(Default)]
 struct PtyCallbacks {
     title: String,
-    clipboard: Option<(Vec<u8>, Vec<u8>)>,
+    clipboard: Option<(u64, Vec<u8>, Vec<u8>)>,
     graphics: graphics::Store,
     graphics_tracker: graphics::Tracker,
 }
@@ -187,7 +187,12 @@ impl vt100::Callbacks for PtyCallbacks {
 impl PtyCallbacks {
     fn record_clipboard(&mut self, ty: &[u8], data: &[u8]) {
         if data.len() <= 140_000 {
-            self.clipboard = Some((ty.to_vec(), data.to_vec()));
+            static NEXT: AtomicU64 = AtomicU64::new(1);
+            self.clipboard = Some((
+                NEXT.fetch_add(1, Ordering::Relaxed),
+                ty.to_vec(),
+                data.to_vec(),
+            ));
         }
     }
 }
@@ -1768,13 +1773,33 @@ impl Session {
 
     /// Consume one OSC 52 write only for this attached connection's focused
     /// pane. Clipboard data is neither replayed nor exposed through queries.
-    fn take_view_clipboard(&self, view: &ClientView) -> Option<ServerMessage> {
+    fn view_clipboard(
+        &self,
+        view: &ClientView,
+        seen: &mut HashMap<PaneId, u64>,
+    ) -> Option<ServerMessage> {
         let focused = {
             let state = self.state.lock().ok()?;
             Self::view_selection(&state, Some(view)).2
         };
-        let pane = self.panes.lock().ok()?.get(&focused).cloned()?;
-        let (selection, encoded) = pane.parser.lock().ok()?.callbacks_mut().clipboard.take()?;
+        let panes = self.panes.lock().ok()?;
+        // Advance this connection's cursor for every pane now. A hidden-pane
+        // request is intentionally dropped, never delivered after a later focus.
+        let mut current = None;
+        for (id, pane) in panes.iter() {
+            let clipboard = pane.parser.lock().ok()?.callbacks().clipboard.clone();
+            let Some((seq, selection, encoded)) = clipboard else {
+                continue;
+            };
+            if seq <= seen.get(id).copied().unwrap_or(0) {
+                continue;
+            }
+            seen.insert(*id, seq);
+            if *id == focused {
+                current = Some((selection, encoded));
+            }
+        }
+        let (selection, encoded) = current?;
         if selection.as_slice() != b"c" {
             return None;
         }
@@ -1789,14 +1814,22 @@ impl Session {
         })
     }
 
-    fn discard_pending_clipboards(&self) {
-        if let Ok(panes) = self.panes.lock() {
-            for pane in panes.values() {
-                if let Ok(mut parser) = pane.parser.lock() {
-                    parser.callbacks_mut().clipboard = None;
-                }
-            }
-        }
+    fn clipboard_cursor(&self) -> HashMap<PaneId, u64> {
+        let Ok(panes) = self.panes.lock() else {
+            return HashMap::new();
+        };
+        panes
+            .iter()
+            .filter_map(|(id, pane)| {
+                pane.parser
+                    .lock()
+                    .ok()?
+                    .callbacks()
+                    .clipboard
+                    .as_ref()
+                    .map(|(seq, _, _)| (*id, *seq))
+            })
+            .collect()
     }
 
     /// Queues a notification with the next sequence number, capping the ring at
@@ -4490,6 +4523,7 @@ async fn serve_client(stream: UnixStream, session: Arc<Session>) -> Result<()> {
     let mut last_snapshot = Instant::now() - Duration::from_millis(16);
     let mut initialized = false;
     let mut view = session.new_client_view()?;
+    let mut clipboard_seen = session.clipboard_cursor();
     // A fresh client only hears about transitions raised after it attached, so
     // the spawn-time backlog never replays.
     let mut last_notify_seq = session.notify_high_water();
@@ -4623,9 +4657,7 @@ async fn serve_client(stream: UnixStream, session: Arc<Session>) -> Result<()> {
                 match result {
                     Ok(()) if hello => {
                         initialized = true;
-                        // A newly attached client must never replay a pane's
-                        // historical OSC 52 request into a fresh host clipboard.
-                        session.discard_pending_clipboards();
+                        clipboard_seen = session.clipboard_cursor();
                         write_server(&mut writer, &ServerMessage::Welcome { session: session.session_name(), version: PROTOCOL_VERSION }).await?;
                         // The first client attach sees `restored: true`; clear it
                         // afterward so later snapshots (and `ls`) report normally.
@@ -4665,7 +4697,7 @@ async fn serve_client(stream: UnixStream, session: Arc<Session>) -> Result<()> {
                     if !remaining.is_zero() { tokio::time::sleep(remaining).await; }
                     write_server(&mut writer, &ServerMessage::Layout(session.snapshot_for_client(&view)?)).await?;
                     send_notifications(&mut writer, &session, &mut last_notify_seq, subscribed).await?;
-                    if let Some(clipboard) = session.take_view_clipboard(&view) {
+                    if let Some(clipboard) = session.view_clipboard(&view, &mut clipboard_seen) {
                         write_server(&mut writer, &clipboard).await?;
                     }
                     last_snapshot = Instant::now();
@@ -4676,7 +4708,7 @@ async fn serve_client(stream: UnixStream, session: Arc<Session>) -> Result<()> {
                 if initialized {
                     write_server(&mut writer, &ServerMessage::Layout(session.snapshot_for_client(&view)?)).await?;
                     send_notifications(&mut writer, &session, &mut last_notify_seq, subscribed).await?;
-                    if let Some(clipboard) = session.take_view_clipboard(&view) {
+                    if let Some(clipboard) = session.view_clipboard(&view, &mut clipboard_seen) {
                         write_server(&mut writer, &clipboard).await?;
                     }
                     last_snapshot = Instant::now();
@@ -4765,21 +4797,33 @@ mod tests {
         let mut parser = PtyParser::new_with_callbacks(2, 10, 10, PtyCallbacks::default());
         parser.process(b"\x1b]52;c;aGk=\x07");
         assert_eq!(
-            parser.callbacks().clipboard.as_ref().map(|(_, data)| data),
+            parser
+                .callbacks()
+                .clipboard
+                .as_ref()
+                .map(|(_, _, data)| data),
             Some(&b"aGk=".to_vec())
         );
         // OSC 52 queries invoke the separate paste callback and never replace
         // the pending copy request.
         parser.process(b"\x1b]52;c;?\x07");
         assert_eq!(
-            parser.callbacks().clipboard.as_ref().map(|(_, data)| data),
+            parser
+                .callbacks()
+                .clipboard
+                .as_ref()
+                .map(|(_, _, data)| data),
             Some(&b"aGk=".to_vec())
         );
         parser
             .callbacks_mut()
             .record_clipboard(b"c", &vec![b'a'; 140_001]);
         assert_eq!(
-            parser.callbacks().clipboard.as_ref().map(|(_, data)| data),
+            parser
+                .callbacks()
+                .clipboard
+                .as_ref()
+                .map(|(_, _, data)| data),
             Some(&b"aGk=".to_vec())
         );
     }
@@ -4794,16 +4838,17 @@ mod tests {
             .lock()
             .unwrap()
             .process(b"\x1b]52;c;aGVsbG8=\x07");
+        let mut seen = HashMap::new();
         assert!(matches!(
-            session.take_view_clipboard(&view),
+            session.view_clipboard(&view, &mut seen),
             Some(ServerMessage::Clipboard { pane, text }) if pane == focused && text == "hello"
         ));
-        assert!(session.take_view_clipboard(&view).is_none());
+        assert!(session.view_clipboard(&view, &mut seen).is_none());
         pane.parser
             .lock()
             .unwrap()
             .process(b"\x1b]52;c;not-base64!\x07");
-        assert!(session.take_view_clipboard(&view).is_none());
+        assert!(session.view_clipboard(&view, &mut seen).is_none());
     }
 
     #[tokio::test]
@@ -4859,7 +4904,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn hidden_pane_clipboard_waits_for_focus_and_cold_attach_discards_it() {
+    async fn hidden_pane_clipboard_is_dropped_before_later_focus() {
         let session = Session::spawn(80, 24, "clipboard-focus".into()).expect("session");
         let first = session.snapshot().unwrap().panes[0].id;
         session.handle(ClientMessage::SplitRight).unwrap();
@@ -4878,20 +4923,18 @@ mod tests {
             .lock()
             .unwrap()
             .process(b"\x1b]52;c;aGlkZGVu\x07");
-        assert!(session.take_view_clipboard(&view).is_none());
+        let mut seen = HashMap::new();
+        assert!(session.view_clipboard(&view, &mut seen).is_none());
         view.focused.insert(view.tabs[&view.workspace], hidden);
-        assert!(matches!(
-            session.take_view_clipboard(&view),
-            Some(ServerMessage::Clipboard { pane, text }) if pane == hidden && text == "hidden"
-        ));
+        assert!(session.view_clipboard(&view, &mut seen).is_none());
         let first_pane = session.panes.lock().unwrap()[&first].clone();
         first_pane
             .parser
             .lock()
             .unwrap()
             .process(b"\x1b]52;c;Y29sZA==\x07");
-        session.discard_pending_clipboards();
-        assert!(session.take_view_clipboard(&view).is_none());
+        let mut cold_attach = session.clipboard_cursor();
+        assert!(session.view_clipboard(&view, &mut cold_attach).is_none());
     }
 
     #[test]
