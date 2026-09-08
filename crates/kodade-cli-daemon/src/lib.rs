@@ -177,10 +177,35 @@ struct PtyCallbacks {
     title: String,
     graphics: graphics::Store,
     graphics_tracker: graphics::Tracker,
+    terminal_replies: Vec<u8>,
 }
 impl vt100::Callbacks for PtyCallbacks {
     fn set_window_title(&mut self, _: &mut vt100::Screen, title: &[u8]) {
         self.title = String::from_utf8_lossy(title).into_owned();
+    }
+
+    fn unhandled_csi(
+        &mut self,
+        screen: &mut vt100::Screen,
+        i1: Option<u8>,
+        _i2: Option<u8>,
+        params: &[&[u16]],
+        c: char,
+    ) {
+        if c != 'n' || params.len() != 1 || params[0] != [6] || !matches!(i1, None | Some(b'?')) {
+            return;
+        }
+        let (row, col) = screen.cursor_position();
+        let private = i1 == Some(b'?');
+        self.terminal_replies.extend_from_slice(
+            format!(
+                "\x1b[{}{};{}R",
+                if private { "?" } else { "" },
+                row.saturating_add(1),
+                col.saturating_add(1)
+            )
+            .as_bytes(),
+        );
     }
 }
 type PtyParser = vt100::Parser<PtyCallbacks>;
@@ -4234,7 +4259,6 @@ fn read_pty(
     tokio::task::spawn_blocking(move || {
         let mut decoder = graphics::Decoder::default();
         let mut bytes = [0_u8; 4096];
-        let mut terminal_query = Vec::new();
         while let Ok(count) = reader.read(&mut bytes) {
             if count == 0 {
                 break;
@@ -4242,20 +4266,6 @@ fn read_pty(
             let mut replies = Vec::new();
             {
                 let mut parser = parser.lock().expect("PTY parser lock poisoned");
-                if let Some(private) = cursor_position_query(&mut terminal_query, &bytes[..count]) {
-                    let (row, col) = parser.screen().cursor_position();
-                    if private {
-                        replies.extend_from_slice(
-                            format!("\x1b[?{};{}R", row.saturating_add(1), col.saturating_add(1))
-                                .as_bytes(),
-                        );
-                    } else {
-                        replies.extend_from_slice(
-                            format!("\x1b[{};{}R", row.saturating_add(1), col.saturating_add(1))
-                                .as_bytes(),
-                        );
-                    }
-                }
                 for token in decoder.feed(&bytes[..count]) {
                     match token {
                         graphics::Token::Invalid => {
@@ -4286,6 +4296,9 @@ fn read_pty(
                         }
                     }
                 }
+                replies.extend_from_slice(&std::mem::take(
+                    &mut parser.callbacks_mut().terminal_replies,
+                ));
             }
             if !replies.is_empty() {
                 if let Ok(mut writer) = writer.lock() {
@@ -4299,35 +4312,15 @@ fn read_pty(
     });
 }
 
-/// Detect a device-status cursor request split across PTY reads. ConPTY asks
-/// this before presenting a child with inherited cursor state.
-fn cursor_position_query(tail: &mut Vec<u8>, bytes: &[u8]) -> Option<bool> {
-    tail.extend_from_slice(bytes);
-    let response = if tail.windows(4).any(|query| query == b"\x1b[6n") {
-        Some(false)
-    } else if tail.windows(5).any(|query| query == b"\x1b[?6n") {
-        Some(true)
-    } else {
-        None
-    };
-    if response.is_some() {
-        tail.clear();
-    } else if tail.len() > 4 {
-        tail.drain(..tail.len() - 4);
-    }
-    response
-}
-
 #[cfg(test)]
 mod terminal_query_tests {
-    use super::cursor_position_query;
+    use super::{PtyCallbacks, PtyParser};
 
     #[test]
-    fn cursor_queries_span_pty_reads_and_keep_their_mode() {
-        let mut tail = Vec::new();
-        assert_eq!(cursor_position_query(&mut tail, b"\x1b["), None);
-        assert_eq!(cursor_position_query(&mut tail, b"6n"), Some(false));
-        assert_eq!(cursor_position_query(&mut tail, b"\x1b[?6n"), Some(true));
+    fn cursor_queries_reply_at_their_stream_position() {
+        let mut parser = PtyParser::new_with_callbacks(12, 20, 100, PtyCallbacks::default());
+        parser.process(b"\x1b[2;3H\x1b[6n\x1b[9;9H\x1b[?6n");
+        assert_eq!(parser.callbacks().terminal_replies, b"\x1b[2;3R\x1b[?9;9R");
     }
 }
 
