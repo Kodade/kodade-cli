@@ -6,7 +6,7 @@
 //! unit-tested; `app.rs` performs the side effects (drawing, writing escapes,
 //! spawning the sound command).
 
-use kodade_cli_proto::{AgentStateKind, LayoutSnapshot, Notification};
+use kodade_cli_proto::{AgentStateKind, LayoutSnapshot, Notification, PaneId};
 
 use crate::config::{self, NotifyToast};
 
@@ -87,6 +87,48 @@ impl Notifier {
     pub fn pop_unread(&mut self) -> Option<Notification> {
         self.unread.pop()
     }
+
+    /// Notifications the attention center can present, oldest to newest.
+    pub fn unread(&self) -> &[Notification] {
+        &self.unread
+    }
+
+    /// Mark every currently presented item as seen without changing daemon
+    /// state; a future state transition will create a fresh notification.
+    pub fn acknowledge_all(&mut self) {
+        self.unread.clear();
+    }
+
+    /// Mark one attention item read after its pane is focused.
+    pub fn acknowledge(&mut self, pane: PaneId) {
+        self.unread.retain(|notification| notification.pane != pane);
+    }
+
+    /// Keep alerts only while their pane still has the state that caused them.
+    /// `LayoutSnapshot::panes` only holds the active tab, so background panes
+    /// are reconciled through the daemon-owned sidebar agent metadata.
+    pub fn reconcile(&mut self, layout: &LayoutSnapshot) {
+        self.unread.retain(|notification| {
+            live_state(layout, notification.pane) == Some(notification.state)
+        });
+    }
+}
+
+fn live_state(layout: &LayoutSnapshot, pane: PaneId) -> Option<AgentStateKind> {
+    layout
+        .panes
+        .iter()
+        .find(|candidate| candidate.id == pane)
+        .map(|candidate| candidate.state)
+        .or_else(|| {
+            layout
+                .workspaces
+                .iter()
+                .flat_map(|workspace| &workspace.tabs)
+                .flat_map(|tab| &tab.agents)
+                .find(|agent| agent.pane == pane)
+                .map(|agent| agent.state)
+        })
 }
 
 /// True when the notification's pane is the focused pane of the active tab and
@@ -298,5 +340,24 @@ mod tests {
             Some(AgentStateKind::Done)
         );
         assert!(notifier.pop_unread().is_none());
+    }
+
+    #[test]
+    fn reconcile_drops_background_alerts_when_agents_resume() {
+        let mut notifier = notifier();
+        let mut snapshot = layout(PaneId(9));
+        let _ = notifier.handle(&notification(AgentStateKind::Blocked), &snapshot);
+        snapshot.workspaces[0].tabs[0].agents[0].state = AgentStateKind::Working;
+        snapshot.panes[0].state = AgentStateKind::Working;
+        notifier.reconcile(&snapshot);
+        assert!(notifier.unread().is_empty());
+
+        snapshot.workspaces[0].tabs[0].agents[0].state = AgentStateKind::Done;
+        snapshot.panes[0].state = AgentStateKind::Done;
+        let _ = notifier.handle(&notification(AgentStateKind::Done), &snapshot);
+        snapshot.workspaces[0].tabs[0].agents[0].state = AgentStateKind::Working;
+        snapshot.panes[0].state = AgentStateKind::Working;
+        notifier.reconcile(&snapshot);
+        assert!(notifier.unread().is_empty());
     }
 }

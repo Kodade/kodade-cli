@@ -1,4 +1,5 @@
 mod app;
+mod attention;
 mod cli;
 mod commands;
 mod config;
@@ -8,6 +9,7 @@ mod keys;
 mod mode;
 mod notify;
 mod overlay;
+mod palette;
 mod paste;
 mod picker;
 mod remote;

@@ -40,6 +40,10 @@ When an agent transitions into a state listed in `notify.on`, the toast reads
 of the most recent unread notification and repeated presses walk back through
 the stack.
 
+`prefix A` opens the attention center. It puts blocked work ahead of completed
+work and shows the agent, workspace/tab breadcrumb, state age, and detection
+reason. `enter` focuses the pane and `a` acknowledges every visible alert.
+
 ```toml
 [notify]
 enabled = true
@@ -216,6 +220,8 @@ modifier (`ctrl+…`/`alt+…`) fires globally.
 | `close_workspace` | `D` |
 | `workspace_prev` | unbound |
 | `goto` | `g` |
+| `command_center` | `space` |
+| `attention` | `A` |
 | `navigate` | `n` |
 | `copy_mode` | `[` |
 | `scroll_up` | `pageup` |
@@ -244,6 +250,13 @@ runs), `ctrl+n`/`ctrl+p` or the arrows move, `enter` jumps, `esc` closes;
 blocked entries always sort to the top. Cycling straight to the next workspace
 without the picker is `workspace_next` (`prefix alt+w`); `workspace_prev`
 ships unbound — bind it to a bare `alt+…` chord to cycle backwards globally.
+
+`command_center` (`prefix space`) executes actions and starts agents. Type an
+action name or its live binding to run it, or type an agent name (`Codex`,
+`Claude Code`, `Gemini CLI`, `OpenCode`, or `Pi`) to start it in a new tab in
+the current workspace. The launch is sent to the attached daemon, so
+`--remote` does not guess at the local client PATH. Choose `shell` for an
+ordinary interactive tab.
 
 `reload_config` re-reads this file and the theme in place, and `settings`
 opens the [settings menu](#settings-menu).
