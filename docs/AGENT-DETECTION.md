@@ -217,8 +217,9 @@ state, so detection does not depend on screen strings alone.
   the commands, Ködade continues with process and screen detection. Use
   `integrate codex --remove` to remove only Ködade's marked commands.
 - `integrate copilot [--write]` — writes Ködade's separate, versioned user hook
-  file at `~/.copilot/hooks/kodade-cli.json`: `userPromptSubmitted` → working,
-  `agentStop` → done, and `errorOccurred` → blocked. Copilot documents those
+  file at `~/.copilot/hooks/kodade-cli.json` (or `$COPILOT_HOME/hooks/kodade-cli.json`):
+  `userPromptSubmitted` → working, `agentStop` → done, and `permissionRequest` /
+  `errorOccurred` → blocked. Copilot documents those
   events and its `sessionId` payload in its [hooks reference](https://docs.github.com/en/copilot/reference/hooks-reference), and resumes the exact reported ID with `copilot --resume=ID`.
 - `integrate cursor [--write]` — merges `sessionStart` and
   `beforeSubmitPrompt` → working plus `stop`/`sessionEnd` → done into

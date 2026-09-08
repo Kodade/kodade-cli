@@ -69,7 +69,14 @@ pub fn integrate_list() -> Result<()> {
             ),
             _ => continue,
         };
-        let path = home.as_ref().map(|home| home.join(target));
+        let path = if *agent == "copilot" {
+            Some(
+                copilot_dir(home.as_deref(), std::env::var_os("COPILOT_HOME"))?
+                    .join("hooks/kodade-cli.json"),
+            )
+        } else {
+            home.as_ref().map(|home| home.join(target))
+        };
         let available = match &path {
             // "available" = the agent's config directory exists on this machine.
             Some(path) => path.parent().map(|parent| parent.exists()).unwrap_or(false),
@@ -98,6 +105,7 @@ fn copilot_hooks() -> Value {
         "hooks": {
             "userPromptSubmitted": [command("working")],
             "agentStop": [command("done")],
+            "permissionRequest": [command("blocked")],
             "errorOccurred": [command("blocked")]
         }
     })
@@ -105,7 +113,8 @@ fn copilot_hooks() -> Value {
 
 pub fn integrate_copilot(write: bool) -> Result<()> {
     let home = dirs::home_dir().ok_or_else(|| anyhow!("home directory unavailable"))?;
-    let path = home.join(".copilot/hooks/kodade-cli.json");
+    let path =
+        copilot_dir(Some(&home), std::env::var_os("COPILOT_HOME"))?.join("hooks/kodade-cli.json");
     if !write {
         println!("{}", serde_json::to_string_pretty(&copilot_hooks())?);
         return Ok(());
@@ -120,7 +129,23 @@ pub fn integrate_copilot(write: bool) -> Result<()> {
 
 pub fn unintegrate_copilot() -> Result<()> {
     let home = dirs::home_dir().ok_or_else(|| anyhow!("home directory unavailable"))?;
-    remove_owned_file(&home.join(".copilot/hooks/kodade-cli.json"))
+    remove_owned_file(
+        &copilot_dir(Some(&home), std::env::var_os("COPILOT_HOME"))?.join("hooks/kodade-cli.json"),
+    )
+}
+
+/// Copilot CLI replaces its complete user configuration root when
+/// `COPILOT_HOME` is set, including the user hook directory.
+fn copilot_dir(
+    home: Option<&Path>,
+    configured: Option<std::ffi::OsString>,
+) -> Result<std::path::PathBuf> {
+    if let Some(dir) = configured.filter(|dir| !dir.is_empty()) {
+        return Ok(dir.into());
+    }
+    Ok(home
+        .ok_or_else(|| anyhow!("home directory unavailable"))?
+        .join(".copilot"))
 }
 
 fn cursor_hooks() -> Value {
@@ -992,9 +1017,16 @@ mod tests {
     fn verified_external_hook_shapes_preserve_lifecycle_and_session_keys() {
         let copilot = copilot_hooks();
         assert_eq!(copilot["version"], 1);
-        assert!(copilot["hooks"]["userPromptSubmitted"][0]["command"]
-            .as_str()
-            .is_some_and(|command| command.contains("--hook-json")));
+        for event in [
+            "userPromptSubmitted",
+            "agentStop",
+            "permissionRequest",
+            "errorOccurred",
+        ] {
+            assert!(copilot["hooks"][event][0]["command"]
+                .as_str()
+                .is_some_and(|command| command.contains("--hook-json")));
+        }
         assert!(cursor_hooks()["sessionStart"][0]["command"]
             .as_str()
             .is_some_and(|command| command.contains("kodade:cursor")));
@@ -1006,6 +1038,19 @@ mod tests {
                 .as_str()
                 .is_some_and(|command| command.contains(" done ")));
         }
+    }
+
+    #[test]
+    fn copilot_home_replaces_the_default_config_root() {
+        let home = Path::new("/tmp/kodade-home");
+        assert_eq!(
+            copilot_dir(Some(home), Some("/tmp/kodade-copilot-home".into())).unwrap(),
+            Path::new("/tmp/kodade-copilot-home")
+        );
+        assert_eq!(
+            copilot_dir(Some(home), None).unwrap(),
+            home.join(".copilot")
+        );
     }
 
     #[test]
