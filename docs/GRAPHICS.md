@@ -82,8 +82,10 @@ verifies PNG upload, image metadata, rename, and attachment cleanup through real
 forwarded sockets. Unit tests cover chunk boundaries, failed transfers, quotas,
 atomic replacement, scrolling, clipping, PNG validation, FIFO rejection, and
 interrupted partial socket reads. Ghostty support follows its documented Kitty
-implementation; it has not been visually tested in this environment. Final
-v0.3.0 release-run evidence remains pending.
+implementation; it has not been visually tested in this environment. The
+v0.3.0 integrated Linux build passes both graphics smokes and the isolated SSH
+image scenario. Platform and publication evidence is in the
+[delivery ledger](features/herdr-parity/PLAN.md).
 
 References: [Kitty graphics protocol](https://sw.kovidgoyal.net/kitty/graphics-protocol/)
 and [Ghostty graphics support](https://ghostty.org/docs/features).

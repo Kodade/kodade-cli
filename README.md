@@ -20,14 +20,13 @@ Ködade CLI also works independently of the
 
 ## Status
 
-v0.2.1 is the latest published version. v0.3.0 is a release candidate; its tag,
-GitHub Release, Homebrew formula, and archives do not exist yet. When published,
-v0.3.0 will ship exactly four standalone archives: macOS and Linux on arm64 and
-x86_64. Native Windows binaries and Windows installation support are deferred.
+v0.3.0 supports macOS and Linux on arm64 and x86_64. Standalone binaries and
+checksums are available from [GitHub Releases](https://github.com/Kodade/kodade-cli/releases).
+Native Windows binaries and Windows installation support remain deferred.
 
-### v0.3.0 release candidate
+### What’s in v0.3.0
 
-The release candidate brings the everyday workspace flows together:
+The release brings the everyday workspace flows together:
 
 - Local and saved SSH machines in one workspace, with independent reconnects.
 - A command center (`prefix space`) and attention history (`prefix A`).
@@ -43,6 +42,8 @@ The release candidate brings the everyday workspace flows together:
   SSH, remote panes, and terminals without a native clipboard tool.
 - Live daemon upgrade for an already-running v0.3.0 Unix session, preserving
   its pane processes while attached clients reconnect.
+- Negotiated keyboard input and theme-aware terminal color queries, preserved
+  through reconnects and live upgrades.
 - Verified stable/preview updates for standalone installations.
 
 ### Moving from v0.2.1
@@ -60,7 +61,7 @@ Attached Ködade clients reconnect with their saved view; queued input is not
 replayed.
 
 See the [competitive delivery ledger](docs/features/herdr-parity/PLAN.md) for
-reviewed evidence and the final release gates that remain pending.
+reviewed evidence and known terminal compatibility limits.
 
 ## Install
 

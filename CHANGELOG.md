@@ -1,10 +1,8 @@
 # Changelog
 
-## 0.3.0 — release candidate
+## 0.3.0 — 2026-09-08
 
-This section describes the pending Linux/macOS release. It is not a published
-release until its tag, GitHub Release, four archives, and Homebrew formula are
-created.
+Linux/macOS workspace release.
 
 ### Workspace and agent flows
 
@@ -36,7 +34,7 @@ created.
 
 ### Platform support
 
-v0.3.0 will publish four standalone archives only: Linux and macOS on arm64 and
+v0.3.0 targets four standalone archives only: Linux and macOS on arm64 and
 x86_64. Native Windows binaries, installation, upgrade, and SSH preparation
 are deferred.
 
@@ -46,3 +44,9 @@ An existing v0.2.1 daemon cannot live-handoff to v0.3.0. Install the new binary,
 leave the v0.2.1 session and its panes running, and start a separately named
 v0.3.0 session. Move work when it is safe; do not kill the old session to
 migrate it.
+
+### Known terminal limits
+
+Graphics implements the [documented Kitty subset](docs/GRAPHICS.md), excluding
+animation. Pane rendering preserves basic underlines; styled underlines remain
+a tracked follow-up ([#76](https://github.com/Kodade/kodade-cli/issues/76)).

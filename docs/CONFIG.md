@@ -535,49 +535,9 @@ Pane rendering supports basic underlines. Styled underlines (double, curly,
 dotted, and dashed) and independent underline colors are not preserved.
 Capability queries therefore do not advertise `Su`, `Smulx`, or `Setulc`.
 
-The complete built-in `kodade-dark` theme:
-
-```toml
-name = "kodade-dark"
-accent = "#E7A33B"
-border = "#3a3733"
-text = "#d6d2c9"
-dim = "#a5a096"
-blocked = "#d97a80"
-working = "#a8c87f"
-done = "#E7A33B"
-idle = "#a5a096"
-tabbar_bg = "#232120"
-status_bg = "#232120"
-
-bg = "#2a2825"
-surface = "#232120"
-selection = "#454038"
-cursor = "#e2b86e"
-menu_bg = "#232120"
-menu_fg = "#d6d2c9"
-tab_active_fg = "#E7A33B"
-tab_active_bg = "#38352f"
-sidebar_bg = "#232120"
-
-[ansi]
-black = "#2a2825"
-red = "#d97a80"
-green = "#a8c87f"
-yellow = "#e2b86e"
-blue = "#7fa3e0"
-magenta = "#d98a5b"
-cyan = "#7fc4d6"
-white = "#d6d2c9"
-bright_black = "#a5a096"
-bright_red = "#e5949a"
-bright_green = "#bcd89a"
-bright_yellow = "#efce8f"
-bright_blue = "#9db9e8"
-bright_magenta = "#e5a67d"
-bright_cyan = "#9dd4e2"
-bright_white = "#f0ece3"
-```
+The complete built-in [`kodade-dark` theme](../crates/kodade-cli/themes/kodade-dark.toml)
+is the canonical example. Copy it to your themes directory, change `name`, and
+edit its fields to create a custom theme.
 
 ### Terminal environment inside panes
 

@@ -1,6 +1,6 @@
 # Ködade CLI versus HerdR
 
-Reference: [HerdR `9e01168`](https://github.com/herdrdev/herdr/tree/9e01168b140ce8e3821131345dc82bc2bf9994eb), compared with Ködade's original `84af09e` and the v0.3.0 Unix release candidate. This is a source and behavior comparison, not a claim about every future HerdR release or every version of an agent CLI. This review records previously reviewed work; the [delivery ledger](PLAN.md) separates it from final release evidence still pending.
+Reference: [HerdR `9e01168`](https://github.com/herdrdev/herdr/tree/9e01168b140ce8e3821131345dc82bc2bf9994eb), compared with Ködade's original `84af09e` and the v0.3.0 Linux/macOS release. This is a source and behavior comparison, not a claim about every future HerdR release or every version of an agent CLI. The [delivery ledger](PLAN.md) records behavior checks, release evidence, and remaining limits.
 
 ## What HerdR had that was missing
 
@@ -27,7 +27,7 @@ The largest gaps were outside basic splitting and navigation. Ködade already ha
 | Extended graphics | File, temporary-file, shared-memory, compressed media and virtual/relative placement gaps | Bounded media decoding and ownership, Unicode placeholders and relative geometry; real PTY and host rendering proof (#61) |
 | Keyboard negotiation | Enhanced input and terminal capability queries missing | Per-pane keyboard negotiation, handoff-preserved parser state, accurate capability replies and theme-aware OSC 10/11/12/4 color queries (#64). |
 | Windows remote bootstrap | Windows client could not prepare Unix hosts | Deferred with native Windows support; it is outside the v0.3.0 release scope. |
-| Terminal polish | Labeled OSC 8 links, synchronized output and native copy were absent | Implemented in #58 with parser regressions addressed in #59; final Unix release evidence remains pending. |
+| Terminal polish | Labeled OSC 8 links, synchronized output and native copy were absent | Real TUI link activation and synchronized output in #58; wrapping/resize regressions in #59. |
 
 HerdR source anchors: [`src/client`](https://github.com/herdrdev/herdr/tree/9e01168b140ce8e3821131345dc82bc2bf9994eb/src/client), [`src/cli`](https://github.com/herdrdev/herdr/tree/9e01168b140ce8e3821131345dc82bc2bf9994eb/src/cli), [`src/integration`](https://github.com/herdrdev/herdr/tree/9e01168b140ce8e3821131345dc82bc2bf9994eb/src/integration), and [`src/platform`](https://github.com/herdrdev/herdr/tree/9e01168b140ce8e3821131345dc82bc2bf9994eb/src/platform).
 
@@ -57,7 +57,7 @@ Defaults should make the first session useful. Advanced commands, hooks and mach
 
 ## How to judge the result
 
-The strongest reasons to choose Ködade are the combined workflows: open local and SSH projects together; send a guarded prompt to the intended agent; run an extension with the exact selected text and pane context; resume the correct conversation; and, for a v0.3.0 Unix daemon, update the workspace without losing running shells. These claims have prior focused real-process tests in addition to Rust unit tests; final integrated release evidence remains pending.
+The strongest reasons to choose Ködade are the combined workflows: open local and SSH projects together; send a guarded prompt to the intended agent; run an extension with the exact selected text and pane context; resume the correct conversation; and, for a v0.3.0 Unix daemon, update the workspace without losing running shells. These flows pass focused real-process checks on the integrated release binary, in addition to 478 Rust tests. See the delivery ledger for platform and publication evidence.
 
 The documented limits remain part of the product contract. [Graphics](../../GRAPHICS.md) describes the supported Kitty subset. [Agent detection](../../AGENT-DETECTION.md) lists each lifecycle and exact-native-resume contract, and separates verified contracts from identification-only rules. Native live PTY handoff is a Unix capability. The ledger must remain explicit about actual operating-system runner results and release artifacts; a compiling platform branch or a printed fixture label is insufficient evidence.
 
@@ -70,4 +70,5 @@ path (`src/pane/terminal.rs`, `src/protocol/wire.rs`, and
 `src/protocol/render_ansi.rs`). Neither compared host/remote path preserves
 independent underline colors. Ködade answers unsupported `Su`, `Smulx`, and
 `Setulc` capability queries negatively instead of promising unavailable
-rendering. Graphics animation remains outside the documented Kitty subset.
+rendering. Styled underlines are tracked in [#76](https://github.com/Kodade/kodade-cli/issues/76).
+Graphics animation remains outside the documented Kitty subset.
