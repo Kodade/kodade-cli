@@ -233,6 +233,7 @@ modifier (`ctrl+…`/`alt+…`) fires globally.
 | `sidebar_toggle` | `b` |
 | `reload_config` | `prefix+ctrl+r` |
 | `paste_buffer` | `]` |
+| `paste_image` | `I` |
 | `mouse_toggle` | `m` |
 | `notification_jump` | `N` |
 <!-- keys:end -->

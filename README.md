@@ -369,6 +369,14 @@ See [docs/CONFIG.md](docs/CONFIG.md), [docs/AGENT-DETECTION.md](docs/AGENT-DETEC
 for reference and contributor details. The product direction is in
 [docs/PRD.md](docs/PRD.md).
 
+## Terminal images
+
+Kitty and Ghostty can display images emitted by panes. Images stay inside pane
+borders, survive detach, and follow scrolling. Press `prefix I` to paste a
+clipboard PNG, or run `kodade-cli pane paste-image 3 screenshot.png`; remote
+panes receive an uploaded file on their own host. See [graphics support and
+limits](docs/GRAPHICS.md).
+
 ## License
 
 Apache License 2.0 — see [LICENSE](LICENSE) and [NOTICE](NOTICE).

@@ -110,6 +110,8 @@ struct DragState {
 }
 
 pub struct App {
+    graphics: crate::graphics::Renderer,
+    image_clipboard: crate::image_paste::Clipboard,
     layout: Option<LayoutSnapshot>,
     prefix: bool,
     rename: bool,
@@ -241,6 +243,8 @@ impl App {
         let onboarding_decided = ui_state.onboarding_seen;
         Self {
             layout: None,
+            graphics: crate::graphics::Renderer::default(),
+            image_clipboard: crate::image_paste::Clipboard::default(),
             prefix: false,
             rename: false,
             new_workspace: false,
@@ -624,7 +628,21 @@ impl App {
         writer: &mut OwnedWriteHalf,
         rx: &mut mpsc::Receiver<Update>,
     ) -> Result<()> {
+        let result = self.run_loop(term, writer, rx).await;
+        let cleanup = self.graphics.clear(term.backend_mut());
+        result.and(cleanup)
+    }
+
+    async fn run_loop(
+        &mut self,
+        term: &mut Term,
+        writer: &mut OwnedWriteHalf,
+        rx: &mut mpsc::Receiver<Update>,
+    ) -> Result<()> {
         loop {
+            if let Some(note) = self.image_clipboard.poll() {
+                self.set_note(note);
+            }
             let mut layout_changed = false;
             while let Ok(update) = rx.try_recv() {
                 match update {
@@ -649,6 +667,20 @@ impl App {
             }
             self.sync_title(term)?;
             term.draw(|frame| self.draw(frame))?;
+            let area = self.content_area(term)?;
+            let hidden = self.center.is_some()
+                || self.help.is_some()
+                || self.settings.is_some()
+                || self.picker.is_some()
+                || self.menu.is_some()
+                || self.copy.is_some()
+                || self.flash_active();
+            let layout = self.layout.as_ref().filter(|_| !hidden);
+            let rects = layout
+                .map(|layout| render::pane_rects_for(layout, area))
+                .unwrap_or_default();
+            self.graphics
+                .draw(term.backend_mut(), &self.socket, layout, &rects)?;
             if !event::poll(Duration::from_millis(16))? {
                 continue;
             }
@@ -1439,6 +1471,13 @@ impl App {
                 } else {
                     let text = self.paste_buffer.clone();
                     self.send_paste(&text, writer).await?;
+                }
+            }
+            config::Action::PasteImage => {
+                if let Some(pane) = self.focused_pane {
+                    if self.image_clipboard.start(self.socket.clone(), pane) {
+                        self.set_note(" reading clipboard image…");
+                    }
                 }
             }
             config::Action::NotificationJump => self.notification_jump(writer).await?,
@@ -2802,7 +2841,13 @@ mod tests {
             "palette-test",
             PathBuf::from("/tmp/kodade-test.sock"),
         );
-        let mut term = Terminal::new(CrosstermBackend::new(std::io::stdout())).unwrap();
+        let mut term = Terminal::with_options(
+            CrosstermBackend::new(std::io::stdout()),
+            ratatui::TerminalOptions {
+                viewport: ratatui::Viewport::Fixed(Rect::new(0, 0, 120, 30)),
+            },
+        )
+        .unwrap();
 
         let (client, mut daemon) = tokio::net::UnixStream::pair().unwrap();
         let (_, mut writer) = client.into_split();
@@ -2894,7 +2939,13 @@ mod tests {
         app.center = Some(CenterOverlay::Palette(palette));
         let (client, _daemon) = tokio::net::UnixStream::pair().unwrap();
         let (_, mut writer) = client.into_split();
-        let mut term = Terminal::new(CrosstermBackend::new(std::io::stdout())).unwrap();
+        let mut term = Terminal::with_options(
+            CrosstermBackend::new(std::io::stdout()),
+            ratatui::TerminalOptions {
+                viewport: ratatui::Viewport::Fixed(Rect::new(0, 0, 120, 30)),
+            },
+        )
+        .unwrap();
 
         assert_eq!(
             app.handle_center_key(KeyEvent::from(KeyCode::Enter), &mut writer, &mut term)

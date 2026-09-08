@@ -14,7 +14,8 @@ the second.
      `/tmp/kodade-cli-$UID/SESSION.sock`.
 - Every message is one UTF-8 JSON value followed by `\n`. There is no length
   prefix and no framing beyond the newline; embedded newlines are escaped by
-  JSON itself.
+  JSON itself. Client requests are capped at 16 MiB before deserialization;
+  partial uploads survive concurrent screen updates.
 - Enums use serde's external tagging: a unit variant is a bare string
   (`"ZoomPane"`), a struct variant is a single-key object
   (`{"FocusPaneId":{"id":3}}`), and a newtype variant wraps its payload
@@ -44,6 +45,8 @@ printf '%s\n' '{"Query":"Layout"}' | nc -U /tmp/kodade-cli-$UID/default.sock
 | --- | --- | --- |
 | `Query(Layout)` | `{"Query":"Layout"}` | `Layout` |
 | `Query(Pane)` | `{"Query":{"Pane":3}}` | `Pane` |
+| `Query(Image)` | `{"Query":{"Image":{"pane":3,"id":7,"revision":1}}}` | `Image { pane, image }` |
+| `PasteImage` | `{"PasteImage":{"pane":3,"data":"base64 PNG"}}` | `ImagePasted { pane, path }` |
 | `Query(Session)` | `{"Query":"Session"}` | `Session` |
 | `Query(Version)` | `{"Query":"Version"}` | `Version` |
 | `Query(Schema)` | `{"Query":"Schema"}` | `Schema` |
@@ -292,3 +295,12 @@ bytes, no path separators or control characters, and neither `.` nor `..`.
 
 `doctor --json` probes `Query(Version)` without starting the daemon. Its JSON
 contains `version`, `session`, `socket`, and `checks` (`name`, `status`, `detail`).
+
+## Images
+
+`Screen.graphics` carries image revision, placement ID, cell position/extent,
+source pixel crop, and z order. `Query(Image)` fetches one exact revision as
+`ImageData { id, revision, format, width, height, data }`; stale revisions fail.
+Image bytes use base64, bounded to 8 MiB decoded. `PasteImage` validates a PNG,
+saves it privately on the daemon host, and pastes its quoted path without
+submitting input. See [GRAPHICS.md](GRAPHICS.md) for modes, limits, and cleanup.

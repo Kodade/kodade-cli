@@ -58,6 +58,11 @@ pub enum ClientMessage {
         id: PaneId,
         bytes: Vec<u8>,
     },
+    /// Upload a bounded PNG and paste its private path, without submitting input.
+    PasteImage {
+        pane: PaneId,
+        data: String,
+    },
     /// Atomically verify a recognized agent identity then write to its pane.
     /// Scripts use this for prompts so a query/write gap cannot send input to
     /// a replacement shell or another agent in the same pane.
@@ -200,6 +205,12 @@ pub enum QueryKind {
     /// only) this reaches panes in background tabs and workspaces, which is
     /// what `agent wait` / `pane wait-output` poll (#16).
     Pane(PaneId),
+    /// Fetch an image only when its revision changes; layouts carry metadata only.
+    Image {
+        pane: PaneId,
+        id: u32,
+        revision: u64,
+    },
     /// Cheap version probe: the daemon replies with `ServerMessage::Version` and
     /// nothing else, so `--remote` can check compatibility before attaching (#23).
     Version,
@@ -211,6 +222,10 @@ pub enum QueryKind {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ServerMessage {
+    ImagePasted {
+        pane: PaneId,
+        path: PathBuf,
+    },
     Welcome {
         session: String,
         /// Protocol version the daemon speaks; an unexpected value makes the
@@ -238,6 +253,10 @@ pub enum ServerMessage {
     Event(Event),
     /// Reply to `Query(QueryKind::Pane(_))`.
     Pane(PaneSnapshot),
+    Image {
+        pane: PaneId,
+        image: ImageData,
+    },
     /// Reply to `Query(QueryKind::Session)` — the persisted layout.
     Session(SessionFile),
     /// Reply to `Query(QueryKind::Schema)`.
@@ -492,6 +511,35 @@ pub struct Screen {
     pub rows: Vec<Vec<Run>>,
     pub bracketed_paste: bool,
     pub mouse_reporting: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub graphics: Vec<ImagePlacement>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImageData {
+    pub id: u32,
+    pub revision: u64,
+    pub format: u32,
+    pub width: u32,
+    pub height: u32,
+    /// Validated base64 pixel/PNG data, bounded to 8 MiB decoded per image.
+    pub data: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImagePlacement {
+    pub image: u32,
+    pub revision: u64,
+    pub placement: u32,
+    pub row: i32,
+    pub col: u16,
+    pub cols: u16,
+    pub rows: u16,
+    pub source_x: u32,
+    pub source_y: u32,
+    pub source_width: u32,
+    pub source_height: u32,
+    pub z: i32,
 }
 
 /// Persisted-session file version understood by this build (#9).
@@ -657,6 +705,7 @@ pub const CLIENT_MESSAGE_NAMES: &[&str] = &[
     "FocusPane",
     "FocusPaneId",
     "SendToPane",
+    "PasteImage",
     "PromptAgent",
     "RenamePaneId",
     "KillSession",
@@ -693,11 +742,13 @@ pub const CLIENT_MESSAGE_NAMES: &[&str] = &[
 
 /// Every `ServerMessage` variant name (see [`CLIENT_MESSAGE_NAMES`]).
 pub const SERVER_MESSAGE_NAMES: &[&str] = &[
+    "ImagePasted",
     "Welcome",
     "Layout",
     "Notification",
     "PaneText",
     "Pane",
+    "Image",
     "Version",
     "Event",
     "Session",
@@ -724,6 +775,7 @@ pub fn client_message_name(message: &ClientMessage) -> &'static str {
         ClientMessage::FocusPane { .. } => "FocusPane",
         ClientMessage::FocusPaneId { .. } => "FocusPaneId",
         ClientMessage::SendToPane { .. } => "SendToPane",
+        ClientMessage::PasteImage { .. } => "PasteImage",
         ClientMessage::PromptAgent { .. } => "PromptAgent",
         ClientMessage::RenamePaneId { .. } => "RenamePaneId",
         ClientMessage::KillSession => "KillSession",
@@ -762,11 +814,13 @@ pub fn client_message_name(message: &ClientMessage) -> &'static str {
 /// Variant name of a server message (see [`client_message_name`]).
 pub fn server_message_name(message: &ServerMessage) -> &'static str {
     match message {
+        ServerMessage::ImagePasted { .. } => "ImagePasted",
         ServerMessage::Welcome { .. } => "Welcome",
         ServerMessage::Layout(_) => "Layout",
         ServerMessage::Notification(_) => "Notification",
         ServerMessage::PaneText { .. } => "PaneText",
         ServerMessage::Pane(_) => "Pane",
+        ServerMessage::Image { .. } => "Image",
         ServerMessage::Version { .. } => "Version",
         ServerMessage::Event(_) => "Event",
         ServerMessage::Session(_) => "Session",
@@ -850,6 +904,7 @@ mod tests {
                     }]],
                     bracketed_paste: true,
                     mouse_reporting: false,
+                    graphics: Vec::new(),
                 },
                 agent: None,
                 agent_generation: 0,
@@ -938,6 +993,10 @@ mod tests {
             ClientMessage::SendToPane {
                 id: pane,
                 bytes: vec![1],
+            },
+            ClientMessage::PasteImage {
+                pane,
+                data: "test".into(),
             },
             ClientMessage::PromptAgent {
                 pane,
@@ -1030,6 +1089,10 @@ mod tests {
             seq: 1,
         };
         vec![
+            ServerMessage::ImagePasted {
+                pane: PaneId(1),
+                path: "/tmp/image.png".into(),
+            },
             ServerMessage::Welcome {
                 session: "demo".into(),
                 version: PROTOCOL_VERSION,
@@ -1067,6 +1130,17 @@ mod tests {
                 state_age_secs: 0,
                 cwd: None,
             }),
+            ServerMessage::Image {
+                pane: PaneId(1),
+                image: ImageData {
+                    id: 7,
+                    revision: 1,
+                    format: 24,
+                    width: 1,
+                    height: 1,
+                    data: "AAAA".into(),
+                },
+            },
             ServerMessage::Event(Event::Notification(notification)),
             ServerMessage::Session(SessionFile {
                 version: SESSION_FILE_VERSION,

@@ -365,9 +365,8 @@ fn group_of(action: Action) -> Group {
         | RenameWorkspace | CloseWorkspace => Group::Workspaces,
         Navigate | Goto | CommandCenter | Attention | CopyMode | ScrollUp | ScrollDown
         | ResizeMode | Settings | Help => Group::Modes,
-        Detach | SidebarToggle | ReloadConfig | PasteBuffer | MouseToggle | NotificationJump => {
-            Group::Other
-        }
+        Detach | SidebarToggle | ReloadConfig | PasteBuffer | PasteImage | MouseToggle
+        | NotificationJump => Group::Other,
     }
 }
 
@@ -427,6 +426,7 @@ fn label_of(action: Action) -> String {
         Help => "help".into(),
         DisplayPanes => "show pane ids".into(),
         PasteBuffer => "paste buffer".into(),
+        PasteImage => "paste clipboard image".into(),
         MouseToggle => "toggle mouse capture".into(),
         NotificationJump => "jump to notification".into(),
     }
