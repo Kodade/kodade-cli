@@ -45,6 +45,18 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand, PartialEq, Eq)]
 pub enum Command {
+    /// Check the selected release channel or install a verified standalone update.
+    Update {
+        #[arg(long)]
+        check: bool,
+        #[arg(long, value_parser = ["stable", "preview"])]
+        channel: Option<String>,
+        /// Print the persisted update channel and exit.
+        #[arg(long, conflicts_with_all = ["check", "install_to"])]
+        show_channel: bool,
+        #[arg(long, conflicts_with = "check")]
+        install_to: Option<PathBuf>,
+    },
     /// Manage local, versioned command extensions.
     Plugin {
         #[command(subcommand)]
@@ -776,6 +788,30 @@ mod tests {
     #[test]
     fn clap_definitions_are_valid() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn update_modes_do_not_mix_check_show_or_explicit_install() {
+        assert!(matches!(
+            parse(&["kodade-cli", "update", "--channel", "preview", "--check"]).command,
+            Some(Command::Update { check: true, .. })
+        ));
+        assert!(Cli::try_parse_from([
+            "kodade-cli",
+            "update",
+            "--check",
+            "--install-to",
+            "/tmp/kodade-cli"
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from([
+            "kodade-cli",
+            "update",
+            "--show-channel",
+            "--install-to",
+            "/tmp/kodade-cli"
+        ])
+        .is_err());
     }
 
     #[test]

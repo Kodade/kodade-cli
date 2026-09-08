@@ -32,3 +32,8 @@ curl -fsSL https://raw.githubusercontent.com/Kodade/kodade-cli/main/install.sh |
 For a non-default destination, set `KODADE_INSTALL_DIR` before running it. The
 installer downloads the latest matching archive and verifies it against
 `SHA256SUMS` before installing.
+
+The CLI updater consumes the GitHub release API and requires every published
+release to retain its matching platform archives and `SHA256SUMS`. Stable
+checks use the latest non-prerelease release; preview checks select the newest
+published prerelease.

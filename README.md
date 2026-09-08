@@ -57,6 +57,19 @@ cargo run -p kodade-cli
 
 The installer supports macOS and Linux on arm64 and x86_64.
 
+## Updates
+
+`kodade-cli update --check` prints the installed and available version from the
+stable channel. Use `kodade-cli update --channel preview --check` to select and
+check preview releases; `kodade-cli update --show-channel` prints the saved
+choice. The selected channel is stored separately from workspace settings.
+
+Recognized Homebrew and system-package paths receive package-manager upgrade
+guidance. Use the package manager for any other managed installation. Standalone
+installations download the published platform archive, verify its
+`SHA256SUMS` entry, and atomically replace the executable. `--install-to PATH`
+is available for an explicit standalone destination.
+
 ## Quick usage
 
 Run `kodade-cli` to attach to the default session; it starts the daemon when
