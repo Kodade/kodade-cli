@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Real daemon PTY + TUI proof for terminal links and synchronized output."""
-import fcntl, json, os
+import errno, fcntl, json, os
 from pathlib import Path
 import pty, select, socket, struct, subprocess, sys, tempfile, termios, time
 
@@ -83,7 +83,15 @@ sleep 10
 
         def drain():
             while select.select([master], [], [], 0)[0]:
-                transcript.extend(os.read(master, 65536))
+                try:
+                    chunk = os.read(master, 65536)
+                except OSError as error:
+                    if error.errno == errno.EIO:
+                        return
+                    raise
+                if not chunk:
+                    return
+                transcript.extend(chunk)
 
         def ctrl_click_link(expect_open):
             for row in range(3, 5):
@@ -141,12 +149,18 @@ sleep 10
             wait_for("TUI completed synchronized frame", lambda: (drain() is None) and b"PARTIAL" in transcript[before_partial:] and b"FINAL" in transcript[before_partial:])
 
             os.write(master, b"\x02d")
+            # Keep consuming the host PTY while cleanup writes its final mode
+            # restores; macOS can otherwise block process exit on queued output.
+            wait_for("TUI detach", lambda: (drain() is None) and tui.poll() is not None)
             assert tui.wait(timeout=5) == 0
         finally:
             if tui.poll() is None:
                 tui.kill()
+                os.close(master)
+                master = None
                 tui.wait(timeout=3)
-            os.close(master)
+            if master is not None:
+                os.close(master)
             os.close(slave)
     finally:
         subprocess.run([str(BINARY), "--session", SESSION, "kill-session"], env=env, capture_output=True)
