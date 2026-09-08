@@ -212,7 +212,7 @@ async fn main() -> Result<()> {
         Some(cli::Command::Session { command }) => {
             session_command(remote.as_deref(), &socket, &session, command).await
         }
-        Some(cli::Command::Machine { command }) => machine(command),
+        Some(cli::Command::Machine { command }) => machine(command).await,
         Some(cli::Command::Worktree { command }) => worktree(&socket, command).await,
         Some(cli::Command::Ls { json }) => {
             let layout =
@@ -406,7 +406,7 @@ async fn main() -> Result<()> {
     }
 }
 
-fn machine(command: cli::MachineCommand) -> Result<()> {
+async fn machine(command: cli::MachineCommand) -> Result<()> {
     let mut catalog = machines::load()?;
     match command {
         cli::MachineCommand::List { json } => {
@@ -432,10 +432,25 @@ fn machine(command: cli::MachineCommand) -> Result<()> {
             target,
             label,
             session,
+            install,
         } => {
+            // Validate catalog constraints before an explicit preparation, but
+            // don't save until the remote is known usable.
+            let mut candidate = machines::Catalog {
+                machines: catalog.machines.clone(),
+            };
+            candidate.add(label.clone(), target.clone(), session.clone())?;
+            if install {
+                remote::prepare_machine(&target, true).await?;
+            }
             let profile = catalog.add(label, target, session)?;
             println!("{}", profile.id);
             machines::save(&catalog)?;
+        }
+        cli::MachineCommand::Prepare { id, install } => {
+            let profile = catalog.get_mut(&id)?.clone();
+            remote::prepare_machine(&profile.target, install).await?;
+            println!("prepared {} ({})", profile.label, profile.target);
         }
         cli::MachineCommand::Rename { id, label } => {
             catalog.get_mut(&id)?.label = label;
