@@ -4234,6 +4234,7 @@ fn read_pty(
     tokio::task::spawn_blocking(move || {
         let mut decoder = graphics::Decoder::default();
         let mut bytes = [0_u8; 4096];
+        let mut terminal_query = Vec::new();
         while let Ok(count) = reader.read(&mut bytes) {
             if count == 0 {
                 break;
@@ -4241,6 +4242,20 @@ fn read_pty(
             let mut replies = Vec::new();
             {
                 let mut parser = parser.lock().expect("PTY parser lock poisoned");
+                if let Some(private) = cursor_position_query(&mut terminal_query, &bytes[..count]) {
+                    let (row, col) = parser.screen().cursor_position();
+                    if private {
+                        replies.extend_from_slice(
+                            format!("\x1b[?{};{}R", row.saturating_add(1), col.saturating_add(1))
+                                .as_bytes(),
+                        );
+                    } else {
+                        replies.extend_from_slice(
+                            format!("\x1b[{};{}R", row.saturating_add(1), col.saturating_add(1))
+                                .as_bytes(),
+                        );
+                    }
+                }
                 for token in decoder.feed(&bytes[..count]) {
                     match token {
                         graphics::Token::Invalid => {
@@ -4283,6 +4298,39 @@ fn read_pty(
         }
     });
 }
+
+/// Detect a device-status cursor request split across PTY reads. ConPTY asks
+/// this before presenting a child with inherited cursor state.
+fn cursor_position_query(tail: &mut Vec<u8>, bytes: &[u8]) -> Option<bool> {
+    tail.extend_from_slice(bytes);
+    let response = if tail.windows(4).any(|query| query == b"\x1b[6n") {
+        Some(false)
+    } else if tail.windows(5).any(|query| query == b"\x1b[?6n") {
+        Some(true)
+    } else {
+        None
+    };
+    if response.is_some() {
+        tail.clear();
+    } else if tail.len() > 4 {
+        tail.drain(..tail.len() - 4);
+    }
+    response
+}
+
+#[cfg(test)]
+mod terminal_query_tests {
+    use super::cursor_position_query;
+
+    #[test]
+    fn cursor_queries_span_pty_reads_and_keep_their_mode() {
+        let mut tail = Vec::new();
+        assert_eq!(cursor_position_query(&mut tail, b"\x1b["), None);
+        assert_eq!(cursor_position_query(&mut tail, b"6n"), Some(false));
+        assert_eq!(cursor_position_query(&mut tail, b"\x1b[?6n"), Some(true));
+    }
+}
+
 /// Track the cell movement that also moves graphics; terminal controls remain
 /// interpreted by vt100, and image state follows clear/reset/alternate buffers.
 fn graphics_text(parser: &mut PtyParser, text: &[u8]) {
