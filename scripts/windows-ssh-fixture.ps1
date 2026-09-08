@@ -66,15 +66,19 @@ try {
 
     # This release is pinned so the fixture remains repeatable. WSL1 is enabled
     # on GitHub's Windows images and lets the SSH server bind host localhost.
+    # Alpine 3.20's Node 20 supports the hosted WSL1 image. Node 22 from the
+    # previous Alpine fixture does not, so ash interpreted its executable as a
+    # script after the failed launch.
     Write-Host 'downloading Alpine WSL fixture'
     Invoke-WebRequest `
-        -Uri 'https://dl-cdn.alpinelinux.org/alpine/v3.22/releases/x86_64/alpine-minirootfs-3.22.1-x86_64.tar.gz' `
+        -Uri 'https://dl-cdn.alpinelinux.org/alpine/v3.20/releases/x86_64/alpine-minirootfs-3.20.10-x86_64.tar.gz' `
         -OutFile $rootfs -TimeoutSec 60
     Write-Host 'importing Alpine as WSL1'
     Invoke-Native 'wsl.exe' @('--import', $distro, $distroRoot, $rootfs, '--version', '1') 60 | Out-Null
 
     Write-Host 'installing Unix OpenSSH server'
     Invoke-Wsl @('sh', '-lc', 'apk add --no-cache nodejs openssh')
+    Invoke-Wsl @('node', '--version')
     # A freshly imported Alpine rootfs has no host keys. Generate them before
     # the foreground sshd starts so it can bind rather than exiting silently.
     Invoke-Wsl @('ssh-keygen', '-A')
@@ -148,6 +152,24 @@ Host $sshAlias
     }
     if (-not $seen) { throw 'Unix PTY output did not return through the Windows SSH bridge' }
 
+    # The command travels as JSON over the SSH stdio bridge, then becomes argv
+    # for the Unix login shell. Check the complete path with spaces, both quote
+    # styles, shell punctuation, and a newline before launching the Node hook.
+    $argumentProbe = "spaces 'single' `"double`" ; | `$dollar`nsecond line"
+    $expectedArgument = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($argumentProbe))
+    $argumentPane = (Invoke-Native $WindowsBinary @('--remote', $sshAlias, '--session', $session, 'run', '--', 'sh', '-c', 'printf %s "$1" | base64', 'kodade-argument-probe', $argumentProbe) 45).Trim()
+    if ($argumentPane -notmatch '^\d+$') { throw "remote argument probe did not return a pane id: $argumentPane" }
+    $argumentPreserved = $false
+    for ($attempt = 0; $attempt -lt 40; $attempt++) {
+        $screen = Invoke-Native $WindowsBinary @('--remote', $sshAlias, '--session', $session, 'pane', 'read', $argumentPane) 45
+        if (($screen -replace '\s', '') -eq $expectedArgument) {
+            $argumentPreserved = $true
+            break
+        }
+        Start-Sleep -Milliseconds 100
+    }
+    if (-not $argumentPreserved) { throw 'remote run did not preserve a quoted multiline argument through the Windows SSH bridge' }
+
     # Use a live Node wrapper and the same trusted Pi hook identity as the
     # native smoke. This proves `agent wait` only accepts a current adapter
     # process, rather than turning an arbitrary remote shell into an agent.
@@ -158,14 +180,10 @@ setTimeout(() => report("working"), 1000);
 setTimeout(() => report("idle"), 5000);
 setInterval(() => {}, 1000);
 '@
-    # Remote command serialization is shell-oriented. Send the JavaScript as
-    # base64 so the Windows client, OpenSSH, and the Unix login shell cannot
-    # reinterpret quotes, semicolons, or newlines before Node receives it.
-    $nodeHookBase64 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($nodeHook))
     # `agent wait` polls through several bridge connections until the adapter
     # transitions to idle. First observe the live adapter rather than guessing
     # when the WSL process group has made Node its foreground process.
-    $waitPane = (Invoke-Native $WindowsBinary @('--remote', $sshAlias, '--session', $session, 'run', '--', 'sh', '-c', "echo $nodeHookBase64 | base64 -d | node") 45).Trim()
+    $waitPane = (Invoke-Native $WindowsBinary @('--remote', $sshAlias, '--session', $session, 'run', '--', 'node', '-e', $nodeHook) 45).Trim()
     if ($waitPane -notmatch '^\d+$') { throw "remote wait fixture did not return a pane id: $waitPane" }
     $recognized = $false
     $lastProbeError = ''
