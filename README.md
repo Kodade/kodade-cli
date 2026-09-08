@@ -20,20 +20,14 @@ Ködade CLI also works independently of the
 
 ## Status
 
-Prebuilt binaries for macOS and Linux (arm64/x86_64) are published on the
-releases page, installable with the command below.
+v0.2.1 is the latest published version. v0.3.0 is a release candidate; its tag,
+GitHub Release, Homebrew formula, and archives do not exist yet. When published,
+v0.3.0 will ship exactly four standalone archives: macOS and Linux on arm64 and
+x86_64. Native Windows binaries and Windows installation support are deferred.
 
-### v0.2.1
+### v0.3.0 release candidate
 
-- Dark theme with charcoal backgrounds, off-white text, and the existing orange accents.
-- Stable scrollback while new output arrives, plus prefixed PageUp/PageDown scrolling.
-- Shift-wheel local history override and immediate copy-mode wheel scrolling.
-
-After upgrading, start a new session to use the updated daemon. Existing
-sessions keep their running daemon until stopped; save work in those panes
-before stopping them.
-
-The next release also includes:
+The release candidate brings the everyday workspace flows together:
 
 - Local and saved SSH machines in one workspace, with independent reconnects.
 - A command center (`prefix space`) and attention history (`prefix A`).
@@ -43,11 +37,26 @@ The next release also includes:
 - Exact native conversation restore and opt-in terminal history after a cold restart.
 - An offline [agent automation guide](docs/AGENT-GUIDE.md), available with `kodade-cli agent guide`.
 - Terminal images, PNG paste, and a focused view for narrow terminals.
+- Live daemon upgrade for an already-running v0.3.0 Unix session, preserving
+  its pane processes while attached clients reconnect.
 - Verified stable/preview updates for standalone installations.
 
-These changes are being validated for the next release. See the
-[competitive delivery ledger](docs/features/herdr-parity/PLAN.md) for shipped
-work, behavioral evidence, and the remaining gaps.
+### Moving from v0.2.1
+
+A v0.2.1 daemon cannot perform a live handoff: it does not understand the
+v0.3.0 upgrade request. Installing the new binary does not stop that daemon or
+its panes. Keep the existing session open, then start a separate v0.3.0 session
+with a new name, for example `kodade-cli -s v03`. Move work only when you are
+ready; do not kill the v0.2.1 session to migrate it.
+
+Once a session is already running v0.3.0 on macOS or Linux, run
+`kodade-cli -s SESSION session upgrade` to replace its daemon without restarting
+its panes. The operation rolls back if the replacement cannot prepare itself.
+Attached Ködade clients reconnect with their saved view; queued input is not
+replayed.
+
+See the [competitive delivery ledger](docs/features/herdr-parity/PLAN.md) for
+reviewed evidence and the final release gates that remain pending.
 
 ## Install
 
