@@ -1225,7 +1225,12 @@ fn key_code(key: &str, whole: &str) -> Result<KeyCode, String> {
 /// `shift+x` and `X` are the same binding: letters normalize to the uppercase
 /// character without SHIFT, so `l` and `L` stay distinct. Non-letters keep the
 /// SHIFT modifier because their unshifted character is a different key.
-pub fn normalize_key(key: KeyEvent) -> KeyEvent {
+pub fn normalize_key(mut key: KeyEvent) -> KeyEvent {
+    // Kitty-capable terminals report lock state even on unrelated keys.
+    // Bindings describe the resulting key and modifiers, not those lock LEDs.
+    key.state.remove(
+        crossterm::event::KeyEventState::NUM_LOCK | crossterm::event::KeyEventState::CAPS_LOCK,
+    );
     match key.code {
         KeyCode::Char(c) if c.is_alphabetic() && key.modifiers.contains(KeyModifiers::SHIFT) => {
             let upper = c.to_uppercase().next().unwrap_or(c);
@@ -1778,6 +1783,32 @@ red = \"#abcdef\"
         assert!(parse_key_chord("ctrl+nope").is_err());
         assert!(parse_key_chord("F13").is_err());
         assert!(parse_key_chord("ctrl+").is_err());
+    }
+
+    #[test]
+    fn lock_state_does_not_change_prefix_or_action_bindings() {
+        use crossterm::event::{KeyEventKind, KeyEventState};
+
+        let defaults = Config::default();
+        for state in [KeyEventState::NUM_LOCK, KeyEventState::CAPS_LOCK] {
+            let prefix = KeyEvent::new_with_kind_and_state(
+                KeyCode::Char('b'),
+                KeyModifiers::CONTROL,
+                KeyEventKind::Press,
+                state,
+            );
+            assert_eq!(normalize_key(prefix), defaults.prefix);
+            let space = KeyEvent::new_with_kind_and_state(
+                KeyCode::Char(' '),
+                KeyModifiers::NONE,
+                KeyEventKind::Press,
+                state,
+            );
+            assert_eq!(
+                defaults.action(space),
+                defaults.action(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE))
+            );
+        }
     }
 
     #[test]

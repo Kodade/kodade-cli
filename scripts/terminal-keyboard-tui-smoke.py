@@ -231,6 +231,24 @@ finally:
         drain()
         assert raw(second_raw) == b"\x1b[113;5u\x1b[113;5:3u", "consumed prefix/palette/rename key release reached pane"
 
+        # Foot reports Num Lock (128) and Caps Lock (64) in Kitty modifier
+        # fields. Neither state may disable the prefix or its next command.
+        for lock in (128, 64, 192):
+            before_palette = len(transcript)
+            host_key(f"\x1b[98;{5 + lock}u".encode())
+            host_key(f"\x1b[98;{5 + lock}:3u".encode())
+            host_key(f"\x1b[32;{1 + lock}u".encode())
+            host_key(f"\x1b[32;{1 + lock}:3u".encode())
+            wait_for(
+                f"command palette with lock state {lock}",
+                lambda: (drain() is None) and b"command center" in transcript[before_palette:],
+            )
+            host_key(f"\x1b[27;{1 + lock}u".encode())
+            host_key(f"\x1b[27;{1 + lock}:3u".encode())
+        time.sleep(.15)
+        drain()
+        assert raw(second_raw) == b"\x1b[113;5u\x1b[113;5:3u", "lock state disabled prefix/palette consumption"
+
         # A live upgrade must keep each pane's negotiated keyboard protocol.
         # Keep this attached real TTY through two replacement daemons, then
         # verify Shift+Enter still reaches the original focused child verbatim.
