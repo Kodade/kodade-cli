@@ -32,7 +32,10 @@ pub fn begin_synchronized_output(mut writer: impl Write) -> std::io::Result<()> 
 }
 
 pub fn end_synchronized_output(mut writer: impl Write) -> std::io::Result<()> {
-    writer.write_all(SYNC_END)
+    writer.write_all(SYNC_END)?;
+    // Present this frame now; buffering END until the next BEGIN can leave
+    // terminals such as Foot waiting indefinitely to display any content.
+    writer.flush()
 }
 
 pub struct TerminalModes;
@@ -105,5 +108,16 @@ mod tests {
         bytes.extend_from_slice(b"frame");
         end_synchronized_output(&mut bytes).unwrap();
         assert_eq!(bytes, b"\x1b[?2026hframe\x1b[?2026l");
+    }
+
+    #[test]
+    fn completed_frame_reaches_a_buffered_terminal_before_the_next_frame() {
+        let mut writer = std::io::BufWriter::new(Vec::new());
+        begin_synchronized_output(&mut writer).unwrap();
+        writer.write_all(b"frame").unwrap();
+        // Ratatui flushes its draw before we append the frame terminator.
+        writer.flush().unwrap();
+        end_synchronized_output(&mut writer).unwrap();
+        assert_eq!(writer.get_ref(), b"\x1b[?2026hframe\x1b[?2026l");
     }
 }

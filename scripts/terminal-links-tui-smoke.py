@@ -106,6 +106,18 @@ sleep 10
 
         try:
             wait_for("TUI attach", lambda: (drain() is None) and b"?2004h" in transcript)
+
+            def frame_presented_before_next_draw():
+                drain()
+                if b"osc8" not in transcript:
+                    return False
+                # A buffered END can appear immediately before the next BEGIN
+                # forever. Foot needs synchronization released between draws.
+                if transcript.rfind(b"\x1b[?2026l") <= transcript.rfind(b"\x1b[?2026h"):
+                    return False
+                return not select.select([master], [], [], .005)[0]
+
+            wait_for("frame presented before next draw", frame_presented_before_next_draw, timeout=3)
             wait_for("daemon PTY scrollback", lambda: command("pane", "read", str(pane_id()), "--scrollback").stdout.startswith("docs"))
             for _ in range(12):
                 os.write(master, b"\x1b[<68;5;3M")
