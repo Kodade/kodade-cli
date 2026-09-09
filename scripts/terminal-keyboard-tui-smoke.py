@@ -171,7 +171,7 @@ finally:
             return f"transcript tail={transcript[-1024:].hex()}, panes={state}"
 
         wait_for("Crossterm keyboard query", lambda: (drain() is None) and replied[0])
-        wait_for("Crossterm enhanced push", lambda: (drain() is None) and b"\x1b[>11u" in transcript)
+        wait_for("Crossterm enhanced push", lambda: (drain() is None) and b"\x1b[>15u" in transcript)
         wait_for("TUI attach", lambda: (drain() is None) and b"?2004h" in transcript)
         # TerminalModes enters raw mode before App::run receives the opening
         # daemon layout. On macOS the first host input can arrive in that gap.

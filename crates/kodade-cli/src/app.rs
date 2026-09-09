@@ -3603,6 +3603,11 @@ pub fn bytes(k: KeyEvent) -> Option<Vec<u8>> {
         KeyCode::Char(c) if k.modifiers.contains(KeyModifiers::CONTROL) => {
             vec![(c.to_ascii_lowercase() as u8) & 0x1f]
         }
+        // Kitty terminals without alternate-key reporting deliver Shift+A as
+        // the base letter plus SHIFT; recover the capital the user typed.
+        KeyCode::Char(c) if k.modifiers.contains(KeyModifiers::SHIFT) && c.is_alphabetic() => {
+            c.to_uppercase().collect::<String>().into_bytes()
+        }
         KeyCode::Char(c) => c.to_string().into_bytes(),
         // Every other key comes from the table `pane send-keys` also uses.
         code => crate::keys::from_code(code)?.to_vec(),
@@ -3933,8 +3938,23 @@ mod tests {
                     modify_other_keys: 1
                 }
             ),
-            Some(b"x".to_vec())
+            Some(b"X".to_vec())
         );
+    }
+
+    #[test]
+    fn shift_on_a_base_letter_recovers_the_typed_capital() {
+        // A Kitty terminal without alternate-key reporting sends Shift+A as
+        // the base letter with SHIFT; the pane must still receive "A".
+        let shifted = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::SHIFT);
+        assert_eq!(bytes(shifted), Some(b"A".to_vec()));
+        assert_eq!(
+            bytes_for_mode(shifted, KeyboardModes::default()),
+            Some(b"A".to_vec())
+        );
+        // Already-shifted characters pass through untouched.
+        let punct = KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE);
+        assert_eq!(bytes(punct), Some(b"?".to_vec()));
     }
 
     #[test]

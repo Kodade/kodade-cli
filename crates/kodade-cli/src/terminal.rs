@@ -62,7 +62,10 @@ impl TerminalModes {
                 PushKeyboardEnhancementFlags(
                     KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
                         | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
-                        | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES,
+                        | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES
+                        // Without alternate keys, Shift+A arrives as the base
+                        // key `a` + SHIFT and typed text loses its shift.
+                        | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS,
                 ),
             )?;
         }
