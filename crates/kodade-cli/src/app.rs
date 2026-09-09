@@ -1191,6 +1191,12 @@ impl App {
             }
             return Ok(Flow::Continue);
         }
+        // Flag 8 reports bare modifier presses (Shift, Ctrl, ...) as their own
+        // key events. They never select a binding and must not cancel prefix
+        // mode or an overlay while the user is mid-chord (e.g. prefix then ?).
+        if matches!(key.code, KeyCode::Modifier(_)) {
+            return Ok(Flow::Continue);
+        }
         let keyboard = self.focused_keyboard();
         // Any keystroke ends a mouse selection (#12).
         self.clear_selection();
@@ -4325,6 +4331,38 @@ mod tests {
         app.handle_key(release, &mut writer, &mut term)
             .await
             .unwrap();
+        assert!(daemon.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn bare_modifier_press_keeps_prefix_mode_armed() {
+        use crossterm::event::ModifierKeyCode;
+
+        let config = config::Config::default();
+        let mut app = App::new(&config, "keyboard-test", PathBuf::from("/tmp/kodade.sock"));
+        app.handle_layout(keyboard_layout(PaneId(1), KeyboardModes::default()));
+        app.prefix = true;
+        let (mut writer, mut daemon) = test_router();
+        let mut term = Terminal::with_options(
+            CrosstermBackend::new(std::io::stdout()),
+            TerminalOptions {
+                viewport: Viewport::Fixed(Rect::new(0, 0, 120, 30)),
+            },
+        )
+        .unwrap();
+        // Flag 8 terminals report the Shift press of `prefix ?` on its own.
+        let shift = KeyEvent::new(
+            KeyCode::Modifier(ModifierKeyCode::LeftShift),
+            KeyModifiers::SHIFT,
+        );
+        app.handle_key(shift, &mut writer, &mut term).await.unwrap();
+        assert!(app.prefix, "modifier press must not cancel prefix mode");
+        let question = KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE);
+        app.handle_key(question, &mut writer, &mut term)
+            .await
+            .unwrap();
+        assert!(app.help.is_some(), "prefix ? must open the help overlay");
+        // Neither the modifier nor the bound key reaches the pane.
         assert!(daemon.try_recv().is_err());
     }
 
