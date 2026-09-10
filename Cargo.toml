@@ -13,7 +13,7 @@ authors = ["ContractorKeith"]
 
 [workspace.dependencies]
 # Base64 encodes bounded Kitty image transfers without copying raw terminal escape sequences.
-base64 = "0.22"
+base64 = "0.23"
 # `anyhow` keeps the small binary boundary readable without a custom error hierarchy yet.
 anyhow = "1"
 # clap gives the binary real subcommand help, typed flags, and future completions.
