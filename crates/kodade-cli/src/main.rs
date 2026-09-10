@@ -67,6 +67,15 @@ async fn main() -> Result<()> {
         std::env::var("KODADE_SESSION").ok(),
         std::env::var_os("KODADE_SOCKET").map(Into::into),
     )?;
+    let launch_directory = if connection::uses_launch_directory(
+        &args,
+        explicit_session,
+        std::env::var_os("KODADE_SESSION").is_some() || std::env::var_os("KODADE_SOCKET").is_some(),
+    ) {
+        Some(std::env::current_dir().context("read launch directory")?)
+    } else {
+        None
+    };
     let session = args.session.clone();
     let remote = args.remote.clone();
     if remote.is_some() && matches!(args.command, Some(cli::Command::Update { .. })) {
@@ -206,7 +215,16 @@ async fn main() -> Result<()> {
             }
         }
         // No subcommand attaches the TUI to the session.
-        None => attach(&socket, &session, &config::Config::load(), remote.is_some()).await,
+        None => {
+            attach(
+                &socket,
+                &session,
+                &config::Config::load(),
+                remote.is_some(),
+                launch_directory.as_deref(),
+            )
+            .await
+        }
         Some(cli::Command::Doctor { json }) => {
             if let Some(host) = remote.as_deref() {
                 remote::run_doctor(host, &session, json).await
@@ -1137,7 +1155,7 @@ async fn agent(
         cli::AgentCommand::Attach { target } => {
             let target = contextual_agent_target(&target, socket, session, remote)?;
             automation::focus(socket, &target).await?;
-            attach(socket, session, config, remote.is_some()).await
+            attach(socket, session, config, remote.is_some(), None).await
         }
         cli::AgentCommand::Rename { target, name } => {
             let target = contextual_agent_target(&target, socket, session, remote)?;
@@ -1433,17 +1451,29 @@ async fn worktree(socket: &Path, command: cli::WorktreeCommand) -> Result<()> {
 /// background when the socket is the local path and nothing answers. A remote
 /// (forwarded) socket is never auto-started here — `remote::resolve_socket`
 /// already ensured the remote daemon is up.
-async fn attach(socket: &Path, session: &str, config: &config::Config, remote: bool) -> Result<()> {
+async fn attach(
+    socket: &Path,
+    session: &str,
+    config: &config::Config,
+    remote: bool,
+    directory: Option<&Path>,
+) -> Result<()> {
     // Only spawn a daemon for this host's own socket; a `--remote` tunnel socket
     // differs from the local path and must not trigger a local daemon.
     let can_spawn = socket == kodade_cli_daemon::socket_path(session).as_path();
     let stream = connection::connect(socket, session, can_spawn).await?;
+    if directory.is_some() {
+        match commands::request(socket, ClientMessage::Query(QueryKind::Schema)).await? {
+            ServerMessage::Schema { client_messages, .. } if client_messages.iter().any(|name| name == "OpenDirectory") => {}
+            _ => bail!("this daemon does not support launch directories yet; run `kodade-cli -s {session} session upgrade`, then retry, or use `kodade-cli -s {session}` to resume"),
+        }
+    }
     let profiles = if !remote {
         machines::load()?.machines
     } else {
         Vec::new()
     };
-    tui(stream, config, session, socket, remote, profiles).await
+    tui(stream, config, session, socket, remote, profiles, directory).await
 }
 
 /// Sets up the terminal, hands the socket to `App`, and always restores it.
@@ -1454,6 +1484,7 @@ async fn tui(
     socket: &Path,
     remote: bool,
     profiles: Vec<machines::MachineProfile>,
+    directory: Option<&Path>,
 ) -> Result<()> {
     let (reader, mut writer) = stream.into_split();
     let mut lines = BufReader::new(reader).lines();
@@ -1475,6 +1506,13 @@ async fn tui(
     tokio::time::timeout(Duration::from_secs(10), handshake(&mut lines, &mut state))
         .await
         .context("daemon handshake timed out after 10s")??;
+    if let Some(path) = directory {
+        writer
+            .write_all(&encode(&ClientMessage::OpenDirectory {
+                path: path.to_path_buf(),
+            })?)
+            .await?;
+    }
     writer
         .write_all(&encode(&ClientMessage::SetCompactView {
             enabled: state.compact_enabled(cols),

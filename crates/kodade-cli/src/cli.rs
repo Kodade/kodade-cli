@@ -31,7 +31,7 @@ pub const DEFAULT_SESSION: &str = "default";
     name = "kodade-cli",
     version,
     about = "Ködade CLI — a terminal workspace for agent CLIs",
-    long_about = None,
+    long_about = "Ködade CLI — a terminal workspace for agent CLIs.\n\nWith no arguments, open or reuse a workspace for the current directory.\nUse --session NAME to resume a session without directory selection."
 )]
 pub struct Cli {
     /// Session to attach to or query.

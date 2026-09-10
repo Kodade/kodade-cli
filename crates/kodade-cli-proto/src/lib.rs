@@ -362,6 +362,10 @@ pub enum ClientMessage {
         id: WorkspaceId,
         name: String,
     },
+    /// Atomically reuse a workspace by canonical root, or create one there.
+    OpenDirectory {
+        path: PathBuf,
+    },
     NewWorkspace {
         name: String,
         /// Root directory new panes in this workspace start in.
@@ -1081,6 +1085,7 @@ pub const CLIENT_MESSAGE_NAMES: &[&str] = &[
     "SelectWorkspaceDelta",
     "RenameTabId",
     "RenameWorkspaceId",
+    "OpenDirectory",
     "NewWorkspace",
     "NewPane",
     "SelectWorkspace",
@@ -1159,6 +1164,7 @@ pub fn client_message_name(message: &ClientMessage) -> &'static str {
         ClientMessage::SelectWorkspaceDelta { .. } => "SelectWorkspaceDelta",
         ClientMessage::RenameTabId { .. } => "RenameTabId",
         ClientMessage::RenameWorkspaceId { .. } => "RenameWorkspaceId",
+        ClientMessage::OpenDirectory { .. } => "OpenDirectory",
         ClientMessage::NewWorkspace { .. } => "NewWorkspace",
         ClientMessage::NewPane { .. } => "NewPane",
         ClientMessage::SelectWorkspace { .. } => "SelectWorkspace",
@@ -1414,6 +1420,9 @@ mod tests {
             ClientMessage::RenameWorkspaceId {
                 id: workspace,
                 name: "a".into(),
+            },
+            ClientMessage::OpenDirectory {
+                path: "/tmp/project".into(),
             },
             ClientMessage::NewWorkspace {
                 name: "a".into(),

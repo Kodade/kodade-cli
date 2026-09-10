@@ -12,6 +12,19 @@ use tokio::{net::UnixStream, time::Instant};
 
 const START_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Only a plain local launch chooses a workspace from its calling directory.
+pub fn uses_launch_directory(
+    cli: &crate::cli::Cli,
+    explicit_session: bool,
+    inherited: bool,
+) -> bool {
+    cli.command.is_none()
+        && !explicit_session
+        && !inherited
+        && cli.remote.is_none()
+        && cli.socket.is_none()
+}
+
 /// Inherited pane context applies only when no explicit endpoint was selected.
 pub fn inherited_context(
     cli: &mut crate::cli::Cli,
@@ -110,6 +123,28 @@ async fn connect_with_command(
 mod tests {
     use super::*;
     use clap::Parser;
+
+    #[test]
+    fn launch_directory_applies_only_to_plain_local_attachment() {
+        for (args, explicit, inherited, expected) in [
+            (vec!["kodade-cli"], false, false, true),
+            (vec!["kodade-cli", "-s", "default"], true, false, false),
+            (vec!["kodade-cli", "--remote", "host"], false, false, false),
+            (
+                vec!["kodade-cli", "--socket", "/tmp/sock"],
+                false,
+                false,
+                false,
+            ),
+            (vec!["kodade-cli", "ls"], false, false, false),
+            (vec!["kodade-cli"], false, true, false),
+        ] {
+            assert_eq!(
+                uses_launch_directory(&crate::cli::Cli::parse_from(args), explicit, inherited),
+                expected
+            );
+        }
+    }
 
     #[test]
     fn explicit_endpoint_overrides_inherited_pane_context() {

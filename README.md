@@ -108,9 +108,22 @@ is available for an explicit standalone destination.
 
 ## Quick usage
 
-Run `kodade-cli` to attach to the default session; it starts the daemon when
-needed. Use `kodade-cli -s SESSION` for a named session. Detach with the prefix
-followed by `d`, and reattach by running `kodade-cli` again.
+Run `kodade-cli` to open the current directory in the default session; it starts
+the daemon when needed. It reuses a workspace with the same canonical root, or
+creates one named after the directory with its first shell starting there.
+Existing workspace names, panes, and shell directories are preserved. Launches
+from symlinks reuse the same workspace; different roots with the same folder
+name remain separate. Each attached terminal keeps its own workspace selection.
+
+Use `kodade-cli -s SESSION` to resume a named session, or `kodade-cli -s default`
+to resume the default session without directory selection. Explicit `--socket`,
+`--remote`, and inherited `KODADE_SESSION`/`KODADE_SOCKET` context also retain
+resume behavior. Detach with the prefix followed by `d`.
+
+If an older running v0.3.0 daemon lacks directory selection, run
+`kodade-cli -s default session upgrade` after installing the updated binary.
+This preserves running panes. The client reports this requirement before
+entering the TUI.
 
 For scripts, `new`, `run`, and new-tab/workspace commands also start a missing
 local daemon. `kodade-cli doctor` (alias `status`, with `--json` for scripts)

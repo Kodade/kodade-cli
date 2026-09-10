@@ -51,7 +51,7 @@ with tempfile.TemporaryDirectory(prefix="kh-", dir="/tmp") as directory:
         def control_terminal():
             os.setsid()
             fcntl.ioctl(0, termios.TIOCSCTTY, 0)
-        client = subprocess.Popen([str(binary)], env=env, stdin=slave, stdout=slave,
+        client = subprocess.Popen([str(binary), "-s", "default"], env=env, stdin=slave, stdout=slave,
                                   stderr=slave, preexec_fn=control_terminal)
         transcript = bytearray()
         def drain():

@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Plain launches open or reuse a workspace for the current directory. Named
+  sessions and explicit endpoints retain resume behavior; existing workspace
+  names and panes remain intact.
+
 ## 0.3.0 — 2026-09-08
 
 Linux/macOS workspace release.

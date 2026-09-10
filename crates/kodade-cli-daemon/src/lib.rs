@@ -3204,6 +3204,55 @@ impl Session {
                 drop(state);
                 self.notify();
             }
+            ClientMessage::OpenDirectory { path } => {
+                let root = fs::canonicalize(&path).context("resolve launch directory")?;
+                if !root.is_dir() {
+                    bail!("launch path must be a directory: {}", root.display());
+                }
+                // Dispatch holds view_dispatch across lookup and creation, so
+                // simultaneous launches cannot create duplicate workspaces.
+                let (existing, name) = {
+                    let state = self
+                        .state
+                        .lock()
+                        .map_err(|_| anyhow!("state lock poisoned"))?;
+                    let existing = state
+                        .workspaces
+                        .iter()
+                        .find(|workspace| {
+                            workspace
+                                .root
+                                .as_ref()
+                                .and_then(|path| fs::canonicalize(path).ok())
+                                .as_ref()
+                                == Some(&root)
+                        })
+                        .map(|workspace| workspace.id);
+                    let basename = root
+                        .file_name()
+                        .unwrap_or(root.as_os_str())
+                        .to_string_lossy()
+                        .into_owned();
+                    let name = if state
+                        .workspaces
+                        .iter()
+                        .any(|workspace| workspace.name == basename)
+                    {
+                        root.to_string_lossy().into_owned()
+                    } else {
+                        basename
+                    };
+                    (existing, name)
+                };
+                self.handle(match existing {
+                    Some(id) => ClientMessage::SelectWorkspace { id },
+                    None => ClientMessage::NewWorkspace {
+                        name,
+                        root: Some(root),
+                        env: HashMap::new(),
+                    },
+                })?;
+            }
             ClientMessage::NewWorkspace { name, root, env } => {
                 // A workspace root seeds its first pane's cwd; later panes inherit.
                 validate_workspace_env(&env)?;
@@ -9347,6 +9396,111 @@ mod tests {
 
         git::worktree_remove(&repo, &worktree, true).expect("forced cleanup");
         fs::remove_dir_all(base).ok();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_directory_launches_reuse_one_workspace_and_preserve_views() {
+        let root = std::env::temp_dir().join(format!("kodade-launch-{}", std::process::id()));
+        fs::create_dir_all(root.join("a/project")).unwrap();
+        fs::create_dir_all(root.join("b/project")).unwrap();
+        let directory = fs::canonicalize(root.join("a/project")).unwrap();
+        let session = Arc::new(Session::spawn(80, 24, "launch-test".into()).unwrap());
+        let original = session.snapshot_stable().unwrap().active_workspace;
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let mut tasks = Vec::new();
+        for _ in 0..2 {
+            let session = Arc::clone(&session);
+            let barrier = Arc::clone(&barrier);
+            let path = directory.clone();
+            tasks.push(tokio::spawn(async move {
+                let mut view = session.new_client_view().unwrap();
+                barrier.wait().await;
+                session
+                    .handle_view(ClientMessage::OpenDirectory { path }, &mut view)
+                    .unwrap();
+                view.workspace
+            }));
+        }
+        let first = tasks.remove(0).await.unwrap();
+        assert_eq!(first, tasks.remove(0).await.unwrap());
+        let snapshot = session.snapshot_stable().unwrap();
+        assert_eq!(snapshot.active_workspace, original);
+        assert_eq!(snapshot.workspaces.len(), 2);
+        assert_eq!(
+            snapshot
+                .workspaces
+                .iter()
+                .find(|w| w.id == first)
+                .unwrap()
+                .name,
+            "project"
+        );
+        session
+            .handle_script(ClientMessage::RenameWorkspaceId {
+                id: first,
+                name: "custom-name".into(),
+            })
+            .unwrap();
+        let mut view = session.new_client_view().unwrap();
+        session
+            .handle_view(
+                ClientMessage::OpenDirectory {
+                    path: directory.clone(),
+                },
+                &mut view,
+            )
+            .unwrap();
+        assert_eq!(view.workspace, first);
+        assert_eq!(
+            session
+                .snapshot_stable()
+                .unwrap()
+                .workspaces
+                .iter()
+                .find(|w| w.id == first)
+                .unwrap()
+                .name,
+            "custom-name"
+        );
+        session
+            .handle_script(ClientMessage::RenameWorkspaceId {
+                id: first,
+                name: "project".into(),
+            })
+            .unwrap();
+        let second = fs::canonicalize(root.join("b/project")).unwrap();
+        session
+            .handle_view(
+                ClientMessage::OpenDirectory {
+                    path: second.clone(),
+                },
+                &mut view,
+            )
+            .unwrap();
+        assert_ne!(view.workspace, first);
+        assert_eq!(
+            session
+                .snapshot_for_client(&view)
+                .unwrap()
+                .workspaces
+                .iter()
+                .find(|w| w.id == view.workspace)
+                .unwrap()
+                .name,
+            second.to_string_lossy()
+        );
+        fs::write(root.join("file"), "not a directory").unwrap();
+        assert!(session
+            .handle_view(
+                ClientMessage::OpenDirectory {
+                    path: root.join("file")
+                },
+                &mut view
+            )
+            .is_err());
+        assert_eq!(session.snapshot_stable().unwrap().workspaces.len(), 3);
+        drop(session);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[cfg(unix)]

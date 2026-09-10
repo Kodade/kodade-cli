@@ -242,6 +242,17 @@ endpoint. OpenSSH remains responsible for credentials.
 
 ## Startup and context
 
+Plain local TUI launches send `OpenDirectory` after `Hello`, using the client's
+current directory. The daemon resolves canonical roots and reuses or creates
+the workspace under its dispatch lock. Selection stays within that client's
+view. Explicit session/socket/remote targets and inherited pane context keep
+resume semantics. The client checks the schema before entering terminal modes
+and gives live-upgrade guidance for older daemons.
+
+`python3 scripts/startup-directory-tui-smoke.py` verifies cold startup, restored
+selection overrides, symlink reuse, real shell directories, independent clients,
+and explicit/inherited resume behavior through controlling PTYs.
+
 `connection.rs` connects or starts a local daemon for attachment and creation
 commands. Startup and attachment handshakes have a ten-second limit. A failed
 child reports its status and a log path beside the socket. Queries and destructive

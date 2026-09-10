@@ -53,6 +53,7 @@ printf '%s\n' '{"Query":"Layout"}' | nc -U /tmp/kodade-cli-$UID/default.sock
 | `Subscribe` | `"Subscribe"` | `Layout`, then `Event`s |
 | `ApplyLayout` | `{"ApplyLayout":{"version":1,…}}` | `Layout` |
 | `Hello` | `{"Hello":{"cols":120,"rows":40,"version":2}}` | `Welcome` + `Layout` |
+| `OpenDirectory` | `{"OpenDirectory":{"path":"/home/me/projects/app"}}` | `Layout` |
 | `Input` | `{"Input":{"bytes":[108,115,13]}}` | `Layout` |
 | `Resize` | `{"Resize":{"cols":120,"rows":40}}` | `Layout` |
 | `SplitRight` / `SplitDown` | `"SplitRight"` | `Layout` |
@@ -93,6 +94,15 @@ printf '%s\n' '{"Query":"Layout"}' | nc -U /tmp/kodade-cli-$UID/default.sock
 | `AgentState` | `{"AgentState":{"pane":3,"state":"blocked","source":"hook"}}` | `Layout` |
 | `Query(Manifests)` | `{"Query":"Manifests"}` | `Manifests` |
 | `ReloadManifests` | `"ReloadManifests"` | `Manifests` |
+
+`OpenDirectory` requires an existing directory on the daemon's host. It
+canonicalizes the path and atomically selects a workspace with that root or
+creates one named after the directory. A name collision uses the full path.
+Existing names and panes are preserved. After `Hello`, selection belongs only
+to that connection. Clients must check `Query(Schema).client_messages` for
+`OpenDirectory` before sending it to an older daemon. This additive message
+retains protocol version 2 so existing attached clients can reconnect after
+a live upgrade.
 
 `MovePaneToTab` accepts a tab in any workspace (tab ids are global). A
 cross-workspace move follows the pane: the target workspace and tab become
