@@ -2,9 +2,17 @@
 
 ## Unreleased
 
+## 0.3.1 — 2026-09-10
+
+- Flush completed synchronized frames so terminals such as Ghostty and Foot
+  present the app instead of leaving a blank or stale screen.
+- Preserve shifted text and shortcuts, ignore lock state when matching
+  shortcuts, and keep prefix mode armed across bare modifier presses.
 - Plain launches open or reuse a workspace for the current directory. Named
   sessions and explicit endpoints retain resume behavior; existing workspace
   names and panes remain intact.
+- Gate release publication on the full Linux/macOS CI workflow, including
+  rendering and enhanced-keyboard PTY checks.
 
 ## 0.3.0 — 2026-09-08
 

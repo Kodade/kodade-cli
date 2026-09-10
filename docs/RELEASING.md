@@ -15,7 +15,10 @@
    git push --tags
    ```
 
-Pushing a `v*` tag starts the release workflow. For v0.3.0 it builds
+Pushing a `v*` tag starts the release workflow. Publication requires the shared
+Linux/macOS CI workflow to pass, including formatting, Clippy, workspace tests,
+and the real-PTY rendering and keyboard smoke tests. Build success alone cannot
+publish a release. The workflow builds
 `kodade-cli` for macOS arm64/x86_64 and Linux arm64/x86_64, packages each binary
 with `LICENSE`, `NOTICE`, and `README.md`, and publishes exactly four tarballs
 plus `SHA256SUMS` to a GitHub Release. Do not add Windows archives or describe
