@@ -74,7 +74,11 @@ with tempfile.TemporaryDirectory(prefix="kd-start-", dir="/tmp") as directory:
                 self.drain()
                 if predicate():
                     return
-                assert self.process.poll() is None, self.output.decode(errors="replace")
+                if self.process.poll() is not None:
+                    # Detach can finish between the predicate and exit check.
+                    if predicate():
+                        return
+                    raise AssertionError(self.output.decode(errors="replace"))
                 time.sleep(.03)
             raise AssertionError(f"{label}: {self.output[-1500:]!r}")
 

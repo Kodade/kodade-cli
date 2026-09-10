@@ -29,3 +29,10 @@
 - Decisions: Reuse the existing Linux/macOS CI workflow from the tagged commit and require it alongside all platform builds before publication. The Homebrew automation secret is present; tap update and installation verification remain part of publication.
 - Checks: All 484 workspace tests passed with `RUST_TEST_THREADS=2 SHELL=/bin/sh cargo test --release --locked`. Formatting, Clippy with warnings denied, release-gate YAML structure, and whitespace checks passed. Release-binary PTY checks passed for rendering/links, enhanced keyboard (Python 3.12), launch directories, graphics media, live client handoff, and terminal colors.
 - Remaining: Push preparation, verify hosted Linux/macOS CI, publish v0.3.1, verify tap checksums, and upgrade the local Homebrew installation. No release has been published at this milestone.
+
+### 2026-09-10 10:05 EDT - Correct pre-release detach-test race
+
+- Outcome: Linux CI passed; macOS first timed out at the frame-presentation check, which passed unchanged on rerun. That rerun exposed a separate startup smoke false failure: the client exited successfully between the detach predicate and the harness liveness assertion.
+- Repair: Recheck the completion predicate after observing exit before failing the wait. Unexpected exits still fail; no application behavior or timeouts changed.
+- Checks: An isolated execution of the actual wait method with deterministic process-poll results `[None, 0, 0]` failed before the fix and passed after it. A false completion predicate with exit code 1 still raises. The complete startup-directory debug-binary smoke passed locally. The rendering smoke also passed locally against the debug build.
+- Remaining: Rerun hosted CI before tagging; investigate frame-check timing further if it recurs. Publication remains pending.
