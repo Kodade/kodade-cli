@@ -36,3 +36,10 @@
 - Repair: Recheck the completion predicate after observing exit before failing the wait. Unexpected exits still fail; no application behavior or timeouts changed.
 - Checks: An isolated execution of the actual wait method with deterministic process-poll results `[None, 0, 0]` failed before the fix and passed after it. A false completion predicate with exit code 1 still raises. The complete startup-directory debug-binary smoke passed locally. The rendering smoke also passed locally against the debug build.
 - Remaining: Rerun hosted CI before tagging; investigate frame-check timing further if it recurs. Publication remains pending.
+
+### 2026-09-10 10:16 EDT - Publish and install v0.3.1
+
+- Outcome: Tagged `9cf7119` as v0.3.1 after Linux and macOS CI run `34486780156` passed. Release run `34487114430` published all four platform archives plus SHA256SUMS and automatically updated `Kodade/homebrew-tap` at `b61eb62`.
+- Checks: The release-time macOS job first timed out starting the keyboard fixture's first recorder; an unchanged failed-job retry passed the complete gate. All four downloaded release archives passed SHA-256 verification. The tap formula exactly matches the generator output for the published checksums. Both the GitHub-built Apple Silicon artifact and the installed Homebrew binary passed rendering and keyboard PTY checks; their executable hashes match. `brew test kodade/tap/kodade-cli` passed, with the existing process-enumeration sandbox warning.
+- Installation: Upgraded only `kodade/tap/kodade-cli` through Homebrew from 0.3.0 to 0.3.1. Disabled automatic update and cleanup for the scoped upgrade. The local command now reports 0.3.1; no user sessions were killed or settings modified. The prior local patch is no longer required.
+- Remaining: The published release includes the permanent fixes and CI publication gate. Intermittent macOS fixture-start/frame-check timeouts remain a test-reliability follow-up; checks were not disabled or weakened to publish. The deterministic detach-test race was corrected before tagging.
