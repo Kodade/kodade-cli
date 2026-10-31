@@ -61,7 +61,10 @@ contexts = ["selection"]
         transcript = bytearray()
         def drain():
             try:
-                while True: transcript.extend(os.read(master, 65536))
+                while True:
+                    chunk = os.read(master, 65536)
+                    if not chunk: return
+                    transcript.extend(chunk)
             except OSError: pass
         threading.Thread(target=drain, daemon=True).start()
         wait("attach", lambda: b"?2004h" in transcript)
@@ -102,7 +105,18 @@ contexts = ["selection"]
         wait("responsive input", lambda: "RESPONSIVE" in cli("pane", "read", str(focused)))
         cli("pane", "kill", pane_id.read_text())
         wait("pane cleanup", lambda: not private.exists())
-        os.write(master, b"\x02d"); assert tui.wait(timeout=5) == 0
+        def detach_diagnostics():
+            return f"TUI exit={tui.poll()}; transcript tail={bytes(transcript[-6000:])!r}"
+        assert tui.poll() is None, "TUI exited before detach: " + detach_diagnostics()
+        try:
+            os.write(master, b"\x02d")
+        except OSError as error:
+            raise RuntimeError(detach_diagnostics()) from error
+        try:
+            status = tui.wait(timeout=5)
+        except subprocess.TimeoutExpired as error:
+            raise RuntimeError("TUI did not detach: " + detach_diagnostics()) from error
+        assert status == 0, detach_diagnostics()
     finally:
         if tui and tui.poll() is None: tui.kill(); tui.wait()
         if slave: os.close(slave)

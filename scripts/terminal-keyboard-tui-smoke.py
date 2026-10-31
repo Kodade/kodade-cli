@@ -7,7 +7,6 @@ import os
 from pathlib import Path
 import pty
 import select
-import shlex
 import shutil
 import struct
 import subprocess
@@ -116,10 +115,15 @@ finally:
     try:
         command("new", "--workspace", "main", str(root))
         first_cmd, first_raw, first_hex, first_ready = recorder("first")
-        # The first pane starts as a shell; replace it with the persistent child.
-        first = next(pane for pane in panes() if pane["focused"])
-        command("send", str(first["id"]), "exec " + shlex.join(first_cmd))
-        wait_for("first recorder ready", first_ready.exists)
+        # Spawn the recorder as a command instead of typing into an unready shell.
+        # Keep the initial shell tab: reconnect must restore a client view even
+        # when it differs from the persisted scripting selection.
+        first_id = int(command("run", "--name", "first-recorder", "--", *first_cmd).stdout.strip())
+        first = next(pane for pane in panes() if pane["id"] == first_id)
+        try:
+            wait_for("first recorder ready", first_ready.exists)
+        except RuntimeError as error:
+            raise RuntimeError(f"{error}; panes={panes()}") from error
         wait_for("first Kitty negotiation", lambda: next(p for p in panes() if p["id"] == first["id"])["screen"]["keyboard"]["kitty_flags"] == 3)
 
         second_cmd, second_raw, second_hex, second_ready = recorder("second")
@@ -168,7 +172,8 @@ finally:
                 ]
             except Exception as error:
                 state = f"pane query failed: {error}"
-            return f"transcript tail={transcript[-1024:].hex()}, panes={state}"
+            return (f"transcript tail={transcript[-1024:].hex()}, panes={state}, "
+                    f"first_raw={raw(first_raw).hex()}, second_raw={raw(second_raw).hex()}")
 
         wait_for("Crossterm keyboard query", lambda: (drain() is None) and replied[0])
         wait_for("Crossterm enhanced push", lambda: (drain() is None) and b"\x1b[>15u" in transcript)
@@ -252,6 +257,7 @@ finally:
         # A live upgrade must keep each pane's negotiated keyboard protocol.
         # Keep this attached real TTY through two replacement daemons, then
         # verify Shift+Enter still reaches the original focused child verbatim.
+        first_before_upgrade = raw(first_raw)
         for generation in (1, 2):
             command("session", "upgrade")
             wait_for(
@@ -263,13 +269,17 @@ finally:
             # before sending input, which is intentionally dropped offline.
             marker = f"UPGRADE-READY-{generation}".encode()
             (root / "second.frame").write_bytes(marker)
-            wait_for(
-                f"attached frame after upgrade {generation}",
-                lambda: (drain() is None) and marker in transcript,
-            )
+            try:
+                wait_for(
+                    f"attached frame after upgrade {generation}",
+                    lambda: (drain() is None) and marker in transcript,
+                )
+            except RuntimeError as error:
+                raise RuntimeError(f"{error}; {keyboard_context()}; panes={panes()}") from error
         host_key(b"\x1b[13;2u")
         expect_bytes("Shift-Enter after two live upgrades", second_raw,
                      b"\x1b[113;5u\x1b[113;5:3u\x1b[13;2u", keyboard_context, drain)
+        assert raw(first_raw) == first_before_upgrade, "reconnect routed input to the first recorder"
 
         # A non-negotiating child still gets legacy bytes but never host releases.
         legacy_cmd, legacy_raw, legacy_hex, legacy_ready = recorder("legacy", negotiate=False)
