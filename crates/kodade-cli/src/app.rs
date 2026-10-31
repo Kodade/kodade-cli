@@ -1023,7 +1023,9 @@ impl App {
                         if reason == "local endpoint shut down" {
                             return Ok(());
                         }
-                        if reason == "local endpoint disconnected" {
+                        if reason == "local endpoint disconnected"
+                            || reason.starts_with("local endpoint disconnected: ")
+                        {
                             return Err(anyhow!(reason.clone()));
                         }
                     }
