@@ -8,6 +8,7 @@ mod handoff;
 mod history;
 mod hyperlinks;
 mod image_paste;
+mod socket_safety;
 pub use image_paste::{validate_png, MAX_IMAGE_BYTES};
 mod layout;
 mod manifest;
@@ -152,6 +153,7 @@ struct Replacement {
     hook: PathBuf,
     public_backup: PathBuf,
     hook_backup: PathBuf,
+    published_identity: Option<socket_safety::Identity>,
     public_saved: bool,
     hook_saved: bool,
     committed: bool,
@@ -226,6 +228,7 @@ impl Replacement {
             staging_alias,
             public,
             hook,
+            published_identity: None,
             public_saved: false,
             hook_saved: false,
             committed: false,
@@ -248,7 +251,19 @@ impl Drop for Replacement {
                 (self.hook_saved, &self.hook_backup, &self.hook),
             ] {
                 if saved {
-                    if let Err(error) = fs::rename(backup, public) {
+                    let restore = (|| -> std::io::Result<()> {
+                        let current = socket_safety::identity(public)?;
+                        if current == socket_safety::identity(backup)? {
+                            return Ok(());
+                        }
+                        if Some(current) != self.published_identity {
+                            return Err(std::io::Error::other(
+                                "published socket replaced; refusing rollback overwrite",
+                            ));
+                        }
+                        fs::rename(backup, public)
+                    })();
+                    if let Err(error) = restore {
                         restored = false;
                         eprintln!(
                             "could not restore {}: {error}; recovery socket retained at {}",
@@ -762,7 +777,7 @@ fn hook_socket_path() -> PathBuf {
 pub fn socket_dir() -> PathBuf {
     let runtime = env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from);
     let home = dirs::home_dir();
-    let uid = env::var("UID").unwrap_or_else(|_| "unknown".to_owned());
+    let uid = unsafe { libc::geteuid() }.to_string();
     socket_path_for(
         "unused",
         runtime.as_deref(),
@@ -798,19 +813,20 @@ pub async fn run(session_name: String) -> Result<()> {
     validate_session_name(&session_name)?;
     let socket = socket_path(&session_name);
     if let Some(parent) = socket.parent() {
-        fs::create_dir_all(parent).context("create Ködade CLI socket directory")?;
+        socket_safety::private_directory(parent).context("create Ködade CLI socket directory")?;
     }
-    if socket.exists() {
-        remove_stale_socket(&socket).await?;
-    }
-    let listener = UnixListener::bind(&socket).context("bind Ködade CLI socket")?;
     let hook_socket = hook_socket_path();
-    fs::create_dir_all(hook_socket.parent().expect("hook socket has parent"))
+    socket_safety::private_directory(hook_socket.parent().expect("hook socket has parent"))
         .context("create Ködade hook socket directory")?;
+    let startup_lock = socket_safety::startup_lock(socket.parent().expect("socket parent"))?;
+    remove_stale_socket(&socket).await?;
+    let listener = UnixListener::bind(&socket).context("bind Ködade CLI socket")?;
+    socket_safety::restrict(&socket)?;
+    let endpoint_identity = socket_safety::identity(&socket)?;
     if let Ok(metadata) = fs::symlink_metadata(&hook_socket) {
         if !metadata.file_type().is_socket() {
             drop(listener);
-            let _ = fs::remove_file(&socket);
+            let _ = socket_safety::remove(&socket, endpoint_identity);
             bail!(
                 "refusing to replace non-socket Ködade hook path {}",
                 hook_socket.display()
@@ -820,22 +836,23 @@ pub async fn run(session_name: String) -> Result<()> {
         // has exclusively bound the public session name. A live socket is not.
         if let Err(error) = remove_stale_socket(&hook_socket).await {
             drop(listener);
-            let _ = fs::remove_file(&socket);
+            let _ = socket_safety::remove(&socket, endpoint_identity);
             return Err(error).context("remove stale Ködade hook socket");
         }
     }
     if let Err(error) = fs::hard_link(&socket, &hook_socket) {
         drop(listener);
-        let _ = fs::remove_file(&socket);
+        let _ = socket_safety::remove(&socket, endpoint_identity);
         return Err(error).context("link stable Ködade hook socket");
     }
+    drop(startup_lock);
     // Binding succeeded, so no live daemon owns this session: safe to restore.
     let session = match load_session(&session_name) {
         Ok(session) => Arc::new(session),
         Err(error) => {
             drop(listener);
-            let _ = fs::remove_file(&hook_socket);
-            let _ = fs::remove_file(&socket);
+            let _ = socket_safety::remove(&hook_socket, endpoint_identity);
+            let _ = socket_safety::remove(&socket, endpoint_identity);
             return Err(error);
         }
     };
@@ -862,6 +879,8 @@ pub async fn run_import(
     final_hook: PathBuf,
 ) -> Result<()> {
     validate_session_name(&session_name)?;
+    socket_safety::private_directory(&socket_dir())?;
+    socket_safety::private_directory(final_hook.parent().context("hook socket has no parent")?)?;
     let received = tokio::task::spawn_blocking(move || handoff::receive(&handoff_path, &token))
         .await
         .context("join handoff receiver")?
@@ -912,6 +931,7 @@ async fn serve_listener(
     session: Arc<Session>,
     mut sigterm: tokio::signal::unix::Signal,
 ) -> Result<()> {
+    let endpoint_identity = socket_safety::identity(&session.socket_path())?;
     let mut shutdown = session.shutdown.subscribe();
     tokio::spawn(persist_loop(Arc::clone(&session)));
     if session.pane_history {
@@ -928,8 +948,8 @@ async fn serve_listener(
                 persist::remove_session_file(&session.session_name());
                 session.images.clear();
                 drop(listener);
-                let _ = fs::remove_file(session.socket_path());
-                let _ = fs::remove_file(session.hook_socket());
+                let _ = socket_safety::remove(&session.socket_path(), endpoint_identity);
+                let _ = socket_safety::remove(&session.hook_socket(), endpoint_identity);
                 return Ok(());
             }
             _ = sigterm.recv() => {
@@ -938,8 +958,8 @@ async fn serve_listener(
                 }
                 session.images.clear();
                 drop(listener);
-                let _ = fs::remove_file(session.socket_path());
-                let _ = fs::remove_file(session.hook_socket());
+                let _ = socket_safety::remove(&session.socket_path(), endpoint_identity);
+                let _ = socket_safety::remove(&session.hook_socket(), endpoint_identity);
                 return Ok(());
             }
             accepted = listener.accept() => {
@@ -1023,12 +1043,24 @@ async fn history_loop(session: Arc<Session>) {
 }
 
 async fn remove_stale_socket(socket: &Path) -> Result<()> {
-    if let Ok(Ok(_)) =
-        tokio::time::timeout(Duration::from_millis(250), UnixStream::connect(socket)).await
-    {
-        bail!("Ködade CLI daemon already running: {}", socket.display());
+    let expected = match socket_safety::identity(socket) {
+        Ok(id) => id,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e.into()),
+    };
+    match tokio::time::timeout(Duration::from_millis(250), UnixStream::connect(socket)).await {
+        Ok(Err(e)) if e.raw_os_error() == Some(libc::ECONNREFUSED) => {}
+        _ => bail!("Ködade CLI socket may still be live: {}", socket.display()),
     }
-    fs::remove_file(socket).context("remove stale Ködade CLI socket")?;
+    // BSD can also return ECONNREFUSED for a full stream listen backlog.
+    // A datagram probe does not enqueue a stream connection: a live stream
+    // endpoint reports EPROTOTYPE even when its accept queue is saturated.
+    let probe = std::os::unix::net::UnixDatagram::unbound()?;
+    match probe.connect(socket) {
+        Err(e) if e.raw_os_error() == Some(libc::ECONNREFUSED) => {}
+        _ => bail!("Ködade CLI socket may still be live: {}", socket.display()),
+    }
+    socket_safety::remove(socket, expected).context("remove stale Ködade CLI socket")?;
     Ok(())
 }
 
@@ -1436,10 +1468,22 @@ impl Session {
             .context("validate replacement daemon")?;
         handoff::send_fds(&control, &captured.fds).context("transfer PTY masters")?;
         handoff::wait_ready(&mut control).context("wait for replacement daemon")?;
+        socket_safety::identity(&transaction.public)?;
+        socket_safety::identity(&transaction.hook)?;
+        socket_safety::restrict(&transaction.staged)?;
+        socket_safety::restrict(&transaction.staged_hook)?;
         fs::hard_link(&transaction.public, &transaction.public_backup)?;
         transaction.public_saved = true;
         fs::hard_link(&transaction.hook, &transaction.hook_backup)?;
         transaction.hook_saved = true;
+        transaction.published_identity = Some(socket_safety::identity(&transaction.staged)?);
+        if socket_safety::identity(&transaction.public)?
+            != socket_safety::identity(&transaction.public_backup)?
+            || socket_safety::identity(&transaction.hook)?
+                != socket_safety::identity(&transaction.hook_backup)?
+        {
+            bail!("socket changed during handoff publication");
+        }
         fs::rename(&transaction.staged, &transaction.public)?;
         fs::rename(&transaction.staged_hook, &transaction.hook)?;
         handoff::commit(&mut control).context("commit replacement daemon")?;
@@ -3944,6 +3988,7 @@ impl Session {
         }
         let old_socket = self.socket_path();
         let new_socket = socket_path(new_name);
+        let endpoint_identity = socket_safety::identity(&old_socket)?;
         // Link-then-unlink instead of `exists()` + `rename`: `hard_link` fails
         // when the target exists, so two daemons cannot race onto one name.
         // The listener stays bound to the inode, so it answers on both paths
@@ -3957,7 +4002,8 @@ impl Session {
                 return Err(error).context("link the session socket to its new name");
             }
         }
-        fs::remove_file(&old_socket).context("remove the old session socket")?;
+        socket_safety::remove(&old_socket, endpoint_identity)
+            .context("remove the old session socket")?;
         *self.socket.lock().expect("socket lock poisoned") = new_socket.clone();
         *self.name.lock().expect("name lock poisoned") = new_name.to_owned();
         if let Some(path) = persist::session_file_path(&old_name) {
@@ -5924,6 +5970,9 @@ async fn read_client_line<R: AsyncBufRead + Unpin>(
 }
 
 async fn serve_client(stream: UnixStream, session: Arc<Session>) -> Result<()> {
+    if stream.peer_cred()?.uid() != unsafe { libc::geteuid() } {
+        bail!("refusing client from another user");
+    }
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
     let mut line_buffer = Vec::new();
@@ -8354,7 +8403,8 @@ mod tests {
             std::env::temp_dir().join(format!("kodade-cli-stale-socket-{}", std::process::id()));
         fs::create_dir_all(&directory).expect("create test directory");
         let socket = directory.join("default.sock");
-        fs::write(&socket, b"stale").expect("create stale socket file");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).expect("bind stale socket");
+        drop(listener);
         remove_stale_socket(&socket)
             .await
             .expect("remove stale socket");
