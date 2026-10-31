@@ -8567,6 +8567,32 @@ mod tests {
         ));
     }
 
+    // Wait for actual child output, with enough evidence to distinguish startup,
+    // process exit, and dispatch failures. Polling observes a condition, never retries input.
+    async fn wait_for_fixture_text(session: &Session, id: PaneId, expected: &str) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let (text, _) = session
+                .read_pane_text(id, true, None)
+                .expect("fixture text");
+            if text.lines().any(|line| line.trim_end() == expected) {
+                return;
+            }
+            if Instant::now() >= deadline {
+                let panes = session.panes.lock().expect("panes");
+                let pane = &panes[&id];
+                let mut child = pane.child.lock().expect("child");
+                let status = child
+                    .as_mut()
+                    .map(|child| (child.process_id(), child.try_wait()));
+                panic!(
+                    "pane {id:?} waiting for {expected:?}; child={status:?}; transcript={text:?}"
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
     #[tokio::test]
     async fn two_socket_clients_keep_selection_scroll_and_size_independent() {
         let session = Arc::new(Session::spawn(80, 24, "views".into()).expect("spawn session"));
@@ -8627,14 +8653,23 @@ mod tests {
             next_layout_matching(&mut b, |layout| layout.active_tab == first_tab).await;
         assert_eq!(b_still_first.active_tab, first_tab);
 
-        // `Input` follows each connection's focused pane, rather than the
-        // session's persisted/script focus. Use the live shells so this is a
-        // real PTY routing assertion instead of inspecting implementation state.
+        // Keep the socket-created identities/layouts, but replace interactive login
+        // shells with quiet recorders. Readiness follows termios setup; terminal
+        // echo cannot satisfy the routing assertions.
         let second_pane = a_second.panes[0].id;
+        for id in [first_pane, second_pane] {
+            session.new_pane_with_id(
+                id, "recorder", None,
+                Some(vec!["/bin/sh".into(), "-c".into(),
+                    "stty -echo || exit 1; printf 'RECORDER_READY\\n'; while IFS= read -r line; do printf 'RECEIVED:%s\\n' \"$line\"; done".into()]),
+                None,
+            ).expect("spawn recorder");
+            wait_for_fixture_text(&session, id, "RECORDER_READY").await;
+        }
         a_writer
             .write_all(
                 &encode(&ClientMessage::Input {
-                    bytes: b"printf VIEW_A\\n\r".to_vec(),
+                    bytes: b"VIEW_A\n".to_vec(),
                 })
                 .unwrap(),
             )
@@ -8643,30 +8678,18 @@ mod tests {
         b_writer
             .write_all(
                 &encode(&ClientMessage::Input {
-                    bytes: b"printf VIEW_B\\n\r".to_vec(),
+                    bytes: b"VIEW_B\n".to_vec(),
                 })
                 .unwrap(),
             )
             .await
             .expect("input b");
-        tokio::time::timeout(Duration::from_secs(2), async {
-            loop {
-                let (first_text, _) = session
-                    .read_pane_text(first_pane, true, None)
-                    .expect("read first");
-                let (second_text, _) = session
-                    .read_pane_text(second_pane, true, None)
-                    .expect("read second");
-                if first_text.contains("VIEW_B") && second_text.contains("VIEW_A") {
-                    assert!(!first_text.contains("VIEW_A"));
-                    assert!(!second_text.contains("VIEW_B"));
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        })
-        .await
-        .expect("inputs reach their own panes");
+        wait_for_fixture_text(&session, first_pane, "RECEIVED:VIEW_B").await;
+        wait_for_fixture_text(&session, second_pane, "RECEIVED:VIEW_A").await;
+        let (first_text, _) = session.read_pane_text(first_pane, true, None).unwrap();
+        let (second_text, _) = session.read_pane_text(second_pane, true, None).unwrap();
+        assert!(!first_text.contains("VIEW_A"));
+        assert!(!second_text.contains("VIEW_B"));
 
         // Scrollback belongs to B's view. Seed real terminal history directly,
         // then verify B sees it while A remains on its own tab.
@@ -8946,8 +8969,23 @@ mod tests {
         fs::hard_link(&public, &stable).unwrap();
         let session = Arc::new(Session::spawn(80, 24, unique.clone()).expect("spawn session"));
 
-        session.rename_session(&renamed).expect("rename session");
         let pane = session.snapshot().unwrap().panes[0].id;
+        // Start before renaming so the live child retains its original routing env.
+        session
+            .new_pane_with_id(
+                pane,
+                "hook shell",
+                None,
+                Some(vec![
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    "stty -echo || exit 1; printf 'HOOK_READY\\n'; while IFS= read -r line; do eval \"$line\"; done".into(),
+                ]),
+                None,
+            )
+            .expect("controlled hook shell");
+        wait_for_fixture_text(&session, pane, "HOOK_READY").await;
+        session.rename_session(&renamed).expect("rename session");
         let server = {
             let session = Arc::clone(&session);
             tokio::spawn(async move {
@@ -8964,7 +9002,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(&shim, fs::Permissions::from_mode(0o700)).unwrap();
         let command = format!(
-            "KODADE_BIN={}; export KODADE_BIN; KODADE_INTEGRATION=kodade-cli; if [ -n \"${{KODADE_PANE:-}}\" ] && [ -n \"${{KODADE_SOCKET:-}}\" ]; then \"$KODADE_BIN\" agent report \"$KODADE_PANE\" working; fi\n",
+            "KODADE_BIN={}; export KODADE_BIN; KODADE_INTEGRATION=kodade-cli; if [ -n \"${{KODADE_PANE:-}}\" ] && [ -n \"${{KODADE_SOCKET:-}}\" ]; then \"$KODADE_BIN\" agent report \"$KODADE_PANE\" working; fi; printf 'HOOK_SENT\\n'\n",
             shim.display()
         );
         session
@@ -8975,6 +9013,7 @@ mod tests {
             .unwrap()
             .write(command.as_bytes())
             .unwrap();
+        wait_for_fixture_text(&session, pane, "HOOK_SENT").await;
         let mut seen = false;
         for _ in 0..40 {
             tokio::time::sleep(Duration::from_millis(25)).await;
@@ -8992,7 +9031,10 @@ mod tests {
             session.snapshot().unwrap().panes[0].screen.contents
         );
         assert!(stable.exists());
-        server.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .expect("hook reporter disconnected")
+            .unwrap();
 
         let _ = fs::remove_file(&shim);
         let _ = fs::remove_file(&stable);

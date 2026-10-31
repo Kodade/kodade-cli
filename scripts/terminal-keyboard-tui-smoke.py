@@ -7,7 +7,6 @@ import os
 from pathlib import Path
 import pty
 import select
-import shlex
 import shutil
 import struct
 import subprocess
@@ -116,10 +115,13 @@ finally:
     try:
         command("new", "--workspace", "main", str(root))
         first_cmd, first_raw, first_hex, first_ready = recorder("first")
-        # The first pane starts as a shell; replace it with the persistent child.
-        first = next(pane for pane in panes() if pane["focused"])
-        command("send", str(first["id"]), "exec " + shlex.join(first_cmd))
-        wait_for("first recorder ready", first_ready.exists)
+        # Spawn the recorder as a command instead of typing into an unready shell.
+        first_id = int(command("run", "--name", "first-recorder", "--", *first_cmd).stdout.strip())
+        first = next(pane for pane in panes() if pane["id"] == first_id)
+        try:
+            wait_for("first recorder ready", first_ready.exists)
+        except RuntimeError as error:
+            raise RuntimeError(f"{error}; panes={panes()}") from error
         wait_for("first Kitty negotiation", lambda: next(p for p in panes() if p["id"] == first["id"])["screen"]["keyboard"]["kitty_flags"] == 3)
 
         second_cmd, second_raw, second_hex, second_ready = recorder("second")
@@ -263,10 +265,13 @@ finally:
             # before sending input, which is intentionally dropped offline.
             marker = f"UPGRADE-READY-{generation}".encode()
             (root / "second.frame").write_bytes(marker)
-            wait_for(
-                f"attached frame after upgrade {generation}",
-                lambda: (drain() is None) and marker in transcript,
-            )
+            try:
+                wait_for(
+                    f"attached frame after upgrade {generation}",
+                    lambda: (drain() is None) and marker in transcript,
+                )
+            except RuntimeError as error:
+                raise RuntimeError(f"{error}; {keyboard_context()}; panes={panes()}") from error
         host_key(b"\x1b[13;2u")
         expect_bytes("Shift-Enter after two live upgrades", second_raw,
                      b"\x1b[113;5u\x1b[113;5:3u\x1b[13;2u", keyboard_context, drain)
