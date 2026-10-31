@@ -2825,6 +2825,47 @@ impl Session {
 
     fn handle(&self, message: ClientMessage) -> Result<()> {
         self.ensure_mutation_open()?;
+        // Callers hold view_dispatch: no other script can redirect the action.
+        let targeted = match &message {
+            ClientMessage::ClosePaneId { id } => Some((*id, ClientMessage::ClosePane)),
+            ClientMessage::ZoomPaneId { id } => Some((*id, ClientMessage::ZoomPane)),
+            ClientMessage::SwapPaneId { id, direction } => Some((
+                *id,
+                ClientMessage::SwapPane {
+                    direction: *direction,
+                },
+            )),
+            ClientMessage::ResizePaneId {
+                id,
+                direction,
+                cells,
+            } => Some((
+                *id,
+                ClientMessage::ResizePane {
+                    direction: *direction,
+                    cells: *cells,
+                },
+            )),
+            _ => None,
+        };
+        if let Some((id, action)) = targeted {
+            {
+                let mut state = self
+                    .state
+                    .lock()
+                    .map_err(|_| anyhow!("state lock poisoned"))?;
+                let exists = state.workspaces.iter().flat_map(|w| &w.tabs).any(|tab| {
+                    let mut ids = Vec::new();
+                    layout::leaves(&tab.tree, &mut ids);
+                    ids.contains(&id)
+                });
+                if !exists {
+                    bail!("pane {} does not exist", id.0);
+                }
+                focus_pane_id(&mut state, id);
+            }
+            return self.handle(action);
+        }
         match message {
             // `Version` / `Session` / `Schema` queries, `Subscribe`, and
             // `ReadPane` are answered by `serve_client`; no state changes here.
@@ -2895,6 +2936,10 @@ impl Session {
                 drop(state);
                 self.resize_current()?;
             }
+            ClientMessage::ClosePaneId { .. }
+            | ClientMessage::ZoomPaneId { .. }
+            | ClientMessage::SwapPaneId { .. }
+            | ClientMessage::ResizePaneId { .. } => unreachable!("handled above"),
             ClientMessage::ClosePane => self.close_pane()?,
             ClientMessage::CloseTab { id } => self.close_tab(id)?,
             ClientMessage::CloseWorkspace { id } => self.close_workspace(id)?,
@@ -6265,6 +6310,111 @@ async fn send_notifications(
 #[cfg(test)]
 mod tests {
 
+    #[tokio::test]
+    async fn atomic_pane_commands_ignore_interleaved_script_focus() {
+        let session = Arc::new(Session::spawn(80, 24, "atomic-pane".into()).unwrap());
+        session.handle_script(ClientMessage::SplitRight).unwrap();
+        let panes = session.snapshot().unwrap().panes;
+        let p1 = panes[0].id;
+        let p2 = panes[1].id;
+        let mut view = ClientView::from_state(&session.state.lock().unwrap(), 80, 24);
+        session
+            .handle_view(ClientMessage::FocusPaneId { id: p2 }, &mut view)
+            .unwrap();
+        let (a, server_a) = UnixStream::pair().unwrap();
+        let (b, server_b) = UnixStream::pair().unwrap();
+        let ta = tokio::spawn(serve_client(server_a, session.clone()));
+        let tb = tokio::spawn(serve_client(server_b, session.clone()));
+        let (ar, mut aw) = a.into_split();
+        let (br, mut bw) = b.into_split();
+        let mut a = BufReader::new(ar).lines();
+        let mut b = BufReader::new(br).lines();
+        let mut expected_zoom = true;
+        for action in [
+            ClientMessage::ZoomPaneId { id: p1 },
+            ClientMessage::ZoomPaneId { id: p1 },
+            ClientMessage::SwapPaneId {
+                id: p1,
+                direction: Direction::Right,
+            },
+            ClientMessage::ResizePaneId {
+                id: p1,
+                direction: Direction::Left,
+                cells: 5,
+            },
+            ClientMessage::ClosePaneId { id: p1 },
+        ] {
+            aw.write_all(&encode(&ClientMessage::FocusPaneId { id: p1 }).unwrap())
+                .await
+                .unwrap();
+            assert!(matches!(
+                next_server_message(&mut a).await,
+                ServerMessage::Layout(_)
+            ));
+            bw.write_all(&encode(&ClientMessage::FocusPaneId { id: p2 }).unwrap())
+                .await
+                .unwrap();
+            assert!(matches!(
+                next_server_message(&mut b).await,
+                ServerMessage::Layout(_)
+            ));
+            aw.write_all(&encode(&action).unwrap()).await.unwrap();
+            let reply = next_server_message(&mut a).await;
+            session
+                .handle_view(ClientMessage::Query(QueryKind::Layout), &mut view)
+                .unwrap();
+            assert_eq!(view.focused.values().copied().collect::<Vec<_>>(), vec![p2]);
+            let ServerMessage::Layout(layout) = reply else {
+                panic!("{reply:?}")
+            };
+            if !matches!(action, ClientMessage::ClosePaneId { .. }) {
+                assert!(layout.panes.iter().find(|p| p.id == p1).unwrap().focused);
+                match action {
+                    ClientMessage::ZoomPaneId { .. } => {
+                        assert_eq!(layout.zoomed, expected_zoom);
+                        expected_zoom = !expected_zoom;
+                    }
+                    ClientMessage::SwapPaneId { .. } => {
+                        let mut ids = Vec::new();
+                        layout::leaves(&layout.tree, &mut ids);
+                        assert_eq!(ids, vec![p2, p1]);
+                    }
+                    ClientMessage::ResizePaneId { .. } => {
+                        if let LayoutTree::Split { ratio, .. } = layout.tree {
+                            assert_ne!(ratio, 0.5);
+                        } else {
+                            panic!("expected split");
+                        }
+                    }
+                    _ => {}
+                }
+            } else {
+                assert_eq!(layout.panes.len(), 1);
+                assert_eq!(layout.panes[0].id, p2);
+            }
+        }
+        for action in [
+            ClientMessage::ClosePaneId { id: p1 },
+            ClientMessage::ZoomPaneId { id: p1 },
+            ClientMessage::SwapPaneId {
+                id: p1,
+                direction: Direction::Right,
+            },
+            ClientMessage::ResizePaneId {
+                id: p1,
+                direction: Direction::Right,
+                cells: 5,
+            },
+        ] {
+            aw.write_all(&encode(&action).unwrap()).await.unwrap();
+            assert!(matches!(
+                next_server_message(&mut a).await,
+                ServerMessage::Error { .. }
+            ));
+        }
+        ta.abort();
+        tb.abort();
+    }
     #[test]
     fn osc52_callback_keeps_only_bounded_copy_requests() {
         let mut parser = pty_parser(2, 10, 10, PtyCallbacks::default());

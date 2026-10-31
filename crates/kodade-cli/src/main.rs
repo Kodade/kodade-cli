@@ -668,19 +668,23 @@ async fn pane(socket: &Path, command: cli::PaneCommand) -> Result<()> {
             )?;
             Ok(())
         }
-        cli::PaneCommand::Kill { pane } => focus_then(socket, pane, ClientMessage::ClosePane).await,
+        cli::PaneCommand::Kill { pane } => {
+            targeted_pane(socket, ClientMessage::ClosePaneId { id: pane }).await
+        }
         cli::PaneCommand::Focus { pane } => {
             commands::layout(
                 commands::request(socket, ClientMessage::FocusPaneId { id: pane }).await?,
             )?;
             Ok(())
         }
-        cli::PaneCommand::Zoom { pane } => focus_then(socket, pane, ClientMessage::ZoomPane).await,
+        cli::PaneCommand::Zoom { pane } => {
+            targeted_pane(socket, ClientMessage::ZoomPaneId { id: pane }).await
+        }
         cli::PaneCommand::Swap { pane, direction } => {
-            focus_then(
+            targeted_pane(
                 socket,
-                pane,
-                ClientMessage::SwapPane {
+                ClientMessage::SwapPaneId {
+                    id: pane,
                     direction: Direction::from(direction),
                 },
             )
@@ -691,10 +695,10 @@ async fn pane(socket: &Path, command: cli::PaneCommand) -> Result<()> {
             direction,
             cells,
         } => {
-            focus_then(
+            targeted_pane(
                 socket,
-                pane,
-                ClientMessage::ResizePane {
+                ClientMessage::ResizePaneId {
+                    id: pane,
                     direction: Direction::from(direction),
                     cells,
                 },
@@ -751,13 +755,17 @@ async fn wait_output(
     }
 }
 
-/// Focus a pane, then run a message the daemon applies to the focused pane.
-async fn focus_then(
-    socket: &Path,
-    pane: kodade_cli_proto::PaneId,
-    message: ClientMessage,
-) -> Result<()> {
-    commands::layout(commands::request(socket, ClientMessage::FocusPaneId { id: pane }).await?)?;
+/// Require the additive capability before sending an atomic mutation.
+async fn targeted_pane(socket: &Path, message: ClientMessage) -> Result<()> {
+    let schema = commands::request(socket, ClientMessage::Query(QueryKind::Schema)).await?;
+    match schema {
+        ServerMessage::Schema {
+            client_messages, ..
+        } if client_messages
+            .iter()
+            .any(|name| name == kodade_cli_proto::client_message_name(&message)) => {}
+        _ => bail!("daemon lacks atomic pane commands; upgrade the daemon"),
+    }
     commands::layout(commands::request(socket, message).await?)?;
     Ok(())
 }

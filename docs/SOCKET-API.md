@@ -57,6 +57,10 @@ printf '%s\n' '{"Query":"Layout"}' | nc -U /tmp/kodade-cli-$UID/default.sock
 | `Input` | `{"Input":{"bytes":[108,115,13]}}` | `Layout` |
 | `Resize` | `{"Resize":{"cols":120,"rows":40}}` | `Layout` |
 | `SplitRight` / `SplitDown` | `"SplitRight"` | `Layout` |
+| `ClosePaneId` | `{"ClosePaneId":{"id":1}}` | `Layout` |
+| `ZoomPaneId` | `{"ZoomPaneId":{"id":1}}` | `Layout` |
+| `SwapPaneId` | `{"SwapPaneId":{"id":1,"direction":"Right"}}` | `Layout` |
+| `ResizePaneId` | `{"ResizePaneId":{"id":1,"direction":"Right","cells":5}}` | `Layout` |
 | `ClosePane` | `"ClosePane"` | `Layout` |
 | `CloseTab` | `{"CloseTab":{"id":2}}` | `Layout` |
 | `CloseWorkspace` | `{"CloseWorkspace":{"id":1}}` | `Layout` |
@@ -135,9 +139,17 @@ The file must also be internally consistent — no id used twice, every tree lea
 backed by a pane entry, and no pane entry outside its tab's tree — or the daemon
 answers `Error` and changes nothing.
 
-Messages that act on "the focused pane" (`ClosePane`, `ZoomPane`, `SwapPane`,
-`ResizePane`, `BreakPane`, …) have no id argument: send `FocusPaneId` first.
-That is exactly what `kodade-cli pane kill|zoom|swap|resize` does.
+Scripts should use `ClosePaneId { id }`, `ZoomPaneId { id }`,
+`SwapPaneId { id, direction }`, and `ResizePaneId { id, direction, cells }`.
+Each returns `Layout`; a missing target returns `Error`. Resolution, selection,
+and mutation happen under one dispatch lock, even across independent script
+sockets. These select the target in the shared script selection. Attached
+interactive clients retain their independent selections (a removed pane is
+reconciled to a surviving pane).
+
+The focused-pane messages remain available for interactive clients. A separate
+`FocusPaneId` followed by a focused action is unsafe for concurrent scripts.
+The CLI uses the atomic variants for `pane kill|zoom|swap|resize`.
 
 `PromptAgent` is the guarded automation write used by `agent prompt`. The
 daemon re-detects the pane immediately before writing and requires both the
@@ -381,3 +393,14 @@ conversation reference, guarded hook process identity, notification sequence,
 and the active history-persistence setting. Daemon-owned extension context
 files remain readable by the existing child and transfer cleanup ownership only
 after the final release; a rejected importer cannot delete the source file.
+
+### Atomic pane command compatibility (#85)
+
+The four PaneId messages are additive protocol-v2 capabilities; neither the
+attach protocol nor persistence format changes. Probe `Query(Schema)` and
+require the specific message in `client_messages` before sending it. The CLI
+does this for kill/zoom/swap/resize and reports an upgrade-required error for
+older daemons. It never falls back to focus-then-act. Older clients continue
+using their existing messages; their two-request script sequences remain
+subject to interleaving. A daemon replacement between probe and action can
+reject an unsupported message, but cannot cause a focused-pane fallback.
