@@ -73,8 +73,14 @@ with tempfile.TemporaryDirectory(prefix="kh-", dir="/tmp") as directory:
         run("pane", "focus", first)
         for generation in (1, 2):
             run("session", "upgrade")
-            settle = time.monotonic() + 0.7
-            while time.monotonic() < settle:
+            # A fixed delay can expire while the client is still reconnecting,
+            # dropping the beginning of the command below. Require fresh output
+            # from the original shell through the attached client's restored view.
+            marker = f"HANDOFF_READY_{generation}".encode()
+            run("send", second, f"printf '\\nHANDOFF_READY_%s\\n' {generation}")
+            deadline = time.monotonic() + 8
+            while marker not in transcript:
+                assert time.monotonic() < deadline, bytes(transcript[-3000:])
                 drain()
             result = root / f"result-{generation}"
             os.write(master, f"printf '%s:%s' \"$$\" \"$(({generation} * 173))\" > {result}\r".encode())
