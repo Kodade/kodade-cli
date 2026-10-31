@@ -844,55 +844,12 @@ pub async fn run(session_name: String) -> Result<()> {
     *session.name.lock().expect("name lock poisoned") = session_name.clone();
     *session.socket.lock().expect("socket lock poisoned") = socket.clone();
     session.run_plugin_hooks("startup", None);
-    let mut shutdown = session.shutdown.subscribe();
-    // Debounced layout persistence runs alongside the accept loop.
-    tokio::spawn(persist_loop(Arc::clone(&session)));
-    if session.pane_history {
-        tokio::spawn(history_loop(Arc::clone(&session)));
-    } else {
+    if !session.pane_history {
         history::remove_for_session(&session.session_name());
     }
-    // Keeps agent detection running for event subscribers with no TUI attached.
-    tokio::spawn(subscriber_tick(Arc::clone(&session)));
-    // Flush state on SIGTERM so a stopped daemon (e.g. logout) can be restored.
-    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+    let sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .context("install SIGTERM handler")?;
-    loop {
-        tokio::select! {
-            _ = shutdown.recv() => {
-                if session.upgraded.load(Ordering::Acquire) {
-                    // The target owns duplicated PTYs. Exit without Rust drops:
-                    // portable-pty closes a master by writing EOT on Drop.
-                    std::process::exit(0);
-                }
-                // `kill-session` is deliberate: drop the state file so it does
-                // not resurrect on the next cold start.
-                persist::remove_session_file(&session.session_name());
-                session.images.clear();
-                drop(listener);
-                let _ = fs::remove_file(session.socket_path());
-                let _ = fs::remove_file(session.hook_socket());
-                return Ok(());
-            }
-            _ = sigterm.recv() => {
-                session.save();
-                session.images.clear();
-                drop(listener);
-                let _ = fs::remove_file(session.socket_path());
-                let _ = fs::remove_file(session.hook_socket());
-                return Ok(());
-            }
-            accepted = listener.accept() => {
-                let (stream, _) = accepted?;
-                let session = Arc::clone(&session);
-                tokio::spawn(async move {
-                    if let Err(error) = serve_client(stream, session).await {
-                        eprintln!("Ködade CLI client disconnected: {error:#}");
-                    }
-                });
-            }
-        }
-    }
+    serve_listener(listener, session, sigterm).await
 }
 
 /// Hidden daemon mode used by a source daemon during a live upgrade.
@@ -920,6 +877,10 @@ pub async fn run_import(
         .hook_socket
         .lock()
         .expect("hook socket lock poisoned") = final_hook;
+    // Install before acknowledging readiness: SIGTERM must never use the default
+    // disposition once the source releases ownership.
+    let sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .context("install SIGTERM handler")?;
     let mut control = received.stream;
     let committed = tokio::task::spawn_blocking(move || {
         handoff::ready(&mut control)?;
@@ -943,10 +904,14 @@ pub async fn run_import(
     }
     // Every fallible staging operation completed before acknowledgment. The
     // published listener is already registered with the replacement runtime.
-    serve_imported_listener(listener, session).await
+    serve_listener(listener, session, sigterm).await
 }
 
-async fn serve_imported_listener(listener: UnixListener, session: Arc<Session>) -> Result<()> {
+async fn serve_listener(
+    listener: UnixListener,
+    session: Arc<Session>,
+    mut sigterm: tokio::signal::unix::Signal,
+) -> Result<()> {
     let mut shutdown = session.shutdown.subscribe();
     tokio::spawn(persist_loop(Arc::clone(&session)));
     if session.pane_history {
@@ -957,9 +922,21 @@ async fn serve_imported_listener(listener: UnixListener, session: Arc<Session>) 
         tokio::select! {
             _ = shutdown.recv() => {
                 if session.upgraded.load(Ordering::Acquire) {
+                    // The replacement owns the PTYs; dropping their masters sends EOT.
                     std::process::exit(0);
                 }
                 persist::remove_session_file(&session.session_name());
+                session.images.clear();
+                drop(listener);
+                let _ = fs::remove_file(session.socket_path());
+                let _ = fs::remove_file(session.hook_socket());
+                return Ok(());
+            }
+            _ = sigterm.recv() => {
+                if let Err(error) = session.save() {
+                    eprintln!("Ködade CLI could not persist on shutdown: {error:#}");
+                }
+                session.images.clear();
                 drop(listener);
                 let _ = fs::remove_file(session.socket_path());
                 let _ = fs::remove_file(session.hook_socket());
@@ -1006,17 +983,21 @@ async fn persist_loop(session: Arc<Session>) {
     let mut updates = session.updates.subscribe();
     let mut last_saved = session.layout_generation.load(Ordering::Relaxed);
     loop {
-        match updates.recv().await {
-            Ok(()) | Err(broadcast::error::RecvError::Lagged(_)) => {}
-            Err(broadcast::error::RecvError::Closed) => return,
-        }
         if session.layout_generation.load(Ordering::Relaxed) == last_saved {
-            continue; // PTY output or a no-op tick: nothing new to persist.
+            match updates.recv().await {
+                Ok(()) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+                Err(broadcast::error::RecvError::Closed) => return,
+            }
+            if session.layout_generation.load(Ordering::Relaxed) == last_saved {
+                continue;
+            }
         }
-        // Coalesce a burst of layout changes into a single write.
+        // Also bounds retries when a write fails without another notification.
         tokio::time::sleep(persist::DEBOUNCE).await;
-        session.save();
-        last_saved = session.layout_generation.load(Ordering::Relaxed);
+        match session.save() {
+            Ok(generation) => last_saved = generation,
+            Err(error) => eprintln!("Ködade CLI could not persist: {error:#}"),
+        }
     }
 }
 
@@ -1582,25 +1563,25 @@ impl Session {
         Ok(session)
     }
 
-    /// Persist the current layout to this session's state file. Best-effort:
-    /// errors are logged, never propagated to the client-facing loop.
-    fn save(&self) {
-        // Keep publication inside dispatch so rename cannot delete the old
-        // state file while an earlier save is still about to publish it.
-        let Ok(_dispatch) = self.view_dispatch.lock() else {
-            eprintln!("Ködade CLI could not persist: view dispatch lock poisoned");
-            return;
-        };
+    /// Publish a snapshot and return the generation it represents.
+    fn save(&self) -> Result<u64> {
+        self.save_with(persist::write_session_file)
+    }
+
+    fn save_with(
+        &self,
+        publish: impl FnOnce(&Path, &persist::SessionFile) -> Result<()>,
+    ) -> Result<u64> {
+        let _dispatch = self
+            .view_dispatch
+            .lock()
+            .map_err(|_| anyhow!("view dispatch lock poisoned"))?;
         let file = self.build_file();
-        let Some(path) = persist::session_file_path(&file.name) else {
-            return;
-        };
-        if let Err(error) = persist::write_session_file(&path, &file) {
-            eprintln!(
-                "Ködade CLI could not persist session '{}': {error:#}",
-                file.name
-            );
+        let generation = self.layout_generation.load(Ordering::Relaxed);
+        if let Some(path) = persist::session_file_path(&file.name) {
+            publish(&path, &file)?;
         }
+        Ok(generation)
     }
 
     fn save_history(&self) -> Result<()> {
@@ -2048,7 +2029,9 @@ impl Session {
         let result = self.handle(message);
         drop(_dispatch);
         if renamed && result.is_ok() {
-            self.save();
+            if let Err(error) = self.save() {
+                eprintln!("Ködade CLI could not persist: {error:#}");
+            }
         }
         result
     }
@@ -2184,7 +2167,9 @@ impl Session {
         }
         drop(_dispatch);
         if matches!(message, ClientMessage::RenameSession { .. }) && result.is_ok() {
-            self.save();
+            if let Err(error) = self.save() {
+                eprintln!("Ködade CLI could not persist: {error:#}");
+            }
         }
         result
     }
@@ -8943,6 +8928,25 @@ mod tests {
         assert_eq!(session.pane_snapshot(pane_id).unwrap().agent, None);
         assert!(session
             .prompt_agent(pane_id, "Pi", pi.agent_generation, b"must-not-write")
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn save_acknowledges_only_the_snapshot_generation() {
+        let session = Session::spawn(80, 24, "generation-test".into()).unwrap();
+        session.layout_generation.store(7, Ordering::Relaxed);
+        let acknowledged = session
+            .save_with(|_, file| {
+                assert_eq!(file.name, "generation-test");
+                // Simulate a newer generation becoming visible during publication.
+                session.layout_generation.store(8, Ordering::Relaxed);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(acknowledged, 7);
+        assert_eq!(session.layout_generation.load(Ordering::Relaxed), 8);
+        assert!(session
+            .save_with(|_, _| Err(anyhow!("write failed")))
             .is_err());
     }
 
