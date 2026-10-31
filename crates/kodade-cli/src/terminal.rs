@@ -122,5 +122,16 @@ mod tests {
         writer.flush().unwrap();
         end_synchronized_output(&mut writer).unwrap();
         assert_eq!(writer.get_ref(), b"\x1b[?2026hframe\x1b[?2026l");
+        // Merely writing END is insufficient: it must leave the buffer while
+        // no subsequent BEGIN/draw exists to flush it accidentally.
+        assert!(writer.buffer().is_empty());
+        begin_synchronized_output(&mut writer).unwrap();
+        writer.write_all(b"next frame").unwrap();
+        assert_eq!(writer.get_ref(), b"\x1b[?2026hframe\x1b[?2026l");
+        end_synchronized_output(&mut writer).unwrap();
+        assert_eq!(
+            writer.get_ref(),
+            b"\x1b[?2026hframe\x1b[?2026l\x1b[?2026hnext frame\x1b[?2026l"
+        );
     }
 }
