@@ -352,3 +352,137 @@ fn hook_identity_does_not_survive_a_node_to_sleep_replacement() {
         String::from_utf8_lossy(&rejected.stderr)
     );
 }
+
+#[test]
+fn layout_write_retries_after_transient_directory_failure() {
+    let harness = Harness::new();
+    let sessions = harness.state.join("kodade-cli/sessions");
+    fs::create_dir_all(sessions.parent().unwrap()).unwrap();
+    if sessions.exists() {
+        fs::remove_dir_all(&sessions).unwrap();
+    }
+    fs::write(&sessions, b"temporarily unavailable").unwrap();
+    assert!(harness.command(["split"]).status.success());
+    thread::sleep(Duration::from_millis(1200));
+    fs::remove_file(&sessions).unwrap();
+    let state = sessions.join("automation.json");
+    let deadline = Instant::now() + Duration::from_secs(8);
+    while !state.exists() {
+        assert!(Instant::now() < deadline, "layout was not retried");
+        thread::sleep(Duration::from_millis(50));
+    }
+    let value: serde_json::Value = serde_json::from_slice(&fs::read(state).unwrap()).unwrap();
+    assert_eq!(
+        value["workspaces"][0]["tabs"][0]["panes"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+}
+
+#[test]
+fn upgraded_sigterm_saves_cleans_and_cold_restores() {
+    use std::os::unix::fs::PermissionsExt;
+    let mut harness = Harness::new();
+    let pid_file = harness.root.join("replacement-pid");
+    let wrapper = harness.root.join("replacement");
+    fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh\necho $$ > '{}'\nexec '{}' \"$@\"\n",
+            pid_file.display(),
+            BIN
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o700)).unwrap();
+    let pane_list: serde_json::Value =
+        serde_json::from_slice(&harness.command(["pane", "ls", "--json"]).stdout).unwrap();
+    let pane = pane_list[0]["id"].to_string();
+    let png = harness.root.join("attachment.png");
+    // A complete, one-pixel PNG.
+    fs::write(
+        &png,
+        [
+            137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0, 1,
+            8, 6, 0, 0, 0, 31, 21, 196, 137, 0, 0, 0, 11, 73, 68, 65, 84, 120, 156, 99, 96, 0, 2,
+            0, 0, 5, 0, 1, 122, 94, 171, 63, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130,
+        ],
+    )
+    .unwrap();
+    let pasted = harness.command(["pane", "paste-image", &pane, png.to_str().unwrap()]);
+    assert!(
+        pasted.status.success(),
+        "{}",
+        String::from_utf8_lossy(&pasted.stderr)
+    );
+    let attachment = PathBuf::from(String::from_utf8(pasted.stdout).unwrap().trim());
+    assert!(attachment.exists());
+    let upgraded = harness.command(["session", "upgrade", "--binary", wrapper.to_str().unwrap()]);
+    assert!(
+        upgraded.status.success(),
+        "{}",
+        String::from_utf8_lossy(&upgraded.stderr)
+    );
+    let pid: i32 = fs::read_to_string(pid_file)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert!(harness.command(["split"]).status.success());
+    let expected: serde_json::Value =
+        serde_json::from_slice(&harness.command(["layout", "export"]).stdout).unwrap();
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
+    let deadline = Instant::now() + Duration::from_secs(8);
+    let socket_root = harness.runtime.clone();
+    loop {
+        let sockets_left = walk_sockets(&socket_root);
+        if sockets_left == 0 && !attachment.exists() {
+            break;
+        }
+        assert!(Instant::now() < deadline, "shutdown left sockets/images");
+        thread::sleep(Duration::from_millis(25));
+    }
+    let state = harness.state.join("kodade-cli/sessions/automation.json");
+    let saved: serde_json::Value = serde_json::from_slice(&fs::read(&state).unwrap()).unwrap();
+    assert_eq!(saved, expected);
+    harness.daemon.wait().unwrap();
+    harness.daemon = Command::new(BIN)
+        .env("HOME", &harness.root)
+        .env("SHELL", "/bin/sh")
+        .env("XDG_RUNTIME_DIR", &harness.runtime)
+        .env("XDG_STATE_HOME", &harness.state)
+        .args(["-s", &harness.session, "daemon"])
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        let output = harness.command(["pane", "ls", "--json"]);
+        if output.status.success() {
+            let panes: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(panes.as_array().unwrap().len(), 2);
+            break;
+        }
+        assert!(Instant::now() < deadline, "cold restore failed");
+        thread::sleep(Duration::from_millis(25));
+    }
+    assert!(harness.command(["kill-session"]).status.success());
+    harness.daemon.wait().unwrap();
+    assert!(!state.exists(), "deliberate kill retained state");
+}
+
+fn walk_sockets(path: &std::path::Path) -> usize {
+    fs::read_dir(path)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| {
+            if entry.path().is_dir() {
+                walk_sockets(&entry.path())
+            } else {
+                usize::from(entry.path().extension().is_some_and(|ext| ext == "sock"))
+            }
+        })
+        .sum()
+}
