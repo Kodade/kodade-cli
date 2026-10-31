@@ -8,10 +8,7 @@ use std::{
     io::{self, Read, Write},
     os::{
         fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
-        unix::{
-            fs::PermissionsExt,
-            net::{UnixListener, UnixStream},
-        },
+        unix::net::{UnixListener, UnixStream},
     },
     path::Path,
     time::{Duration, Instant},
@@ -255,8 +252,14 @@ pub(crate) struct ReceivedHandoff {
 /// Bind a temporary private endpoint. This must never be the public or hook
 /// socket alias; callers keep those paths until their final commit.
 pub(crate) fn bind_listener(path: &Path) -> io::Result<UnixListener> {
+    // Resolve the source-created short staging alias, then validate its target.
+    let parent = fs::canonicalize(
+        path.parent()
+            .ok_or_else(|| io::Error::other("socket has no parent"))?,
+    )?;
+    crate::socket_safety::private_directory(&parent)?;
     let listener = UnixListener::bind(path)?;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    crate::socket_safety::restrict(path)?;
     listener.set_nonblocking(true)?;
     Ok(listener)
 }
@@ -587,6 +590,7 @@ fn input(message: &str) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
     use std::{os::fd::IntoRawFd, thread};
 
     fn manifest() -> HandoffManifest {
@@ -610,7 +614,7 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
-        fs::create_dir(&path).unwrap();
+        crate::socket_safety::private_directory(&path).unwrap();
         path
     }
     #[test]
