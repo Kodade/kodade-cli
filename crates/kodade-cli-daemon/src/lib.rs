@@ -51,6 +51,7 @@ use tokio::{
     io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::{UnixListener, UnixStream},
     sync::broadcast,
+    task::JoinSet,
 };
 
 struct Session {
@@ -102,6 +103,7 @@ struct Session {
     /// legacy mutation is dispatched.
     view_dispatch: Mutex<()>,
     upgraded: AtomicBool,
+    closing: AtomicBool,
     upgrading: broadcast::Sender<()>,
     upgrade_lock: Mutex<()>,
     handoff_active: AtomicBool,
@@ -857,35 +859,23 @@ pub async fn run(session_name: String) -> Result<()> {
     // Flush state on SIGTERM so a stopped daemon (e.g. logout) can be restored.
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .context("install SIGTERM handler")?;
+    let mut clients = JoinSet::new();
     loop {
         tokio::select! {
+            biased;
+            _ = clients.join_next(), if !clients.is_empty() => {}
             _ = shutdown.recv() => {
-                if session.upgraded.load(Ordering::Acquire) {
-                    // The target owns duplicated PTYs. Exit without Rust drops:
-                    // portable-pty closes a master by writing EOT on Drop.
-                    std::process::exit(0);
-                }
-                // `kill-session` is deliberate: drop the state file so it does
-                // not resurrect on the next cold start.
-                persist::remove_session_file(&session.session_name());
-                session.images.clear();
-                drop(listener);
-                let _ = fs::remove_file(session.socket_path());
-                let _ = fs::remove_file(session.hook_socket());
+                finish_session(listener, &session, &mut clients, false).await;
                 return Ok(());
             }
             _ = sigterm.recv() => {
-                session.save();
-                session.images.clear();
-                drop(listener);
-                let _ = fs::remove_file(session.socket_path());
-                let _ = fs::remove_file(session.hook_socket());
+                finish_session(listener, &session, &mut clients, true).await;
                 return Ok(());
             }
             accepted = listener.accept() => {
                 let (stream, _) = accepted?;
                 let session = Arc::clone(&session);
-                tokio::spawn(async move {
+                clients.spawn(async move {
                     if let Err(error) = serve_client(stream, session).await {
                         eprintln!("Ködade CLI client disconnected: {error:#}");
                     }
@@ -953,22 +943,25 @@ async fn serve_imported_listener(listener: UnixListener, session: Arc<Session>) 
         tokio::spawn(history_loop(Arc::clone(&session)));
     }
     tokio::spawn(subscriber_tick(Arc::clone(&session)));
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .context("install SIGTERM handler")?;
+    let mut clients = JoinSet::new();
     loop {
         tokio::select! {
+            biased;
+            _ = clients.join_next(), if !clients.is_empty() => {}
             _ = shutdown.recv() => {
-                if session.upgraded.load(Ordering::Acquire) {
-                    std::process::exit(0);
-                }
-                persist::remove_session_file(&session.session_name());
-                drop(listener);
-                let _ = fs::remove_file(session.socket_path());
-                let _ = fs::remove_file(session.hook_socket());
+                finish_session(listener, &session, &mut clients, false).await;
+                return Ok(());
+            }
+            _ = sigterm.recv() => {
+                finish_session(listener, &session, &mut clients, true).await;
                 return Ok(());
             }
             accepted = listener.accept() => {
                 let (stream, _) = accepted?;
                 let session = Arc::clone(&session);
-                tokio::spawn(async move { let _ = serve_client(stream, session).await; });
+                clients.spawn(async move { let _ = serve_client(stream, session).await; });
             }
         }
     }
@@ -1097,6 +1090,7 @@ impl Session {
             hook_socket: Mutex::new(hook_socket_path()),
             view_dispatch: Mutex::new(()),
             upgraded: AtomicBool::new(false),
+            closing: AtomicBool::new(false),
             upgrading: broadcast::channel(16).0,
             upgrade_lock: Mutex::new(()),
             handoff_active: AtomicBool::new(false),
@@ -1163,6 +1157,7 @@ impl Session {
             hook_socket: Mutex::new(hook_socket_path()),
             view_dispatch: Mutex::new(()),
             upgraded: AtomicBool::new(false),
+            closing: AtomicBool::new(false),
             upgrading: broadcast::channel(16).0,
             upgrade_lock: Mutex::new(()),
             handoff_active: AtomicBool::new(false),
@@ -1402,6 +1397,9 @@ impl Session {
                 .view_dispatch
                 .lock()
                 .map_err(|_| anyhow!("view dispatch lock poisoned"))?;
+            if self.closing.load(Ordering::Acquire) {
+                bail!("daemon shutting down");
+            }
             if self.handoff_active.swap(true, Ordering::AcqRel) {
                 bail!("a live upgrade is already in progress");
             }
@@ -1511,6 +1509,7 @@ impl Session {
             hook_socket: Mutex::new(hook_socket_path()),
             view_dispatch: Mutex::new(()),
             upgraded: AtomicBool::new(false),
+            closing: AtomicBool::new(false),
             upgrading: broadcast::channel(16).0,
             upgrade_lock: Mutex::new(()),
             handoff_active: AtomicBool::new(false),
@@ -1591,6 +1590,14 @@ impl Session {
             eprintln!("Ködade CLI could not persist: view dispatch lock poisoned");
             return;
         };
+        if self.closing.load(Ordering::Acquire) {
+            return;
+        }
+        self.save_locked();
+    }
+
+    // Caller holds view_dispatch, including the final SIGTERM publication.
+    fn save_locked(&self) {
         let file = self.build_file();
         let Some(path) = persist::session_file_path(&file.name) else {
             return;
@@ -1608,6 +1615,9 @@ impl Session {
             .view_dispatch
             .lock()
             .map_err(|_| anyhow!("view dispatch lock poisoned"))?;
+        if self.closing.load(Ordering::Acquire) {
+            return Ok(());
+        }
         let file = self.build_file();
         let Some(state_path) = persist::session_file_path(&file.name) else {
             return Ok(());
@@ -2817,6 +2827,9 @@ impl Session {
     }
 
     fn ensure_mutation_open(&self) -> Result<()> {
+        if self.closing.load(Ordering::Acquire) {
+            bail!("daemon shutting down");
+        }
         if self.handoff_active.load(Ordering::Acquire) {
             bail!("daemon upgrade in progress");
         }
@@ -2963,6 +2976,7 @@ impl Session {
                 self.notify();
             }
             ClientMessage::KillSession => {
+                self.closing.store(true, Ordering::Release);
                 let _ = self.shutdown.send(());
             }
             ClientMessage::Upgrade { .. } => bail!("live upgrade is handled by the socket server"),
@@ -5938,6 +5952,53 @@ async fn read_client_line<R: AsyncBufRead + Unpin>(
     }
 }
 
+async fn finish_session(
+    listener: UnixListener,
+    session: &Session,
+    clients: &mut JoinSet<()>,
+    preserve: bool,
+) {
+    let upgraded = {
+        let _dispatch = session.view_dispatch.lock().expect("view dispatch");
+        session.closing.store(true, Ordering::Release);
+        let upgraded = session.upgraded.load(Ordering::Acquire);
+        if !upgraded {
+            if preserve {
+                session.save_locked();
+            } else {
+                persist::remove_session_file(&session.session_name());
+            }
+        }
+        upgraded
+    };
+    drop(listener);
+    let _ = session.shutdown.send(());
+    if upgraded {
+        drain_client_handlers(clients).await;
+        // The replacement owns the PTYs and public sockets. Avoid master Drop
+        // (which writes EOT) and leave the replacement's paths untouched.
+        std::process::exit(0);
+    }
+    session.images.clear();
+    let _ = fs::remove_file(session.socket_path());
+    let _ = fs::remove_file(session.hook_socket());
+    drain_client_handlers(clients).await;
+}
+
+// Every tracked handler acknowledges delivery by completing its terminal write.
+// Bound stalled peers, but never race healthy clients against a fixed exit delay.
+async fn drain_client_handlers(clients: &mut JoinSet<()>) {
+    if tokio::time::timeout(Duration::from_secs(5), async {
+        while clients.join_next().await.is_some() {}
+    })
+    .await
+    .is_err()
+    {
+        eprintln!("Ködade CLI shutdown: timed out delivering terminal notices to stalled clients");
+        clients.abort_all();
+    }
+}
+
 async fn serve_client(stream: UnixStream, session: Arc<Session>) -> Result<()> {
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
@@ -5959,6 +6020,15 @@ async fn serve_client(stream: UnixStream, session: Arc<Session>) -> Result<()> {
     // the spawn-time backlog never replays.
     let mut last_notify_seq = session.notify_high_water();
     loop {
+        if session.upgraded.load(Ordering::Acquire) || session.closing.load(Ordering::Acquire) {
+            let message = if session.upgraded.load(Ordering::Acquire) {
+                ServerMessage::Upgrading
+            } else {
+                ServerMessage::Shutdown
+            };
+            write_server(&mut writer, &message).await?;
+            return Ok(());
+        }
         tokio::select! {
             line = read_client_line(&mut reader, &mut line_buffer) => {
                 let Some(line) = line? else { return Ok(()); };
@@ -6080,13 +6150,9 @@ async fn serve_client(stream: UnixStream, session: Arc<Session>) -> Result<()> {
                             Ok(()) => {
                                 session.upgraded.store(true, Ordering::Release);
                                 let _ = session.upgrading.send(());
-                                let shutdown = session.shutdown.clone();
-                                // This must outlive the requesting socket: a client can vanish
-                                // immediately after committing a valid replacement.
-                                tokio::spawn(async move {
-                                    tokio::time::sleep(Duration::from_millis(50)).await;
-                                    let _ = shutdown.send(());
-                                });
+                                // The listener waits for live handlers to deliver their
+                                // terminal message before exiting; elapsed time is not an ack.
+                                let _ = session.shutdown.send(());
                                 let _ = write_server(&mut writer, &ServerMessage::Upgrading).await;
                                 return Ok(());
                             }
@@ -6193,7 +6259,12 @@ async fn serve_client(stream: UnixStream, session: Arc<Session>) -> Result<()> {
                 Err(broadcast::error::RecvError::Closed) => return Ok(()),
             },
             _ = shutdown.recv() => {
-                write_server(&mut writer, &ServerMessage::Shutdown).await?;
+                let message = if session.upgraded.load(Ordering::Acquire) {
+                    ServerMessage::Upgrading
+                } else {
+                    ServerMessage::Shutdown
+                };
+                write_server(&mut writer, &message).await?;
                 return Ok(());
             },
             _ = upgrading.recv() => {
@@ -8565,6 +8636,149 @@ mod tests {
                 .tree,
             LayoutTree::Split { .. }
         ));
+    }
+
+    async fn fill_client_send_queue(server: &UnixStream) -> usize {
+        server.writable().await.unwrap();
+        let mut queued = 0;
+        loop {
+            match server.try_write(&[b'\n'; 4096]) {
+                Ok(n) => queued += n,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return queued,
+                Err(error) => panic!("fill socket: {error}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn kill_session_delivers_backpressured_shutdown_before_dropping_handlers() {
+        use std::{future::Future, task::Poll};
+        use tokio::io::AsyncReadExt;
+
+        let name = format!("kill-notice-{}", std::process::id());
+        let session = Arc::new(Session::spawn(80, 24, name).unwrap());
+        session.save();
+        let path = PathBuf::from(format!("/tmp/kk-{}.sock", std::process::id()));
+        let _ = fs::remove_file(&path);
+        let listener = UnixListener::bind(&path).unwrap();
+        *session.socket.lock().unwrap() = path.clone();
+        *session.hook_socket.lock().unwrap() = path.with_extension("hook");
+        let (server, mut client) = UnixStream::pair().unwrap();
+        let queued = fill_client_send_queue(&server).await;
+        let mut clients = JoinSet::new();
+        let serving = Arc::clone(&session);
+        clients.spawn(async move {
+            serve_client(server, serving).await.unwrap();
+        });
+        client
+            .write_all(&encode(&ClientMessage::KillSession).unwrap())
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !session.closing.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            session.handle_script(ClientMessage::NewTab).is_err(),
+            "shutdown must reject new mutations while delivering replies"
+        );
+        let finishing = finish_session(listener, &session, &mut clients, false);
+        tokio::pin!(finishing);
+        std::future::poll_fn(|cx| {
+            assert!(matches!(finishing.as_mut().poll(cx), Poll::Pending));
+            Poll::Ready(())
+        })
+        .await;
+        assert!(!path.exists(), "listener path stays closed while draining");
+        // Pending background publishers cannot recreate a deliberately killed session.
+        session.save();
+        session.save_history().unwrap();
+        if let Some(state_path) = persist::session_file_path(&session.session_name()) {
+            assert!(!state_path.exists());
+        }
+
+        let mut prefix = vec![0; queued];
+        client.read_exact(&mut prefix).await.unwrap();
+        let (reader, _writer) = client.into_split();
+        let mut lines = BufReader::new(reader).lines();
+        assert!(matches!(
+            next_server_message(&mut lines).await,
+            ServerMessage::Shutdown
+        ));
+        tokio::time::timeout(Duration::from_secs(2), finishing)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn signal_shutdown_preserves_layout_and_cleans_socket_paths() {
+        let name = format!("signal-notice-{}", std::process::id());
+        let session = Session::spawn(80, 24, name).unwrap();
+        let path = PathBuf::from(format!("/tmp/ks-{}.sock", std::process::id()));
+        let _ = fs::remove_file(&path);
+        let listener = UnixListener::bind(&path).unwrap();
+        *session.socket.lock().unwrap() = path.clone();
+        *session.hook_socket.lock().unwrap() = path.with_extension("hook");
+        finish_session(listener, &session, &mut JoinSet::new(), true).await;
+        assert!(session.closing.load(Ordering::Acquire));
+        assert!(!path.exists());
+        if let Some(state_path) = persist::session_file_path(&session.session_name()) {
+            let saved = persist::read_session_file(&state_path).unwrap().unwrap();
+            assert_eq!(saved.name, session.session_name());
+            persist::remove_session_file(&session.session_name());
+        }
+    }
+
+    #[tokio::test]
+    async fn retiring_daemon_waits_for_backpressured_client_upgrade_notice() {
+        use std::{future::Future, task::Poll};
+        use tokio::io::AsyncReadExt;
+
+        let session = Arc::new(Session::spawn(80, 24, "upgrade-notice".into()).unwrap());
+        let (server, mut client) = UnixStream::pair().unwrap();
+        // Keep the terminal write pending until the client explicitly reads.
+        let queued = fill_client_send_queue(&server).await;
+        let mut clients = JoinSet::new();
+        let serving = Arc::clone(&session);
+        clients.spawn(async move {
+            serve_client(server, serving).await.unwrap();
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while session.shutdown.receiver_count() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        // Model shutdown winning the select before the upgrade broadcast is
+        // consumed. The committed epoch must still produce Upgrading, not Shutdown.
+        session.upgraded.store(true, Ordering::Release);
+        session.shutdown.send(()).unwrap();
+        let draining = drain_client_handlers(&mut clients);
+        tokio::pin!(draining);
+        std::future::poll_fn(|cx| {
+            assert!(
+                matches!(draining.as_mut().poll(cx), Poll::Pending),
+                "retiring daemon exited before the blocked notice was delivered"
+            );
+            Poll::Ready(())
+        })
+        .await;
+        let mut prefix = vec![0; queued];
+        client.read_exact(&mut prefix).await.unwrap();
+        assert!(prefix.iter().all(|byte| *byte == b'\n'));
+        let (reader, _writer) = client.into_split();
+        let mut lines = BufReader::new(reader).lines();
+        assert!(matches!(
+            next_server_message(&mut lines).await,
+            ServerMessage::Upgrading
+        ));
+        tokio::time::timeout(Duration::from_secs(2), draining)
+            .await
+            .unwrap();
     }
 
     // Wait for actual child output, with enough evidence to distinguish startup,
