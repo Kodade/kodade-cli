@@ -18,6 +18,8 @@ with tempfile.TemporaryDirectory(prefix="kodade-smoke-") as directory:
     env = {key: value for key, value in os.environ.items() if not key.startswith("KODADE_")}
     env.update(HOME=str(root), XDG_RUNTIME_DIR=str(root / "run"),
                XDG_STATE_HOME=str(root / "state"), SHELL="/bin/sh")
+    # Shell exit can outlive the CLI reply; keep history outside the temporary HOME.
+    env["HISTFILE"] = "/dev/null"
 
     def run(*args, extra=None, success=True):
         result = subprocess.run([str(binary), *args], env=env | (extra or {}),
@@ -30,19 +32,34 @@ with tempfile.TemporaryDirectory(prefix="kodade-smoke-") as directory:
         deadline = time.monotonic() + 3
         while True:
             matches = []
-            for proc in Path("/proc").glob("[0-9]*"):
-                try:
-                    environ = (proc / "environ").read_bytes()
-                    command = (proc / "cmdline").read_bytes().replace(b"\0", b" ")
-                except OSError:
-                    continue
-                if f"XDG_RUNTIME_DIR={env['XDG_RUNTIME_DIR']}".encode() in environ and \
-                        f"kodade-cli daemon {session}".encode() in command:
-                    matches.append(proc.name)
+            if sys.platform == "darwin":
+                listing = subprocess.check_output(
+                    ["/bin/ps", "eww", "-axo", "pid=,command="], text=True)
+                for line in listing.splitlines():
+                    pid, command = line.strip().split(None, 1)
+                    if f" XDG_RUNTIME_DIR={env['XDG_RUNTIME_DIR']} " in command + " " and \
+                            f"{binary} daemon {session}" in command:
+                        matches.append(pid)
+            else:
+                for proc in Path("/proc").glob("[0-9]*"):
+                    try:
+                        environ = (proc / "environ").read_bytes()
+                        command = (proc / "cmdline").read_bytes().replace(b"\0", b" ")
+                    except OSError:
+                        continue
+                    if f"XDG_RUNTIME_DIR={env['XDG_RUNTIME_DIR']}".encode() in environ and \
+                            f"kodade-cli daemon {session}".encode() in command:
+                        matches.append(proc.name)
             if len(matches) == 1:
                 return int(matches[0])
             assert time.monotonic() < deadline, (session, matches)
             time.sleep(0.05)
+
+    def process_start(pid):
+        if sys.platform == "darwin":
+            return subprocess.check_output(
+                ["/bin/ps", "-p", str(pid), "-o", "lstart="], text=True).strip()
+        return Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[19]
 
     try:
         # Read-only diagnostics must not start a daemon or initialize user config.
@@ -80,7 +97,7 @@ with tempfile.TemporaryDirectory(prefix="kodade-smoke-") as directory:
             assert time.monotonic() < deadline, "shell did not execute identity command"
             time.sleep(0.05)
         child = int(identity_file.read_text())
-        start = Path(f"/proc/{child}/stat").read_text().rsplit(")", 1)[1].split()[19]
+        start = process_start(child)
         old_daemon = daemon_pid("default")
         # A failed replacement leaves the source usable; successful replacements
         # preserve the original PTY process through two daemon PID changes.
@@ -143,7 +160,7 @@ assert exact(7)==b'commit\\n'
             assert time.monotonic() < deadline, "original shell did not execute after two upgrades"
             time.sleep(0.05)
         assert result_file.read_text() == f"{child}:5017"
-        assert Path(f"/proc/{child}/stat").read_text().rsplit(")", 1)[1].split()[19] == start
+        assert process_start(child) == start
         assert not list(socket.parent.glob(".up-*")), "handoff staging leaked"
         run("pane", "kill", pane)
         run("pane", "read", other)

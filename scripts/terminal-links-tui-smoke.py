@@ -4,6 +4,8 @@ import errno, fcntl, json, os
 from pathlib import Path
 import pty, select, socket, struct, subprocess, sys, tempfile, termios, time
 
+from terminal_frames import completed_frame_contains
+
 BINARY = Path(sys.argv[1] if len(sys.argv) > 1 else "target/debug/kodade-cli").resolve()
 OLD_URI = "https://example.test/osc8?exact=history"
 FRESH_URI = "https://example.test/osc8?exact=fresh"
@@ -107,17 +109,12 @@ sleep 10
         try:
             wait_for("TUI attach", lambda: (drain() is None) and b"?2004h" in transcript)
 
-            def frame_presented_before_next_draw():
-                drain()
-                if b"osc8" not in transcript:
-                    return False
-                # A buffered END can appear immediately before the next BEGIN
-                # forever. Foot needs synchronization released between draws.
-                if transcript.rfind(b"\x1b[?2026l") <= transcript.rfind(b"\x1b[?2026h"):
-                    return False
-                return not select.select([master], [], [], .005)[0]
-
-            wait_for("frame presented before next draw", frame_presented_before_next_draw, timeout=3)
+            # PTY reads may coalesce adjacent draws or end midway through the
+            # next one. Observe a completed frame, without requiring idle time.
+            # terminal.rs's buffered-writer regression proves END is flushed
+            # before the next draw; a PTY transcript cannot prove flush timing.
+            wait_for("completed attached frame", lambda: (drain() is None) and
+                     completed_frame_contains(transcript, b"osc8"), timeout=3)
             wait_for("daemon PTY scrollback", lambda: command("pane", "read", str(pane_id()), "--scrollback").stdout.startswith("docs"))
             for _ in range(12):
                 os.write(master, b"\x1b[<68;5;3M")
@@ -158,7 +155,7 @@ sleep 10
             release.touch()
             wait_for("child synchronized-output end", completed.exists)
             wait_for("completed synchronized frame", lambda: "PARTIAL FINAL" in screen()["contents"])
-            wait_for("TUI completed synchronized frame", lambda: (drain() is None) and b"PARTIAL" in transcript[before_partial:] and b"FINAL" in transcript[before_partial:])
+            wait_for("TUI completed synchronized frame", lambda: (drain() is None) and completed_frame_contains(transcript[before_partial:], b"PARTIAL", b"FINAL"))
 
             os.write(master, b"\x02d")
             # Keep consuming the host PTY while cleanup writes its final mode

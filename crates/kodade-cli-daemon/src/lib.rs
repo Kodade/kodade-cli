@@ -8,6 +8,7 @@ mod handoff;
 mod history;
 mod hyperlinks;
 mod image_paste;
+mod socket_safety;
 pub use image_paste::{validate_png, MAX_IMAGE_BYTES};
 mod layout;
 mod manifest;
@@ -51,6 +52,7 @@ use tokio::{
     io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::{UnixListener, UnixStream},
     sync::broadcast,
+    task::JoinSet,
 };
 
 struct Session {
@@ -102,6 +104,7 @@ struct Session {
     /// legacy mutation is dispatched.
     view_dispatch: Mutex<()>,
     upgraded: AtomicBool,
+    closing: AtomicBool,
     upgrading: broadcast::Sender<()>,
     upgrade_lock: Mutex<()>,
     handoff_active: AtomicBool,
@@ -152,6 +155,7 @@ struct Replacement {
     hook: PathBuf,
     public_backup: PathBuf,
     hook_backup: PathBuf,
+    published_identity: Option<socket_safety::Identity>,
     public_saved: bool,
     hook_saved: bool,
     committed: bool,
@@ -226,6 +230,7 @@ impl Replacement {
             staging_alias,
             public,
             hook,
+            published_identity: None,
             public_saved: false,
             hook_saved: false,
             committed: false,
@@ -248,7 +253,19 @@ impl Drop for Replacement {
                 (self.hook_saved, &self.hook_backup, &self.hook),
             ] {
                 if saved {
-                    if let Err(error) = fs::rename(backup, public) {
+                    let restore = (|| -> std::io::Result<()> {
+                        let current = socket_safety::identity(public)?;
+                        if current == socket_safety::identity(backup)? {
+                            return Ok(());
+                        }
+                        if Some(current) != self.published_identity {
+                            return Err(std::io::Error::other(
+                                "published socket replaced; refusing rollback overwrite",
+                            ));
+                        }
+                        fs::rename(backup, public)
+                    })();
+                    if let Err(error) = restore {
                         restored = false;
                         eprintln!(
                             "could not restore {}: {error}; recovery socket retained at {}",
@@ -762,7 +779,7 @@ fn hook_socket_path() -> PathBuf {
 pub fn socket_dir() -> PathBuf {
     let runtime = env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from);
     let home = dirs::home_dir();
-    let uid = env::var("UID").unwrap_or_else(|_| "unknown".to_owned());
+    let uid = unsafe { libc::geteuid() }.to_string();
     socket_path_for(
         "unused",
         runtime.as_deref(),
@@ -798,19 +815,20 @@ pub async fn run(session_name: String) -> Result<()> {
     validate_session_name(&session_name)?;
     let socket = socket_path(&session_name);
     if let Some(parent) = socket.parent() {
-        fs::create_dir_all(parent).context("create Ködade CLI socket directory")?;
+        socket_safety::private_directory(parent).context("create Ködade CLI socket directory")?;
     }
-    if socket.exists() {
-        remove_stale_socket(&socket).await?;
-    }
-    let listener = UnixListener::bind(&socket).context("bind Ködade CLI socket")?;
     let hook_socket = hook_socket_path();
-    fs::create_dir_all(hook_socket.parent().expect("hook socket has parent"))
+    socket_safety::private_directory(hook_socket.parent().expect("hook socket has parent"))
         .context("create Ködade hook socket directory")?;
+    let startup_lock = socket_safety::startup_lock(socket.parent().expect("socket parent"))?;
+    remove_stale_socket(&socket).await?;
+    let listener = UnixListener::bind(&socket).context("bind Ködade CLI socket")?;
+    socket_safety::restrict(&socket)?;
+    let endpoint_identity = socket_safety::identity(&socket)?;
     if let Ok(metadata) = fs::symlink_metadata(&hook_socket) {
         if !metadata.file_type().is_socket() {
             drop(listener);
-            let _ = fs::remove_file(&socket);
+            let _ = socket_safety::remove(&socket, endpoint_identity);
             bail!(
                 "refusing to replace non-socket Ködade hook path {}",
                 hook_socket.display()
@@ -820,22 +838,23 @@ pub async fn run(session_name: String) -> Result<()> {
         // has exclusively bound the public session name. A live socket is not.
         if let Err(error) = remove_stale_socket(&hook_socket).await {
             drop(listener);
-            let _ = fs::remove_file(&socket);
+            let _ = socket_safety::remove(&socket, endpoint_identity);
             return Err(error).context("remove stale Ködade hook socket");
         }
     }
     if let Err(error) = fs::hard_link(&socket, &hook_socket) {
         drop(listener);
-        let _ = fs::remove_file(&socket);
+        let _ = socket_safety::remove(&socket, endpoint_identity);
         return Err(error).context("link stable Ködade hook socket");
     }
+    drop(startup_lock);
     // Binding succeeded, so no live daemon owns this session: safe to restore.
     let session = match load_session(&session_name) {
         Ok(session) => Arc::new(session),
         Err(error) => {
             drop(listener);
-            let _ = fs::remove_file(&hook_socket);
-            let _ = fs::remove_file(&socket);
+            let _ = socket_safety::remove(&hook_socket, endpoint_identity);
+            let _ = socket_safety::remove(&socket, endpoint_identity);
             return Err(error);
         }
     };
@@ -844,55 +863,12 @@ pub async fn run(session_name: String) -> Result<()> {
     *session.name.lock().expect("name lock poisoned") = session_name.clone();
     *session.socket.lock().expect("socket lock poisoned") = socket.clone();
     session.run_plugin_hooks("startup", None);
-    let mut shutdown = session.shutdown.subscribe();
-    // Debounced layout persistence runs alongside the accept loop.
-    tokio::spawn(persist_loop(Arc::clone(&session)));
-    if session.pane_history {
-        tokio::spawn(history_loop(Arc::clone(&session)));
-    } else {
+    if !session.pane_history {
         history::remove_for_session(&session.session_name());
     }
-    // Keeps agent detection running for event subscribers with no TUI attached.
-    tokio::spawn(subscriber_tick(Arc::clone(&session)));
-    // Flush state on SIGTERM so a stopped daemon (e.g. logout) can be restored.
-    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+    let sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .context("install SIGTERM handler")?;
-    loop {
-        tokio::select! {
-            _ = shutdown.recv() => {
-                if session.upgraded.load(Ordering::Acquire) {
-                    // The target owns duplicated PTYs. Exit without Rust drops:
-                    // portable-pty closes a master by writing EOT on Drop.
-                    std::process::exit(0);
-                }
-                // `kill-session` is deliberate: drop the state file so it does
-                // not resurrect on the next cold start.
-                persist::remove_session_file(&session.session_name());
-                session.images.clear();
-                drop(listener);
-                let _ = fs::remove_file(session.socket_path());
-                let _ = fs::remove_file(session.hook_socket());
-                return Ok(());
-            }
-            _ = sigterm.recv() => {
-                session.save();
-                session.images.clear();
-                drop(listener);
-                let _ = fs::remove_file(session.socket_path());
-                let _ = fs::remove_file(session.hook_socket());
-                return Ok(());
-            }
-            accepted = listener.accept() => {
-                let (stream, _) = accepted?;
-                let session = Arc::clone(&session);
-                tokio::spawn(async move {
-                    if let Err(error) = serve_client(stream, session).await {
-                        eprintln!("Ködade CLI client disconnected: {error:#}");
-                    }
-                });
-            }
-        }
-    }
+    serve_listener(listener, session, sigterm).await
 }
 
 /// Hidden daemon mode used by a source daemon during a live upgrade.
@@ -905,6 +881,8 @@ pub async fn run_import(
     final_hook: PathBuf,
 ) -> Result<()> {
     validate_session_name(&session_name)?;
+    socket_safety::private_directory(&socket_dir())?;
+    socket_safety::private_directory(final_hook.parent().context("hook socket has no parent")?)?;
     let received = tokio::task::spawn_blocking(move || handoff::receive(&handoff_path, &token))
         .await
         .context("join handoff receiver")?
@@ -920,6 +898,10 @@ pub async fn run_import(
         .hook_socket
         .lock()
         .expect("hook socket lock poisoned") = final_hook;
+    // Install before acknowledging readiness: SIGTERM must never use the default
+    // disposition once the source releases ownership.
+    let sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .context("install SIGTERM handler")?;
     let mut control = received.stream;
     let committed = tokio::task::spawn_blocking(move || {
         handoff::ready(&mut control)?;
@@ -943,32 +925,38 @@ pub async fn run_import(
     }
     // Every fallible staging operation completed before acknowledgment. The
     // published listener is already registered with the replacement runtime.
-    serve_imported_listener(listener, session).await
+    serve_listener(listener, session, sigterm).await
 }
 
-async fn serve_imported_listener(listener: UnixListener, session: Arc<Session>) -> Result<()> {
+async fn serve_listener(
+    listener: UnixListener,
+    session: Arc<Session>,
+    mut sigterm: tokio::signal::unix::Signal,
+) -> Result<()> {
+    let endpoint_identity = socket_safety::identity(&session.socket_path())?;
     let mut shutdown = session.shutdown.subscribe();
     tokio::spawn(persist_loop(Arc::clone(&session)));
     if session.pane_history {
         tokio::spawn(history_loop(Arc::clone(&session)));
     }
     tokio::spawn(subscriber_tick(Arc::clone(&session)));
+    let mut clients = JoinSet::new();
     loop {
         tokio::select! {
+            biased;
+            _ = clients.join_next(), if !clients.is_empty() => {}
             _ = shutdown.recv() => {
-                if session.upgraded.load(Ordering::Acquire) {
-                    std::process::exit(0);
-                }
-                persist::remove_session_file(&session.session_name());
-                drop(listener);
-                let _ = fs::remove_file(session.socket_path());
-                let _ = fs::remove_file(session.hook_socket());
+                finish_session(listener, &session, &mut clients, false, endpoint_identity).await;
+                return Ok(());
+            }
+            _ = sigterm.recv() => {
+                finish_session(listener, &session, &mut clients, true, endpoint_identity).await;
                 return Ok(());
             }
             accepted = listener.accept() => {
                 let (stream, _) = accepted?;
                 let session = Arc::clone(&session);
-                tokio::spawn(async move { let _ = serve_client(stream, session).await; });
+                clients.spawn(async move { let _ = serve_client(stream, session).await; });
             }
         }
     }
@@ -1006,17 +994,24 @@ async fn persist_loop(session: Arc<Session>) {
     let mut updates = session.updates.subscribe();
     let mut last_saved = session.layout_generation.load(Ordering::Relaxed);
     loop {
-        match updates.recv().await {
-            Ok(()) | Err(broadcast::error::RecvError::Lagged(_)) => {}
-            Err(broadcast::error::RecvError::Closed) => return,
+        if session.closing.load(Ordering::Acquire) {
+            return;
         }
         if session.layout_generation.load(Ordering::Relaxed) == last_saved {
-            continue; // PTY output or a no-op tick: nothing new to persist.
+            match updates.recv().await {
+                Ok(()) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+                Err(broadcast::error::RecvError::Closed) => return,
+            }
+            if session.layout_generation.load(Ordering::Relaxed) == last_saved {
+                continue;
+            }
         }
-        // Coalesce a burst of layout changes into a single write.
+        // Also bounds retries when a write fails without another notification.
         tokio::time::sleep(persist::DEBOUNCE).await;
-        session.save();
-        last_saved = session.layout_generation.load(Ordering::Relaxed);
+        match session.save() {
+            Ok(generation) => last_saved = generation,
+            Err(error) => eprintln!("Ködade CLI could not persist: {error:#}"),
+        }
     }
 }
 
@@ -1042,12 +1037,24 @@ async fn history_loop(session: Arc<Session>) {
 }
 
 async fn remove_stale_socket(socket: &Path) -> Result<()> {
-    if let Ok(Ok(_)) =
-        tokio::time::timeout(Duration::from_millis(250), UnixStream::connect(socket)).await
-    {
-        bail!("Ködade CLI daemon already running: {}", socket.display());
+    let expected = match socket_safety::identity(socket) {
+        Ok(id) => id,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e.into()),
+    };
+    match tokio::time::timeout(Duration::from_millis(250), UnixStream::connect(socket)).await {
+        Ok(Err(e)) if e.raw_os_error() == Some(libc::ECONNREFUSED) => {}
+        _ => bail!("Ködade CLI socket may still be live: {}", socket.display()),
     }
-    fs::remove_file(socket).context("remove stale Ködade CLI socket")?;
+    // BSD can also return ECONNREFUSED for a full stream listen backlog.
+    // A datagram probe does not enqueue a stream connection: a live stream
+    // endpoint reports EPROTOTYPE even when its accept queue is saturated.
+    let probe = std::os::unix::net::UnixDatagram::unbound()?;
+    match probe.connect(socket) {
+        Err(e) if e.raw_os_error() == Some(libc::ECONNREFUSED) => {}
+        _ => bail!("Ködade CLI socket may still be live: {}", socket.display()),
+    }
+    socket_safety::remove(socket, expected).context("remove stale Ködade CLI socket")?;
     Ok(())
 }
 
@@ -1097,6 +1104,7 @@ impl Session {
             hook_socket: Mutex::new(hook_socket_path()),
             view_dispatch: Mutex::new(()),
             upgraded: AtomicBool::new(false),
+            closing: AtomicBool::new(false),
             upgrading: broadcast::channel(16).0,
             upgrade_lock: Mutex::new(()),
             handoff_active: AtomicBool::new(false),
@@ -1163,6 +1171,7 @@ impl Session {
             hook_socket: Mutex::new(hook_socket_path()),
             view_dispatch: Mutex::new(()),
             upgraded: AtomicBool::new(false),
+            closing: AtomicBool::new(false),
             upgrading: broadcast::channel(16).0,
             upgrade_lock: Mutex::new(()),
             handoff_active: AtomicBool::new(false),
@@ -1402,6 +1411,9 @@ impl Session {
                 .view_dispatch
                 .lock()
                 .map_err(|_| anyhow!("view dispatch lock poisoned"))?;
+            if self.closing.load(Ordering::Acquire) {
+                bail!("daemon shutting down");
+            }
             if self.handoff_active.swap(true, Ordering::AcqRel) {
                 bail!("a live upgrade is already in progress");
             }
@@ -1455,10 +1467,22 @@ impl Session {
             .context("validate replacement daemon")?;
         handoff::send_fds(&control, &captured.fds).context("transfer PTY masters")?;
         handoff::wait_ready(&mut control).context("wait for replacement daemon")?;
+        socket_safety::identity(&transaction.public)?;
+        socket_safety::identity(&transaction.hook)?;
+        socket_safety::restrict(&transaction.staged)?;
+        socket_safety::restrict(&transaction.staged_hook)?;
         fs::hard_link(&transaction.public, &transaction.public_backup)?;
         transaction.public_saved = true;
         fs::hard_link(&transaction.hook, &transaction.hook_backup)?;
         transaction.hook_saved = true;
+        transaction.published_identity = Some(socket_safety::identity(&transaction.staged)?);
+        if socket_safety::identity(&transaction.public)?
+            != socket_safety::identity(&transaction.public_backup)?
+            || socket_safety::identity(&transaction.hook)?
+                != socket_safety::identity(&transaction.hook_backup)?
+        {
+            bail!("socket changed during handoff publication");
+        }
         fs::rename(&transaction.staged, &transaction.public)?;
         fs::rename(&transaction.staged_hook, &transaction.hook)?;
         handoff::commit(&mut control).context("commit replacement daemon")?;
@@ -1511,6 +1535,7 @@ impl Session {
             hook_socket: Mutex::new(hook_socket_path()),
             view_dispatch: Mutex::new(()),
             upgraded: AtomicBool::new(false),
+            closing: AtomicBool::new(false),
             upgrading: broadcast::channel(16).0,
             upgrade_lock: Mutex::new(()),
             handoff_active: AtomicBool::new(false),
@@ -1582,25 +1607,40 @@ impl Session {
         Ok(session)
     }
 
-    /// Persist the current layout to this session's state file. Best-effort:
-    /// errors are logged, never propagated to the client-facing loop.
-    fn save(&self) {
-        // Keep publication inside dispatch so rename cannot delete the old
-        // state file while an earlier save is still about to publish it.
-        let Ok(_dispatch) = self.view_dispatch.lock() else {
-            eprintln!("Ködade CLI could not persist: view dispatch lock poisoned");
-            return;
-        };
-        let file = self.build_file();
-        let Some(path) = persist::session_file_path(&file.name) else {
-            return;
-        };
-        if let Err(error) = persist::write_session_file(&path, &file) {
-            eprintln!(
-                "Ködade CLI could not persist session '{}': {error:#}",
-                file.name
-            );
+    /// Publish a snapshot and return the generation it represents.
+    fn save(&self) -> Result<u64> {
+        self.save_with(persist::write_session_file)
+    }
+
+    fn save_with(
+        &self,
+        publish: impl FnOnce(&Path, &persist::SessionFile) -> Result<()>,
+    ) -> Result<u64> {
+        let _dispatch = self
+            .view_dispatch
+            .lock()
+            .map_err(|_| anyhow!("view dispatch lock poisoned"))?;
+        if self.closing.load(Ordering::Acquire) {
+            bail!("daemon shutting down");
         }
+        self.save_locked_with(publish)
+    }
+
+    // Caller holds dispatch; final SIGTERM publication intentionally allows closing.
+    fn save_locked(&self) -> Result<u64> {
+        self.save_locked_with(persist::write_session_file)
+    }
+
+    fn save_locked_with(
+        &self,
+        publish: impl FnOnce(&Path, &persist::SessionFile) -> Result<()>,
+    ) -> Result<u64> {
+        let file = self.build_file();
+        let generation = self.layout_generation.load(Ordering::Relaxed);
+        if let Some(path) = persist::session_file_path(&file.name) {
+            publish(&path, &file)?;
+        }
+        Ok(generation)
     }
 
     fn save_history(&self) -> Result<()> {
@@ -1608,6 +1648,9 @@ impl Session {
             .view_dispatch
             .lock()
             .map_err(|_| anyhow!("view dispatch lock poisoned"))?;
+        if self.closing.load(Ordering::Acquire) {
+            return Ok(());
+        }
         let file = self.build_file();
         let Some(state_path) = persist::session_file_path(&file.name) else {
             return Ok(());
@@ -2048,7 +2091,9 @@ impl Session {
         let result = self.handle(message);
         drop(_dispatch);
         if renamed && result.is_ok() {
-            self.save();
+            if let Err(error) = self.save() {
+                eprintln!("Ködade CLI could not persist: {error:#}");
+            }
         }
         result
     }
@@ -2184,7 +2229,9 @@ impl Session {
         }
         drop(_dispatch);
         if matches!(message, ClientMessage::RenameSession { .. }) && result.is_ok() {
-            self.save();
+            if let Err(error) = self.save() {
+                eprintln!("Ködade CLI could not persist: {error:#}");
+            }
         }
         result
     }
@@ -2817,6 +2864,9 @@ impl Session {
     }
 
     fn ensure_mutation_open(&self) -> Result<()> {
+        if self.closing.load(Ordering::Acquire) {
+            bail!("daemon shutting down");
+        }
         if self.handoff_active.load(Ordering::Acquire) {
             bail!("daemon upgrade in progress");
         }
@@ -3008,6 +3058,7 @@ impl Session {
                 self.notify();
             }
             ClientMessage::KillSession => {
+                self.closing.store(true, Ordering::Release);
                 let _ = self.shutdown.send(());
             }
             ClientMessage::Upgrade { .. } => bail!("live upgrade is handled by the socket server"),
@@ -4004,6 +4055,7 @@ impl Session {
         }
         let old_socket = self.socket_path();
         let new_socket = socket_path(new_name);
+        let endpoint_identity = socket_safety::identity(&old_socket)?;
         // Link-then-unlink instead of `exists()` + `rename`: `hard_link` fails
         // when the target exists, so two daemons cannot race onto one name.
         // The listener stays bound to the inode, so it answers on both paths
@@ -4017,7 +4069,8 @@ impl Session {
                 return Err(error).context("link the session socket to its new name");
             }
         }
-        fs::remove_file(&old_socket).context("remove the old session socket")?;
+        socket_safety::remove(&old_socket, endpoint_identity)
+            .context("remove the old session socket")?;
         *self.socket.lock().expect("socket lock poisoned") = new_socket.clone();
         *self.name.lock().expect("name lock poisoned") = new_name.to_owned();
         if let Some(path) = persist::session_file_path(&old_name) {
@@ -5983,7 +6036,60 @@ async fn read_client_line<R: AsyncBufRead + Unpin>(
     }
 }
 
+async fn finish_session(
+    listener: UnixListener,
+    session: &Session,
+    clients: &mut JoinSet<()>,
+    preserve: bool,
+    endpoint_identity: socket_safety::Identity,
+) {
+    let upgraded = {
+        let _dispatch = session.view_dispatch.lock().expect("view dispatch");
+        session.closing.store(true, Ordering::Release);
+        let upgraded = session.upgraded.load(Ordering::Acquire);
+        if !upgraded {
+            if preserve {
+                if let Err(error) = session.save_locked() {
+                    eprintln!("Ködade CLI could not persist on shutdown: {error:#}");
+                }
+            } else {
+                persist::remove_session_file(&session.session_name());
+            }
+        }
+        upgraded
+    };
+    drop(listener);
+    let _ = session.shutdown.send(());
+    if upgraded {
+        drain_client_handlers(clients).await;
+        // The replacement owns the PTYs and public sockets. Avoid master Drop
+        // (which writes EOT) and leave the replacement's paths untouched.
+        std::process::exit(0);
+    }
+    session.images.clear();
+    let _ = socket_safety::remove(&session.socket_path(), endpoint_identity);
+    let _ = socket_safety::remove(&session.hook_socket(), endpoint_identity);
+    drain_client_handlers(clients).await;
+}
+
+// Every tracked handler acknowledges delivery by completing its terminal write.
+// Bound stalled peers, but never race healthy clients against a fixed exit delay.
+async fn drain_client_handlers(clients: &mut JoinSet<()>) {
+    if tokio::time::timeout(Duration::from_secs(5), async {
+        while clients.join_next().await.is_some() {}
+    })
+    .await
+    .is_err()
+    {
+        eprintln!("Ködade CLI shutdown: timed out delivering terminal notices to stalled clients");
+        clients.abort_all();
+    }
+}
+
 async fn serve_client(stream: UnixStream, session: Arc<Session>) -> Result<()> {
+    if stream.peer_cred()?.uid() != unsafe { libc::geteuid() } {
+        bail!("refusing client from another user");
+    }
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
     let mut line_buffer = Vec::new();
@@ -6004,6 +6110,15 @@ async fn serve_client(stream: UnixStream, session: Arc<Session>) -> Result<()> {
     // the spawn-time backlog never replays.
     let mut last_notify_seq = session.notify_high_water();
     loop {
+        if session.upgraded.load(Ordering::Acquire) || session.closing.load(Ordering::Acquire) {
+            let message = if session.upgraded.load(Ordering::Acquire) {
+                ServerMessage::Upgrading
+            } else {
+                ServerMessage::Shutdown
+            };
+            write_server(&mut writer, &message).await?;
+            return Ok(());
+        }
         tokio::select! {
             line = read_client_line(&mut reader, &mut line_buffer) => {
                 let Some(line) = line? else { return Ok(()); };
@@ -6125,13 +6240,9 @@ async fn serve_client(stream: UnixStream, session: Arc<Session>) -> Result<()> {
                             Ok(()) => {
                                 session.upgraded.store(true, Ordering::Release);
                                 let _ = session.upgrading.send(());
-                                let shutdown = session.shutdown.clone();
-                                // This must outlive the requesting socket: a client can vanish
-                                // immediately after committing a valid replacement.
-                                tokio::spawn(async move {
-                                    tokio::time::sleep(Duration::from_millis(50)).await;
-                                    let _ = shutdown.send(());
-                                });
+                                // The listener waits for live handlers to deliver their
+                                // terminal message before exiting; elapsed time is not an ack.
+                                let _ = session.shutdown.send(());
                                 let _ = write_server(&mut writer, &ServerMessage::Upgrading).await;
                                 return Ok(());
                             }
@@ -6238,7 +6349,12 @@ async fn serve_client(stream: UnixStream, session: Arc<Session>) -> Result<()> {
                 Err(broadcast::error::RecvError::Closed) => return Ok(()),
             },
             _ = shutdown.recv() => {
-                write_server(&mut writer, &ServerMessage::Shutdown).await?;
+                let message = if session.upgraded.load(Ordering::Acquire) {
+                    ServerMessage::Upgrading
+                } else {
+                    ServerMessage::Shutdown
+                };
+                write_server(&mut writer, &message).await?;
                 return Ok(());
             },
             _ = upgrading.recv() => {
@@ -8519,7 +8635,8 @@ mod tests {
             std::env::temp_dir().join(format!("kodade-cli-stale-socket-{}", std::process::id()));
         fs::create_dir_all(&directory).expect("create test directory");
         let socket = directory.join("default.sock");
-        fs::write(&socket, b"stale").expect("create stale socket file");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).expect("bind stale socket");
+        drop(listener);
         remove_stale_socket(&socket)
             .await
             .expect("remove stale socket");
@@ -8717,6 +8834,177 @@ mod tests {
         ));
     }
 
+    async fn fill_client_send_queue(server: &UnixStream) -> usize {
+        server.writable().await.unwrap();
+        let mut queued = 0;
+        loop {
+            match server.try_write(&[b'\n'; 4096]) {
+                Ok(n) => queued += n,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return queued,
+                Err(error) => panic!("fill socket: {error}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn kill_session_delivers_backpressured_shutdown_before_dropping_handlers() {
+        use std::{future::Future, task::Poll};
+        use tokio::io::AsyncReadExt;
+
+        let name = format!("kill-notice-{}", std::process::id());
+        let session = Arc::new(Session::spawn(80, 24, name).unwrap());
+        session.save().unwrap();
+        let path = PathBuf::from(format!("/tmp/kk-{}.sock", std::process::id()));
+        let _ = fs::remove_file(&path);
+        let listener = UnixListener::bind(&path).unwrap();
+        *session.socket.lock().unwrap() = path.clone();
+        *session.hook_socket.lock().unwrap() = path.with_extension("hook");
+        let (server, mut client) = UnixStream::pair().unwrap();
+        let queued = fill_client_send_queue(&server).await;
+        let mut clients = JoinSet::new();
+        let serving = Arc::clone(&session);
+        clients.spawn(async move {
+            serve_client(server, serving).await.unwrap();
+        });
+        client
+            .write_all(&encode(&ClientMessage::KillSession).unwrap())
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !session.closing.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            session.handle_script(ClientMessage::NewTab).is_err(),
+            "shutdown must reject new mutations while delivering replies"
+        );
+        let identity = socket_safety::identity(&session.socket_path()).unwrap();
+        let finishing = finish_session(listener, &session, &mut clients, false, identity);
+        tokio::pin!(finishing);
+        std::future::poll_fn(|cx| {
+            assert!(matches!(finishing.as_mut().poll(cx), Poll::Pending));
+            Poll::Ready(())
+        })
+        .await;
+        assert!(!path.exists(), "listener path stays closed while draining");
+        // Pending background publishers cannot recreate a deliberately killed session.
+        assert!(session.save().is_err());
+        session.save_history().unwrap();
+        if let Some(state_path) = persist::session_file_path(&session.session_name()) {
+            assert!(!state_path.exists());
+        }
+
+        let mut prefix = vec![0; queued];
+        client.read_exact(&mut prefix).await.unwrap();
+        let (reader, _writer) = client.into_split();
+        let mut lines = BufReader::new(reader).lines();
+        assert!(matches!(
+            next_server_message(&mut lines).await,
+            ServerMessage::Shutdown
+        ));
+        tokio::time::timeout(Duration::from_secs(2), finishing)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn signal_shutdown_preserves_layout_and_cleans_socket_paths() {
+        let name = format!("signal-notice-{}", std::process::id());
+        let session = Session::spawn(80, 24, name).unwrap();
+        let path = PathBuf::from(format!("/tmp/ks-{}.sock", std::process::id()));
+        let _ = fs::remove_file(&path);
+        let listener = UnixListener::bind(&path).unwrap();
+        *session.socket.lock().unwrap() = path.clone();
+        *session.hook_socket.lock().unwrap() = path.with_extension("hook");
+        let identity = socket_safety::identity(&session.socket_path()).unwrap();
+        finish_session(listener, &session, &mut JoinSet::new(), true, identity).await;
+        assert!(session.closing.load(Ordering::Acquire));
+        assert!(!path.exists());
+        if let Some(state_path) = persist::session_file_path(&session.session_name()) {
+            let saved = persist::read_session_file(&state_path).unwrap().unwrap();
+            assert_eq!(saved.name, session.session_name());
+            persist::remove_session_file(&session.session_name());
+        }
+    }
+
+    #[tokio::test]
+    async fn retiring_daemon_waits_for_backpressured_client_upgrade_notice() {
+        use std::{future::Future, task::Poll};
+        use tokio::io::AsyncReadExt;
+
+        let session = Arc::new(Session::spawn(80, 24, "upgrade-notice".into()).unwrap());
+        let (server, mut client) = UnixStream::pair().unwrap();
+        // Keep the terminal write pending until the client explicitly reads.
+        let queued = fill_client_send_queue(&server).await;
+        let mut clients = JoinSet::new();
+        let serving = Arc::clone(&session);
+        clients.spawn(async move {
+            serve_client(server, serving).await.unwrap();
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while session.shutdown.receiver_count() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        // Model shutdown winning the select before the upgrade broadcast is
+        // consumed. The committed epoch must still produce Upgrading, not Shutdown.
+        session.upgraded.store(true, Ordering::Release);
+        session.shutdown.send(()).unwrap();
+        let draining = drain_client_handlers(&mut clients);
+        tokio::pin!(draining);
+        std::future::poll_fn(|cx| {
+            assert!(
+                matches!(draining.as_mut().poll(cx), Poll::Pending),
+                "retiring daemon exited before the blocked notice was delivered"
+            );
+            Poll::Ready(())
+        })
+        .await;
+        let mut prefix = vec![0; queued];
+        client.read_exact(&mut prefix).await.unwrap();
+        assert!(prefix.iter().all(|byte| *byte == b'\n'));
+        let (reader, _writer) = client.into_split();
+        let mut lines = BufReader::new(reader).lines();
+        assert!(matches!(
+            next_server_message(&mut lines).await,
+            ServerMessage::Upgrading
+        ));
+        tokio::time::timeout(Duration::from_secs(2), draining)
+            .await
+            .unwrap();
+    }
+
+    // Wait for actual child output, with enough evidence to distinguish startup,
+    // process exit, and dispatch failures. Polling observes a condition, never retries input.
+    async fn wait_for_fixture_text(session: &Session, id: PaneId, expected: &str) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let (text, _) = session
+                .read_pane_text(id, true, None)
+                .expect("fixture text");
+            if text.lines().any(|line| line.trim_end() == expected) {
+                return;
+            }
+            if Instant::now() >= deadline {
+                let panes = session.panes.lock().expect("panes");
+                let pane = &panes[&id];
+                let mut child = pane.child.lock().expect("child");
+                let status = child
+                    .as_mut()
+                    .map(|child| (child.process_id(), child.try_wait()));
+                panic!(
+                    "pane {id:?} waiting for {expected:?}; child={status:?}; transcript={text:?}"
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
     #[tokio::test]
     async fn two_socket_clients_keep_selection_scroll_and_size_independent() {
         let session = Arc::new(Session::spawn(80, 24, "views".into()).expect("spawn session"));
@@ -8777,14 +9065,23 @@ mod tests {
             next_layout_matching(&mut b, |layout| layout.active_tab == first_tab).await;
         assert_eq!(b_still_first.active_tab, first_tab);
 
-        // `Input` follows each connection's focused pane, rather than the
-        // session's persisted/script focus. Use the live shells so this is a
-        // real PTY routing assertion instead of inspecting implementation state.
+        // Keep the socket-created identities/layouts, but replace interactive login
+        // shells with quiet recorders. Readiness follows termios setup; terminal
+        // echo cannot satisfy the routing assertions.
         let second_pane = a_second.panes[0].id;
+        for id in [first_pane, second_pane] {
+            session.new_pane_with_id(
+                id, "recorder", None,
+                Some(vec!["/bin/sh".into(), "-c".into(),
+                    "stty -echo || exit 1; printf 'RECORDER_READY\\n'; while IFS= read -r line; do printf 'RECEIVED:%s\\n' \"$line\"; done".into()]),
+                None,
+            ).expect("spawn recorder");
+            wait_for_fixture_text(&session, id, "RECORDER_READY").await;
+        }
         a_writer
             .write_all(
                 &encode(&ClientMessage::Input {
-                    bytes: b"printf VIEW_A\\n\r".to_vec(),
+                    bytes: b"VIEW_A\n".to_vec(),
                 })
                 .unwrap(),
             )
@@ -8793,30 +9090,18 @@ mod tests {
         b_writer
             .write_all(
                 &encode(&ClientMessage::Input {
-                    bytes: b"printf VIEW_B\\n\r".to_vec(),
+                    bytes: b"VIEW_B\n".to_vec(),
                 })
                 .unwrap(),
             )
             .await
             .expect("input b");
-        tokio::time::timeout(Duration::from_secs(2), async {
-            loop {
-                let (first_text, _) = session
-                    .read_pane_text(first_pane, true, None)
-                    .expect("read first");
-                let (second_text, _) = session
-                    .read_pane_text(second_pane, true, None)
-                    .expect("read second");
-                if first_text.contains("VIEW_B") && second_text.contains("VIEW_A") {
-                    assert!(!first_text.contains("VIEW_A"));
-                    assert!(!second_text.contains("VIEW_B"));
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        })
-        .await
-        .expect("inputs reach their own panes");
+        wait_for_fixture_text(&session, first_pane, "RECEIVED:VIEW_B").await;
+        wait_for_fixture_text(&session, second_pane, "RECEIVED:VIEW_A").await;
+        let (first_text, _) = session.read_pane_text(first_pane, true, None).unwrap();
+        let (second_text, _) = session.read_pane_text(second_pane, true, None).unwrap();
+        assert!(!first_text.contains("VIEW_A"));
+        assert!(!second_text.contains("VIEW_B"));
 
         // Scrollback belongs to B's view. Seed real terminal history directly,
         // then verify B sees it while A remains on its own tab.
@@ -9074,6 +9359,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn save_acknowledges_only_the_snapshot_generation() {
+        let session = Session::spawn(80, 24, "generation-test".into()).unwrap();
+        session.layout_generation.store(7, Ordering::Relaxed);
+        let acknowledged = session
+            .save_with(|_, file| {
+                assert_eq!(file.name, "generation-test");
+                // Simulate a newer generation becoming visible during publication.
+                session.layout_generation.store(8, Ordering::Relaxed);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(acknowledged, 7);
+        assert_eq!(session.layout_generation.load(Ordering::Relaxed), 8);
+        assert!(session
+            .save_with(|_, _| Err(anyhow!("write failed")))
+            .is_err());
+    }
+
+    #[tokio::test]
     async fn existing_pane_hooks_keep_their_stable_socket_after_session_rename() {
         let unique = format!(
             "hook-rename-{}-{}",
@@ -9096,8 +9400,23 @@ mod tests {
         fs::hard_link(&public, &stable).unwrap();
         let session = Arc::new(Session::spawn(80, 24, unique.clone()).expect("spawn session"));
 
-        session.rename_session(&renamed).expect("rename session");
         let pane = session.snapshot().unwrap().panes[0].id;
+        // Start before renaming so the live child retains its original routing env.
+        session
+            .new_pane_with_id(
+                pane,
+                "hook shell",
+                None,
+                Some(vec![
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    "stty -echo || exit 1; printf 'HOOK_READY\\n'; while IFS= read -r line; do eval \"$line\"; done".into(),
+                ]),
+                None,
+            )
+            .expect("controlled hook shell");
+        wait_for_fixture_text(&session, pane, "HOOK_READY").await;
+        session.rename_session(&renamed).expect("rename session");
         let server = {
             let session = Arc::clone(&session);
             tokio::spawn(async move {
@@ -9114,7 +9433,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(&shim, fs::Permissions::from_mode(0o700)).unwrap();
         let command = format!(
-            "KODADE_BIN={}; export KODADE_BIN; KODADE_INTEGRATION=kodade-cli; if [ -n \"${{KODADE_PANE:-}}\" ] && [ -n \"${{KODADE_SOCKET:-}}\" ]; then \"$KODADE_BIN\" agent report \"$KODADE_PANE\" working; fi\n",
+            "KODADE_BIN={}; export KODADE_BIN; KODADE_INTEGRATION=kodade-cli; if [ -n \"${{KODADE_PANE:-}}\" ] && [ -n \"${{KODADE_SOCKET:-}}\" ]; then \"$KODADE_BIN\" agent report \"$KODADE_PANE\" working; fi; printf 'HOOK_SENT\\n'\n",
             shim.display()
         );
         session
@@ -9125,6 +9444,7 @@ mod tests {
             .unwrap()
             .write(command.as_bytes())
             .unwrap();
+        wait_for_fixture_text(&session, pane, "HOOK_SENT").await;
         let mut seen = false;
         for _ in 0..40 {
             tokio::time::sleep(Duration::from_millis(25)).await;
@@ -9142,7 +9462,10 @@ mod tests {
             session.snapshot().unwrap().panes[0].screen.contents
         );
         assert!(stable.exists());
-        server.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .expect("hook reporter disconnected")
+            .unwrap();
 
         let _ = fs::remove_file(&shim);
         let _ = fs::remove_file(&stable);
