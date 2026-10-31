@@ -284,6 +284,22 @@ pub enum ClientMessage {
     },
     SplitRight,
     SplitDown,
+    /// Atomic script mutations; target resolution and action share one dispatch.
+    ClosePaneId {
+        id: PaneId,
+    },
+    ZoomPaneId {
+        id: PaneId,
+    },
+    SwapPaneId {
+        id: PaneId,
+        direction: Direction,
+    },
+    ResizePaneId {
+        id: PaneId,
+        direction: Direction,
+        cells: i16,
+    },
     ClosePane,
     CloseTab {
         id: TabId,
@@ -1059,6 +1075,10 @@ pub const CLIENT_MESSAGE_NAMES: &[&str] = &[
     "SetTerminalColors",
     "SplitRight",
     "SplitDown",
+    "ClosePaneId",
+    "ZoomPaneId",
+    "SwapPaneId",
+    "ResizePaneId",
     "ClosePane",
     "CloseTab",
     "CloseWorkspace",
@@ -1138,6 +1158,10 @@ pub fn client_message_name(message: &ClientMessage) -> &'static str {
         ClientMessage::SetTerminalColors { .. } => "SetTerminalColors",
         ClientMessage::SplitRight => "SplitRight",
         ClientMessage::SplitDown => "SplitDown",
+        ClientMessage::ClosePaneId { .. } => "ClosePaneId",
+        ClientMessage::ZoomPaneId { .. } => "ZoomPaneId",
+        ClientMessage::SwapPaneId { .. } => "SwapPaneId",
+        ClientMessage::ResizePaneId { .. } => "ResizePaneId",
         ClientMessage::ClosePane => "ClosePane",
         ClientMessage::CloseTab { .. } => "CloseTab",
         ClientMessage::CloseWorkspace { .. } => "CloseWorkspace",
@@ -1371,6 +1395,17 @@ mod tests {
             },
             ClientMessage::SplitRight,
             ClientMessage::SplitDown,
+            ClientMessage::ClosePaneId { id: PaneId(1) },
+            ClientMessage::ZoomPaneId { id: PaneId(1) },
+            ClientMessage::SwapPaneId {
+                id: PaneId(1),
+                direction: Direction::Right,
+            },
+            ClientMessage::ResizePaneId {
+                id: PaneId(1),
+                direction: Direction::Right,
+                cells: 5,
+            },
             ClientMessage::ClosePane,
             ClientMessage::CloseTab { id: tab },
             ClientMessage::CloseWorkspace { id: workspace },

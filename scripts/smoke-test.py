@@ -18,6 +18,8 @@ with tempfile.TemporaryDirectory(prefix="kodade-smoke-") as directory:
     env = {key: value for key, value in os.environ.items() if not key.startswith("KODADE_")}
     env.update(HOME=str(root), XDG_RUNTIME_DIR=str(root / "run"),
                XDG_STATE_HOME=str(root / "state"), SHELL="/bin/sh")
+    # Shell exit can outlive the CLI reply; keep history outside the temporary HOME.
+    env["HISTFILE"] = "/dev/null"
 
     def run(*args, extra=None, success=True):
         result = subprocess.run([str(binary), *args], env=env | (extra or {}),
