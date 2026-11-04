@@ -194,11 +194,14 @@ fn read_shared_mapping(file: File, params: &BTreeMap<String, String>) -> Result<
         size > 0 && size <= available && size <= MAX_IMAGE as u64,
         "invalid shared memory image range"
     );
+    // SAFETY: sysconf takes a scalar name and touches no memory.
     let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
     ensure!(page > 0, "cannot determine shared memory page size");
     let aligned = offset / page as u64 * page as u64;
     let delta = (offset - aligned) as usize;
     let length = size as usize + delta;
+    // SAFETY: the kernel chooses the address; the descriptor is open, length is non-zero and
+    // offset is page-aligned. The result is checked against MAP_FAILED below.
     let mapping = unsafe {
         libc::mmap(
             std::ptr::null_mut(),
@@ -213,9 +216,12 @@ fn read_shared_mapping(file: File, params: &BTreeMap<String, String>) -> Result<
         mapping != libc::MAP_FAILED,
         "cannot map shared memory image"
     );
+    // SAFETY: the mapping is length bytes of readable memory, and delta + size equals length,
+    // so the slice stays inside it; it is copied before the unmap below.
     let bytes = unsafe {
         std::slice::from_raw_parts(mapping.cast::<u8>().add(delta), size as usize).to_vec()
     };
+    // SAFETY: mapping and length are exactly what mmap returned, and no borrow of it remains.
     unsafe {
         libc::munmap(mapping, length);
     }
