@@ -134,6 +134,8 @@ async fn run_native(program: &str, args: &[&str], bytes: &[u8], timeout: Duratio
         use std::os::unix::process::CommandExt;
         // A backend is allowed to fork. Give it its own group so a timeout
         // terminates the whole backend tree instead of orphaning a writer.
+        // SAFETY: the pre_exec closure only calls setpgid, which is async-signal-safe, and
+        // touches no locks, allocation or captured state after fork.
         unsafe {
             command.as_std_mut().pre_exec(|| {
                 if libc::setpgid(0, 0) == -1 {
@@ -169,6 +171,8 @@ async fn run_native(program: &str, args: &[&str], bytes: &[u8], timeout: Duratio
             #[cfg(unix)]
             if let Some(pid) = child.id() {
                 // The child became its process-group leader in pre_exec.
+                // SAFETY: scalar arguments; the group was created by setpgid in pre_exec and
+                // the child timed out without being awaited to completion.
                 unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
             }
             let _ = child.start_kill();
@@ -184,6 +188,8 @@ struct BackendGroup(Option<u32>);
 impl Drop for BackendGroup {
     fn drop(&mut self) {
         if let Some(pid) = self.0 {
+            // SAFETY: scalar arguments; the group was created by setpgid in pre_exec and the
+            // guard is disarmed after a successful wait.
             unsafe {
                 libc::kill(-(pid as i32), libc::SIGKILL);
             }

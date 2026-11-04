@@ -1,5 +1,7 @@
 //! Persistent PTY host and session model for Ködade CLI.
 
+#![cfg_attr(not(test), warn(clippy::undocumented_unsafe_blocks))]
+
 mod agent;
 mod git;
 mod graphics;
@@ -113,9 +115,7 @@ struct Session {
 /// Source-side staging guard. Dropping it on any validation, transfer, or
 /// importer failure resumes every reader before the source continues serving.
 struct CapturedHandoff {
-    #[allow(dead_code)] // Consumed by the upgrade transaction after validation.
     manifest: handoff::HandoffManifest,
-    #[allow(dead_code)] // SCM_RIGHTS duplicates these while the source retains ownership.
     fds: Vec<RawFd>,
     paused: Vec<Arc<Pane>>,
     committed: bool,
@@ -184,7 +184,7 @@ fn staging_alias(directory: &Path) -> Result<PathBuf> {
     use std::os::unix::fs::symlink;
 
     let target = fs::canonicalize(directory).context("resolve handoff staging directory")?;
-    let uid = unsafe { libc::geteuid() };
+    let uid = socket_safety::effective_uid();
     for _ in 0..8 {
         let alias = PathBuf::from(format!("/tmp/.kodade-up-{uid}-{}", &handoff_nonce()?[..12]));
         match symlink(&target, &alias) {
@@ -521,7 +521,7 @@ impl ContextFile {
         use std::os::unix::fs::MetadataExt;
         let metadata = fs::symlink_metadata(&path).context("inspect imported context")?;
         if !metadata.is_file()
-            || metadata.uid() != unsafe { libc::geteuid() }
+            || metadata.uid() != socket_safety::effective_uid()
             || metadata.mode() & 0o077 != 0
             || metadata.len() > MAX_CONTEXT_BYTES as u64
             || path.parent() != Some(std::env::temp_dir().as_path())
@@ -580,6 +580,7 @@ fn terminate_owned_child(mut child: Box<dyn portable_pty::Child + Send>) {
     if let Some(pid) = pid {
         // The child is ours, so PID reuse cannot occur before its wait handle
         // is dropped. SIGKILL covers portable-pty's failed-SIGHUP path.
+        // SAFETY: kill takes scalar arguments; pid is the unreaped child checked above.
         let _ = unsafe { libc::kill(pid, libc::SIGKILL) };
         if child_exited_within(&mut *child, CHILD_EXIT_GRACE) {
             return;
@@ -605,6 +606,8 @@ impl Drop for Pane {
                 return;
             }
             if proc::start_identity(*pid).as_deref() == Some(start) {
+                // SAFETY: scalar arguments; pid is positive (checked on adoption) and
+                // its start identity still matches the adopted child.
                 let _ = unsafe { libc::kill(*pid, libc::SIGTERM) };
                 let (pid, start) = (*pid, start.clone());
                 // An adopted child has no wait handle in this daemon. Recheck
@@ -612,6 +615,7 @@ impl Drop for Pane {
                 std::thread::spawn(move || {
                     std::thread::sleep(CHILD_EXIT_GRACE);
                     if proc::start_identity(pid).as_deref() == Some(start.as_str()) {
+                        // SAFETY: scalar arguments; same positive pid and identity recheck as above.
                         let _ = unsafe { libc::kill(pid, libc::SIGKILL) };
                     }
                 });
@@ -656,7 +660,6 @@ impl ReaderControl {
         }
     }
 
-    #[allow(dead_code)] // Called by the live-handoff commit phase.
     fn pause(&self, timeout: Duration) -> Result<()> {
         let mut state = self
             .state
@@ -678,7 +681,6 @@ impl ReaderControl {
         }
     }
 
-    #[allow(dead_code)] // Called when an import rejects or times out.
     fn resume(&self) {
         if let Ok(mut state) = self.state.lock() {
             state.paused = false;
@@ -779,7 +781,7 @@ fn hook_socket_path() -> PathBuf {
 pub fn socket_dir() -> PathBuf {
     let runtime = env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from);
     let home = dirs::home_dir();
-    let uid = unsafe { libc::geteuid() }.to_string();
+    let uid = socket_safety::effective_uid().to_string();
     socket_path_for(
         "unused",
         runtime.as_deref(),
@@ -887,6 +889,7 @@ pub async fn run_import(
         .await
         .context("join handoff receiver")?
         .context("receive live handoff")?;
+    // SAFETY: received.fds were just taken from SCM_RIGHTS; the importer takes sole ownership.
     let session = unsafe { Session::import_handoff(received.manifest, received.fds) }?;
     let session = Arc::new(session);
     let listener = handoff::bind_listener(&staged_socket).context("bind staged daemon socket")?;
@@ -1353,7 +1356,6 @@ impl Session {
 
     /// Snapshot layout ids and runtime state only after every source reader
     /// acknowledges its pause. `CapturedHandoff` is the rollback authority.
-    #[allow(dead_code)] // Used by the live upgrade transaction.
     fn capture_handoff(&self) -> Result<CapturedHandoff> {
         let file = self.build_file_stable()?;
         file.validate()?;
@@ -1500,9 +1502,16 @@ impl Session {
 
     /// Rebuild session layout with its original ids around imported PTY masters.
     /// Readers remain paused until the transport ownership stage completes.
-    #[allow(dead_code)] // Called by the hidden handoff-import daemon mode.
+    ///
+    /// # Safety
+    /// Every descriptor in `fds` must be open and owned by the caller, who must not use or
+    /// close it after this call.
     unsafe fn import_handoff(manifest: handoff::HandoffManifest, fds: Vec<RawFd>) -> Result<Self> {
-        let fds: Vec<OwnedFd> = fds.into_iter().map(|fd| OwnedFd::from_raw_fd(fd)).collect();
+        let fds: Vec<OwnedFd> = fds
+            .into_iter()
+            // SAFETY: the caller transfers ownership of each descriptor.
+            .map(|fd| unsafe { OwnedFd::from_raw_fd(fd) })
+            .collect();
         manifest.session.validate()?;
         if manifest.panes.len() != fds.len() {
             bail!("handoff runtime/descriptor count mismatch");
@@ -1564,12 +1573,15 @@ impl Session {
                         .map_err(|_| anyhow!("pane lock poisoned"))?
                         .insert(
                             PaneId(saved_pane.id),
-                            Arc::new(Pane::import_handoff(
-                                runtime,
-                                fd.into_raw_fd(),
-                                session.updates.clone(),
-                                Arc::clone(&session.output_generation),
-                            )?),
+                            // SAFETY: into_raw_fd releases our ownership to the pane.
+                            Arc::new(unsafe {
+                                Pane::import_handoff(
+                                    runtime,
+                                    fd.into_raw_fd(),
+                                    session.updates.clone(),
+                                    Arc::clone(&session.output_generation),
+                                )
+                            }?),
                         );
                 }
                 tabs.push(Tab {
@@ -1767,7 +1779,10 @@ impl Session {
     ) -> Result<PaneId> {
         self.new_pane_with_id_replay(id, title, cwd, command, None, context_file, HashMap::new())
     }
-    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "mirrors the persisted pane record field by field"
+    )]
     fn new_pane_with_id_replay(
         &self,
         id: PaneId,
@@ -4232,7 +4247,10 @@ impl Session {
     /// Build the workspace list `apply_layout` will install, spawning the panes
     /// a saved tree names that are not already alive. Records every spawn in
     /// `spawned` so the caller can undo them when a later spawn fails.
-    #[allow(clippy::type_complexity)]
+    #[allow(
+        clippy::type_complexity,
+        reason = "one-off tuple of rollback bookkeeping returned to a single caller"
+    )]
     fn build_applied_workspaces(
         &self,
         file: &kodade_cli_proto::SessionFile,
@@ -4509,7 +4527,10 @@ fn focus_pane_id(state: &mut SessionState, pane: PaneId) -> bool {
 impl Pane {
     // Panes carry a lot of spawn context (size, session, cwd, command); grouping
     // it into a struct would not make the single caller clearer.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "single caller; a parameter struct would not clarify it"
+    )]
     fn spawn(
         id: PaneId,
         title: &str,
@@ -4783,13 +4804,19 @@ impl Pane {
 
     /// Rebuild a pane around an SCM_RIGHTS master. It deliberately starts
     /// paused: the source continues reading until the ownership stage commits.
+    ///
+    /// # Safety
+    /// `fd` must be an open PTY master owned by the caller, who must not use or close it
+    /// after this call.
     unsafe fn import_handoff(
         runtime: handoff::PaneRuntime,
         fd: RawFd,
         updates: broadcast::Sender<()>,
         output_generation: Arc<AtomicU64>,
     ) -> Result<Self> {
-        let master: Box<dyn MasterPty + Send> = Box::new(handoff::ImportedMaster::from_raw_fd(fd));
+        // SAFETY: the caller transfers ownership of fd.
+        let master: Box<dyn MasterPty + Send> =
+            Box::new(unsafe { handoff::ImportedMaster::from_raw_fd(fd) });
         let master_fd = master
             .as_raw_fd()
             .ok_or_else(|| anyhow!("imported master has no fd"))?;
@@ -4883,8 +4910,10 @@ impl Pane {
             _context_file: context_file,
             child: Mutex::new(None),
             adopted_child_owned: AtomicBool::new(false),
+            // Cleanup signals this PID; 0 or negative values would address process groups.
             adopted_child: runtime
                 .start_identity
+                .filter(|_| runtime.child_pid > 0)
                 .map(|start| (runtime.child_pid, start)),
             process: Mutex::new(ProcessEvidence {
                 pid: (runtime.child_pid > 0).then_some(runtime.child_pid),
@@ -5526,6 +5555,7 @@ fn read_pty(
                 events: libc::POLLIN,
                 revents: 0,
             };
+            // SAFETY: ready is one initialized pollfd that lives through the call.
             let polled = unsafe { libc::poll(&mut ready, 1, 50) };
             if polled < 0 {
                 if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
@@ -6087,7 +6117,7 @@ async fn drain_client_handlers(clients: &mut JoinSet<()>) {
 }
 
 async fn serve_client(stream: UnixStream, session: Arc<Session>) -> Result<()> {
-    if stream.peer_cred()?.uid() != unsafe { libc::geteuid() } {
+    if stream.peer_cred()?.uid() != socket_safety::effective_uid() {
         bail!("refusing client from another user");
     }
     let (reader, mut writer) = stream.into_split();
@@ -8125,6 +8155,44 @@ mod tests {
             exited,
             "closing a committed imported pane left its child running"
         );
+    }
+
+    #[tokio::test]
+    async fn import_never_adopts_a_non_positive_child_pid() {
+        let (updates, _) = broadcast::channel(8);
+        let source = Pane::spawn(
+            PaneId(1),
+            "adopted",
+            40,
+            4,
+            "adopted-pid".into(),
+            hook_socket_path(),
+            updates.clone(),
+            Arc::new(AtomicU64::new(0)),
+            None,
+            Some(vec!["sh".into(), "-c".into(), "sleep 30".into()]),
+            None,
+            None,
+            HashMap::new(),
+        )
+        .unwrap();
+        let (mut runtime, fd) = source.capture_handoff().unwrap();
+        runtime.start_identity = Some("forged".into());
+        for pid in [0, -1] {
+            runtime.child_pid = pid;
+            let duplicate = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
+            assert!(duplicate >= 0);
+            let imported = unsafe {
+                Pane::import_handoff(
+                    runtime.clone(),
+                    duplicate,
+                    updates.clone(),
+                    Arc::new(AtomicU64::new(0)),
+                )
+            }
+            .unwrap();
+            assert!(imported.adopted_child.is_none(), "pid {pid} was adopted");
+        }
     }
 
     #[test]

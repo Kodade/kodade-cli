@@ -9,15 +9,19 @@ use std::{
 
 pub(crate) fn pair(fd: RawFd) -> io::Result<(File, Box<dyn Write + Send>)> {
     fn duplicate(fd: RawFd) -> io::Result<File> {
+        // SAFETY: fcntl with F_DUPFD_CLOEXEC takes scalar arguments and reports bad fds.
         let copy = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
         if copy < 0 {
             return Err(io::Error::last_os_error());
         }
+        // SAFETY: copy is a fresh descriptor that nothing else owns.
         Ok(unsafe { File::from_raw_fd(copy) })
     }
     let reader = duplicate(fd)?;
     let writer = duplicate(fd)?;
+    // SAFETY: F_GETFL/F_SETFL take scalar arguments and report bad fds.
     let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    // SAFETY: as above.
     if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
         return Err(io::Error::last_os_error());
     }
@@ -45,6 +49,7 @@ impl Write for Writer {
                 events: libc::POLLOUT,
                 revents: 0,
             };
+            // SAFETY: ready is one initialized pollfd that lives through the call.
             let result = unsafe { libc::poll(&mut ready, 1, 50) };
             if result < 0 && io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
                 return Err(io::Error::last_os_error());

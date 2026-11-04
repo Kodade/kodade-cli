@@ -1,3 +1,5 @@
+#![cfg_attr(not(test), warn(clippy::undocumented_unsafe_blocks))]
+
 mod app;
 mod atomic_file;
 mod attention;

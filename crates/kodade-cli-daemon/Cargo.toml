@@ -21,3 +21,6 @@ vte.workspace = true
 unicode-width.workspace = true
 png.workspace = true
 getrandom.workspace = true
+
+[lints]
+workspace = true

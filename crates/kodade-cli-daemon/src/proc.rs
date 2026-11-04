@@ -48,6 +48,8 @@ pub fn start_identity(pid: i32) -> Option<String> {
     {
         let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::uninit();
         let size = std::mem::size_of::<libc::proc_bsdinfo>() as i32;
+        // SAFETY: info is writable for `size` bytes, the exact size of proc_bsdinfo; the kernel
+        // reports how many bytes it filled.
         let read = unsafe {
             libc::proc_pidinfo(
                 pid,
@@ -60,6 +62,7 @@ pub fn start_identity(pid: i32) -> Option<String> {
         if read != size {
             return None;
         }
+        // SAFETY: proc_pidinfo filled the whole struct (read == size, checked above).
         let info = unsafe { info.assume_init() };
         Some(format!(
             "{}:{}",

@@ -94,7 +94,7 @@ fn verify_owner(file: &File) -> Result<()> {
     use std::os::unix::fs::MetadataExt;
 
     ensure!(
-        file.metadata()?.uid() == unsafe { libc::geteuid() },
+        file.metadata()?.uid() == crate::socket_safety::effective_uid(),
         "image media must be owned by the daemon user"
     );
     Ok(())
@@ -156,11 +156,15 @@ fn read_shared_memory(params: &BTreeMap<String, String>, payload: &[u8]) -> Resu
         "invalid shared memory name"
     );
     let name = CString::new(payload).context("invalid shared memory name")?;
+    // SAFETY: name is a NUL-terminated string that outlives the call; shm_open
+    // returns a new descriptor or -1 and reads nothing else.
     let fd = unsafe { libc::shm_open(name.as_ptr(), libc::O_RDONLY, 0) };
     ensure!(fd >= 0, "shared memory unavailable");
+    // SAFETY: fd was just returned by shm_open and nothing else owns it, so File may close it.
     let file = unsafe { File::from_raw_fd(fd) };
     verify_owner(&file)?;
     // Once opened, our descriptor stays valid and no path is left behind.
+    // SAFETY: name is a NUL-terminated string that outlives the call.
     unsafe {
         libc::shm_unlink(name.as_ptr());
     }
@@ -190,11 +194,14 @@ fn read_shared_mapping(file: File, params: &BTreeMap<String, String>) -> Result<
         size > 0 && size <= available && size <= MAX_IMAGE as u64,
         "invalid shared memory image range"
     );
+    // SAFETY: sysconf takes a scalar name and touches no memory.
     let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
     ensure!(page > 0, "cannot determine shared memory page size");
     let aligned = offset / page as u64 * page as u64;
     let delta = (offset - aligned) as usize;
     let length = size as usize + delta;
+    // SAFETY: the kernel chooses the address; the descriptor is open, length is non-zero and
+    // offset is page-aligned. The result is checked against MAP_FAILED below.
     let mapping = unsafe {
         libc::mmap(
             std::ptr::null_mut(),
@@ -209,9 +216,12 @@ fn read_shared_mapping(file: File, params: &BTreeMap<String, String>) -> Result<
         mapping != libc::MAP_FAILED,
         "cannot map shared memory image"
     );
+    // SAFETY: the mapping is length bytes of readable memory, and delta + size equals length,
+    // so the slice stays inside it; it is copied before the unmap below.
     let bytes = unsafe {
         std::slice::from_raw_parts(mapping.cast::<u8>().add(delta), size as usize).to_vec()
     };
+    // SAFETY: mapping and length are exactly what mmap returned, and no borrow of it remains.
     unsafe {
         libc::munmap(mapping, length);
     }
