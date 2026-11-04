@@ -40,7 +40,7 @@ regex = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 semver = "1"
-sha2 = "0.10"
+sha2 = "0.11"
 tar = "0.4"
 # TOML plus Serde derives load public agent-detection manifests without a custom parser.
 toml = "0.8"
