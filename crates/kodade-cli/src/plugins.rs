@@ -743,6 +743,8 @@ pub async fn run_bounded_command(
     label: &str,
 ) -> Result<std::process::ExitStatus> {
     command.stdin(Stdio::null());
+    // SAFETY: the pre_exec closure only calls setpgid, which is async-signal-safe, and
+    // touches no locks, allocation or captured state after fork.
     unsafe {
         command.pre_exec(|| {
             if libc::setpgid(0, 0) == -1 {
@@ -781,6 +783,7 @@ async fn settle_group(pid: i32) {
 }
 
 fn group_alive(pid: i32) -> bool {
+    // SAFETY: scalar arguments; signal 0 only probes for the group.
     unsafe {
         libc::kill(-pid, 0) == 0
             || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
@@ -790,6 +793,7 @@ fn group_alive(pid: i32) -> bool {
 fn terminate_group(pid: i32, signal: i32) {
     // The child made itself group leader in pre_exec; a negative pid targets
     // the entire group, including shell descendants from a plugin build.
+    // SAFETY: scalar arguments; pid is the group leader created by setpgid in pre_exec.
     unsafe {
         libc::kill(-pid, signal);
     }

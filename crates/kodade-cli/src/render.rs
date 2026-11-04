@@ -1291,7 +1291,10 @@ pub fn auto_color(name: &str) -> Color {
     Color::Indexed(PALETTE[(hash as usize) % PALETTE.len()])
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "render inputs stay explicit; the sidebar has one caller"
+)]
 fn render_sidebar(
     frame: &mut Frame,
     layout: &LayoutSnapshot,

@@ -1344,7 +1344,7 @@ struct AnsiFile {
 #[derive(Debug, Clone)]
 pub struct Theme {
     /// Kept for diagnostics and future theme listings.
-    #[allow(dead_code)]
+    #[allow(dead_code, reason = "kept for diagnostics and future theme listings")]
     pub name: String,
     pub accent: Color,
     pub border: Color,
@@ -1359,11 +1359,12 @@ pub struct Theme {
     // Expanded schema (#8).
     pub bg: Color,
     /// Consumed by the colored-pane renderer (#7) / selection (#12); parsed now.
-    #[allow(dead_code)]
+    #[allow(
+        dead_code,
+        reason = "parsed with the theme; the renderer does not read it yet"
+    )]
     pub surface: Color,
-    #[allow(dead_code)]
     pub selection: Color,
-    #[allow(dead_code)]
     pub cursor: Color,
     pub menu_bg: Color,
     pub menu_fg: Color,
@@ -1372,7 +1373,6 @@ pub struct Theme {
     pub sidebar_bg: Color,
     /// Indexed ANSI palette, order: black..white then bright_black..bright_white.
     /// Consumed by the colored-pane renderer (#7); parsed now so themes carry it.
-    #[allow(dead_code)]
     pub ansi: [Color; 16],
 }
 
@@ -1591,6 +1591,7 @@ fn terminal_background() -> Option<String> {
             events: libc::POLLIN,
             revents: 0,
         };
+        // SAFETY: pollfd is one initialized entry that outlives the call.
         if unsafe { libc::poll(&mut pollfd, 1, 100) } <= 0 {
             return None;
         }

@@ -147,7 +147,7 @@ impl Inbox {
                 .file_name()
                 .is_some_and(|name| name.to_string_lossy().starts_with("kodade-images-"))
             || !metadata.file_type().is_dir()
-            || metadata.uid() != unsafe { libc::geteuid() }
+            || metadata.uid() != crate::socket_safety::effective_uid()
             || metadata.permissions().mode() & 0o777 != 0o700
             || directory.count > 64
             || directory.bytes > MAX_DECODED

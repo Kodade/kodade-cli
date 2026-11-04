@@ -20,7 +20,6 @@ use crate::config::Theme;
 /// What a row activates. `Index` points back into the owner's own list; the
 /// layout variants are for the help overlay (#6) and the pickers (#17).
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)]
 pub enum OverlayTarget {
     None,
     Index(usize),

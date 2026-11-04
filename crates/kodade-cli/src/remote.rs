@@ -81,7 +81,9 @@ fn runtime_dir() -> PathBuf {
     if normal.as_os_str().len() <= 35 {
         normal
     } else {
-        PathBuf::from(format!("/tmp/kodade-ssh-{}", unsafe { libc::geteuid() }))
+        // SAFETY: geteuid takes no arguments, touches no memory and cannot fail.
+        let uid = unsafe { libc::geteuid() };
+        PathBuf::from(format!("/tmp/kodade-ssh-{uid}"))
     }
 }
 
@@ -94,6 +96,7 @@ fn ensure_runtime_dir() -> Result<()> {
         .create(&path)?;
     let metadata = std::fs::symlink_metadata(&path)?;
     if !metadata.is_dir()
+        // SAFETY: geteuid takes no arguments, touches no memory and cannot fail.
         || metadata.uid() != unsafe { libc::geteuid() }
         || metadata.permissions().mode() & 0o077 != 0
     {

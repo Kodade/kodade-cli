@@ -94,7 +94,7 @@ fn verify_owner(file: &File) -> Result<()> {
     use std::os::unix::fs::MetadataExt;
 
     ensure!(
-        file.metadata()?.uid() == unsafe { libc::geteuid() },
+        file.metadata()?.uid() == crate::socket_safety::effective_uid(),
         "image media must be owned by the daemon user"
     );
     Ok(())
@@ -156,11 +156,15 @@ fn read_shared_memory(params: &BTreeMap<String, String>, payload: &[u8]) -> Resu
         "invalid shared memory name"
     );
     let name = CString::new(payload).context("invalid shared memory name")?;
+    // SAFETY: name is a NUL-terminated string that outlives the call; shm_open
+    // returns a new descriptor or -1 and reads nothing else.
     let fd = unsafe { libc::shm_open(name.as_ptr(), libc::O_RDONLY, 0) };
     ensure!(fd >= 0, "shared memory unavailable");
+    // SAFETY: fd was just returned by shm_open and nothing else owns it, so File may close it.
     let file = unsafe { File::from_raw_fd(fd) };
     verify_owner(&file)?;
     // Once opened, our descriptor stays valid and no path is left behind.
+    // SAFETY: name is a NUL-terminated string that outlives the call.
     unsafe {
         libc::shm_unlink(name.as_ptr());
     }

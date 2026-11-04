@@ -41,7 +41,7 @@ pub(crate) fn private_directory(path: &Path) -> io::Result<()> {
         .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
         .open(path)?;
     let m = directory.metadata()?;
-    if !m.is_dir() || m.uid() != unsafe { libc::geteuid() } {
+    if !m.is_dir() || m.uid() != effective_uid() {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             format!("unsafe private socket directory: {}", path.display()),
@@ -60,9 +60,15 @@ pub(crate) fn private_directory(path: &Path) -> io::Result<()> {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Identity(u64, u64);
+/// Effective user id of the daemon, the owner every private path must have.
+pub(crate) fn effective_uid() -> u32 {
+    // SAFETY: geteuid takes no arguments, touches no memory and cannot fail.
+    unsafe { libc::geteuid() }
+}
+
 pub(crate) fn identity(path: &Path) -> io::Result<Identity> {
     let m = fs::symlink_metadata(path)?;
-    if !m.file_type().is_socket() || m.uid() != unsafe { libc::geteuid() } {
+    if !m.file_type().is_socket() || m.uid() != effective_uid() {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             format!(
@@ -96,13 +102,11 @@ pub(crate) fn startup_lock(directory: &Path) -> io::Result<fs::File> {
         .custom_flags(libc::O_NOFOLLOW)
         .open(directory.join(".socket-lock"))?;
     let m = file.metadata()?;
-    if !m.is_file()
-        || m.uid() != unsafe { libc::geteuid() }
-        || m.nlink() != 1
-        || m.mode() & 0o077 != 0
-    {
+    if !m.is_file() || m.uid() != effective_uid() || m.nlink() != 1 || m.mode() & 0o077 != 0 {
         return Err(io::Error::other("unsafe socket startup lock"));
     }
+    // SAFETY: the descriptor is owned by `file`, which outlives this call; the
+    // lock is released when the returned file is dropped.
     if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
         return Err(io::Error::last_os_error());
     }

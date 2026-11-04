@@ -25,9 +25,12 @@ pub(crate) struct ImportedMaster {
 }
 
 impl ImportedMaster {
+    /// # Safety
+    /// `fd` must be an open descriptor that the caller no longer owns or uses.
     pub(crate) unsafe fn from_raw_fd(fd: RawFd) -> Self {
         Self {
-            file: fs::File::from(OwnedFd::from_raw_fd(fd)),
+            // SAFETY: the caller transfers sole ownership of fd.
+            file: fs::File::from(unsafe { OwnedFd::from_raw_fd(fd) }),
             writer_taken: std::sync::atomic::AtomicBool::new(false),
         }
     }
@@ -41,6 +44,8 @@ impl MasterPty for ImportedMaster {
             ws_xpixel: size.pixel_width,
             ws_ypixel: size.pixel_height,
         };
+        // SAFETY: the descriptor is owned by self.file; size is an initialized winsize
+        // that outlives the call.
         if unsafe { libc::ioctl(self.file.as_raw_fd(), libc::TIOCSWINSZ, &size) } != 0 {
             anyhow::bail!(io::Error::last_os_error());
         }
@@ -53,6 +58,8 @@ impl MasterPty for ImportedMaster {
             ws_xpixel: 0,
             ws_ypixel: 0,
         };
+        // SAFETY: the descriptor is owned by self.file; size is a writable winsize that
+        // outlives the call.
         if unsafe { libc::ioctl(self.file.as_raw_fd(), libc::TIOCGWINSZ, &mut size) } != 0 {
             anyhow::bail!(io::Error::last_os_error());
         }
@@ -76,6 +83,7 @@ impl MasterPty for ImportedMaster {
         Ok(Box::new(self.file.try_clone()?))
     }
     fn process_group_leader(&self) -> Option<libc::pid_t> {
+        // SAFETY: tcgetpgrp takes the descriptor by value and reports non-TTY fds.
         let pid = unsafe { libc::tcgetpgrp(self.file.as_raw_fd()) };
         (pid > 0).then_some(pid)
     }
@@ -408,12 +416,16 @@ pub(crate) fn send_fds(stream: &UnixStream, fds: &[RawFd]) -> io::Result<()> {
         iov_len: 1,
     }];
     let bytes = std::mem::size_of_val(fds);
+    // SAFETY: CMSG_SPACE is pure arithmetic; bytes is at most 64 descriptors.
     let mut control = vec![0; unsafe { libc::CMSG_SPACE(bytes as u32) as usize }];
+    // SAFETY: msghdr is plain C data for which all-zero is a valid empty message.
     let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
     message.msg_iov = iov.as_ptr() as *mut _;
     message.msg_iovlen = 1;
     message.msg_control = control.as_mut_ptr() as *mut _;
     message.msg_controllen = control.len() as _;
+    // SAFETY: control was sized with CMSG_SPACE for `bytes` of payload, so the first header and
+    // `bytes` of data fit inside it; iov and control outlive sendmsg, which only reads them.
     unsafe {
         let cmsg = libc::CMSG_FIRSTHDR(&message);
         if cmsg.is_null() {
@@ -434,6 +446,7 @@ pub(crate) fn send_fds(stream: &UnixStream, fds: &[RawFd]) -> io::Result<()> {
 
 pub(crate) fn close_fds(fds: impl IntoIterator<Item = RawFd>) {
     for fd in fds {
+        // SAFETY: the caller hands over descriptors it owns; close only takes the integer.
         let _ = unsafe { libc::close(fd) };
     }
 }
@@ -447,12 +460,14 @@ pub(crate) fn recv_fds(stream: &UnixStream, expected: usize) -> io::Result<Vec<R
         iov_base: marker.as_mut_ptr() as *mut _,
         iov_len: 1,
     }];
+    // SAFETY: CMSG_SPACE is pure arithmetic.
     let mut control = vec![
         0;
         unsafe {
             libc::CMSG_SPACE((MAX_HANDOFF_FDS * std::mem::size_of::<RawFd>()) as u32) as usize
         }
     ];
+    // SAFETY: msghdr is plain C data for which all-zero is a valid empty message.
     let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
     message.msg_iov = iov.as_mut_ptr();
     message.msg_iovlen = 1;
@@ -462,6 +477,8 @@ pub(crate) fn recv_fds(stream: &UnixStream, expected: usize) -> io::Result<Vec<R
     let flags = libc::MSG_CMSG_CLOEXEC;
     #[cfg(not(target_os = "linux"))]
     let flags = 0;
+    // SAFETY: message points at iov and control, both writable and alive through the call;
+    // control is sized for the most descriptors accepted.
     let read = unsafe { libc::recvmsg(stream.as_raw_fd(), &mut message, flags) };
     if read < 0 {
         return Err(io::Error::last_os_error());
@@ -476,6 +493,7 @@ pub(crate) fn recv_fds(stream: &UnixStream, expected: usize) -> io::Result<Vec<R
         return Err(data("handoff PTY descriptor transfer is invalid"));
     }
     for &fd in &fds {
+        // SAFETY: fcntl takes scalar arguments; fd was just received and is still open.
         if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
             close_fds(fds);
             return Err(io::Error::last_os_error());
@@ -486,6 +504,9 @@ pub(crate) fn recv_fds(stream: &UnixStream, expected: usize) -> io::Result<Vec<R
 
 fn ancillary_fds(message: &libc::msghdr) -> Vec<RawFd> {
     let mut result = Vec::new();
+    // SAFETY: message came from a successful recvmsg, so its control buffer is initialized up to
+    // msg_controllen; the CMSG_* walk stays inside it and each SCM_RIGHTS payload is read as
+    // whole c_ints within the header's declared length.
     unsafe {
         let mut current = libc::CMSG_FIRSTHDR(message);
         while !current.is_null() {

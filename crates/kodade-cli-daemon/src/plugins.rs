@@ -180,6 +180,8 @@ async fn run_bounded_for(
     command: &mut tokio::process::Command,
     timeout: Duration,
 ) -> Result<(std::process::ExitStatus, Vec<u8>, Vec<u8>)> {
+    // SAFETY: the pre_exec closure only calls setpgid, which is async-signal-safe, and
+    // touches no locks, allocation or captured state after fork.
     unsafe {
         command.pre_exec(|| {
             if libc::setpgid(0, 0) == -1 {
@@ -266,6 +268,7 @@ fn log_lock() -> &'static Mutex<()> {
     VALUE.get_or_init(|| Mutex::new(()))
 }
 fn terminate_group(pid: i32, signal: i32) {
+    // SAFETY: scalar arguments; pid is our hook's process group, created by setpgid in pre_exec.
     unsafe {
         libc::kill(-pid, signal);
     }
@@ -278,6 +281,7 @@ async fn settle_group(pid: i32) {
     }
 }
 fn group_alive(pid: i32) -> bool {
+    // SAFETY: scalar arguments; signal 0 only probes for the group.
     unsafe {
         libc::kill(-pid, 0) == 0
             || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
